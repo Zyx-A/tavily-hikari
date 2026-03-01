@@ -262,7 +262,7 @@ function PublicHome(): JSX.Element {
   const canUseTokenAccessModal = SUPPORTS_NATIVE_DIALOG
   const showLinuxDoLogin = isLoggedOut
   const hasTokenInfo = token.trim().length > 0
-  const hideTokenPanels = isLoggedOut && !hasTokenInfo && canUseTokenAccessModal
+  const hideTokenPanels = !hasTokenInfo && canUseTokenAccessModal && (loading || isLoggedOut)
   const availableKeys = summary?.active_keys ?? null
   const exhaustedKeys = summary?.exhausted_keys ?? null
   const totalKeys = availableKeys != null && exhaustedKeys != null ? availableKeys + exhaustedKeys : null
