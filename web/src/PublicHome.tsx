@@ -49,6 +49,9 @@ const REPO_URL = 'https://github.com/IvanLi-CN/tavily-hikari'
 const ICONIFY_ENDPOINT = 'https://api.iconify.design'
 const STORAGE_LAST_TOKEN = 'tavily-hikari-last-token'
 const STORAGE_TOKEN_MAP = 'tavily-hikari-token-map'
+const SUPPORTS_NATIVE_DIALOG =
+  typeof HTMLDialogElement !== 'undefined' &&
+  typeof HTMLDialogElement.prototype.showModal === 'function'
 // Keep in sync with backend constants in src/lib.rs
 const TOKEN_HOURLY_LIMIT = 100
 const TOKEN_DAILY_LIMIT = 500
@@ -256,9 +259,10 @@ function PublicHome(): JSX.Element {
   const isAdmin = profile?.isAdmin ?? false
   const builtinAuthEnabled = profile?.builtinAuthEnabled ?? false
   const isLoggedOut = profile?.userLoggedIn === false
+  const canUseTokenAccessModal = SUPPORTS_NATIVE_DIALOG
   const showLinuxDoLogin = isLoggedOut
   const hasTokenInfo = token.trim().length > 0
-  const hideTokenPanels = isLoggedOut && !hasTokenInfo
+  const hideTokenPanels = isLoggedOut && !hasTokenInfo && canUseTokenAccessModal
   const availableKeys = summary?.active_keys ?? null
   const exhaustedKeys = summary?.exhausted_keys ?? null
   const totalKeys = availableKeys != null && exhaustedKeys != null ? availableKeys + exhaustedKeys : null
@@ -333,6 +337,7 @@ function PublicHome(): JSX.Element {
   }, [])
 
   const openTokenAccessDialog = useCallback(() => {
+    if (!canUseTokenAccessModal) return
     setTokenDraft(token)
     // Ensure the modal starts masked and doesn't leak into the main input after confirm.
     setTokenVisible(false)
@@ -340,7 +345,7 @@ function PublicHome(): JSX.Element {
     const dialog = tokenAccessDialogRef.current
     if (!dialog) return
     if (!dialog.open) dialog.showModal()
-  }, [token])
+  }, [canUseTokenAccessModal, token])
 
   const closeTokenAccessDialog = useCallback(() => {
     tokenAccessDialogRef.current?.close()
@@ -759,120 +764,122 @@ function PublicHome(): JSX.Element {
           )}
         </div>
       </footer>
-      <dialog
-        ref={tokenAccessDialogRef}
-        className="modal token-access-modal"
-        onClick={(event) => {
-          // Close when clicking on the backdrop (not inside the modal box).
-          if (event.target === event.currentTarget) closeTokenAccessDialog()
-        }}
-        onClose={() => {
-          // Dialog can also be closed via ESC; keep sensitive states reset.
-          setTokenVisible(false)
-          setCopyState('idle')
-        }}
-      >
-        <div className="modal-box">
-          <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>
-            {publicStrings.tokenAccess.dialog.title}
-          </h3>
-          <p className="opacity-80" style={{ marginTop: 8 }}>
-            {publicStrings.tokenAccess.dialog.description}
-          </p>
-          <div className="token-input-wrapper" style={{ marginTop: 14 }}>
-            <label htmlFor="access-token-modal" className="token-label">
-              {publicStrings.accessToken.label}
-            </label>
-            <div className="token-input-row">
-              <div className="token-input-shell">
-                <input
-                  id="access-token-modal"
-                  name="not-a-login-field"
-                  className={`token-input${tokenVisible ? '' : ' masked'}`}
-                  // Always use text input to avoid triggering password managers
-                  type="text"
-                  value={tokenDraft}
-                  onChange={(event) => setTokenDraft(event.target.value)}
-                  placeholder={publicStrings.accessToken.placeholder}
-                  autoComplete="off"
-                  autoCorrect="off"
-                  autoCapitalize="off"
-                  spellCheck={false}
-                  aria-autocomplete="none"
-                  inputMode="text"
-                  data-1p-ignore="true"
-                  data-lpignore="true"
-                  data-form-type="other"
-                />
+      {canUseTokenAccessModal && (
+        <dialog
+          ref={tokenAccessDialogRef}
+          className="modal token-access-modal"
+          onClick={(event) => {
+            // Close when clicking on the backdrop (not inside the modal box).
+            if (event.target === event.currentTarget) closeTokenAccessDialog()
+          }}
+          onClose={() => {
+            // Dialog can also be closed via ESC; keep sensitive states reset.
+            setTokenVisible(false)
+            setCopyState('idle')
+          }}
+        >
+          <div className="modal-box">
+            <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>
+              {publicStrings.tokenAccess.dialog.title}
+            </h3>
+            <p className="opacity-80" style={{ marginTop: 8 }}>
+              {publicStrings.tokenAccess.dialog.description}
+            </p>
+            <div className="token-input-wrapper" style={{ marginTop: 14 }}>
+              <label htmlFor="access-token-modal" className="token-label">
+                {publicStrings.accessToken.label}
+              </label>
+              <div className="token-input-row">
+                <div className="token-input-shell">
+                  <input
+                    id="access-token-modal"
+                    name="not-a-login-field"
+                    className={`token-input${tokenVisible ? '' : ' masked'}`}
+                    // Always use text input to avoid triggering password managers
+                    type="text"
+                    value={tokenDraft}
+                    onChange={(event) => setTokenDraft(event.target.value)}
+                    placeholder={publicStrings.accessToken.placeholder}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    aria-autocomplete="none"
+                    inputMode="text"
+                    data-1p-ignore="true"
+                    data-lpignore="true"
+                    data-form-type="other"
+                  />
+                  <button
+                    type="button"
+                    className="token-visibility-button"
+                    onClick={() => setTokenVisible((prev) => !prev)}
+                    aria-label={tokenVisible ? publicStrings.accessToken.toggle.hide : publicStrings.accessToken.toggle.show}
+                  >
+                    <img
+                      src={`${ICONIFY_ENDPOINT}/mdi/${tokenVisible ? 'eye-off-outline' : 'eye-outline'}.svg?color=%236b7280`}
+                      alt={publicStrings.accessToken.toggle.iconAlt}
+                    />
+                  </button>
+                </div>
                 <button
                   type="button"
-                  className="token-visibility-button"
-                  onClick={() => setTokenVisible((prev) => !prev)}
-                  aria-label={tokenVisible ? publicStrings.accessToken.toggle.hide : publicStrings.accessToken.toggle.show}
+                  className={`btn token-copy-button${
+                    copyState === 'copied'
+                      ? ' btn-success'
+                      : copyState === 'error'
+                        ? ' btn-warning'
+                        : ' btn-outline'
+                  }`}
+                  onClick={() => void handleCopyToken(tokenDraft.trim())}
+                  aria-label={publicStrings.copyToken.iconAlt}
+                  disabled={tokenDraft.trim().length === 0}
                 >
-                  <img
-                    src={`${ICONIFY_ENDPOINT}/mdi/${tokenVisible ? 'eye-off-outline' : 'eye-outline'}.svg?color=%236b7280`}
-                    alt={publicStrings.accessToken.toggle.iconAlt}
+                  <Icon
+                    icon={
+                      copyState === 'copied'
+                        ? 'mdi:check'
+                        : copyState === 'error'
+                          ? 'mdi:alert-circle-outline'
+                          : 'mdi:content-copy'
+                    }
+                    aria-hidden="true"
+                    className="token-copy-icon"
                   />
+                  <span>
+                    {copyState === 'copied'
+                      ? publicStrings.copyToken.copied
+                      : copyState === 'error'
+                        ? publicStrings.copyToken.error
+                        : publicStrings.copyToken.copy}
+                  </span>
                 </button>
               </div>
-              <button
-                type="button"
-                className={`btn token-copy-button${
-                  copyState === 'copied'
-                    ? ' btn-success'
-                    : copyState === 'error'
-                      ? ' btn-warning'
-                      : ' btn-outline'
-                }`}
-                onClick={() => void handleCopyToken(tokenDraft.trim())}
-                aria-label={publicStrings.copyToken.iconAlt}
-                disabled={tokenDraft.trim().length === 0}
-              >
-                <Icon
-                  icon={
-                    copyState === 'copied'
-                      ? 'mdi:check'
-                      : copyState === 'error'
-                        ? 'mdi:alert-circle-outline'
-                        : 'mdi:content-copy'
-                  }
-                  aria-hidden="true"
-                  className="token-copy-icon"
-                />
-                <span>
-                  {copyState === 'copied'
-                    ? publicStrings.copyToken.copied
-                    : copyState === 'error'
-                      ? publicStrings.copyToken.error
-                      : publicStrings.copyToken.copy}
-                </span>
-              </button>
+            </div>
+            <p className="opacity-80" style={{ marginTop: 14, marginBottom: 0 }}>
+              {publicStrings.tokenAccess.dialog.loginHint}{' '}
+              <a href="/auth/linuxdo" className="link">
+                {publicStrings.linuxDoLogin.button}
+              </a>
+            </p>
+            <div className="modal-action">
+              <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button type="button" className="btn" onClick={closeTokenAccessDialog}>
+                  {publicStrings.tokenAccess.dialog.actions.cancel}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={confirmTokenAccessDialog}
+                  disabled={!isFullToken(tokenDraft.trim())}
+                >
+                  {publicStrings.tokenAccess.dialog.actions.confirm}
+                </button>
+              </form>
             </div>
           </div>
-          <p className="opacity-80" style={{ marginTop: 14, marginBottom: 0 }}>
-            {publicStrings.tokenAccess.dialog.loginHint}{' '}
-            <a href="/auth/linuxdo" className="link">
-              {publicStrings.linuxDoLogin.button}
-            </a>
-          </p>
-          <div className="modal-action">
-            <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              <button type="button" className="btn" onClick={closeTokenAccessDialog}>
-                {publicStrings.tokenAccess.dialog.actions.cancel}
-              </button>
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={confirmTokenAccessDialog}
-                disabled={!isFullToken(tokenDraft.trim())}
-              >
-                {publicStrings.tokenAccess.dialog.actions.confirm}
-              </button>
-            </form>
-          </div>
-        </div>
-      </dialog>
+        </dialog>
+      )}
     </main>
   )
 }
