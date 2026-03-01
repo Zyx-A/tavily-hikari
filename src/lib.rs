@@ -121,6 +121,7 @@ const AUTH_TOKEN_LOG_RETENTION_SECS: i64 = 90 * SECS_PER_DAY;
 
 const META_KEY_DATA_CONSISTENCY_DONE: &str = "data_consistency_v1_done";
 const META_KEY_TOKEN_USAGE_ROLLUP_TS: &str = "token_usage_rollup_last_ts";
+const META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2: &str = "token_usage_rollup_last_log_id_v2";
 const META_KEY_HEAL_ORPHAN_TOKENS_V1: &str = "heal_orphan_auth_tokens_from_logs_v1";
 const META_KEY_API_KEY_USAGE_BUCKETS_V1_DONE: &str = "api_key_usage_buckets_v1_done";
 
@@ -1945,6 +1946,13 @@ impl KeyStore {
         }
 
         sqlx::query(
+            r#"CREATE INDEX IF NOT EXISTS idx_token_logs_billable_id
+               ON auth_token_logs(counts_business_quota, id)"#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS token_usage_buckets (
                 token_id TEXT NOT NULL,
@@ -2536,20 +2544,46 @@ impl KeyStore {
     /// Returns (rows_affected, new_last_rollup_ts). When there are no new logs,
     /// rows_affected is 0 and new_last_rollup_ts is None.
     async fn rollup_token_usage_stats(&self) -> Result<(i64, Option<i64>), ProxyError> {
-        let last_ts = self
-            .get_meta_i64(META_KEY_TOKEN_USAGE_ROLLUP_TS)
+        // v2 cursor: strictly monotonic auth_token_logs.id to guarantee idempotent rollup.
+        // Backward compatibility: if v2 cursor is missing, map legacy timestamp cursor once.
+        let last_log_id = if let Some(id) = self
+            .get_meta_i64(META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2)
             .await?
-            .unwrap_or(0);
-
-        // Use an inclusive lower bound so that logs with the same created_at
-        // as the previous max_ts are reprocessed rather than skipped.
-        let max_created: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(created_at) FROM auth_token_logs WHERE created_at >= ?")
-                .bind(last_ts)
+        {
+            id
+        } else {
+            let legacy_ts = self.get_meta_i64(META_KEY_TOKEN_USAGE_ROLLUP_TS).await?;
+            let mapped_id = if let Some(ts) = legacy_ts {
+                sqlx::query_scalar::<_, Option<i64>>(
+                    "SELECT MAX(id) FROM auth_token_logs WHERE counts_business_quota = 1 AND created_at <= ?",
+                )
+                .bind(ts)
                 .fetch_one(&self.pool)
+                .await?
+                .unwrap_or(0)
+            } else {
+                0
+            };
+            self.set_meta_i64(META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2, mapped_id)
                 .await?;
+            mapped_id
+        };
 
-        let Some(max_ts) = max_created else {
+        let (max_log_id, max_created_at): (Option<i64>, Option<i64>) = sqlx::query_as(
+            r#"
+            SELECT
+                MAX(id) AS max_log_id,
+                MAX(created_at) AS max_created_at
+            FROM auth_token_logs
+            WHERE counts_business_quota = 1
+              AND id > ?
+            "#,
+        )
+        .bind(last_log_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let Some(max_log_id) = max_log_id else {
             return Ok((0, None));
         };
 
@@ -2596,7 +2630,7 @@ impl KeyStore {
                 SUM(CASE WHEN result_status = 'quota_exhausted' THEN 1 ELSE 0 END) AS quota_exhausted_count
             FROM auth_token_logs
             WHERE counts_business_quota = 1
-              AND created_at >= ? AND created_at <= ?
+              AND id > ? AND id <= ?
             GROUP BY token_id, bucket_start
             ON CONFLICT(token_id, bucket_start, bucket_secs) DO UPDATE SET
                 success_count = token_usage_stats.success_count + excluded.success_count,
@@ -2611,17 +2645,22 @@ impl KeyStore {
         .bind(bucket_secs)
         .bind(bucket_secs)
         .bind(bucket_secs)
-        .bind(last_ts)
-        .bind(max_ts)
+        .bind(last_log_id)
+        .bind(max_log_id)
         .execute(&self.pool)
         .await?;
 
         let affected = result.rows_affected() as i64;
 
-        self.set_meta_i64(META_KEY_TOKEN_USAGE_ROLLUP_TS, max_ts)
+        self.set_meta_i64(META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2, max_log_id)
             .await?;
+        if let Some(ts) = max_created_at {
+            // Keep legacy timestamp cursor updated for observability and downgrade compatibility.
+            self.set_meta_i64(META_KEY_TOKEN_USAGE_ROLLUP_TS, ts)
+                .await?;
+        }
 
-        Ok((affected, Some(max_ts)))
+        Ok((affected, max_created_at))
     }
 
     async fn increment_monthly_quota(
@@ -7062,6 +7101,226 @@ mod tests {
             success_after, 2,
             "bucket should grow by billable increments"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn rollup_token_usage_stats_is_idempotent_without_new_logs() {
+        let db_path = temp_db_path("rollup-idempotent");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("rollup-idempotent"))
+            .await
+            .expect("create token");
+        let store = proxy.key_store.clone();
+        let ts = 1_700_001_000i64;
+
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id, method, path, query, http_status, mcp_status, result_status, error_message, counts_business_quota, created_at
+            ) VALUES (?, 'GET', '/mcp', NULL, 200, NULL, 'success', NULL, 1, ?)
+            "#,
+        )
+        .bind(&token.id)
+        .bind(ts)
+        .execute(&store.pool)
+        .await
+        .expect("insert billable log");
+
+        let first = proxy
+            .rollup_token_usage_stats()
+            .await
+            .expect("first rollup");
+        assert!(first.0 > 0, "first rollup should process at least one row");
+
+        let after_first = proxy
+            .token_summary_since(&token.id, 0, None)
+            .await
+            .expect("summary after first rollup");
+        assert_eq!(after_first.total_requests, 1);
+        assert_eq!(after_first.success_count, 1);
+
+        let second = proxy
+            .rollup_token_usage_stats()
+            .await
+            .expect("second rollup");
+        assert_eq!(second.0, 0, "second rollup should be a no-op");
+        assert!(second.1.is_none(), "second rollup should return no max ts");
+
+        let after_second = proxy
+            .token_summary_since(&token.id, 0, None)
+            .await
+            .expect("summary after second rollup");
+        assert_eq!(after_second.total_requests, 1);
+        assert_eq!(after_second.success_count, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn rollup_token_usage_stats_processes_same_second_log_once() {
+        let db_path = temp_db_path("rollup-same-second");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("rollup-same-second"))
+            .await
+            .expect("create token");
+        let store = proxy.key_store.clone();
+        let ts = 1_700_002_000i64;
+
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id, method, path, query, http_status, mcp_status, result_status, error_message, counts_business_quota, created_at
+            ) VALUES (?, 'GET', '/mcp', NULL, 200, NULL, 'success', NULL, 1, ?)
+            "#,
+        )
+        .bind(&token.id)
+        .bind(ts)
+        .execute(&store.pool)
+        .await
+        .expect("insert first log");
+
+        proxy
+            .rollup_token_usage_stats()
+            .await
+            .expect("first rollup");
+
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id, method, path, query, http_status, mcp_status, result_status, error_message, counts_business_quota, created_at
+            ) VALUES (?, 'GET', '/mcp', NULL, 200, NULL, 'success', NULL, 1, ?)
+            "#,
+        )
+        .bind(&token.id)
+        .bind(ts)
+        .execute(&store.pool)
+        .await
+        .expect("insert second log with same second");
+
+        let second = proxy
+            .rollup_token_usage_stats()
+            .await
+            .expect("second rollup");
+        assert!(second.0 > 0, "second rollup should process the new row");
+
+        let after_second = proxy
+            .token_summary_since(&token.id, 0, None)
+            .await
+            .expect("summary after second rollup");
+        assert_eq!(after_second.total_requests, 2);
+        assert_eq!(after_second.success_count, 2);
+
+        let third = proxy
+            .rollup_token_usage_stats()
+            .await
+            .expect("third rollup");
+        assert_eq!(third.0, 0, "third rollup should be a no-op");
+
+        let after_third = proxy
+            .token_summary_since(&token.id, 0, None)
+            .await
+            .expect("summary after third rollup");
+        assert_eq!(after_third.total_requests, 2);
+        assert_eq!(after_third.success_count, 2);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn rollup_token_usage_stats_migrates_legacy_timestamp_cursor() {
+        let db_path = temp_db_path("rollup-legacy-cursor");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("rollup-legacy-cursor"))
+            .await
+            .expect("create token");
+        let store = proxy.key_store.clone();
+        let base_ts = 1_700_003_000i64;
+
+        for offset in [0_i64, 10, 20] {
+            sqlx::query(
+                r#"
+                INSERT INTO auth_token_logs (
+                    token_id, method, path, query, http_status, mcp_status, result_status, error_message, counts_business_quota, created_at
+                ) VALUES (?, 'GET', '/mcp', NULL, 200, NULL, 'success', NULL, 1, ?)
+                "#,
+            )
+            .bind(&token.id)
+            .bind(base_ts + offset)
+            .execute(&store.pool)
+            .await
+            .expect("insert log");
+        }
+
+        // Simulate pre-v2 state with only the legacy timestamp cursor present.
+        sqlx::query("DELETE FROM meta WHERE key = ?")
+            .bind(META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2)
+            .execute(&store.pool)
+            .await
+            .expect("delete v2 cursor");
+        sqlx::query(
+            r#"
+            INSERT INTO meta (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+        )
+        .bind(META_KEY_TOKEN_USAGE_ROLLUP_TS)
+        .bind((base_ts + 10).to_string())
+        .execute(&store.pool)
+        .await
+        .expect("set legacy cursor");
+
+        proxy
+            .rollup_token_usage_stats()
+            .await
+            .expect("rollup with migrated cursor");
+
+        let summary = proxy
+            .token_summary_since(&token.id, 0, None)
+            .await
+            .expect("summary after migrated rollup");
+        assert_eq!(
+            summary.total_requests, 1,
+            "should only process logs after mapped legacy cursor"
+        );
+        assert_eq!(summary.success_count, 1);
+
+        let expected_last_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(id) FROM auth_token_logs WHERE counts_business_quota = 1",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("max log id")
+        .expect("max log id should exist");
+        let cursor_v2_raw: String = sqlx::query_scalar("SELECT value FROM meta WHERE key = ?")
+            .bind(META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2)
+            .fetch_one(&store.pool)
+            .await
+            .expect("v2 cursor exists");
+        let cursor_v2 = cursor_v2_raw
+            .parse::<i64>()
+            .expect("v2 cursor should be numeric");
+        assert_eq!(cursor_v2, expected_last_id);
+
+        let second = proxy
+            .rollup_token_usage_stats()
+            .await
+            .expect("second rollup after migration");
+        assert_eq!(second.0, 0, "should not reprocess previous logs");
 
         let _ = std::fs::remove_file(db_path);
     }
