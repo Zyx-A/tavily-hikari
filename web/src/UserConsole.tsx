@@ -134,6 +134,8 @@ export default function UserConsole(): JSX.Element {
       setDetailLogs([])
       return
     }
+    setDetail(null)
+    setDetailLogs([])
     setDetailLoading(true)
     const controller = new AbortController()
     Promise.all([

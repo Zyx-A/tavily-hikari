@@ -1,4 +1,9 @@
-use std::{cmp::min, collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    cmp::min,
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use chrono::{Datelike, Local, TimeZone, Utc};
@@ -13,7 +18,7 @@ use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use url::form_urlencoded;
 
 /// Tavily MCP upstream默认端点。
@@ -99,6 +104,9 @@ const TOKEN_AFFINITY_TTL_SECS: i64 = 15 * 60;
 // Hard cap on the number of token→key affinity entries kept in memory to prevent
 // unbounded growth under churny traffic (many distinct tokens).
 const TOKEN_AFFINITY_MAX_ENTRIES: usize = 10_000;
+// Cache token -> user binding to avoid repeated DB lookups on hot request paths.
+const TOKEN_BINDING_CACHE_TTL_SECS: u64 = 30;
+const TOKEN_BINDING_CACHE_MAX_ENTRIES: usize = 10_000;
 
 const REQUEST_LOGS_MIN_RETENTION_DAYS: i64 = 7;
 
@@ -408,6 +416,12 @@ struct AccountQuotaSnapshot {
 enum QuotaSubject {
     Token(String),
     Account(String),
+}
+
+#[derive(Debug, Clone)]
+struct TokenBindingCacheEntry {
+    user_id: Option<String>,
+    expires_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -1591,16 +1605,20 @@ impl TokenQuota {
         let day_window_start = hour_bucket - 23 * SECS_PER_HOUR;
         let month_start = start_of_month(now).timestamp();
 
+        let token_bindings = self.store.list_user_bindings_for_tokens(token_ids).await?;
         let mut token_subjects: Vec<String> = Vec::new();
         let mut account_subjects: Vec<(String, String)> = Vec::new();
+        let mut account_user_ids: Vec<String> = Vec::new();
         for token_id in token_ids {
-            match self.resolve_subject(token_id).await? {
-                QuotaSubject::Token(id) => token_subjects.push(id),
-                QuotaSubject::Account(user_id) => {
-                    account_subjects.push((token_id.clone(), user_id));
-                }
+            if let Some(user_id) = token_bindings.get(token_id) {
+                account_subjects.push((token_id.clone(), user_id.clone()));
+                account_user_ids.push(user_id.clone());
+            } else {
+                token_subjects.push(token_id.clone());
             }
         }
+        account_user_ids.sort_unstable();
+        account_user_ids.dedup();
 
         let token_hourly_totals = self
             .store
@@ -1632,31 +1650,61 @@ impl TokenQuota {
                 ),
             );
         }
-        for (token_id, user_id) in account_subjects {
-            let limits = self.store.ensure_account_quota_limits(&user_id).await?;
-            let hourly_used = self
-                .store
-                .sum_account_usage_buckets(&user_id, GRANULARITY_MINUTE, hour_window_start)
+        if !account_user_ids.is_empty() {
+            self.store
+                .ensure_account_quota_limits_for_users(&account_user_ids)
                 .await?;
-            let daily_used = self
+            let account_limits = self
                 .store
-                .sum_account_usage_buckets(&user_id, GRANULARITY_HOUR, day_window_start)
+                .fetch_account_quota_limits_bulk(&account_user_ids)
                 .await?;
-            let monthly_used = self
+            let account_hourly_totals = self
                 .store
-                .fetch_account_monthly_count(&user_id, month_start)
+                .sum_account_usage_buckets_bulk(
+                    &account_user_ids,
+                    GRANULARITY_MINUTE,
+                    hour_window_start,
+                )
                 .await?;
-            verdicts.insert(
-                token_id,
-                TokenQuotaVerdict::new(
-                    hourly_used,
-                    limits.hourly_limit,
-                    daily_used,
-                    limits.daily_limit,
-                    monthly_used,
-                    limits.monthly_limit,
-                ),
-            );
+            let account_daily_totals = self
+                .store
+                .sum_account_usage_buckets_bulk(
+                    &account_user_ids,
+                    GRANULARITY_HOUR,
+                    day_window_start,
+                )
+                .await?;
+            let account_monthly_totals = self
+                .store
+                .fetch_account_monthly_counts(&account_user_ids, month_start)
+                .await?;
+            let default_limits = AccountQuotaLimits {
+                hourly_any_limit: effective_token_hourly_request_limit(),
+                hourly_limit: effective_token_hourly_limit(),
+                daily_limit: effective_token_daily_limit(),
+                monthly_limit: effective_token_monthly_limit(),
+            };
+
+            for (token_id, user_id) in account_subjects {
+                let limits = account_limits
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| default_limits.clone());
+                let hourly_used = account_hourly_totals.get(&user_id).copied().unwrap_or(0);
+                let daily_used = account_daily_totals.get(&user_id).copied().unwrap_or(0);
+                let monthly_used = account_monthly_totals.get(&user_id).copied().unwrap_or(0);
+                verdicts.insert(
+                    token_id,
+                    TokenQuotaVerdict::new(
+                        hourly_used,
+                        limits.hourly_limit,
+                        daily_used,
+                        limits.daily_limit,
+                        monthly_used,
+                        limits.monthly_limit,
+                    ),
+                );
+            }
         }
         Ok(verdicts)
     }
@@ -1745,27 +1793,63 @@ impl TokenRequestLimit {
         let minute_bucket = now_ts - (now_ts % SECS_PER_MINUTE);
         let hour_window_start = minute_bucket - 59 * SECS_PER_MINUTE;
 
-        let mut map = HashMap::new();
+        let token_bindings = self.store.list_user_bindings_for_tokens(token_ids).await?;
+        let mut token_subjects: Vec<String> = Vec::new();
+        let mut account_subjects: Vec<(String, String)> = Vec::new();
+        let mut account_user_ids: Vec<String> = Vec::new();
         for token_id in token_ids {
-            let verdict = if let Some(user_id) = self.store.find_user_id_by_token(token_id).await? {
-                let limits = self.store.ensure_account_quota_limits(&user_id).await?;
-                let used = self
-                    .store
-                    .sum_account_usage_buckets(
-                        &user_id,
-                        GRANULARITY_REQUEST_MINUTE,
-                        hour_window_start,
-                    )
-                    .await?;
-                TokenHourlyRequestVerdict::new(used, limits.hourly_any_limit)
+            if let Some(user_id) = token_bindings.get(token_id) {
+                account_subjects.push((token_id.clone(), user_id.clone()));
+                account_user_ids.push(user_id.clone());
             } else {
-                let used = self
-                    .store
-                    .sum_usage_buckets(token_id, GRANULARITY_REQUEST_MINUTE, hour_window_start)
-                    .await?;
-                TokenHourlyRequestVerdict::new(used, self.hourly_limit)
-            };
-            map.insert(token_id.clone(), verdict);
+                token_subjects.push(token_id.clone());
+            }
+        }
+        account_user_ids.sort_unstable();
+        account_user_ids.dedup();
+
+        let mut map = HashMap::new();
+        let token_totals = self
+            .store
+            .sum_usage_buckets_bulk(
+                &token_subjects,
+                GRANULARITY_REQUEST_MINUTE,
+                hour_window_start,
+            )
+            .await?;
+        for token_id in token_subjects {
+            let used = token_totals.get(&token_id).copied().unwrap_or(0);
+            map.insert(
+                token_id,
+                TokenHourlyRequestVerdict::new(used, self.hourly_limit),
+            );
+        }
+
+        if !account_user_ids.is_empty() {
+            self.store
+                .ensure_account_quota_limits_for_users(&account_user_ids)
+                .await?;
+            let account_limits = self
+                .store
+                .fetch_account_quota_limits_bulk(&account_user_ids)
+                .await?;
+            let account_totals = self
+                .store
+                .sum_account_usage_buckets_bulk(
+                    &account_user_ids,
+                    GRANULARITY_REQUEST_MINUTE,
+                    hour_window_start,
+                )
+                .await?;
+            let default_hourly_any_limit = effective_token_hourly_request_limit();
+            for (token_id, user_id) in account_subjects {
+                let used = account_totals.get(&user_id).copied().unwrap_or(0);
+                let limit = account_limits
+                    .get(&user_id)
+                    .map(|limits| limits.hourly_any_limit)
+                    .unwrap_or(default_hourly_any_limit);
+                map.insert(token_id, TokenHourlyRequestVerdict::new(used, limit));
+            }
         }
         Ok(map)
     }
@@ -1969,6 +2053,7 @@ impl TavilyProxy {
 #[derive(Debug)]
 struct KeyStore {
     pool: SqlitePool,
+    token_binding_cache: RwLock<HashMap<String, TokenBindingCacheEntry>>,
 }
 
 impl KeyStore {
@@ -1985,7 +2070,10 @@ impl KeyStore {
             .connect_with(options)
             .await?;
 
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            token_binding_cache: RwLock::new(HashMap::new()),
+        };
         store.initialize_schema().await?;
         Ok(store)
     }
@@ -2878,6 +2966,40 @@ impl KeyStore {
         Ok(sum.unwrap_or(0))
     }
 
+    async fn sum_account_usage_buckets_bulk(
+        &self,
+        user_ids: &[String],
+        granularity: &str,
+        bucket_start_at_least: i64,
+    ) -> Result<HashMap<String, i64>, ProxyError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut builder = QueryBuilder::new(
+            "SELECT user_id, SUM(count) as total FROM account_usage_buckets WHERE granularity = ",
+        );
+        builder.push_bind(granularity);
+        builder.push(" AND bucket_start >= ");
+        builder.push_bind(bucket_start_at_least);
+        builder.push(" AND user_id IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for user_id in user_ids {
+                separated.push_bind(user_id);
+            }
+        }
+        builder.push(") GROUP BY user_id");
+        let rows = builder
+            .build_query_as::<(String, i64)>()
+            .fetch_all(&self.pool)
+            .await?;
+        let mut map = HashMap::new();
+        for (user_id, total) in rows {
+            map.insert(user_id, total);
+        }
+        Ok(map)
+    }
+
     async fn sum_usage_buckets_bulk(
         &self,
         token_ids: &[String],
@@ -3083,6 +3205,55 @@ impl KeyStore {
             return Ok(0);
         }
         Ok(stored_count)
+    }
+
+    async fn fetch_account_monthly_counts(
+        &self,
+        user_ids: &[String],
+        current_month_start: i64,
+    ) -> Result<HashMap<String, i64>, ProxyError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut builder = QueryBuilder::new(
+            "SELECT user_id, month_start, month_count FROM account_monthly_quota WHERE user_id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for user_id in user_ids {
+                separated.push_bind(user_id);
+            }
+        }
+        builder.push(")");
+
+        let rows = builder
+            .build_query_as::<(String, i64, i64)>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut map = HashMap::new();
+        let mut stale_ids = Vec::new();
+        for (user_id, stored_start, stored_count) in rows {
+            if stored_start < current_month_start {
+                map.insert(user_id.clone(), 0);
+                stale_ids.push(user_id);
+            } else {
+                map.insert(user_id, stored_count);
+            }
+        }
+
+        for user_id in stale_ids {
+            sqlx::query(
+                "UPDATE account_monthly_quota SET month_start = ?, month_count = 0 WHERE user_id = ?",
+            )
+            .bind(current_month_start)
+            .bind(&user_id)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(map)
     }
 
     async fn delete_old_usage_buckets(
@@ -4661,13 +4832,49 @@ impl KeyStore {
     }
 
     async fn find_user_id_by_token(&self, token_id: &str) -> Result<Option<String>, ProxyError> {
+        let now = Instant::now();
+        if let Some(cached) = {
+            let cache = self.token_binding_cache.read().await;
+            cache.get(token_id).cloned()
+        } && cached.expires_at > now
+        {
+            return Ok(cached.user_id);
+        }
+
         let row = sqlx::query_as::<_, (String,)>(
             r#"SELECT user_id FROM user_token_bindings WHERE token_id = ? LIMIT 1"#,
         )
         .bind(token_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(user_id,)| user_id))
+        let user_id = row.map(|(id,)| id);
+        self.cache_token_binding(token_id, user_id.as_deref()).await;
+        Ok(user_id)
+    }
+
+    async fn cache_token_binding(&self, token_id: &str, user_id: Option<&str>) {
+        let mut cache = self.token_binding_cache.write().await;
+        cache.insert(
+            token_id.to_string(),
+            TokenBindingCacheEntry {
+                user_id: user_id.map(str::to_string),
+                expires_at: Instant::now() + Duration::from_secs(TOKEN_BINDING_CACHE_TTL_SECS),
+            },
+        );
+
+        if cache.len() <= TOKEN_BINDING_CACHE_MAX_ENTRIES {
+            return;
+        }
+        let now = Instant::now();
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() <= TOKEN_BINDING_CACHE_MAX_ENTRIES {
+            return;
+        }
+        let overflow = cache.len() - TOKEN_BINDING_CACHE_MAX_ENTRIES;
+        let keys: Vec<String> = cache.keys().take(overflow).cloned().collect();
+        for key in keys {
+            cache.remove(&key);
+        }
     }
 
     async fn user_has_token_binding(&self, user_id: &str) -> Result<bool, ProxyError> {
@@ -4744,6 +4951,74 @@ impl KeyStore {
             daily_limit,
             monthly_limit,
         })
+    }
+
+    async fn ensure_account_quota_limits_for_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<(), ProxyError> {
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        let now = Utc::now().timestamp();
+        let hourly_any_limit = effective_token_hourly_request_limit();
+        let hourly_limit = effective_token_hourly_limit();
+        let daily_limit = effective_token_daily_limit();
+        let monthly_limit = effective_token_monthly_limit();
+
+        let mut builder = QueryBuilder::new(
+            "INSERT INTO account_quota_limits (user_id, hourly_any_limit, hourly_limit, daily_limit, monthly_limit, created_at, updated_at) ",
+        );
+        builder.push_values(user_ids, |mut b, user_id| {
+            b.push_bind(user_id)
+                .push_bind(hourly_any_limit)
+                .push_bind(hourly_limit)
+                .push_bind(daily_limit)
+                .push_bind(monthly_limit)
+                .push_bind(now)
+                .push_bind(now);
+        });
+        builder.push(" ON CONFLICT(user_id) DO NOTHING");
+        builder.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn fetch_account_quota_limits_bulk(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, AccountQuotaLimits>, ProxyError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut builder = QueryBuilder::new(
+            "SELECT user_id, hourly_any_limit, hourly_limit, daily_limit, monthly_limit FROM account_quota_limits WHERE user_id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for user_id in user_ids {
+                separated.push_bind(user_id);
+            }
+        }
+        builder.push(")");
+
+        let rows = builder
+            .build_query_as::<(String, i64, i64, i64, i64)>()
+            .fetch_all(&self.pool)
+            .await?;
+        let mut map = HashMap::new();
+        for (user_id, hourly_any_limit, hourly_limit, daily_limit, monthly_limit) in rows {
+            map.insert(
+                user_id,
+                AccountQuotaLimits {
+                    hourly_any_limit,
+                    hourly_limit,
+                    daily_limit,
+                    monthly_limit,
+                },
+            );
+        }
+        Ok(map)
     }
 
     async fn fetch_user_success_failure(
@@ -5097,6 +5372,7 @@ impl KeyStore {
         note: Option<&str>,
     ) -> Result<AuthTokenSecret, ProxyError> {
         if let Some(existing) = self.fetch_user_token_any_status(user_id).await? {
+            self.cache_token_binding(&existing.id, Some(user_id)).await;
             return Ok(existing);
         }
 
@@ -5175,6 +5451,7 @@ impl KeyStore {
             match inserted_binding {
                 Ok(_) => {
                     tx.commit().await?;
+                    self.cache_token_binding(&token_id, Some(user_id)).await;
                     return Ok(AuthTokenSecret {
                         id: token_id.clone(),
                         token: Self::compose_full_token(&token_id, &secret),

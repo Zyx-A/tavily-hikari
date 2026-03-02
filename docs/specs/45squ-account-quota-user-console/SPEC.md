@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 进行中（fast-track）
+- Status: 已完成（fast-track）
 - Created: 2026-03-02
 - Last: 2026-03-02
 
@@ -89,8 +89,10 @@
 - [x] M2: 账户级配额存储与回填迁移落地
 - [x] M3: 用户控制台 API 与路由落地
 - [x] M4: 前端 `/console` 仪表盘 + token 管理落地
-- [ ] M5: fast-track 交付（push + PR + checks + review-loop）
+- [x] M5: fast-track 交付（push + PR + checks + review-loop）
 
 ## 变更记录
 
 - 2026-03-02: 初始化规格，冻结范围、接口与验收口径。
+- 2026-03-02: 完成账户级配额迁移与用户控制台交付，补齐登录跳转与用户接口链路。
+- 2026-03-02: 完成 review-loop 收敛，修复快照查询批量化、详情页切换闪旧数据与登录回退边界。

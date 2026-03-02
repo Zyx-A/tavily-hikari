@@ -763,6 +763,13 @@ async fn load_spa_response(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn spa_file_exists(state: &AppState, file_name: &str) -> bool {
+    let Some(dir) = state.static_dir.as_ref() else {
+        return false;
+    };
+    tokio::fs::metadata(dir.join(file_name)).await.is_ok()
+}
+
 async fn serve_index(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -777,6 +784,7 @@ async fn serve_index(
         && resolve_user_session(state.as_ref(), &headers)
             .await
             .is_some()
+        && spa_file_exists(state.as_ref(), "console.html").await
     {
         return Ok(Redirect::temporary("/console").into_response());
     }
@@ -3215,7 +3223,7 @@ async fn get_linuxdo_auth(
         .proxy
         .create_oauth_login_state_with_binding(
             "linuxdo",
-            Some("/console"),
+            None,
             cfg.login_state_ttl_secs,
             Some(&binding_hash),
         )
@@ -3426,7 +3434,14 @@ async fn get_linuxdo_callback(
         user_session_set_cookie(&session.token, cfg.session_max_age_secs, use_secure_cookie)?;
     let clear_binding_cookie = oauth_login_binding_clear_cookie(use_secure_cookie)?;
 
-    let target = redirect_to.unwrap_or_else(|| "/console".to_string());
+    let default_target = if spa_file_exists(state.as_ref(), "console.html").await {
+        "/console"
+    } else if spa_file_exists(state.as_ref(), "index.html").await {
+        "/"
+    } else {
+        "/api/profile"
+    };
+    let target = redirect_to.unwrap_or_else(|| default_target.to_string());
     let mut response = Redirect::temporary(&target).into_response();
     response.headers_mut().append(SET_COOKIE, cookie);
     response
@@ -6432,6 +6447,32 @@ mod tests {
         std::env::temp_dir().join(file)
     }
 
+    fn temp_static_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}-static-{}", nanoid!(8)));
+        std::fs::create_dir_all(&dir).expect("create temp static dir");
+        std::fs::write(
+            dir.join("index.html"),
+            "<!doctype html><title>index</title>",
+        )
+        .expect("write index");
+        std::fs::write(
+            dir.join("console.html"),
+            "<!doctype html><title>console</title>",
+        )
+        .expect("write console");
+        std::fs::write(
+            dir.join("admin.html"),
+            "<!doctype html><title>admin</title>",
+        )
+        .expect("write admin");
+        std::fs::write(
+            dir.join("login.html"),
+            "<!doctype html><title>login</title>",
+        )
+        .expect("write login");
+        dir
+    }
+
     async fn spawn_mock_upstream(expected_api_key: String) -> SocketAddr {
         let app = Router::new().route(
             "/mcp",
@@ -6826,9 +6867,10 @@ mod tests {
     }
 
     async fn spawn_user_oauth_server(proxy: TavilyProxy) -> SocketAddr {
+        let static_dir = temp_static_dir("linuxdo-user-oauth");
         let state = Arc::new(AppState {
             proxy,
-            static_dir: None,
+            static_dir: Some(static_dir),
             forward_auth: ForwardAuthConfig::new(None, None, None, None),
             forward_auth_enabled: false,
             builtin_admin: BuiltinAdminAuth::new(false, None, None),
