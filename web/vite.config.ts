@@ -28,9 +28,20 @@ export default defineConfig({
       configureServer(server) {
         server.middlewares.use((req, _res, next) => {
           const url = req.url ?? ''
-          if (url === '/admin' || url === '/admin/') req.url = '/admin.html'
-          if (url === '/console' || url === '/console/') req.url = '/console.html'
-          if (url === '/login' || url === '/login/') req.url = '/login.html'
+          const parsed = new URL(url, 'http://localhost')
+          const pathname = parsed.pathname
+          if (
+            (pathname === '/admin' || pathname.startsWith('/admin/')) &&
+            pathname !== '/admin.html'
+          ) {
+            req.url = `/admin.html${parsed.search}`
+          }
+          if (pathname === '/console' || pathname === '/console/') {
+            req.url = `/console.html${parsed.search}`
+          }
+          if (pathname === '/login' || pathname === '/login/') {
+            req.url = `/login.html${parsed.search}`
+          }
           next()
         })
       },

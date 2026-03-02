@@ -8,6 +8,19 @@ import AdminPanelHeader from './components/AdminPanelHeader'
 import SegmentedTabs from './components/ui/SegmentedTabs'
 import TokenUsageHeader from './components/TokenUsageHeader'
 import TokenDetail from './pages/TokenDetail'
+import AdminShell, { type AdminNavItem } from './admin/AdminShell'
+import DashboardOverview from './admin/DashboardOverview'
+import ModulePlaceholder from './admin/ModulePlaceholder'
+import {
+  type AdminModuleId,
+  type AdminPathRoute,
+  isSameAdminRoute,
+  keyDetailPath,
+  modulePath,
+  parseAdminPath,
+  tokenDetailPath,
+  tokenLeaderboardPath,
+} from './admin/routes'
 import { useTranslate, type AdminTranslations } from './i18n'
 import { extractTvlyDevApiKeysFromText } from './lib/api-key-extract'
 import {
@@ -43,6 +56,7 @@ import {
   fetchKeyMetrics,
   fetchKeyLogs,
   type KeySummary,
+  type JobLogView,
   fetchApiKeyDetail,
   syncApiKeyUsage,
   fetchJobs,
@@ -50,27 +64,19 @@ import {
   type TokenGroup,
 } from './api'
 
-function parseHashForKeyId(): string | null {
-  const hash = location.hash || ''
-  const m = hash.match(/^#\/keys\/([^\/?#]+)/)
-  return m ? decodeURIComponent(m[1]) : null
-}
-
-function parseHashForTokenId(): string | null {
-  const hash = location.hash || ''
-  const m = hash.match(/^#\/tokens\/([^\/?#]+)/)
-  return m ? decodeURIComponent(m[1]) : null
-}
-
 const REFRESH_INTERVAL_MS = 30_000
 const LOGS_PER_PAGE = 20
 const LOGS_MAX_PAGES = 10
+const DASHBOARD_RECENT_LOGS_PER_PAGE = 64
+const DASHBOARD_RECENT_JOBS_PER_PAGE = 20
 // Auto-collapse behavior for the API keys batch overlay (empty textarea only):
 // The user wants "delay + close animation" to total 500ms.
 const KEYS_BATCH_CLOSE_ANIMATION_MS = 200
 const KEYS_BATCH_AUTO_COLLAPSE_TOTAL_MS = 500
 const KEYS_BATCH_AUTO_COLLAPSE_DELAY_MS = Math.max(0, KEYS_BATCH_AUTO_COLLAPSE_TOTAL_MS - KEYS_BATCH_CLOSE_ANIMATION_MS)
 const API_KEYS_IMPORT_CHUNK_SIZE = 1000
+const DASHBOARD_TOKENS_PAGE_SIZE = 100
+const DASHBOARD_TOKENS_MAX_PAGES = 10
 
 function leaderboardPrimaryValue(
   item: TokenUsageLeaderboardItem,
@@ -305,26 +311,8 @@ function formatErrorMessage(log: RequestLog, errorsStrings: AdminTranslations['l
   return errorsStrings.none
 }
 
-type AdminRoute =
-  | { name: 'home' }
-  | { name: 'key'; id: string }
-  | { name: 'token'; id: string }
-  | { name: 'token-usage' }
-
-function parseHashForLeaderboard(): boolean {
-  const hash = location.hash || ''
-  return /^#\/token-usage/.test(hash)
-}
-
 function AdminDashboard(): JSX.Element {
-  const [route, setRoute] = useState<AdminRoute>(() => {
-    const keyId = parseHashForKeyId()
-    if (keyId) return { name: 'key', id: keyId }
-    const tokenId = parseHashForTokenId()
-    if (tokenId) return { name: 'token', id: tokenId }
-    if (parseHashForLeaderboard()) return { name: 'token-usage' }
-    return { name: 'home' }
-  })
+  const [route, setRoute] = useState<AdminPathRoute>(() => parseAdminPath(window.location.pathname))
   const translations = useTranslate()
   const adminStrings = translations.admin
   const headerStrings = adminStrings.header
@@ -345,6 +333,8 @@ function AdminDashboard(): JSX.Element {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [keys, setKeys] = useState<ApiKeyStats[]>([])
   const [tokens, setTokens] = useState<AuthToken[]>([])
+  const [dashboardTokens, setDashboardTokens] = useState<AuthToken[]>([])
+  const [dashboardTokenCoverage, setDashboardTokenCoverage] = useState<'ok' | 'truncated' | 'error'>('ok')
   const [tokensPage, setTokensPage] = useState(1)
   const tokensPerPage = 10
   const [tokensTotal, setTokensTotal] = useState(0)
@@ -360,10 +350,12 @@ function AdminDashboard(): JSX.Element {
   const [tokenLeaderboardFocus, setTokenLeaderboardFocus] = useState<TokenLeaderboardFocus>('usage')
   const [tokenLeaderboardNonce, setTokenLeaderboardNonce] = useState(0)
   const [logs, setLogs] = useState<RequestLog[]>([])
+  const [dashboardLogs, setDashboardLogs] = useState<RequestLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsPage, setLogsPage] = useState(1)
   const [logResultFilter, setLogResultFilter] = useState<'all' | 'success' | 'error' | 'quota_exhausted'>('all')
-  const [jobs, setJobs] = useState<import('./api').JobLogView[]>([])
+  const [jobs, setJobs] = useState<JobLogView[]>([])
+  const [dashboardJobs, setDashboardJobs] = useState<JobLogView[]>([])
   const [jobFilter, setJobFilter] = useState<'all' | 'quota' | 'usage' | 'logs'>('all')
   const [jobsPage, setJobsPage] = useState(1)
   const jobsPerPage = 10
@@ -663,6 +655,28 @@ function AdminDashboard(): JSX.Element {
     return secret
   }, [])
 
+  const loadAllTokensForDashboard = useCallback(async (
+    signal?: AbortSignal,
+  ): Promise<{ items: AuthToken[]; truncated: boolean }> => {
+    const perPage = DASHBOARD_TOKENS_PAGE_SIZE
+    const maxPages = DASHBOARD_TOKENS_MAX_PAGES
+    let page = 1
+    let total = Number.POSITIVE_INFINITY
+    const items: AuthToken[] = []
+
+    while (page <= maxPages && items.length < total) {
+      const result = await fetchTokens(page, perPage, undefined, signal)
+      if (signal?.aborted) break
+      items.push(...result.items)
+      total = result.total
+      if (result.items.length < perPage) break
+      page += 1
+    }
+
+    const truncated = items.length < total
+    return { items, truncated }
+  }, [])
+
   const handleCopySecret = useCallback(
     async (id: string, stateKey: string) => {
       updateCopyState(stateKey, 'loading')
@@ -734,8 +748,61 @@ function AdminDashboard(): JSX.Element {
           setLoading(false)
         }
       }
-  },
+    },
     [tokensPage, selectedTokenGroupName, selectedTokenUngrouped],
+  )
+
+  const loadDashboardOverview = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        const [dashboardTokenSnapshot, dashboardLogsData, dashboardJobsData] = await Promise.all([
+          loadAllTokensForDashboard(signal)
+            .then((value) => ({ kind: 'ok' as const, ...value }))
+            .catch(() => ({ kind: 'error' as const })),
+          fetchRequestLogs(1, DASHBOARD_RECENT_LOGS_PER_PAGE, undefined, signal).catch(
+            () =>
+              ({
+                items: [],
+                total: 0,
+                page: 1,
+                perPage: DASHBOARD_RECENT_LOGS_PER_PAGE,
+              }) as Paginated<RequestLog>,
+          ),
+          fetchJobs(1, DASHBOARD_RECENT_JOBS_PER_PAGE, 'all', signal).catch(
+            () =>
+              ({
+                items: [],
+                total: 0,
+                page: 1,
+                perPage: DASHBOARD_RECENT_JOBS_PER_PAGE,
+              }) as Paginated<JobLogView>,
+          ),
+        ])
+
+        if (signal?.aborted) {
+          return
+        }
+
+        if (dashboardTokenSnapshot.kind === 'ok') {
+          setDashboardTokens(dashboardTokenSnapshot.items)
+          setDashboardTokenCoverage(dashboardTokenSnapshot.truncated ? 'truncated' : 'ok')
+        } else {
+          setDashboardTokens([])
+          setDashboardTokenCoverage('error')
+        }
+        setDashboardLogs(dashboardLogsData.items)
+        setDashboardJobs(dashboardJobsData.items)
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') {
+          return
+        }
+        setDashboardTokens([])
+        setDashboardTokenCoverage('error')
+        setDashboardLogs([])
+        setDashboardJobs([])
+      }
+    },
+    [loadAllTokensForDashboard],
   )
 
   const loadTokenLeaderboard = useCallback(
@@ -771,6 +838,15 @@ function AdminDashboard(): JSX.Element {
     void loadData(controller.signal)
     return () => controller.abort()
   }, [loadData])
+
+  useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'dashboard')) {
+      return
+    }
+    const controller = new AbortController()
+    void loadDashboardOverview(controller.signal)
+    return () => controller.abort()
+  }, [route, loadDashboardOverview])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -850,7 +926,11 @@ function AdminDashboard(): JSX.Element {
     if (pollingTimerRef.current == null) {
       pollingTimerRef.current = window.setInterval(() => {
         const controller = new AbortController()
-        void loadData(controller.signal).finally(() => controller.abort())
+        const tasks: Array<Promise<unknown>> = [loadData(controller.signal)]
+        if (route.name === 'module' && route.module === 'dashboard') {
+          tasks.push(loadDashboardOverview(controller.signal))
+        }
+        void Promise.all(tasks).finally(() => controller.abort())
       }, REFRESH_INTERVAL_MS) as unknown as number
     }
 
@@ -860,7 +940,7 @@ function AdminDashboard(): JSX.Element {
         pollingTimerRef.current = null
       }
     }
-  }, [sseConnected, loadData])
+  }, [sseConnected, loadData, loadDashboardOverview, route])
 
   // Detect whether the collapsed token groups row overflows horizontally.
   // If everything fits in a single line, we hide the "more" toggle button.
@@ -921,58 +1001,55 @@ function AdminDashboard(): JSX.Element {
   }, [])
 
   useEffect(() => {
-    const onHash = () => {
-      const keyId = parseHashForKeyId()
-      if (keyId) {
-        setRoute({ name: 'key', id: keyId })
-        return
-      }
-      const tokenId = parseHashForTokenId()
-      if (tokenId) {
-        setRoute({ name: 'token', id: tokenId })
-        return
-      }
-      if (parseHashForLeaderboard()) {
-        setRoute({ name: 'token-usage' })
-        return
-      }
-      setRoute({ name: 'home' })
+    const onPopState = () => {
+      setRoute(parseAdminPath(window.location.pathname))
     }
-    window.addEventListener('hashchange', onHash)
-    return () => window.removeEventListener('hashchange', onHash)
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
   }, [])
 
-  const navigateHome = () => {
-    if (window.location.pathname !== '/admin') {
-      window.history.pushState(null, '', '/admin')
+  const navigateToPath = useCallback((path: string) => {
+    const nextRoute = parseAdminPath(path)
+    if (window.location.pathname !== path) {
+      window.history.pushState(null, '', path)
     }
-    location.hash = ''
-    setRoute({ name: 'home' })
-  }
+    setRoute((previous) => (isSameAdminRoute(previous, nextRoute) ? previous : nextRoute))
+  }, [])
 
-  const navigateKey = (id: string) => {
-    location.hash = `#/keys/${encodeURIComponent(id)}`
-    setRoute({ name: 'key', id })
-  }
+  const navigateModule = useCallback(
+    (module: AdminModuleId) => {
+      navigateToPath(modulePath(module))
+    },
+    [navigateToPath],
+  )
 
-  const navigateToken = (id: string) => {
-    location.hash = `#/tokens/${encodeURIComponent(id)}`
-    setRoute({ name: 'token', id })
-  }
+  const navigateKey = useCallback(
+    (id: string) => {
+      navigateToPath(keyDetailPath(id))
+    },
+    [navigateToPath],
+  )
 
-  const navigateTokenLeaderboard = () => {
-    if (window.location.pathname !== '/admin') {
-      window.history.pushState(null, '', '/admin')
-    }
-    location.hash = '#/token-usage'
-    setRoute({ name: 'token-usage' })
-  }
+  const navigateToken = useCallback(
+    (id: string) => {
+      navigateToPath(tokenDetailPath(id))
+    },
+    [navigateToPath],
+  )
+
+  const navigateTokenLeaderboard = useCallback(() => {
+    navigateToPath(tokenLeaderboardPath())
+  }, [navigateToPath])
 
   const handleManualRefresh = () => {
     const controller = new AbortController()
     setLoading(true)
     setTokenLeaderboardNonce((value) => value + 1)
-    void loadData(controller.signal).finally(() => controller.abort())
+    const tasks: Array<Promise<unknown>> = [loadData(controller.signal)]
+    if (route.name === 'module' && route.module === 'dashboard') {
+      tasks.push(loadDashboardOverview(controller.signal))
+    }
+    void Promise.all(tasks).finally(() => controller.abort())
   }
 
   const metrics = useMemo(() => {
@@ -1925,12 +2002,42 @@ function AdminDashboard(): JSX.Element {
     if (!tokenLeaderboard || tokenLeaderboard.length === 0) return []
     return sortLeaderboard(tokenLeaderboard, tokenLeaderboardPeriod, tokenLeaderboardFocus).slice(0, 50)
   }, [tokenLeaderboard, tokenLeaderboardPeriod, tokenLeaderboardFocus])
+  const navItems: AdminNavItem[] = [
+    { module: 'dashboard', label: adminStrings.nav.dashboard, icon: 'mdi:view-dashboard-outline' },
+    { module: 'tokens', label: adminStrings.nav.tokens, icon: 'mdi:key-chain-variant' },
+    { module: 'keys', label: adminStrings.nav.keys, icon: 'mdi:key-outline' },
+    { module: 'requests', label: adminStrings.nav.requests, icon: 'mdi:file-document-outline' },
+    { module: 'jobs', label: adminStrings.nav.jobs, icon: 'mdi:calendar-clock-outline' },
+    { module: 'users', label: adminStrings.nav.users, icon: 'mdi:account-group-outline' },
+    { module: 'alerts', label: adminStrings.nav.alerts, icon: 'mdi:bell-ring-outline' },
+    { module: 'proxy-settings', label: adminStrings.nav.proxySettings, icon: 'mdi:tune-variant' },
+  ]
+  const activeModule: AdminModuleId =
+    route.name === 'module' ? route.module : route.name === 'key' ? 'keys' : 'tokens'
 
   if (route.name === 'key') {
-    return <KeyDetails id={route.id} onBack={navigateHome} />
+    return (
+      <AdminShell
+        activeModule={activeModule}
+        navItems={navItems}
+        skipToContentLabel={adminStrings.accessibility.skipToContent}
+        onSelectModule={navigateModule}
+      >
+        <KeyDetails id={route.id} onBack={() => navigateModule('keys')} />
+      </AdminShell>
+    )
   }
   if (route.name === 'token') {
-    return <TokenDetail id={route.id} onBack={navigateHome} />
+    return (
+      <AdminShell
+        activeModule={activeModule}
+        navItems={navItems}
+        skipToContentLabel={adminStrings.accessibility.skipToContent}
+        onSelectModule={navigateModule}
+      >
+        <TokenDetail id={route.id} onBack={() => navigateModule('tokens')} />
+      </AdminShell>
+    )
   }
 
   if (route.name === 'token-usage') {
@@ -1965,7 +2072,12 @@ function AdminDashboard(): JSX.Element {
     }
 
     return (
-      <main className="app-shell">
+      <AdminShell
+        activeModule={activeModule}
+        navItems={navItems}
+        skipToContentLabel={adminStrings.accessibility.skipToContent}
+        onSelectModule={navigateModule}
+      >
         <TokenUsageHeader
           title={tokenLeaderboardStrings.title}
           subtitle={tokenLeaderboardStrings.description}
@@ -1986,7 +2098,7 @@ function AdminDashboard(): JSX.Element {
             { value: 'errors', label: tokenLeaderboardStrings.focus.errors },
             { value: 'other', label: tokenLeaderboardStrings.focus.other },
           ]}
-          onBack={navigateHome}
+          onBack={() => navigateModule('tokens')}
           onRefresh={() => setTokenLeaderboardNonce((x) => x + 1)}
           onPeriodChange={setTokenLeaderboardPeriod}
           onFocusChange={setTokenLeaderboardFocus}
@@ -2065,7 +2177,7 @@ function AdminDashboard(): JSX.Element {
             </div>
           )}
         </section>
-      </main>
+      </AdminShell>
     )
   }
 
@@ -2074,9 +2186,42 @@ function AdminDashboard(): JSX.Element {
   const ungroupedGroup = tokenGroupList.find((group) => !group.name || group.name.trim().length === 0)
   const namedTokenGroups = tokenGroupList.filter((group) => group.name && group.name.trim().length > 0)
   const hasTokenGroups = tokenGroupList.length > 0
+  const showDashboard = activeModule === 'dashboard'
+  const showTokens = activeModule === 'tokens'
+  const showKeys = activeModule === 'keys'
+  const showRequests = activeModule === 'requests'
+  const showJobs = activeModule === 'jobs'
+  const showUsers = activeModule === 'users'
+  const showAlerts = activeModule === 'alerts'
+  const showProxySettings = activeModule === 'proxy-settings'
+  const trendBuckets = (() => {
+    const windowSize = 8
+    const sorted = [...dashboardLogs]
+      .filter((log) => typeof log.created_at === 'number' && Number.isFinite(log.created_at))
+      .sort((a, b) => a.created_at - b.created_at)
+      .slice(-64)
+    if (sorted.length === 0) {
+      return { request: new Array(windowSize).fill(0), error: new Array(windowSize).fill(0) }
+    }
+    const minTime = sorted[0].created_at
+    const maxTime = sorted[sorted.length - 1].created_at
+    const span = Math.max(1, maxTime - minTime + 1)
+    const request = new Array<number>(windowSize).fill(0)
+    const error = new Array<number>(windowSize).fill(0)
+    for (const item of sorted) {
+      const ratio = (item.created_at - minTime) / span
+      const index = Math.min(windowSize - 1, Math.max(0, Math.floor(ratio * windowSize)))
+      request[index] += 1
+      if (item.result_status === 'error' || item.result_status === 'quota_exhausted') {
+        error[index] += 1
+      }
+    }
+    return { request, error }
+  })()
   return (
     <>
-      {keysBatchVisible &&
+      {showKeys &&
+        keysBatchVisible &&
         typeof document !== 'undefined' &&
         createPortal(
           <div
@@ -2179,7 +2324,12 @@ function AdminDashboard(): JSX.Element {
 	          </div>,
           document.body,
         )}
-      <main className="app-shell">
+      <AdminShell
+        activeModule={activeModule}
+        navItems={navItems}
+        skipToContentLabel={adminStrings.accessibility.skipToContent}
+        onSelectModule={navigateModule}
+      >
       <AdminPanelHeader
         title={headerStrings.title}
         subtitle={headerStrings.subtitle}
@@ -2193,6 +2343,23 @@ function AdminDashboard(): JSX.Element {
         onRefresh={handleManualRefresh}
       />
 
+      {showDashboard && (
+        <DashboardOverview
+          strings={adminStrings.dashboard}
+          metrics={metrics}
+          trend={trendBuckets}
+          tokenCoverage={dashboardTokenCoverage}
+          tokens={dashboardTokens}
+          keys={dedupedKeys}
+          logs={dashboardLogs}
+          jobs={dashboardJobs}
+          onOpenModule={navigateModule}
+          onOpenToken={navigateToken}
+          onOpenKey={navigateKey}
+        />
+      )}
+
+      {showTokens && (
       <section className="surface panel">
         <div className="panel-header" style={{ flexWrap: 'wrap', gap: 12, alignItems: 'flex-start' }}>
           <div style={{ flex: '1 1 320px', minWidth: 240 }}>
@@ -2479,24 +2646,10 @@ function AdminDashboard(): JSX.Element {
           </div>
         )}
       </section>
+      )}
       {error && <div className="surface error-banner">{error}</div>}
 
-      <section className="surface quick-stats-grid">
-        {metrics.length === 0 && loading ? (
-          <div className="empty-state" style={{ gridColumn: '1 / -1' }}>
-            {metricsStrings.loading}
-          </div>
-        ) : (
-          metrics.map((metric) => (
-            <div key={metric.id} className="metric-card quick-stats-card">
-              <h3>{metric.label}</h3>
-              <div className="metric-value">{metric.value}</div>
-              <div className="metric-subtitle">{metric.subtitle}</div>
-            </div>
-          ))
-        )}
-      </section>
-
+      {showKeys && (
       <section className="surface panel" style={keysBatchVisible ? { position: 'relative', zIndex: 40 } : undefined}>
 	        <div className="panel-header" style={{ flexWrap: 'wrap', gap: 12, alignItems: 'flex-start' }}>
 	          <div style={{ flex: '1 1 320px', minWidth: 240 }}>
@@ -2767,7 +2920,9 @@ function AdminDashboard(): JSX.Element {
           )}
         </div>
       </section>
+      )}
 
+      {showRequests && (
       <section className="surface panel">
         <div className="panel-header">
           <div>
@@ -2815,6 +2970,8 @@ function AdminDashboard(): JSX.Element {
                     expanded={expandedLogs.has(log.id)}
                     onToggle={toggleLogExpansion}
                     strings={adminStrings}
+                    onOpenKey={navigateKey}
+                    onOpenToken={navigateToken}
                   />
                 ))}
               </tbody>
@@ -2841,7 +2998,9 @@ function AdminDashboard(): JSX.Element {
           </div>
         )}
       </section>
+      )}
 
+      {showJobs && (
       <section className="surface panel">
         <div className="panel-header">
           <div>
@@ -3056,6 +3215,46 @@ function AdminDashboard(): JSX.Element {
           </div>
         )}
       </section>
+      )}
+
+      {showUsers && (
+        <ModulePlaceholder
+          title={adminStrings.modules.users.title}
+          description={adminStrings.modules.users.description}
+          comingSoonLabel={adminStrings.modules.comingSoon}
+          sections={[
+            adminStrings.modules.users.sections.list,
+            adminStrings.modules.users.sections.roles,
+            adminStrings.modules.users.sections.status,
+          ]}
+        />
+      )}
+
+      {showAlerts && (
+        <ModulePlaceholder
+          title={adminStrings.modules.alerts.title}
+          description={adminStrings.modules.alerts.description}
+          comingSoonLabel={adminStrings.modules.comingSoon}
+          sections={[
+            adminStrings.modules.alerts.sections.rules,
+            adminStrings.modules.alerts.sections.thresholds,
+            adminStrings.modules.alerts.sections.channels,
+          ]}
+        />
+      )}
+
+      {showProxySettings && (
+        <ModulePlaceholder
+          title={adminStrings.modules.proxySettings.title}
+          description={adminStrings.modules.proxySettings.description}
+          comingSoonLabel={adminStrings.modules.comingSoon}
+          sections={[
+            adminStrings.modules.proxySettings.sections.upstream,
+            adminStrings.modules.proxySettings.sections.routing,
+            adminStrings.modules.proxySettings.sections.rateLimit,
+          ]}
+        />
+      )}
 
       <div className="app-footer">
         <span>{footerStrings.title}</span>
@@ -3093,7 +3292,7 @@ function AdminDashboard(): JSX.Element {
           )}
         </span>
       </div>
-    </main>
+    </AdminShell>
     {/* Batch Create Tokens modal */}
     <dialog id="batch_create_tokens_modal" ref={batchDialogRef} className="modal">
       <div className="modal-box">
@@ -3376,9 +3575,11 @@ interface LogRowProps {
   expanded: boolean
   onToggle: (id: number) => void
   strings: AdminTranslations
+  onOpenKey?: (id: string) => void
+  onOpenToken?: (id: string) => void
 }
 
-function LogRow({ log, expanded, onToggle, strings }: LogRowProps): JSX.Element {
+function LogRow({ log, expanded, onToggle, strings, onOpenKey, onOpenToken }: LogRowProps): JSX.Element {
   const requestButtonLabel = expanded ? strings.logs.toggles.hide : strings.logs.toggles.show
   const tokenId = log.auth_token_id ?? null
   const timeLabel = formatClockTime(log.created_at)
@@ -3404,10 +3605,17 @@ function LogRow({ log, expanded, onToggle, strings }: LogRowProps): JSX.Element 
         </td>
         <td>
           <a
-            href={`#/keys/${encodeURIComponent(log.key_id)}`}
+            href={keyDetailPath(log.key_id)}
             className="log-key-pill"
             title={strings.keys.actions.details}
             aria-label={strings.keys.actions.details}
+            onClick={(event) => {
+              if (!onOpenKey) return
+              if (event.defaultPrevented) return
+              if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return
+              event.preventDefault()
+              onOpenKey(log.key_id)
+            }}
           >
             <code>{log.key_id}</code>
           </a>
@@ -3415,10 +3623,17 @@ function LogRow({ log, expanded, onToggle, strings }: LogRowProps): JSX.Element 
         <td>
           {tokenId ? (
             <a
-              href={`#/tokens/${encodeURIComponent(tokenId)}`}
+              href={tokenDetailPath(tokenId)}
               className="link-button log-token-link"
               title={strings.tokens.table.id}
               aria-label={strings.tokens.table.id}
+              onClick={(event) => {
+                if (!onOpenToken) return
+                if (event.defaultPrevented) return
+                if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return
+                event.preventDefault()
+                onOpenToken(tokenId)
+              }}
             >
               <code>{tokenId}</code>
             </a>

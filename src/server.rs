@@ -4978,6 +4978,7 @@ pub async fn serve(
                 router = router.route("/console", get(serve_console_index));
                 router = router.route("/console/", get(serve_console_index));
                 router = router.route("/console.html", get(serve_console_index));
+                router = router.route("/admin/*path", get(serve_admin_index));
                 router = router.route("/login", get(serve_login));
                 router = router.route("/login/", get(serve_login));
                 router = router.route("/login.html", get(serve_login));

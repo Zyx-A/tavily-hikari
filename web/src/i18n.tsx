@@ -171,6 +171,72 @@ interface AdminTranslationsShape {
     refreshNow: string
     refreshing: string
   }
+  nav: {
+    dashboard: string
+    tokens: string
+    keys: string
+    requests: string
+    jobs: string
+    users: string
+    alerts: string
+    proxySettings: string
+  }
+  dashboard: {
+    title: string
+    description: string
+    trendsTitle: string
+    trendsDescription: string
+    requestTrend: string
+    errorTrend: string
+    riskTitle: string
+    riskDescription: string
+    riskEmpty: string
+    actionsTitle: string
+    actionsDescription: string
+    recentRequests: string
+    recentJobs: string
+    openModule: string
+    openToken: string
+    openKey: string
+    disabledTokenRisk: string
+    exhaustedKeyRisk: string
+    failedJobRisk: string
+    tokenCoverageTruncated: string
+    tokenCoverageError: string
+  }
+  modules: {
+    comingSoon: string
+    users: {
+      title: string
+      description: string
+      sections: {
+        list: string
+        roles: string
+        status: string
+      }
+    }
+    alerts: {
+      title: string
+      description: string
+      sections: {
+        rules: string
+        thresholds: string
+        channels: string
+      }
+    }
+    proxySettings: {
+      title: string
+      description: string
+      sections: {
+        upstream: string
+        routing: string
+        rateLimit: string
+      }
+    }
+  }
+  accessibility: {
+    skipToContent: string
+  }
   tokens: {
     title: string
     description: string
@@ -770,6 +836,72 @@ export const translations: Record<Language, TranslationShape> = {
         refreshNow: 'Refresh Now',
         refreshing: 'Refreshing…',
       },
+      nav: {
+        dashboard: 'Dashboard',
+        tokens: 'Tokens',
+        keys: 'API Keys',
+        requests: 'Requests',
+        jobs: 'Jobs',
+        users: 'Users',
+        alerts: 'Alerts',
+        proxySettings: 'Proxy Settings',
+      },
+      dashboard: {
+        title: 'Operations Dashboard',
+        description: 'Global health, risk signals, and actionable activity in one place.',
+        trendsTitle: 'Traffic Trends',
+        trendsDescription: 'Recent request and error changes from latest logs.',
+        requestTrend: 'Request volume',
+        errorTrend: 'Error volume',
+        riskTitle: 'Risk Watchlist',
+        riskDescription: 'Items that may require operator action soon.',
+        riskEmpty: 'No active risk signals detected.',
+        actionsTitle: 'Action Center',
+        actionsDescription: 'Recent events you can jump into quickly.',
+        recentRequests: 'Recent requests',
+        recentJobs: 'Recent jobs',
+        openModule: 'Open',
+        openToken: 'Open token',
+        openKey: 'Open key',
+        disabledTokenRisk: 'Token {id} is disabled',
+        exhaustedKeyRisk: 'API key {id} is exhausted',
+        failedJobRisk: 'Job #{id} status: {status}',
+        tokenCoverageTruncated: 'Token risk scope is truncated. Open Tokens for complete coverage.',
+        tokenCoverageError: 'Token risk scope could not be loaded. Open Tokens to retry.',
+      },
+      modules: {
+        comingSoon: 'Coming soon',
+        users: {
+          title: 'User Management',
+          description: 'Skeleton module reserved for user and role administration.',
+          sections: {
+            list: 'User directory',
+            roles: 'Roles & permissions',
+            status: 'Account status',
+          },
+        },
+        alerts: {
+          title: 'Alerts',
+          description: 'Skeleton module reserved for alert rules and notifications.',
+          sections: {
+            rules: 'Alert rules',
+            thresholds: 'Threshold policy',
+            channels: 'Notification channels',
+          },
+        },
+        proxySettings: {
+          title: 'Proxy Settings',
+          description: 'Skeleton module reserved for proxy and upstream controls.',
+          sections: {
+            upstream: 'Upstream targets',
+            routing: 'Forwarding strategy',
+            rateLimit: 'Rate limit policy',
+          },
+        },
+      },
+      accessibility: {
+        skipToContent: 'Skip to main content',
+      },
       tokens: {
         title: 'Access Tokens',
         description: 'Auth for /mcp. Format th-xxxx-xxxxxxxxxxxx',
@@ -1345,6 +1477,72 @@ export const translations: Record<Language, TranslationShape> = {
         updatedPrefix: '更新于',
         refreshNow: '立即刷新',
         refreshing: '刷新中…',
+      },
+      nav: {
+        dashboard: '仪表盘',
+        tokens: '访问令牌',
+        keys: 'API Keys',
+        requests: '请求日志',
+        jobs: '任务作业',
+        users: '用户管理',
+        alerts: '告警中心',
+        proxySettings: '代理设置',
+      },
+      dashboard: {
+        title: '运营仪表盘',
+        description: '在一个页面查看全局健康度、风险与可执行动作。',
+        trendsTitle: '流量趋势',
+        trendsDescription: '基于最新请求日志的请求量与错误变化。',
+        requestTrend: '请求量趋势',
+        errorTrend: '错误量趋势',
+        riskTitle: '风险看板',
+        riskDescription: '即将需要处理的异常项。',
+        riskEmpty: '当前未发现明显风险信号。',
+        actionsTitle: '行动中心',
+        actionsDescription: '快速查看最近活动并跳转到对应模块。',
+        recentRequests: '近期请求',
+        recentJobs: '近期任务',
+        openModule: '查看',
+        openToken: '查看令牌',
+        openKey: '查看密钥',
+        disabledTokenRisk: '令牌 {id} 已被禁用',
+        exhaustedKeyRisk: 'API Key {id} 已耗尽',
+        failedJobRisk: '任务 #{id} 状态：{status}',
+        tokenCoverageTruncated: '令牌风险范围已截断，请进入“访问令牌”查看完整数据。',
+        tokenCoverageError: '令牌风险数据加载失败，请进入“访问令牌”重试。',
+      },
+      modules: {
+        comingSoon: '即将支持',
+        users: {
+          title: '用户管理',
+          description: '预留骨架页：后续接入用户、角色与状态管理能力。',
+          sections: {
+            list: '用户列表',
+            roles: '角色与权限',
+            status: '账号状态',
+          },
+        },
+        alerts: {
+          title: '告警中心',
+          description: '预留骨架页：后续接入规则告警与通知策略。',
+          sections: {
+            rules: '告警规则',
+            thresholds: '阈值策略',
+            channels: '通知渠道',
+          },
+        },
+        proxySettings: {
+          title: '代理设置',
+          description: '预留骨架页：后续接入上游、转发与限流设置。',
+          sections: {
+            upstream: '上游目标',
+            routing: '转发策略',
+            rateLimit: '限流策略',
+          },
+        },
+      },
+      accessibility: {
+        skipToContent: '跳转到主内容',
       },
       tokens: {
         title: '访问令牌',

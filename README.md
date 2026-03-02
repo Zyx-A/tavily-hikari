@@ -216,6 +216,7 @@ export LINUXDO_OAUTH_REDIRECT_URL='https://tavily.ivanli.cc/auth/linuxdo/callbac
 
 - Built with React 18, TanStack Router, shadcn/ui (Radix), Tailwind, Iconify.
 - Displays live key table, request log stream, and admin-only actions (copy real key, restore, delete).
+- Admin routes are path-based (`/admin/dashboard`, `/admin/tokens/:id`, `/admin/keys/:id`); legacy hash routes are removed.
 - `scripts/write-version.mjs` stamps the build version into the UI during CI releases.
 - `bun run dev` proxies `/api`, `/mcp`, and `/health` to the backend to avoid CORS hassle during development.
 
