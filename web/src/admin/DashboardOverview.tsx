@@ -137,7 +137,7 @@ export default function DashboardOverview({
   }
 
   return (
-    <>
+    <div className="dashboard-overview-stack">
       <section className="surface panel dashboard-hero-panel">
         <div className="panel-header">
           <div>
@@ -242,6 +242,6 @@ export default function DashboardOverview({
           </article>
         </div>
       </section>
-    </>
+    </div>
   )
 }

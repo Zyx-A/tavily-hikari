@@ -598,6 +598,15 @@
     radial-gradient(420px 240px at 100% 0%, hsl(var(--secondary) / 0.16), transparent 70%);
 }
 
+.dashboard-overview-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.dashboard-overview-stack .panel + .panel {
+  margin-top: 0;
+}
+
 .dashboard-trend-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3890,6 +3899,10 @@ tbody .log-details-row:hover {
 
   .user-console-mobile-list.user-console-md-down {
     display: flex;
+  }
+
+  .dashboard-overview-stack {
+    gap: 12px;
   }
 
   .app-header {
