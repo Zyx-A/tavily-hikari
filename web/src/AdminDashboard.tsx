@@ -363,6 +363,9 @@ function AdminDashboard(): JSX.Element {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const pollingTimerRef = useRef<number | null>(null)
+  const routeRef = useRef<AdminPathRoute>(route)
+  const loadDashboardOverviewRef = useRef<((signal?: AbortSignal) => Promise<void>) | null>(null)
+  const dashboardOverviewInFlightRef = useRef(false)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [version, setVersion] = useState<{ backend: string; frontend: string } | null>(null)
   const [profile, setProfile] = useState<Profile | null>(null)
@@ -805,6 +808,14 @@ function AdminDashboard(): JSX.Element {
     [loadAllTokensForDashboard],
   )
 
+  useEffect(() => {
+    routeRef.current = route
+  }, [route])
+
+  useEffect(() => {
+    loadDashboardOverviewRef.current = loadDashboardOverview
+  }, [loadDashboardOverview])
+
   const loadTokenLeaderboard = useCallback(
     async (signal?: AbortSignal) => {
       try {
@@ -985,6 +996,21 @@ function AdminDashboard(): JSX.Element {
           setLastUpdated(new Date())
           setError(null)
           setLoading(false)
+          if (
+            routeRef.current.name === 'module' &&
+            routeRef.current.module === 'dashboard' &&
+            !dashboardOverviewInFlightRef.current
+          ) {
+            const refreshOverview = loadDashboardOverviewRef.current
+            if (refreshOverview) {
+              dashboardOverviewInFlightRef.current = true
+              const controller = new AbortController()
+              void refreshOverview(controller.signal).finally(() => {
+                controller.abort()
+                dashboardOverviewInFlightRef.current = false
+              })
+            }
+          }
         } catch (e) {
           console.error('SSE parse error', e)
         }
