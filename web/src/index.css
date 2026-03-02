@@ -3905,7 +3905,7 @@ tbody .log-details-row:hover {
 
   .admin-panel-header-main {
     width: 100%;
-    flex: none;
+    flex: 0 1 auto;
   }
 
   .admin-panel-header-subtitle {
