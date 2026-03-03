@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成（快车道）
 - Created: 2026-03-04
 - Last: 2026-03-04
 
@@ -66,16 +66,17 @@
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --locked --all-features`
-- `for i in {1..50}; do cargo test --locked --all-features api_keys_batch_reports_statuses_and_is_partial_success -- --exact -q; done`
+- `for i in {1..50}; do cargo test --locked --all-features server::tests::api_keys_batch_reports_statuses_and_is_partial_success -q; done`
 
 ## 实现里程碑（Milestones）
 
 - [x] M1: 在 `src/lib.rs` 增加 SQLite 瞬时错误判定与 upsert 重试包装
 - [x] M2: 显式回滚失败事务，确保失败路径不污染后续操作
 - [x] M3: 增加回归测试覆盖“失败后紧接成功写入”场景
-- [ ] M4: 完成本地质量门禁与快车道 PR 收敛
+- [x] M4: 完成本地质量门禁与快车道 PR 收敛
 
 ## 变更记录（Change log）
 
 - 2026-03-04: 创建规格，冻结目标/范围/验收口径。
 - 2026-03-04: 完成 lib 层事务回滚与重试加固；新增失败后连续写入回归测试；本地 fmt/clippy/test 与目标用例 50 次循环通过。
+- 2026-03-04: 补充日志脱敏（重试日志改为 key preview）；PR #87 checks 全绿；review-loop 收敛为“无 P0/P1 阻塞，1 条 P2 测试增强建议待后续评估”。
