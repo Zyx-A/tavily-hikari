@@ -19,6 +19,33 @@ mod tests {
         std::env::temp_dir().join(file)
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(prev) = self.previous.as_deref() {
+                    std::env::set_var(self.key, prev);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     fn temp_static_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("{prefix}-static-{}", nanoid!(8)));
         std::fs::create_dir_all(&dir).expect("create temp static dir");
@@ -1443,11 +1470,7 @@ mod tests {
         let db_path = temp_db_path("http-search-hourly-any-nonbillable");
         let db_str = db_path.to_string_lossy().to_string();
 
-        // Preserve any existing env value to avoid cross-test leakage.
-        let previous_limit = std::env::var("TOKEN_HOURLY_REQUEST_LIMIT").ok();
-        unsafe {
-            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "1");
-        }
+        let _hourly_limit_guard = EnvVarGuard::set("TOKEN_HOURLY_REQUEST_LIMIT", "1");
 
         let expected_api_key = "tvly-http-search-hourly-any-key";
         let proxy = TavilyProxy::with_endpoint(
@@ -1562,14 +1585,6 @@ mod tests {
             "hourly-any 429 should not be included in billable totals"
         );
 
-        unsafe {
-            if let Some(prev) = previous_limit {
-                std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", prev);
-            } else {
-                std::env::remove_var("TOKEN_HOURLY_REQUEST_LIMIT");
-            }
-        }
-
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -1620,10 +1635,7 @@ mod tests {
         let db_path = temp_db_path("http-map-hourly-any-bypass");
         let db_str = db_path.to_string_lossy().to_string();
 
-        let previous_limit = std::env::var("TOKEN_HOURLY_REQUEST_LIMIT").ok();
-        unsafe {
-            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "1");
-        }
+        let _hourly_limit_guard = EnvVarGuard::set("TOKEN_HOURLY_REQUEST_LIMIT", "1");
 
         let expected_api_key = "tvly-http-map-hourly-any-key";
         let proxy = TavilyProxy::with_endpoint(
@@ -1672,13 +1684,6 @@ mod tests {
             second.status()
         );
 
-        unsafe {
-            if let Some(prev) = previous_limit {
-                std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", prev);
-            } else {
-                std::env::remove_var("TOKEN_HOURLY_REQUEST_LIMIT");
-            }
-        }
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -2117,9 +2122,7 @@ mod tests {
 
         // Tighten business hourly quota to 1 so that the token is quickly exhausted
         // for TokenQuota, while the per-hour raw request limiter still uses default.
-        unsafe {
-            std::env::set_var("TOKEN_HOURLY_LIMIT", "1");
-        }
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1");
 
         let expected_api_key = "tvly-mcp-non-tool-key";
         let upstream_addr = spawn_mock_upstream(expected_api_key.to_string()).await;
@@ -2196,9 +2199,6 @@ mod tests {
         let counts_business_quota: i64 = row.try_get("counts_business_quota").unwrap();
         assert_eq!(counts_business_quota, 0);
 
-        unsafe {
-            std::env::remove_var("TOKEN_HOURLY_LIMIT");
-        }
         let _ = std::fs::remove_file(db_path);
     }
 
