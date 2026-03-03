@@ -6270,9 +6270,10 @@ impl KeyStore {
                 {
                     let backoff_ms = API_KEY_UPSERT_TRANSIENT_RETRY_BACKOFF_MS[retry_idx];
                     retry_idx += 1;
+                    let key_preview = preview_key(api_key);
                     eprintln!(
-                        "api key upsert transient sqlite error (api_key={}, attempt={}, backoff={}ms): {}",
-                        api_key, retry_idx, backoff_ms, err
+                        "api key upsert transient sqlite error (api_key_preview={}, attempt={}, backoff={}ms): {}",
+                        key_preview, retry_idx, backoff_ms, err
                     );
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 }
