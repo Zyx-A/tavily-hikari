@@ -1,0 +1,734 @@
+#[derive(Debug, Serialize)]
+struct ApiKeyView {
+    id: String,
+    status: String,
+    group: Option<String>,
+    status_changed_at: Option<i64>,
+    last_used_at: Option<i64>,
+    deleted_at: Option<i64>,
+    quota_limit: Option<i64>,
+    quota_remaining: Option<i64>,
+    quota_synced_at: Option<i64>,
+    total_requests: i64,
+    success_count: i64,
+    error_count: i64,
+    quota_exhausted_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiKeySecretView {
+    api_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RequestLogView {
+    id: i64,
+    key_id: String,
+    auth_token_id: Option<String>,
+    method: String,
+    path: String,
+    query: Option<String>,
+    http_status: Option<i64>,
+    mcp_status: Option<i64>,
+    result_status: String,
+    created_at: i64,
+    error_message: Option<String>,
+    request_body: Option<String>,
+    response_body: Option<String>,
+    forwarded_headers: Vec<String>,
+    dropped_headers: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobLogView {
+    id: i64,
+    job_type: String,
+    key_id: Option<String>,
+    status: String,
+    attempt: i64,
+    message: Option<String>,
+    started_at: i64,
+    finished_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SummaryView {
+    total_requests: i64,
+    success_count: i64,
+    error_count: i64,
+    quota_exhausted_count: i64,
+    active_keys: i64,
+    exhausted_keys: i64,
+    last_activity: Option<i64>,
+    total_quota_limit: i64,
+    total_quota_remaining: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicMetricsView {
+    monthly_success: i64,
+    daily_success: i64,
+}
+
+// ---- Access Token views ----
+#[derive(Debug, Serialize)]
+struct AuthTokenView {
+    id: String,
+    enabled: bool,
+    note: Option<String>,
+    group: Option<String>,
+    total_requests: i64,
+    created_at: i64,
+    last_used_at: Option<i64>,
+    quota_state: String,
+    quota_hourly_used: i64,
+    quota_hourly_limit: i64,
+    quota_daily_used: i64,
+    quota_daily_limit: i64,
+    quota_monthly_used: i64,
+    quota_monthly_limit: i64,
+    quota_hourly_reset_at: Option<i64>,
+    quota_daily_reset_at: Option<i64>,
+    quota_monthly_reset_at: Option<i64>,
+}
+
+impl From<AuthToken> for AuthTokenView {
+    fn from(t: AuthToken) -> Self {
+        let (
+            quota_state,
+            quota_hourly_used,
+            quota_hourly_limit,
+            quota_daily_used,
+            quota_daily_limit,
+            quota_monthly_used,
+            quota_monthly_limit,
+        ) = if let Some(quota) = t.quota {
+            (
+                quota.state_key().to_string(),
+                quota.hourly_used,
+                quota.hourly_limit,
+                quota.daily_used,
+                quota.daily_limit,
+                quota.monthly_used,
+                quota.monthly_limit,
+            )
+        } else {
+            (
+                "normal".to_string(),
+                0,
+                effective_token_hourly_limit(),
+                0,
+                effective_token_daily_limit(),
+                0,
+                effective_token_monthly_limit(),
+            )
+        };
+        Self {
+            id: t.id,
+            enabled: t.enabled,
+            note: t.note,
+            group: t.group_name,
+            total_requests: t.total_requests,
+            created_at: t.created_at,
+            last_used_at: t.last_used_at,
+            quota_state,
+            quota_hourly_used,
+            quota_hourly_limit,
+            quota_daily_used,
+            quota_daily_limit,
+            quota_monthly_used,
+            quota_monthly_limit,
+            quota_hourly_reset_at: t.quota_hourly_reset_at,
+            quota_daily_reset_at: t.quota_daily_reset_at,
+            quota_monthly_reset_at: t.quota_monthly_reset_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AuthTokenSecretView {
+    token: String,
+}
+
+// ---- Token Detail views ----
+#[derive(Debug, Serialize)]
+struct TokenSummaryView {
+    total_requests: i64,
+    success_count: i64,
+    error_count: i64,
+    quota_exhausted_count: i64,
+    last_activity: Option<i64>,
+}
+
+impl From<TokenSummary> for TokenSummaryView {
+    fn from(s: TokenSummary) -> Self {
+        Self {
+            total_requests: s.total_requests,
+            success_count: s.success_count,
+            error_count: s.error_count,
+            quota_exhausted_count: s.quota_exhausted_count,
+            last_activity: s.last_activity,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TokenLogView {
+    id: i64,
+    method: String,
+    path: String,
+    query: Option<String>,
+    http_status: Option<i64>,
+    mcp_status: Option<i64>,
+    result_status: String,
+    error_message: Option<String>,
+    created_at: i64,
+}
+
+impl From<TokenLogRecord> for TokenLogView {
+    fn from(r: TokenLogRecord) -> Self {
+        Self {
+            id: r.id,
+            method: r.method,
+            path: r.path,
+            query: r.query,
+            http_status: r.http_status,
+            mcp_status: r.mcp_status,
+            result_status: r.result_status,
+            error_message: r.error_message,
+            created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTokenRequest {
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+    result: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyMetricsQuery {
+    period: Option<String>,
+    since: Option<i64>,
+}
+
+async fn get_key_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<KeyMetricsQuery>,
+) -> Result<Json<SummaryView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let since = if let Some(since) = q.since {
+        since
+    } else {
+        // fallback by period
+        let now = chrono::Local::now();
+        let local_midnight_ts = |date: chrono::NaiveDate| -> i64 {
+            let naive = date.and_hms_opt(0, 0, 0).expect("valid midnight");
+            match chrono::Local.from_local_datetime(&naive) {
+                chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc).timestamp(),
+                chrono::LocalResult::Ambiguous(dt, _) => dt.with_timezone(&Utc).timestamp(),
+                chrono::LocalResult::None => now.with_timezone(&Utc).timestamp(),
+            }
+        };
+        match q.period.as_deref() {
+            Some("day") => local_midnight_ts(now.date_naive()),
+            Some("week") => {
+                let weekday = now.weekday().num_days_from_monday() as i64;
+                let start = (now - chrono::Duration::days(weekday)).date_naive();
+                local_midnight_ts(start)
+            }
+            _ => {
+                // month default
+                let first =
+                    chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1).expect("valid");
+                local_midnight_ts(first)
+            }
+        }
+    };
+
+    state
+        .proxy
+        .key_summary_since(&id, since)
+        .await
+        .map(|s| Json(s.into()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyLogsQuery {
+    limit: Option<usize>,
+    since: Option<i64>,
+}
+
+async fn get_key_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<KeyLogsQuery>,
+) -> Result<Json<Vec<RequestLogView>>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, 500);
+    state
+        .proxy
+        .key_recent_logs(&id, limit, q.since)
+        .await
+        .map(|logs| Json(logs.into_iter().map(RequestLogView::from).collect()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+// ---- Token detail endpoints ----
+
+#[derive(Debug, Deserialize)]
+struct TokenMetricsQuery {
+    period: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+async fn get_token_metrics(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<TokenMetricsQuery>,
+) -> Result<Json<TokenSummaryView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_since(q.period.as_deref()));
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_until(q.period.as_deref(), since));
+
+    state
+        .proxy
+        .token_summary_since(&id, since, Some(until))
+        .await
+        .map(|s| Json(s.into()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenLogsQuery {
+    limit: Option<usize>,
+    before: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenHourlyQuery {
+    hours: Option<i64>,
+}
+
+async fn get_token_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<TokenLogsQuery>,
+) -> Result<Json<Vec<TokenLogView>>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, 500);
+    state
+        .proxy
+        .token_recent_logs(&id, limit, q.before)
+        .await
+        .map(|logs| {
+            let mapped: Vec<TokenLogView> = logs
+                .into_iter()
+                .map(TokenLogView::from)
+                .map(|mut v| {
+                    if let Some(err) = v.error_message.as_ref() {
+                        v.error_message = Some(redact_sensitive(err));
+                    }
+                    v
+                })
+                .collect();
+            Json(mapped)
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenLogsPageQuery {
+    page: Option<usize>,
+    per_page: Option<usize>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenLogsPageView {
+    items: Vec<TokenLogView>,
+    page: usize,
+    per_page: usize,
+    total: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenHourlyBucketView {
+    bucket_start: i64,
+    success_count: i64,
+    system_failure_count: i64,
+    external_failure_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenUsageBucketView {
+    bucket_start: i64,
+    success_count: i64,
+    system_failure_count: i64,
+    external_failure_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenLeaderboardQuery {
+    period: Option<String>,
+    focus: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenLeaderboardItemView {
+    id: String,
+    enabled: bool,
+    note: Option<String>,
+    group: Option<String>,
+    total_requests: i64,
+    last_used_at: Option<i64>,
+    quota_state: String,
+    // Business quota windows (tools/call)
+    quota_hourly_used: i64,
+    quota_hourly_limit: i64,
+    quota_daily_used: i64,
+    quota_daily_limit: i64,
+    // Hourly raw request limiter (any authenticated request)
+    hourly_any_used: i64,
+    hourly_any_limit: i64,
+    today_total: i64,
+    today_errors: i64,
+    today_other: i64,
+    month_total: i64,
+    month_errors: i64,
+    month_other: i64,
+    all_total: i64,
+    all_errors: i64,
+    all_other: i64,
+}
+
+async fn get_token_logs_page(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<TokenLogsPageQuery>,
+) -> Result<Json<TokenLogsPageView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let page = q.page.unwrap_or(1).max(1);
+    let per_page = q.per_page.unwrap_or(20).clamp(1, 200);
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_since(Some("month")));
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_until(Some("month"), since));
+    if until <= since {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .proxy
+        .token_logs_page(&id, page, per_page, since, Some(until))
+        .await
+        .map(|(items, total)| {
+            let mapped: Vec<TokenLogView> = items
+                .into_iter()
+                .map(TokenLogView::from)
+                .map(|mut v| {
+                    if let Some(err) = v.error_message.as_ref() {
+                        v.error_message = Some(redact_sensitive(err));
+                    }
+                    v
+                })
+                .collect();
+            Json(TokenLogsPageView {
+                items: mapped,
+                page,
+                per_page,
+                total,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_token_hourly_breakdown(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<TokenHourlyQuery>,
+) -> Result<Json<Vec<TokenHourlyBucketView>>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let hours = q.hours.unwrap_or(25);
+    state
+        .proxy
+        .token_hourly_breakdown(&id, hours)
+        .await
+        .map(|buckets| {
+            Json(
+                buckets
+                    .into_iter()
+                    .map(
+                        |TokenHourlyBucket {
+                             bucket_start,
+                             success_count,
+                             system_failure_count,
+                             external_failure_count,
+                         }| TokenHourlyBucketView {
+                            bucket_start,
+                            success_count,
+                            system_failure_count,
+                            external_failure_count,
+                        },
+                    )
+                    .collect(),
+            )
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageSeriesQuery {
+    since: Option<String>,
+    until: Option<String>,
+    bucket_secs: Option<i64>,
+}
+
+async fn get_token_usage_series(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<UsageSeriesQuery>,
+) -> Result<Json<Vec<TokenUsageBucketView>>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let now = Utc::now().timestamp();
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or(now);
+    let default_since = until - ChronoDuration::hours(25).num_seconds();
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or(default_since);
+    if until <= since {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let bucket_secs = q
+        .bucket_secs
+        .unwrap_or(ChronoDuration::hours(1).num_seconds());
+    state
+        .proxy
+        .token_usage_series(&id, since, until, bucket_secs)
+        .await
+        .map(|series| {
+            Json(
+                series
+                    .into_iter()
+                    .map(
+                        |TokenUsageBucket {
+                             bucket_start,
+                             success_count,
+                             system_failure_count,
+                             external_failure_count,
+                         }| TokenUsageBucketView {
+                            bucket_start,
+                            success_count,
+                            system_failure_count,
+                            external_failure_count,
+                        },
+                    )
+                    .collect(),
+            )
+        })
+        .map_err(|err| match err {
+            ProxyError::Other(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
+}
+
+async fn get_token_leaderboard(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<TokenLeaderboardQuery>,
+) -> Result<Json<Vec<TokenLeaderboardItemView>>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let now = Utc::now();
+    let day_since = start_of_day_dt(now).timestamp();
+    let month_since = start_of_month_dt(now).timestamp();
+
+    let period = match q.period.as_deref() {
+        Some("day") | None => "day",
+        Some("month") => "month",
+        Some("all") => "all",
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let focus = match q.focus.as_deref() {
+        Some("usage") | None => "usage",
+        Some("errors") => "errors",
+        Some("other") => "other",
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let tokens = state
+        .proxy
+        .list_access_tokens()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let token_ids: Vec<String> = tokens.iter().map(|t| t.id.clone()).collect();
+    let hourly_any_map = state
+        .proxy
+        .token_hourly_any_snapshot(&token_ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut items: Vec<TokenLeaderboardItemView> = Vec::with_capacity(tokens.len());
+
+    for token in tokens {
+        // summaries
+        let today = state
+            .proxy
+            .token_summary_since(&token.id, day_since, None)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let month = state
+            .proxy
+            .token_summary_since(&token.id, month_since, None)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let all = state
+            .proxy
+            .token_summary_since(&token.id, 0, None)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let other_today = (today.total_requests - today.success_count - today.error_count).max(0);
+        let other_month = (month.total_requests - month.success_count - month.error_count).max(0);
+        let other_all = (all.total_requests - all.success_count - all.error_count).max(0);
+
+        // quota snapshot
+        let quota_verdict = match token.quota {
+            Some(ref v) => Some(v.clone()),
+            None => state
+                .proxy
+                .token_quota_snapshot(&token.id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .clone(),
+        };
+        let (hour_used, hour_limit, day_used, day_limit) = quota_verdict
+            .as_ref()
+            .map(|q| (q.hourly_used, q.hourly_limit, q.daily_used, q.daily_limit))
+            .unwrap_or((
+                0,
+                effective_token_hourly_limit(),
+                0,
+                effective_token_daily_limit(),
+            ));
+        let quota_state = quota_verdict
+            .as_ref()
+            .and_then(|q| q.exceeded_window)
+            .map(|w| w.as_str().to_string())
+            .unwrap_or_else(|| "normal".to_string());
+
+        let (hourly_any_used, hourly_any_limit) = hourly_any_map
+            .get(&token.id)
+            .map(|v| (v.hourly_used, v.hourly_limit))
+            .unwrap_or((0, effective_token_hourly_request_limit()));
+
+        let item = TokenLeaderboardItemView {
+            id: token.id.clone(),
+            enabled: token.enabled,
+            note: token.note.clone(),
+            group: token.group_name.clone(),
+            total_requests: all.total_requests,
+            last_used_at: all.last_activity,
+            quota_state,
+            quota_hourly_used: hour_used,
+            quota_hourly_limit: hour_limit,
+            quota_daily_used: day_used,
+            quota_daily_limit: day_limit,
+            hourly_any_used,
+            hourly_any_limit,
+            today_total: today.total_requests,
+            today_errors: today.error_count,
+            today_other: other_today,
+            month_total: month.total_requests,
+            month_errors: month.error_count,
+            month_other: other_month,
+            all_total: all.total_requests,
+            all_errors: all.error_count,
+            all_other: other_all,
+        };
+        items.push(item);
+    }
+
+    let metric = |it: &TokenLeaderboardItemView, p: &str, f: &str| -> i64 {
+        match (p, f) {
+            ("day", "usage") => it.today_total,
+            ("day", "errors") => it.today_errors,
+            ("day", "other") => it.today_other,
+            ("month", "usage") => it.month_total,
+            ("month", "errors") => it.month_errors,
+            ("month", "other") => it.month_other,
+            ("all", "usage") => it.all_total,
+            ("all", "errors") => it.all_errors,
+            ("all", "other") => it.all_other,
+            _ => 0,
+        }
+    };
+
+    items.sort_by(|a, b| {
+        metric(b, period, focus)
+            .cmp(&metric(a, period, focus))
+            .then_with(|| b.total_requests.cmp(&a.total_requests))
+    });
+
+    items.truncate(50);
+
+    Ok(Json(items))
+}
+
