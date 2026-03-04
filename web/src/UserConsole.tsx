@@ -1,9 +1,17 @@
-import React, { ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
+import React, { ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Icon } from '@iconify/react'
 import CherryStudioMock from './components/CherryStudioMock'
 
 import {
   fetchProfile,
+  probeApiTavilyCrawl,
+  probeApiTavilyExtract,
+  probeApiTavilyMap,
+  probeApiTavilyResearch,
+  probeApiTavilyResearchResult,
+  probeApiTavilySearch,
+  probeMcpPing,
+  probeMcpToolsList,
   fetchUserDashboard,
   fetchUserTokenDetail,
   fetchUserTokenLogs,
@@ -61,6 +69,43 @@ type ConsoleRoute =
   | { name: 'tokens' }
   | { name: 'token'; id: string }
 
+type ProbeButtonState = 'idle' | 'running' | 'success' | 'partial' | 'failed'
+type ProbeStepStatus = 'running' | 'success' | 'failed'
+type ProbeBubbleAnchor = 'mcp' | 'api'
+
+interface ProbeButtonModel {
+  state: ProbeButtonState
+  completed: number
+  total: number
+}
+
+interface ProbeBubbleItem {
+  id: string
+  label: string
+  status: ProbeStepStatus
+}
+
+interface ProbeBubbleModel {
+  visible: boolean
+  anchor: ProbeBubbleAnchor
+  items: ProbeBubbleItem[]
+}
+
+interface McpProbeStepDefinition {
+  id: string
+  label: string
+  run: (token: string) => Promise<string | null>
+}
+
+interface ApiProbeStepDefinition {
+  id: string
+  label: string
+  run: (
+    token: string,
+    context: { requestId: string | null },
+  ) => Promise<string | null>
+}
+
 const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 })
 
 function formatNumber(value: number): string {
@@ -114,6 +159,80 @@ function tokenLabel(tokenId: string): string {
   return `th-${tokenId}-************************`
 }
 
+function createProbeButtonModel(total: number): ProbeButtonModel {
+  return {
+    state: 'idle',
+    completed: 0,
+    total,
+  }
+}
+
+function getProbeErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message.trim().length > 0) {
+    return err.message
+  }
+  return 'Request failed'
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null
+}
+
+function envelopeError(payload: unknown): string | null {
+  const map = asRecord(payload)
+  if (!map) return null
+  const topError = map.error
+  if (typeof topError === 'string' && topError.trim().length > 0) {
+    return topError
+  }
+  if (topError != null) {
+    if (typeof topError === 'object') {
+      const topErrorObj = asRecord(topError)
+      const message = topErrorObj?.message
+      if (typeof message === 'string' && message.trim().length > 0) {
+        return message
+      }
+    }
+    return 'Request failed'
+  }
+  const detail = asRecord(map.detail)
+  const detailError = detail?.error
+  if (typeof detailError === 'string' && detailError.trim().length > 0) {
+    return detailError
+  }
+  if (detailError != null) {
+    if (typeof detailError === 'object') {
+      const detailErrorObj = asRecord(detailError)
+      const message = detailErrorObj?.message
+      if (typeof message === 'string' && message.trim().length > 0) {
+        return message
+      }
+    }
+    return 'Request failed'
+  }
+  return null
+}
+
+function getResearchRequestId(payload: unknown): string | null {
+  const map = asRecord(payload)
+  if (!map) return null
+  const snake = map.request_id
+  if (typeof snake === 'string' && snake.trim().length > 0) return snake
+  const camel = map.requestId
+  if (typeof camel === 'string' && camel.trim().length > 0) return camel
+  return null
+}
+
+function formatTemplate(
+  template: string,
+  values: Record<string, string | number>,
+): string {
+  return Object.entries(values).reduce(
+    (current, [key, value]) => current.replace(new RegExp(`\\{${key}\\}`, 'g'), String(value)),
+    template,
+  )
+}
+
 export default function UserConsole(): JSX.Element {
   const language = useLanguage().language
   const publicStrings = useTranslate().public
@@ -131,6 +250,12 @@ export default function UserConsole(): JSX.Element {
   const [copyState, setCopyState] = useState<Record<string, 'idle' | 'copied' | 'error'>>({})
   const [activeGuide, setActiveGuide] = useState<GuideKey>('codex')
   const [isMobileGuide, setIsMobileGuide] = useState(false)
+  const [mcpProbe, setMcpProbe] = useState<ProbeButtonModel>(() => createProbeButtonModel(2))
+  const [apiProbe, setApiProbe] = useState<ProbeButtonModel>(() => createProbeButtonModel(6))
+  const [probeBubble, setProbeBubble] = useState<ProbeBubbleModel | null>(null)
+  const [probeBubbleShift, setProbeBubbleShift] = useState(0)
+  const probeBubbleRef = useRef<HTMLDivElement | null>(null)
+  const probeRunIdRef = useRef(0)
 
   useEffect(() => {
     const onHash = () => setRoute(parseRouteFromHash())
@@ -209,6 +334,45 @@ export default function UserConsole(): JSX.Element {
     return () => controller.abort()
   }, [route, text.errors.detail])
 
+  useEffect(() => {
+    probeRunIdRef.current += 1
+    setMcpProbe(createProbeButtonModel(2))
+    setApiProbe(createProbeButtonModel(6))
+    setProbeBubble(null)
+    setProbeBubbleShift(0)
+  }, [route.name === 'token' ? route.id : route.name])
+
+  useLayoutEffect(() => {
+    if (!probeBubble?.visible || probeBubble.items.length === 0) {
+      setProbeBubbleShift(0)
+      return
+    }
+
+    let frame = 0
+    const updateShift = () => {
+      const bubble = probeBubbleRef.current
+      if (!bubble) return
+      const rect = bubble.getBoundingClientRect()
+      const viewportWidth = window.innerWidth
+      const margin = 10
+
+      let nextShift = 0
+      if (rect.left < margin) {
+        nextShift = margin - rect.left
+      } else if (rect.right > viewportWidth - margin) {
+        nextShift = (viewportWidth - margin) - rect.right
+      }
+      setProbeBubbleShift(Math.round(nextShift))
+    }
+
+    frame = window.requestAnimationFrame(updateShift)
+    window.addEventListener('resize', updateShift)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.removeEventListener('resize', updateShift)
+    }
+  }, [probeBubble])
+
   const copyToken = useCallback(async (tokenId: string) => {
     try {
       const { token } = await fetchUserTokenSecret(tokenId)
@@ -248,6 +412,422 @@ export default function UserConsole(): JSX.Element {
     [publicStrings.guide.tabs],
   )
 
+  const anyProbeRunning = mcpProbe.state === 'running' || apiProbe.state === 'running'
+
+  const runMcpProbe = useCallback(async () => {
+    if (route.name !== 'token' || anyProbeRunning) return
+    const runId = probeRunIdRef.current + 1
+    probeRunIdRef.current = runId
+    const isActiveRun = () => probeRunIdRef.current === runId
+
+    const stepDefinitions: McpProbeStepDefinition[] = [
+      {
+        id: 'mcp-ping',
+        label: text.detail.probe.steps.mcpPing,
+        run: async (token: string): Promise<string | null> => {
+          const payload = await probeMcpPing(token)
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          return null
+        },
+      },
+      {
+        id: 'mcp-tools-list',
+        label: text.detail.probe.steps.mcpToolsList,
+        run: async (token: string): Promise<string | null> => {
+          const payload = await probeMcpToolsList(token)
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          return null
+        },
+      },
+    ]
+
+    setMcpProbe({
+      state: 'running',
+      completed: 0,
+      total: stepDefinitions.length,
+    })
+    setProbeBubble({ visible: true, anchor: 'mcp', items: [] })
+
+    let token = ''
+    try {
+      const secret = await fetchUserTokenSecret(route.id)
+      if (!isActiveRun()) return
+      token = secret.token
+    } catch (err) {
+      if (!isActiveRun()) return
+      setMcpProbe({
+        state: 'failed',
+        completed: 0,
+        total: stepDefinitions.length,
+      })
+      setProbeBubble({
+        visible: true,
+        anchor: 'mcp',
+        items: [{
+          id: stepDefinitions[0].id,
+          label: stepDefinitions[0].label,
+          status: 'failed',
+        }],
+      })
+      return
+    }
+
+    const completedItems: ProbeBubbleItem[] = []
+    let passed = 0
+    for (let index = 0; index < stepDefinitions.length; index += 1) {
+      if (!isActiveRun()) return
+      const current = stepDefinitions[index]
+      const runningItem: ProbeBubbleItem = {
+        id: current.id,
+        label: current.label,
+        status: 'running',
+      }
+      setProbeBubble({
+        visible: true,
+        anchor: 'mcp',
+        items: [...completedItems, runningItem],
+      })
+
+      try {
+        await current.run(token)
+        if (!isActiveRun()) return
+        passed += 1
+        completedItems.push({
+          ...runningItem,
+          status: 'success',
+        })
+      } catch (err) {
+        if (!isActiveRun()) return
+        completedItems.push({
+          ...runningItem,
+          status: 'failed',
+        })
+      }
+      setMcpProbe((prev) => ({
+        ...prev,
+        state: 'running',
+        completed: index + 1,
+      }))
+      setProbeBubble({
+        visible: true,
+        anchor: 'mcp',
+        items: [...completedItems],
+      })
+    }
+    if (!isActiveRun()) return
+
+    const failed = stepDefinitions.length - passed
+    const finalState: ProbeButtonState = failed === 0
+      ? 'success'
+      : passed === 0
+        ? 'failed'
+        : 'partial'
+    setMcpProbe({
+      state: finalState,
+      completed: stepDefinitions.length,
+      total: stepDefinitions.length,
+    })
+    setProbeBubble({ visible: true, anchor: 'mcp', items: [...completedItems] })
+  }, [anyProbeRunning, route, text.detail.probe])
+
+  const runApiProbe = useCallback(async () => {
+    if (route.name !== 'token' || anyProbeRunning) return
+    const runId = probeRunIdRef.current + 1
+    probeRunIdRef.current = runId
+    const isActiveRun = () => probeRunIdRef.current === runId
+
+    const stepDefinitions: ApiProbeStepDefinition[] = [
+      {
+        id: 'api-search',
+        label: text.detail.probe.steps.apiSearch,
+        run: async (token: string): Promise<string | null> => {
+          const payload = await probeApiTavilySearch(token, {
+            query: 'health check',
+            max_results: 1,
+            search_depth: 'basic',
+            include_answer: false,
+            include_raw_content: false,
+            include_images: false,
+          })
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          return null
+        },
+      },
+      {
+        id: 'api-extract',
+        label: text.detail.probe.steps.apiExtract,
+        run: async (token: string): Promise<string | null> => {
+          const payload = await probeApiTavilyExtract(token, {
+            urls: ['https://example.com'],
+            include_images: false,
+          })
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          return null
+        },
+      },
+      {
+        id: 'api-crawl',
+        label: text.detail.probe.steps.apiCrawl,
+        run: async (token: string): Promise<string | null> => {
+          const payload = await probeApiTavilyCrawl(token, {
+            url: 'https://example.com',
+            max_depth: 1,
+            limit: 1,
+          })
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          return null
+        },
+      },
+      {
+        id: 'api-map',
+        label: text.detail.probe.steps.apiMap,
+        run: async (token: string): Promise<string | null> => {
+          const payload = await probeApiTavilyMap(token, {
+            url: 'https://example.com',
+            max_depth: 1,
+            limit: 1,
+          })
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          return null
+        },
+      },
+      {
+        id: 'api-research',
+        label: text.detail.probe.steps.apiResearch,
+        run: async (token: string): Promise<string | null> => {
+          const payload = await probeApiTavilyResearch(token, {
+            input: 'health check',
+            model: 'mini',
+            citation_format: 'numbered',
+          })
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          const requestId = getResearchRequestId(payload)
+          if (!requestId) {
+            throw new Error(text.detail.probe.errors.missingRequestId)
+          }
+          return requestId
+        },
+      },
+      {
+        id: 'api-research-result',
+        label: text.detail.probe.steps.apiResearchResult,
+        run: async (token: string, context: { requestId: string | null }): Promise<string | null> => {
+          if (!context.requestId) {
+            throw new Error(text.detail.probe.errors.missingRequestId)
+          }
+          const payload = await probeApiTavilyResearchResult(token, context.requestId)
+          const error = envelopeError(payload)
+          if (error) throw new Error(error)
+          const status = payload.status
+          if (typeof status === 'string' && status.trim().length > 0) {
+            const normalized = status.trim().toLowerCase()
+            if (
+              normalized === 'failed'
+              || normalized === 'failure'
+              || normalized === 'error'
+              || normalized === 'errored'
+              || normalized === 'cancelled'
+              || normalized === 'canceled'
+            ) {
+              throw new Error(text.detail.probe.errors.researchFailed)
+            }
+            if (
+              normalized === 'pending'
+              || normalized === 'processing'
+              || normalized === 'running'
+              || normalized === 'in_progress'
+              || normalized === 'queued'
+            ) {
+              return text.detail.probe.researchPendingAccepted
+            }
+            if (
+              normalized === 'completed'
+              || normalized === 'success'
+              || normalized === 'succeeded'
+              || normalized === 'done'
+            ) {
+              return formatTemplate(text.detail.probe.researchStatus, { status: normalized })
+            }
+            throw new Error(
+              formatTemplate(text.detail.probe.errors.researchUnexpectedStatus, {
+                status: normalized,
+              }),
+            )
+          }
+          return null
+        },
+      },
+    ]
+
+    setApiProbe({
+      state: 'running',
+      completed: 0,
+      total: stepDefinitions.length,
+    })
+    setProbeBubble({ visible: true, anchor: 'api', items: [] })
+
+    let token = ''
+    try {
+      const secret = await fetchUserTokenSecret(route.id)
+      if (!isActiveRun()) return
+      token = secret.token
+    } catch (err) {
+      if (!isActiveRun()) return
+      setApiProbe({
+        state: 'failed',
+        completed: 0,
+        total: stepDefinitions.length,
+      })
+      setProbeBubble({
+        visible: true,
+        anchor: 'api',
+        items: [{
+          id: stepDefinitions[0].id,
+          label: stepDefinitions[0].label,
+          status: 'failed',
+        }],
+      })
+      return
+    }
+
+    const completedItems: ProbeBubbleItem[] = []
+    let passed = 0
+    let researchRequestId: string | null = null
+    for (let index = 0; index < stepDefinitions.length; index += 1) {
+      if (!isActiveRun()) return
+      const current = stepDefinitions[index]
+      const runningItem: ProbeBubbleItem = {
+        id: current.id,
+        label: current.label,
+        status: 'running',
+      }
+      setProbeBubble({
+        visible: true,
+        anchor: 'api',
+        items: [...completedItems, runningItem],
+      })
+
+      try {
+        const detail = await current.run(token, { requestId: researchRequestId })
+        if (!isActiveRun()) return
+        if (current.id === 'api-research' && detail) {
+          researchRequestId = detail
+        }
+        passed += 1
+        completedItems.push({
+          ...runningItem,
+          status: 'success',
+        })
+      } catch (err) {
+        if (!isActiveRun()) return
+        completedItems.push({
+          ...runningItem,
+          status: 'failed',
+        })
+      }
+      setApiProbe((prev) => ({
+        ...prev,
+        state: 'running',
+        completed: index + 1,
+      }))
+      setProbeBubble({
+        visible: true,
+        anchor: 'api',
+        items: [...completedItems],
+      })
+    }
+    if (!isActiveRun()) return
+
+    const failed = stepDefinitions.length - passed
+    const finalState: ProbeButtonState = failed === 0
+      ? 'success'
+      : passed === 0
+        ? 'failed'
+        : 'partial'
+    setApiProbe({
+      state: finalState,
+      completed: stepDefinitions.length,
+      total: stepDefinitions.length,
+    })
+    setProbeBubble({ visible: true, anchor: 'api', items: [...completedItems] })
+  }, [anyProbeRunning, route, text.detail.probe])
+
+  const buttonMeta = useMemo(() => {
+    const tone = (state: ProbeButtonState): string => {
+      if (state === 'success') return 'user-console-probe-btn-success'
+      if (state === 'partial') return 'user-console-probe-btn-partial'
+      if (state === 'failed') return 'user-console-probe-btn-failed'
+      if (state === 'running') return 'user-console-probe-btn-running'
+      return 'user-console-probe-btn-idle'
+    }
+    const icon = (state: ProbeButtonState): string => {
+      if (state === 'success') return 'mdi:check-circle-outline'
+      if (state === 'partial') return 'mdi:alert-circle-outline'
+      if (state === 'failed') return 'mdi:close-circle-outline'
+      if (state === 'running') return 'mdi:loading'
+      return 'mdi:play-circle-outline'
+    }
+    return {
+      tone,
+      icon,
+    }
+  }, [])
+
+  const probeItemMeta = useMemo(() => {
+    const icon = (status: ProbeStepStatus): string => {
+      if (status === 'success') return 'mdi:check-circle-outline'
+      if (status === 'failed') return 'mdi:close-circle-outline'
+      return 'mdi:loading'
+    }
+    const textFor = (status: ProbeStepStatus): string => text.detail.probe.stepStatus[status]
+    return {
+      icon,
+      textFor,
+    }
+  }, [text.detail.probe.stepStatus])
+
+  const renderProbeBubble = (): JSX.Element | null => {
+    if (!probeBubble?.visible || probeBubble.items.length === 0) return null
+    const bubbleStyle = {
+      '--probe-bubble-shift': `${probeBubbleShift}px`,
+    } as React.CSSProperties
+    return (
+      <div
+        ref={probeBubbleRef}
+        className={`user-console-probe-bubble user-console-probe-bubble-anchor-${probeBubble.anchor}`}
+        style={bubbleStyle}
+        role="status"
+        aria-live="polite"
+      >
+        <ul className="user-console-probe-bubble-list">
+          {probeBubble.items.map((item) => (
+            <li
+              key={item.id}
+              className="user-console-probe-bubble-item"
+              aria-label={`${probeItemMeta.textFor(item.status)} · ${item.label}`}
+            >
+              <Icon
+                icon={probeItemMeta.icon(item.status)}
+                className={
+                  `user-console-probe-bubble-item-icon user-console-probe-bubble-item-icon-status-${item.status} `
+                  + `${item.status === 'running' ? 'is-spinning' : ''}`
+                }
+              />
+              <strong className="user-console-probe-bubble-item-label">{item.label}</strong>
+            </li>
+          ))}
+        </ul>
+      </div>
+    )
+  }
+
   const goDashboard = () => {
     window.location.hash = '#/dashboard'
   }
@@ -257,6 +837,24 @@ export default function UserConsole(): JSX.Element {
   const goTokenDetail = (tokenId: string) => {
     window.location.hash = `#/tokens/${encodeURIComponent(tokenId)}`
   }
+
+  const probeButtonLabel = useCallback((
+    kind: 'mcp' | 'api',
+    model: ProbeButtonModel,
+  ): string => {
+    const titles = kind === 'mcp' ? text.detail.probe.mcpButton : text.detail.probe.apiButton
+    if (model.state === 'running') {
+      return formatTemplate(text.detail.probe.runningButton, {
+        label: titles.idle,
+        done: model.completed,
+        total: model.total,
+      })
+    }
+    if (model.state === 'success') return titles.success
+    if (model.state === 'partial') return titles.partial
+    if (model.state === 'failed') return titles.failed
+    return titles.idle
+  }, [text.detail.probe])
 
   return (
     <main className="app-shell public-home">
@@ -553,9 +1151,61 @@ export default function UserConsole(): JSX.Element {
                 </button>
               </div>
             </div>
+
+            <div className="user-console-probe-box">
+              <div className="user-console-probe-label-row">
+                <label className="token-label">{text.detail.probe.title}</label>
+                <span className="user-console-probe-hint">
+                  <button
+                    type="button"
+                    className="user-console-probe-hint-trigger"
+                    aria-label={text.detail.probe.costHintAria}
+                  >
+                    <Icon icon="mdi:help-circle-outline" />
+                  </button>
+                  <span className="user-console-probe-hint-bubble" role="tooltip">
+                    {text.detail.probe.costHint}
+                  </span>
+                </span>
+              </div>
+              <div className="user-console-probe-actions">
+                <div className="user-console-probe-action">
+                  {probeBubble?.anchor === 'mcp' && renderProbeBubble()}
+                  <button
+                    type="button"
+                    data-probe-kind="mcp"
+                    className={`btn btn-sm user-console-probe-btn ${buttonMeta.tone(mcpProbe.state)}`}
+                    onClick={() => void runMcpProbe()}
+                    disabled={anyProbeRunning}
+                  >
+                    <Icon
+                      icon={buttonMeta.icon(mcpProbe.state)}
+                      className={`user-console-probe-btn-icon ${mcpProbe.state === 'running' ? 'is-spinning' : ''}`}
+                    />
+                    <span>{probeButtonLabel('mcp', mcpProbe)}</span>
+                  </button>
+                </div>
+                <div className="user-console-probe-action">
+                  {probeBubble?.anchor === 'api' && renderProbeBubble()}
+                  <button
+                    type="button"
+                    data-probe-kind="api"
+                    className={`btn btn-sm user-console-probe-btn ${buttonMeta.tone(apiProbe.state)}`}
+                    onClick={() => void runApiProbe()}
+                    disabled={anyProbeRunning}
+                  >
+                    <Icon
+                      icon={buttonMeta.icon(apiProbe.state)}
+                      className={`user-console-probe-btn-icon ${apiProbe.state === 'running' ? 'is-spinning' : ''}`}
+                    />
+                    <span>{probeButtonLabel('api', apiProbe)}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
           </section>
 
-          <section className="surface panel">
+          <section className="surface panel user-console-detail-panel">
             <div className="panel-header">
               <h2>{text.detail.logs}</h2>
             </div>
@@ -1050,6 +1700,59 @@ const EN = {
     subtitle: 'Same token-level modules as home page (without global site card).',
     back: 'Back',
     tokenLabel: 'Token',
+    probe: {
+      title: 'Connectivity Checks',
+      costHint: "This check uses this token's own quota/credits.",
+      costHintAria: 'Quota usage hint',
+      mcpButton: {
+        idle: 'Test MCP',
+        success: 'MCP Ready',
+        partial: 'MCP Partial',
+        failed: 'MCP Failed',
+      },
+      apiButton: {
+        idle: 'Test API',
+        success: 'API Ready',
+        partial: 'API Partial',
+        failed: 'API Failed',
+      },
+      runningButton: '{label} {done}/{total}',
+      running: 'Checking: {step}',
+      preflightFailed: 'Cannot load token secret: {message}',
+      summarySuccess: '{passed}/{total} checks passed',
+      summaryPartial: '{passed}/{total} checks passed, {failed} failed',
+      stepOk: 'OK',
+      stepStatus: {
+        running: 'Running',
+        success: 'Success',
+        failed: 'Failed',
+      },
+      bubbles: {
+        mcpTitle: 'MCP Probe',
+        apiTitle: 'API Probe',
+        current: 'Current',
+        result: 'Result',
+        preflight: 'Token Secret',
+        done: 'Summary',
+      },
+      steps: {
+        mcpPing: 'MCP service connectivity',
+        mcpToolsList: 'MCP tool discovery',
+        apiSearch: 'Web search capability',
+        apiExtract: 'Page extract capability',
+        apiCrawl: 'Site crawl capability',
+        apiMap: 'Site map capability',
+        apiResearch: 'Research task creation',
+        apiResearchResult: 'Research result query',
+      },
+      errors: {
+        missingRequestId: 'Research request_id is missing',
+        researchFailed: 'Research task failed',
+        researchUnexpectedStatus: 'Research returned unsupported status: {status}',
+      },
+      researchPendingAccepted: 'pending (accepted)',
+      researchStatus: 'status={status}',
+    },
     logs: 'Recent Requests (20)',
     emptyLogs: 'No recent requests.',
     guideTitle: 'Client Setup',
@@ -1115,6 +1818,59 @@ const ZH = {
     subtitle: '保留首页 token 相关模块（不展示首个站点全局卡片）。',
     back: '返回',
     tokenLabel: 'Token',
+    probe: {
+      title: '连通性检测',
+      costHint: '该检测会消耗当前 Token 自身额度。',
+      costHintAria: '额度消耗提示',
+      mcpButton: {
+        idle: '检测 MCP',
+        success: 'MCP 就绪',
+        partial: 'MCP 部分通过',
+        failed: 'MCP 失败',
+      },
+      apiButton: {
+        idle: '检测 API',
+        success: 'API 就绪',
+        partial: 'API 部分通过',
+        failed: 'API 失败',
+      },
+      runningButton: '{label} {done}/{total}',
+      running: '检测中：{step}',
+      preflightFailed: '读取 Token 失败：{message}',
+      summarySuccess: '{passed}/{total} 项通过',
+      summaryPartial: '{passed}/{total} 项通过，{failed} 项失败',
+      stepOk: '通过',
+      stepStatus: {
+        running: '进行中',
+        success: '成功',
+        failed: '失败',
+      },
+      bubbles: {
+        mcpTitle: 'MCP 检测',
+        apiTitle: 'API 检测',
+        current: '当前检测',
+        result: '结果',
+        preflight: '读取 Token',
+        done: '汇总',
+      },
+      steps: {
+        mcpPing: 'MCP 服务连通',
+        mcpToolsList: 'MCP 工具发现',
+        apiSearch: '网页搜索能力',
+        apiExtract: '页面抽取能力',
+        apiCrawl: '站点抓取能力',
+        apiMap: '站点映射能力',
+        apiResearch: '研究任务创建',
+        apiResearchResult: '研究结果查询',
+      },
+      errors: {
+        missingRequestId: 'research 响应缺少 request_id',
+        researchFailed: 'research 任务失败',
+        researchUnexpectedStatus: 'research 返回了不支持的状态：{status}',
+      },
+      researchPendingAccepted: 'pending（已受理）',
+      researchStatus: '状态={status}',
+    },
     logs: '近期请求（20 条）',
     emptyLogs: '暂无请求记录。',
     guideTitle: '客户端接入',
