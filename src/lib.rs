@@ -9827,6 +9827,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_user_token_binding_with_preferred_falls_back_when_preferred_unavailable() {
+        let db_path = temp_db_path("user-token-binding-preferred-unavailable");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "preferred-unavailable-user".to_string(),
+                username: Some("preferred_unavailable".to_string()),
+                name: Some("Preferred Unavailable".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(1),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+        let original = proxy
+            .ensure_user_token_binding(&user.user_id, Some("linuxdo:preferred_unavailable"))
+            .await
+            .expect("ensure original binding");
+        let disabled = proxy
+            .create_access_token(Some("linuxdo:disabled_preferred"))
+            .await
+            .expect("create disabled preferred token");
+        proxy
+            .set_access_token_enabled(&disabled.id, false)
+            .await
+            .expect("disable preferred token");
+
+        let fallback_disabled = proxy
+            .ensure_user_token_binding_with_preferred(
+                &user.user_id,
+                Some("linuxdo:preferred_unavailable"),
+                Some(&disabled.id),
+            )
+            .await
+            .expect("fallback when preferred disabled");
+        assert_eq!(
+            fallback_disabled.id, original.id,
+            "disabled preferred token should be ignored"
+        );
+
+        let deleted = proxy
+            .create_access_token(Some("linuxdo:deleted_preferred"))
+            .await
+            .expect("create deleted preferred token");
+        proxy
+            .delete_access_token(&deleted.id)
+            .await
+            .expect("soft delete preferred token");
+
+        let fallback_deleted = proxy
+            .ensure_user_token_binding_with_preferred(
+                &user.user_id,
+                Some("linuxdo:preferred_unavailable"),
+                Some(&deleted.id),
+            )
+            .await
+            .expect("fallback when preferred deleted");
+        assert_eq!(
+            fallback_deleted.id, original.id,
+            "soft-deleted preferred token should be ignored"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn force_user_relogin_migration_revokes_existing_sessions_once() {
         let db_path = temp_db_path("force-user-relogin-v1");
         let db_str = db_path.to_string_lossy().to_string();
