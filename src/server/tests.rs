@@ -1670,7 +1670,7 @@ mod tests {
             .await
             .expect("post linuxdo auth");
 
-        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.status(), reqwest::StatusCode::SEE_OTHER);
         let location = response
             .headers()
             .get(reqwest::header::LOCATION)
@@ -1781,7 +1781,7 @@ mod tests {
             .send()
             .await
             .expect("start linuxdo oauth");
-        assert_eq!(auth_resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(auth_resp.status(), reqwest::StatusCode::SEE_OTHER);
 
         let location = auth_resp
             .headers()
