@@ -131,35 +131,6 @@ fn extract_token_from_query(raw_query: Option<&str>) -> (Option<String>, Option<
     (query, token)
 }
 
-fn mcp_request_counts_toward_business_quota(path: &str, body: &[u8]) -> bool {
-    // Only apply special handling for /mcp traffic. Other endpoints (such as
-    // /api/tavily/*) are always treated as business-costful.
-    if !path.starts_with("/mcp") {
-        return true;
-    }
-
-    // Non-business whitelist: only the following methods are treated as "no business cost".
-    // Everything else is considered business-costful and will consume business quota.
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Object(map)) => {
-            let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
-            let is_non_business = matches!(
-                method,
-                "tools/list"
-                    | "resources/list"
-                    | "resources/templates/list"
-                    | "resources/read"
-                    | "prompts/list"
-                    | "prompts/get"
-            ) || method.starts_with("notifications/");
-            // Return semantics: true = count towards business quota; false = only hourly-any limiter.
-            !is_non_business
-        }
-        // 对于无法解析或缺少 method 的请求，保守起见视为“有业务成本”。
-        _ => true,
-    }
-}
-
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
@@ -229,7 +200,67 @@ async fn proxy_handler(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let billable_flag = mcp_request_counts_toward_business_quota(&path, &body_bytes);
+    // Billing plan (1:1 upstream credits):
+    // - Non-business whitelist methods are ignored by business quota.
+    // - tools/call for tavily-* injects include_usage=true so upstream returns usage.credits.
+    // - Only tavily-search uses a predictable cost check (search_depth -> expected credits).
+    let mut billable_flag = true;
+    let mut mcp_tool_name: Option<String> = None;
+    let mut expected_search_credits: Option<i64> = None;
+    let mut forwarded_body = body_bytes.clone();
+    if path.starts_with("/mcp")
+        && let Ok(mut value) = serde_json::from_slice::<Value>(&body_bytes)
+        && let Some(map) = value.as_object_mut()
+    {
+        let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let is_non_business = matches!(
+            method,
+            "tools/list"
+                | "resources/list"
+                | "resources/templates/list"
+                | "resources/read"
+                | "prompts/list"
+                | "prompts/get"
+        ) || method.starts_with("notifications/");
+        billable_flag = !is_non_business;
+
+        if method == "tools/call"
+            && let Some(Value::Object(params)) = map.get_mut("params")
+        {
+            let tool = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !tool.is_empty() {
+                mcp_tool_name = Some(tool.clone());
+            }
+
+            if matches!(
+                tool.as_str(),
+                "tavily-search" | "tavily-extract" | "tavily-crawl" | "tavily-map"
+            ) {
+                let args_entry = params
+                    .entry("arguments".to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if !args_entry.is_object() {
+                    *args_entry = Value::Object(serde_json::Map::new());
+                }
+                if let Value::Object(args) = args_entry {
+                    args.insert("include_usage".to_string(), Value::Bool(true));
+                }
+
+                if tool == "tavily-search" {
+                    expected_search_credits = Some(tavily_search_expected_credits(args_entry));
+                }
+
+                if let Ok(encoded) = serde_json::to_vec(&value) {
+                    forwarded_body = bytes::Bytes::from(encoded);
+                }
+            }
+        }
+    }
 
     let auth_token_id = if state.dev_open_admin {
         Some("dev".to_string())
@@ -245,7 +276,7 @@ async fn proxy_handler(
         path: path.clone(),
         query,
         headers,
-        body: body_bytes.clone(),
+        body: forwarded_body.clone(),
         auth_token_id,
     };
 
@@ -293,31 +324,39 @@ async fn proxy_handler(
 
         // 2) 业务配额（小时 / 日 / 月）只对 MCP 工具调用生效。
         if billable_flag {
-            match state.proxy.check_token_quota(tid).await {
+            match state.proxy.peek_token_quota(tid).await {
                 Ok(verdict) => {
-                    if !state.dev_open_admin && !verdict.allowed {
-                        let message = build_quota_error_message(&verdict);
-                        let _ = state
-                            .proxy
-                            .record_token_attempt(
-                                tid,
-                                &method,
-                                &path,
-                                parts.uri.query(),
-                                Some(StatusCode::TOO_MANY_REQUESTS.as_u16() as i64),
-                                None,
-                                true,
-                                "quota_exhausted",
-                                Some(&message),
-                            )
-                            .await;
-                        let response = quota_exceeded_response(&verdict)?;
-                        return Ok(response);
+                    if !state.dev_open_admin {
+                        let blocked = if mcp_tool_name.as_deref() == Some("tavily-search") {
+                            quota_would_exceed(&verdict, expected_search_credits.unwrap_or(1))
+                        } else {
+                            quota_exhausted_now(&verdict)
+                        };
+
+                        if blocked {
+                            let message = build_quota_error_message(&verdict);
+                            let _ = state
+                                .proxy
+                                .record_token_attempt(
+                                    tid,
+                                    &method,
+                                    &path,
+                                    parts.uri.query(),
+                                    Some(StatusCode::TOO_MANY_REQUESTS.as_u16() as i64),
+                                    None,
+                                    true,
+                                    "quota_exhausted",
+                                    Some(&message),
+                                )
+                                .await;
+                            let response = quota_exceeded_response(&verdict)?;
+                            return Ok(response);
+                        }
                     }
                     _quota_verdict = Some(verdict);
                 }
                 Err(err) => {
-                    eprintln!("quota check failed: {err}");
+                    eprintln!("quota peek failed: {err}");
                     return Err(StatusCode::INTERNAL_SERVER_ERROR);
                 }
             }
@@ -363,6 +402,40 @@ async fn proxy_handler(
 
                 if result_status == "success" && !resp.status.is_success() {
                     result_status = "error";
+                }
+
+                // Charge credits after a successful billable Tavily tool call.
+                if billable_flag
+                    && result_status == "success"
+                    && resp.status.is_success()
+                    && matches!(
+                        mcp_tool_name.as_deref(),
+                        Some("tavily-search")
+                            | Some("tavily-extract")
+                            | Some("tavily-crawl")
+                            | Some("tavily-map")
+                    )
+                {
+                    let credits = if mcp_tool_name.as_deref() == Some("tavily-search") {
+                        extract_usage_credits_from_json_bytes(&resp.body)
+                            .unwrap_or_else(|| expected_search_credits.unwrap_or(1))
+                    } else {
+                        match extract_usage_credits_from_json_bytes(&resp.body) {
+                            Some(credits) => credits,
+                            None => {
+                                eprintln!(
+                                    "missing usage.credits for MCP tool response; skipping billing"
+                                );
+                                0
+                            }
+                        }
+                    };
+
+                    if credits > 0
+                        && let Err(err) = state.proxy.charge_token_quota(tid, credits).await
+                    {
+                        eprintln!("charge_token_quota failed for {path}: {err}");
+                    }
                 }
 
                 let http_code = resp.status.as_u16() as i64;

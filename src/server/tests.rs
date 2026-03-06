@@ -12,6 +12,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tavily_hikari::DEFAULT_UPSTREAM;
     use tokio::net::TcpListener;
 
@@ -114,6 +115,89 @@ mod tests {
         addr
     }
 
+    async fn spawn_mock_mcp_upstream_for_tavily_search(
+        expected_api_key: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/mcp",
+            any({
+                let hits = hits.clone();
+                move |Query(params): Query<HashMap<String, String>>, Json(body): Json<Value>| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let received = params.get("tavilyApiKey").cloned();
+                        assert_eq!(
+                            received.as_deref(),
+                            Some(expected_api_key.as_str()),
+                            "missing or incorrect tavilyApiKey"
+                        );
+
+                        assert_eq!(
+                            body.get("method").and_then(|v| v.as_str()),
+                            Some("tools/call"),
+                            "expected MCP tools/call"
+                        );
+                        assert_eq!(
+                            body.get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str()),
+                            Some("tavily-search"),
+                            "expected tavily-search tool call"
+                        );
+                        assert_eq!(
+                            body.get("params")
+                                .and_then(|p| p.get("arguments"))
+                                .and_then(|a| a.get("include_usage"))
+                                .and_then(|v| v.as_bool()),
+                            Some(true),
+                            "proxy should inject include_usage=true"
+                        );
+
+                        let args = body
+                            .get("params")
+                            .and_then(|p| p.get("arguments"))
+                            .unwrap_or(&Value::Null);
+                        let depth = args
+                            .get("search_depth")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let credits = if depth.eq_ignore_ascii_case("advanced") {
+                            2
+                        } else {
+                            1
+                        };
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!(1)),
+                                "result": {
+                                    "structuredContent": {
+                                        "status": 200,
+                                        "usage": { "credits": credits },
+                                    }
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
     fn assert_upstream_json_auth(
         headers: &HeaderMap,
         body: &Value,
@@ -129,6 +213,14 @@ mod tests {
             !api_key.starts_with("th-"),
             "upstream {endpoint} api_key must not be Hikari token"
         );
+
+        if matches!(endpoint, "/search" | "/extract" | "/crawl" | "/map") {
+            assert_eq!(
+                body.get("include_usage").and_then(|v| v.as_bool()),
+                Some(true),
+                "upstream {endpoint} should be forced to include usage"
+            );
+        }
 
         assert_upstream_bearer_auth(headers, expected_api_key, endpoint);
     }
@@ -177,6 +269,142 @@ mod tests {
                 .unwrap();
         });
         addr
+    }
+
+    async fn spawn_http_search_mock_with_usage(
+        expected_api_key: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/search",
+            post({
+                let hits = hits.clone();
+                move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        assert_upstream_json_auth(&headers, &body, &expected_api_key, "/search");
+
+                        let search_depth = body
+                            .get("search_depth")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let credits = if search_depth.eq_ignore_ascii_case("advanced") {
+                            2
+                        } else {
+                            1
+                        };
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": 200,
+                                "results": [],
+                                "usage": { "credits": credits },
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
+    async fn spawn_http_json_endpoints_mock_with_usage(
+        expected_api_key: String,
+        extract_credits: i64,
+        crawl_credits: i64,
+        map_credits: i64,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let expected_api_key_extract = expected_api_key.clone();
+        let expected_api_key_crawl = expected_api_key.clone();
+        let expected_api_key_map = expected_api_key;
+        let app = Router::new()
+            .route(
+                "/extract",
+                post({
+                    let hits = hits.clone();
+                    move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let expected_api_key = expected_api_key_extract.clone();
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            assert_upstream_json_auth(&headers, &body, &expected_api_key, "/extract");
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "status": 200,
+                                    "results": [],
+                                    "usage": { "credits": extract_credits },
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/crawl",
+                post({
+                    let hits = hits.clone();
+                    move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let expected_api_key = expected_api_key_crawl.clone();
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            assert_upstream_json_auth(&headers, &body, &expected_api_key, "/crawl");
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "status": 200,
+                                    "results": [],
+                                    "usage": { "credits": crawl_credits },
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/map",
+                post({
+                    let hits = hits.clone();
+                    move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let expected_api_key = expected_api_key_map.clone();
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            assert_upstream_json_auth(&headers, &body, &expected_api_key, "/map");
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "status": 200,
+                                    "results": [],
+                                    "usage": { "credits": map_credits },
+                                })),
+                            )
+                        }
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
     }
 
     async fn spawn_http_extract_mock_asserting_api_key(expected_api_key: String) -> SocketAddr {
@@ -269,25 +497,63 @@ mod tests {
         addr
     }
 
-    async fn spawn_http_research_mock_asserting_api_key(expected_api_key: String) -> SocketAddr {
-        let app = Router::new().route(
-            "/research",
-            post({
-                move |headers: HeaderMap, Json(body): Json<Value>| {
-                    let expected_api_key = expected_api_key.clone();
-                    async move {
-                        assert_upstream_json_auth(&headers, &body, &expected_api_key, "/research");
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "request_id": "mock-research-request",
-                                "status": "pending",
-                            })),
-                        )
+    async fn spawn_http_research_mock_with_usage_diff(
+        expected_api_key: String,
+        base_research_usage: i64,
+        delta: i64,
+    ) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let research_calls = Arc::new(AtomicUsize::new(0));
+        let expected_api_key_usage = expected_api_key.clone();
+        let expected_api_key_research = expected_api_key;
+        let app = Router::new()
+            .route(
+                "/usage",
+                get({
+                    let usage_calls = usage_calls.clone();
+                    move |headers: HeaderMap| {
+                        let expected_api_key = expected_api_key_usage.clone();
+                        let usage_calls = usage_calls.clone();
+                        async move {
+                            let call_index = usage_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                            assert_upstream_bearer_auth(&headers, &expected_api_key, "/usage");
+                            // First call: base, second call: base + delta.
+                            let research_usage = if call_index <= 1 {
+                                base_research_usage
+                            } else {
+                                base_research_usage + delta
+                            };
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "key": { "research_usage": research_usage }
+                                })),
+                            )
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .route(
+                "/research",
+                post({
+                    let research_calls = research_calls.clone();
+                    move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let expected_api_key = expected_api_key_research.clone();
+                        let research_calls = research_calls.clone();
+                        async move {
+                            research_calls.fetch_add(1, Ordering::SeqCst);
+                            assert_upstream_json_auth(&headers, &body, &expected_api_key, "/research");
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "request_id": "mock-research-request",
+                                    "status": "pending",
+                                })),
+                            )
+                        }
+                    }
+                }),
+            );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -296,7 +562,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        addr
+        (addr, usage_calls, research_calls)
     }
 
     async fn spawn_http_research_result_mock_asserting_bearer(
@@ -2362,6 +2628,9 @@ mod tests {
         let db_path = temp_db_path("http-search-429-quota");
         let db_str = db_path.to_string_lossy().to_string();
 
+        // Keep env stable across proxy creation + quota warmup.
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "2");
+
         let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
             .await
             .expect("proxy created");
@@ -2438,6 +2707,125 @@ mod tests {
         assert_eq!(http_status, Some(429));
         assert_eq!(mcp_status, None);
         assert_eq!(result_status, "quota_exhausted");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tavily_http_search_charges_credits_and_blocks_basic_without_hitting_upstream() {
+        let db_path = temp_db_path("http-search-credits-basic");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "2");
+
+        let expected_api_key = "tvly-http-search-credits-basic-key";
+        let (upstream_addr, hits) =
+            spawn_http_search_mock_with_usage(expected_api_key.to_string()).await;
+        let usage_base = format!("http://{}", upstream_addr);
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("http-search-credits-basic"))
+            .await
+            .expect("create token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+        let client = Client::new();
+        let url = format!("http://{}/api/tavily/search", proxy_addr);
+
+        let resp1 = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.token))
+            .json(&serde_json::json!({ "query": "test-1", "search_depth": "basic" }))
+            .send()
+            .await
+            .expect("request 1");
+        assert_eq!(resp1.status(), reqwest::StatusCode::OK);
+        let verdict1 = proxy.peek_token_quota(&token.id).await.expect("peek quota 1");
+        assert_eq!(verdict1.hourly_used, 1);
+
+        let resp2 = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.token))
+            .json(&serde_json::json!({ "query": "test-2", "search_depth": "basic" }))
+            .send()
+            .await
+            .expect("request 2");
+        assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+        let verdict2 = proxy.peek_token_quota(&token.id).await.expect("peek quota 2");
+        assert_eq!(verdict2.hourly_used, 2);
+
+        // Third request should be blocked by predicted cost, without hitting upstream.
+        let resp3 = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.token))
+            .json(&serde_json::json!({ "query": "test-3", "search_depth": "basic" }))
+            .send()
+            .await
+            .expect("request 3");
+        assert_eq!(resp3.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let verdict3 = proxy.peek_token_quota(&token.id).await.expect("peek quota 3");
+        assert_eq!(verdict3.hourly_used, 2);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tavily_http_search_charges_credits_and_blocks_advanced_without_hitting_upstream() {
+        let db_path = temp_db_path("http-search-credits-advanced");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "2");
+
+        let expected_api_key = "tvly-http-search-credits-advanced-key";
+        let (upstream_addr, hits) =
+            spawn_http_search_mock_with_usage(expected_api_key.to_string()).await;
+        let usage_base = format!("http://{}", upstream_addr);
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("http-search-credits-advanced"))
+            .await
+            .expect("create token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+        let client = Client::new();
+        let url = format!("http://{}/api/tavily/search", proxy_addr);
+
+        let resp1 = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.token))
+            .json(&serde_json::json!({ "query": "test-1", "search_depth": "advanced" }))
+            .send()
+            .await
+            .expect("request 1");
+        assert_eq!(resp1.status(), reqwest::StatusCode::OK);
+        let verdict1 = proxy.peek_token_quota(&token.id).await.expect("peek quota 1");
+        assert_eq!(verdict1.hourly_used, 2);
+
+        // Second request should be blocked (2 + 2 > 2), without hitting upstream.
+        let resp2 = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.token))
+            .json(&serde_json::json!({ "query": "test-2", "search_depth": "advanced" }))
+            .send()
+            .await
+            .expect("request 2");
+        assert_eq!(resp2.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -3050,9 +3438,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tavily_http_extract_crawl_map_charge_credits_from_upstream_usage() {
+        let db_path = temp_db_path("http-json-credits-charge");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // Avoid cross-test env var interference (quota verdict clamps used to limit).
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1000");
+
+        let expected_api_key = "tvly-http-json-credits-charge-key";
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("http-json-credits-charge"))
+            .await
+            .expect("create token");
+
+        // extract=0 (no charge), crawl=5, map=3
+        let (upstream_addr, hits) = spawn_http_json_endpoints_mock_with_usage(
+            expected_api_key.to_string(),
+            0,
+            5,
+            3,
+        )
+        .await;
+        let usage_base = format!("http://{}", upstream_addr);
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+
+        let client = Client::new();
+
+        let extract_url = format!("http://{}/api/tavily/extract", proxy_addr);
+        let extract_resp = client
+            .post(extract_url)
+            .json(&serde_json::json!({
+                "api_key": access_token.token,
+                "urls": ["https://example.com"]
+            }))
+            .send()
+            .await
+            .expect("extract request");
+        assert_eq!(extract_resp.status(), reqwest::StatusCode::OK);
+        let verdict_after_extract = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek quota after extract");
+        assert_eq!(verdict_after_extract.hourly_used, 0);
+
+        let crawl_url = format!("http://{}/api/tavily/crawl", proxy_addr);
+        let crawl_resp = client
+            .post(crawl_url)
+            .json(&serde_json::json!({
+                "api_key": access_token.token,
+                "urls": ["https://example.com/page"]
+            }))
+            .send()
+            .await
+            .expect("crawl request");
+        assert_eq!(crawl_resp.status(), reqwest::StatusCode::OK);
+        let verdict_after_crawl = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek quota after crawl");
+        assert_eq!(verdict_after_crawl.hourly_used, 5);
+
+        let map_url = format!("http://{}/api/tavily/map", proxy_addr);
+        let map_resp = client
+            .post(map_url)
+            .json(&serde_json::json!({
+                "api_key": access_token.token,
+                "url": "https://example.com"
+            }))
+            .send()
+            .await
+            .expect("map request");
+        assert_eq!(map_resp.status(), reqwest::StatusCode::OK);
+        let verdict_after_map = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek quota after map");
+        assert_eq!(verdict_after_map.hourly_used, 8);
+
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn tavily_http_research_replaces_body_api_key_with_tavily_key() {
         let db_path = temp_db_path("http-research-replace-key");
         let db_str = db_path.to_string_lossy().to_string();
+
+        // Avoid cross-test env var interference (research uses predicted min cost enforcement).
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1000");
 
         let expected_api_key = "tvly-http-research-key";
         let proxy = TavilyProxy::with_endpoint(
@@ -3068,8 +3549,8 @@ mod tests {
             .await
             .expect("create token");
 
-        let upstream_addr =
-            spawn_http_research_mock_asserting_api_key(expected_api_key.to_string()).await;
+        let (upstream_addr, _usage_calls, _research_calls) =
+            spawn_http_research_mock_with_usage_diff(expected_api_key.to_string(), 10, 0).await;
         let usage_base = format!("http://{}", upstream_addr);
 
         let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
@@ -3093,6 +3574,110 @@ mod tests {
             body.get("request_id").and_then(|v| v.as_str()),
             Some("mock-research-request")
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tavily_http_research_charges_credits_from_usage_diff() {
+        let db_path = temp_db_path("http-research-usage-diff-charge");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // Avoid cross-test env var interference.
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1000");
+
+        let expected_api_key = "tvly-http-research-usage-diff-key";
+        let (upstream_addr, usage_calls, research_calls) =
+            spawn_http_research_mock_with_usage_diff(expected_api_key.to_string(), 10, 7).await;
+        let usage_base = format!("http://{}", upstream_addr);
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("http-research-usage-diff-charge"))
+            .await
+            .expect("create token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+        let client = Client::new();
+
+        let url = format!("http://{}/api/tavily/research", proxy_addr);
+        let resp = client
+            .post(url)
+            .json(&serde_json::json!({
+                "api_key": access_token.token,
+                "input": "usage-diff",
+                "model": "mini"
+            }))
+            .send()
+            .await
+            .expect("research request");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let verdict = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek quota");
+        assert_eq!(verdict.hourly_used, 7);
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(research_calls.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tavily_http_research_blocks_when_min_cost_would_exceed_quota() {
+        let db_path = temp_db_path("http-research-usage-diff-block");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // Research mini minimum is 4 credits.
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "3");
+
+        let expected_api_key = "tvly-http-research-usage-diff-block-key";
+        let (upstream_addr, usage_calls, research_calls) =
+            spawn_http_research_mock_with_usage_diff(expected_api_key.to_string(), 10, 7).await;
+        let usage_base = format!("http://{}", upstream_addr);
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("http-research-usage-diff-block"))
+            .await
+            .expect("create token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+        let client = Client::new();
+
+        let url = format!("http://{}/api/tavily/research", proxy_addr);
+        let resp = client
+            .post(url)
+            .json(&serde_json::json!({
+                "api_key": access_token.token,
+                "input": "usage-diff-block",
+                "model": "mini"
+            }))
+            .send()
+            .await
+            .expect("research request");
+        assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(research_calls.load(Ordering::SeqCst), 0);
+
+        let verdict = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek quota");
+        assert_eq!(verdict.hourly_used, 0);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -3633,6 +4218,78 @@ mod tests {
 
         let counts_business_quota: i64 = row.try_get("counts_business_quota").unwrap();
         assert_eq!(counts_business_quota, 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_tavily_search_charges_credits_and_blocks_without_hitting_upstream() {
+        let db_path = temp_db_path("mcp-tools-call-search-credits");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "2");
+
+        let expected_api_key = "tvly-mcp-tools-call-search-credits-key";
+        let (upstream_addr, hits) =
+            spawn_mock_mcp_upstream_for_tavily_search(expected_api_key.to_string()).await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("mcp-tools-call-search-credits"))
+            .await
+            .expect("create access token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), upstream.clone()).await;
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let first = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "tavily-search",
+                    "arguments": {
+                        "query": "mcp credits",
+                        "search_depth": "advanced"
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("first request");
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+        let verdict1 = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek quota 1");
+        assert_eq!(verdict1.hourly_used, 2);
+
+        // Second request should be blocked (2 + 2 > 2), without hitting upstream.
+        let second = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "tavily-search",
+                    "arguments": {
+                        "query": "mcp credits blocked",
+                        "search_depth": "advanced"
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("second request");
+        assert_eq!(second.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_file(db_path);
     }
