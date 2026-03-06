@@ -9354,8 +9354,10 @@ fn extract_research_request_id(body: &[u8]) -> Option<String> {
 /// - Handles nested MCP envelopes by recursively scanning for an object containing `{ "usage": { "credits": ... } }`.
 /// - If credits is a float, rounds up to avoid under-charging.
 pub fn extract_usage_credits_from_json_bytes(body: &[u8]) -> Option<i64> {
-    let parsed = serde_json::from_slice::<Value>(body).ok()?;
-    extract_usage_credits_from_value(&parsed)
+    if let Ok(parsed) = serde_json::from_slice::<Value>(body) {
+        return extract_usage_credits_from_value(&parsed);
+    }
+    extract_usage_credits_from_sse_bytes(body)
 }
 
 /// Best-effort extraction of Tavily `usage.credits` from an upstream JSON response body,
@@ -9363,8 +9365,10 @@ pub fn extract_usage_credits_from_json_bytes(body: &[u8]) -> Option<i64> {
 ///
 /// For non-batch responses, this matches `extract_usage_credits_from_json_bytes()`.
 pub fn extract_usage_credits_total_from_json_bytes(body: &[u8]) -> Option<i64> {
-    let parsed = serde_json::from_slice::<Value>(body).ok()?;
-    extract_usage_credits_total_from_value(&parsed)
+    if let Ok(parsed) = serde_json::from_slice::<Value>(body) {
+        return extract_usage_credits_total_from_value(&parsed);
+    }
+    extract_usage_credits_total_from_sse_bytes(body)
 }
 
 fn extract_usage_credits_total_from_value(value: &Value) -> Option<i64> {
@@ -9432,6 +9436,54 @@ fn parse_credits_value(value: &Value) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+fn extract_usage_credits_from_sse_bytes(body: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(body).ok()?;
+    let messages = extract_sse_json_messages(text);
+    let mut best: Option<i64> = None;
+    for message in messages {
+        if let Some(credits) = extract_usage_credits_from_value(&message) {
+            best = Some(best.map_or(credits, |current| current.max(credits)));
+        }
+    }
+    best
+}
+
+fn extract_usage_credits_total_from_sse_bytes(body: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(body).ok()?;
+    let messages = extract_sse_json_messages(text);
+    if messages.is_empty() {
+        return None;
+    }
+
+    // SSE streams can contain multiple messages for the same JSON-RPC `id` (e.g. progress updates).
+    // To avoid double-charging, we take the maximum observed credits per id and then sum.
+    let mut per_id_max: HashMap<String, i64> = HashMap::new();
+    let mut found = false;
+
+    for message in messages {
+        let Some(credits) = extract_usage_credits_total_from_value(&message) else {
+            continue;
+        };
+        found = true;
+
+        let id_key = match &message {
+            Value::Object(map) => map
+                .get("id")
+                .filter(|v| !v.is_null())
+                .map(|v| v.to_string()),
+            _ => None,
+        }
+        .unwrap_or_else(|| "__no_id__".to_string());
+
+        per_id_max
+            .entry(id_key)
+            .and_modify(|current| *current = (*current).max(credits))
+            .or_insert(credits);
+    }
+
+    found.then(|| per_id_max.values().copied().sum())
 }
 
 fn classify_status_text(status: &str) -> Option<MessageOutcome> {
@@ -9599,6 +9651,22 @@ mod tests {
     fn extract_usage_credits_total_from_json_bytes_sums_across_arrays() {
         let body = br#"[{"result":{"structuredContent":{"usage":{"credits":1}}}},{"result":{"structuredContent":{"usage":{"credits":2.1}}}}]"#;
         assert_eq!(extract_usage_credits_total_from_json_bytes(body), Some(4));
+    }
+
+    #[test]
+    fn extract_usage_credits_from_json_bytes_parses_sse_and_returns_max() {
+        let body = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"structuredContent\":{\"usage\":{\"credits\":1}}}}\n\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"structuredContent\":{\"usage\":{\"credits\":2}}}}\n\n";
+        assert_eq!(extract_usage_credits_from_json_bytes(body), Some(2));
+    }
+
+    #[test]
+    fn extract_usage_credits_total_from_json_bytes_parses_sse_and_sums_by_id() {
+        // Duplicate id=1 message should not double count.
+        let body = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"structuredContent\":{\"usage\":{\"credits\":1}}}}\n\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"structuredContent\":{\"usage\":{\"credits\":1}}}}\n\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"structuredContent\":{\"usage\":{\"credits\":2}}}}\n\n";
+        assert_eq!(extract_usage_credits_total_from_json_bytes(body), Some(3));
     }
 
     #[test]
