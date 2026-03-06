@@ -206,7 +206,6 @@ async fn proxy_handler(
     // - Only tavily-search uses a predictable cost check (search_depth -> expected credits).
     // - For unknown / batch / positional request shapes, default to billable to avoid bypass.
     let mut billable_flag = false;
-    let mut mcp_tool_name: Option<String> = None;
     let mut expected_search_credits: Option<i64> = None;
     let mut forwarded_body = body_bytes.clone();
     let mut lockable_tool = false;
@@ -214,11 +213,14 @@ async fn proxy_handler(
         match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(mut value) => {
                 // Default to billable unless we can *prove* it's a non-billable control plane call.
-                let mut non_billable = false;
+                let mut any_billable = false;
+                let mut any_lockable = false;
+                let mut all_non_billable = true;
+                let mut mutated = false;
+                let mut expected_search_total = 0i64;
 
-                if let Some(map) = value.as_object_mut() {
-                    let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                    non_billable = matches!(
+                let is_non_billable_method = |method: &str| {
+                    matches!(
                         method,
                         "initialize"
                             | "ping"
@@ -228,64 +230,136 @@ async fn proxy_handler(
                             | "resources/read"
                             | "prompts/list"
                             | "prompts/get"
-                    ) || method.starts_with("notifications/");
+                    ) || method.starts_with("notifications/")
+                };
 
-                    if method == "tools/call" {
-                        // Tools/call is treated as billable by default unless we can prove it's
-                        // a non-Tavily tool call (name does not start with `tavily-`).
-                        billable_flag = true;
-                        lockable_tool = true;
+                let handle_tool_call = |map: &mut serde_json::Map<String, Value>,
+                                            any_billable: &mut bool,
+                                            any_lockable: &mut bool,
+                                            all_non_billable: &mut bool,
+                                            mutated: &mut bool,
+                                            expected_search_total: &mut i64| {
+                    // tools/call is treated as billable by default unless we can prove it's
+                    // a non-Tavily tool call (name does not start with `tavily-`).
+                    *any_lockable = true;
 
-                        if let Some(Value::Object(params)) = map.get_mut("params") {
-                            let tool = params
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
-                            if !tool.is_empty() {
-                                mcp_tool_name = Some(tool.clone());
+                    if let Some(Value::Object(params)) = map.get_mut("params") {
+                        let tool = params
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+
+                        if tool.starts_with("tavily-") {
+                            *any_billable = true;
+                            *all_non_billable = false;
+
+                            let args_entry = params
+                                .entry("arguments".to_string())
+                                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                            if !args_entry.is_object() {
+                                *args_entry = Value::Object(serde_json::Map::new());
+                            }
+                            if let Value::Object(args) = args_entry {
+                                args.insert("include_usage".to_string(), Value::Bool(true));
+                            }
+                            *mutated = true;
+
+                            if tool == "tavily-search" {
+                                *expected_search_total = (*expected_search_total).saturating_add(
+                                    tavily_search_expected_credits(args_entry),
+                                );
+                            }
+                        } else if tool.is_empty() {
+                            // Unknown tool name: billable safe default.
+                            *any_billable = true;
+                            *all_non_billable = false;
+                        } else {
+                            // Proven non-Tavily tool call: do not charge business quota.
+                        }
+                    } else {
+                        // Missing params: billable safe default.
+                        *any_billable = true;
+                        *all_non_billable = false;
+                    }
+                };
+
+                match value {
+                    Value::Object(ref mut map) => {
+                        let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                        let non_billable = is_non_billable_method(method);
+                        if !non_billable {
+                            all_non_billable = false;
+                        }
+
+                        if method == "tools/call" {
+                            handle_tool_call(
+                                map,
+                                &mut any_billable,
+                                &mut any_lockable,
+                                &mut all_non_billable,
+                                &mut mutated,
+                                &mut expected_search_total,
+                            );
+                        } else if !non_billable {
+                            // Unknown object-shaped method: treat as billable (safe default).
+                            any_billable = true;
+                            any_lockable = true;
+                        }
+                    }
+                    Value::Array(ref mut items) => {
+                        // JSON-RPC batch: only treat as non-billable if *every* item is provably
+                        // a control-plane method or a non-Tavily tool call.
+                        for item in items.iter_mut() {
+                            let Some(map) = item.as_object_mut() else {
+                                // Positional/batch junk: billable safe default.
+                                any_billable = true;
+                                any_lockable = true;
+                                all_non_billable = false;
+                                continue;
+                            };
+
+                            let method =
+                                map.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                            let non_billable = is_non_billable_method(method);
+                            if !non_billable {
+                                all_non_billable = false;
                             }
 
-                            if tool.starts_with("tavily-") {
-                                let args_entry = params
-                                    .entry("arguments".to_string())
-                                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                                if !args_entry.is_object() {
-                                    *args_entry = Value::Object(serde_json::Map::new());
-                                }
-                                if let Value::Object(args) = args_entry {
-                                    args.insert("include_usage".to_string(), Value::Bool(true));
-                                }
-
-                                if tool == "tavily-search" {
-                                    expected_search_credits =
-                                        Some(tavily_search_expected_credits(args_entry));
-                                }
-
-                                if let Ok(encoded) = serde_json::to_vec(&value) {
-                                    forwarded_body = bytes::Bytes::from(encoded);
-                                }
-                            } else if !tool.is_empty() {
-                                // Proven non-Tavily tool call: do not charge business quota.
-                                billable_flag = false;
-                                lockable_tool = false;
+                            if method == "tools/call" {
+                                handle_tool_call(
+                                    map,
+                                    &mut any_billable,
+                                    &mut any_lockable,
+                                    &mut all_non_billable,
+                                    &mut mutated,
+                                    &mut expected_search_total,
+                                );
+                            } else if !non_billable {
+                                any_billable = true;
+                                any_lockable = true;
                             }
                         }
-                    } else if !non_billable {
-                        // Unknown object-shaped method: treat as billable (safe default).
-                        billable_flag = true;
-                        lockable_tool = true;
                     }
-                } else {
-                    // JSON-RPC batch or positional params: treat as billable to avoid bypass.
-                    billable_flag = true;
-                    lockable_tool = true;
+                    _ => {
+                        // Unknown / non-object: treat as billable to avoid bypass.
+                        any_billable = true;
+                        any_lockable = true;
+                        all_non_billable = false;
+                    }
                 }
 
-                if non_billable {
-                    billable_flag = false;
-                    lockable_tool = false;
+                billable_flag = any_billable && !all_non_billable;
+                lockable_tool = any_lockable && billable_flag;
+                if expected_search_total > 0 {
+                    expected_search_credits = Some(expected_search_total);
+                }
+
+                if mutated
+                    && let Ok(encoded) = serde_json::to_vec(&value)
+                {
+                    forwarded_body = bytes::Bytes::from(encoded);
                 }
             }
             Err(_) => {
@@ -372,8 +446,8 @@ async fn proxy_handler(
             match state.proxy.peek_token_quota(tid).await {
                 Ok(verdict) => {
                     if !state.dev_open_admin {
-                        let blocked = if mcp_tool_name.as_deref() == Some("tavily-search") {
-                            quota_would_exceed(&verdict, expected_search_credits.unwrap_or(1))
+                        let blocked = if let Some(expected) = expected_search_credits {
+                            quota_would_exceed(&verdict, expected)
                         } else {
                             quota_exhausted_now(&verdict)
                         };
@@ -421,13 +495,12 @@ async fn proxy_handler(
                     && result_status == "success"
                     && resp.status.is_success()
                 {
-                    let credits = if mcp_tool_name.as_deref() == Some("tavily-search") {
-                        extract_usage_credits_from_json_bytes(&resp.body)
-                            .unwrap_or_else(|| expected_search_credits.unwrap_or(1))
-                    } else {
-                        match extract_usage_credits_from_json_bytes(&resp.body) {
-                            Some(credits) => credits,
-                            None => {
+                    let credits = match extract_usage_credits_total_from_json_bytes(&resp.body) {
+                        Some(credits) => credits,
+                        None => {
+                            if let Some(expected) = expected_search_credits {
+                                expected
+                            } else {
                                 eprintln!(
                                     "missing usage.credits for MCP tool response; skipping billing"
                                 );

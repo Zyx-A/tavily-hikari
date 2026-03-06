@@ -137,6 +137,10 @@ const META_KEY_HEAL_ORPHAN_TOKENS_V1: &str = "heal_orphan_auth_tokens_from_logs_
 const META_KEY_API_KEY_USAGE_BUCKETS_V1_DONE: &str = "api_key_usage_buckets_v1_done";
 const META_KEY_ACCOUNT_QUOTA_BACKFILL_V1: &str = "account_quota_backfill_v1";
 const META_KEY_FORCE_USER_RELOGIN_V1: &str = "force_user_relogin_v1";
+// Cutover marker for switching business quota counters from "requests" to "credits".
+// We cannot retroactively convert legacy request counts into credits, so we reset the
+// lightweight counters once and start charging by upstream credits going forward.
+const META_KEY_BUSINESS_QUOTA_CREDITS_CUTOVER_V1: &str = "business_quota_credits_cutover_v1";
 const API_KEY_UPSERT_TRANSIENT_RETRY_BACKOFF_MS: [u64; 2] = [20, 50];
 
 fn token_limit_from_env(var: &str, default: i64) -> i64 {
@@ -538,12 +542,22 @@ impl TavilyProxy {
         })
     }
 
-    /// Serialize billing/quota checks per token within this process.
+    /// Serialize billing/quota checks per quota subject within this process.
     ///
     /// This is intentionally in-memory (not DB transactional), and exists to prevent
     /// concurrent requests from "peeking" the same snapshot and then charging later,
     /// which can otherwise allow limit bypass under concurrency.
     pub async fn lock_token_billing(&self, token_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        // Lock on the *effective* quota subject so bound tokens (account-scoped quota)
+        // cannot interleave billing with other requests for the same account.
+        //
+        // Errors fall back to token-scoped locking; subsequent quota ops will fail anyway.
+        let lock_key = match self.key_store.find_user_id_by_token(token_id).await {
+            Ok(Some(user_id)) => format!("account:{user_id}"),
+            Ok(None) => format!("token:{token_id}"),
+            Err(_) => format!("token:{token_id}"),
+        };
+
         let lock = {
             let mut locks = self.token_billing_locks.lock().await;
             // Opportunistic cleanup: drop dead weak refs when the map starts growing.
@@ -551,11 +565,11 @@ impl TavilyProxy {
                 locks.retain(|_, lock| lock.strong_count() > 0);
             }
 
-            if let Some(existing) = locks.get(token_id).and_then(|lock| lock.upgrade()) {
+            if let Some(existing) = locks.get(&lock_key).and_then(|lock| lock.upgrade()) {
                 existing
             } else {
                 let lock = Arc::new(Mutex::new(()));
-                locks.insert(token_id.to_string(), Arc::downgrade(&lock));
+                locks.insert(lock_key, Arc::downgrade(&lock));
                 lock
             }
         };
@@ -2662,7 +2676,7 @@ impl TavilyProxy {
         let usage = json
             .get("key")
             .and_then(|k| k.get("research_usage"))
-            .and_then(|v| v.as_i64());
+            .and_then(parse_credits_value);
         usage.ok_or_else(|| ProxyError::QuotaDataMissing {
             reason: "missing key.research_usage field".to_owned(),
         })
@@ -3280,6 +3294,22 @@ impl KeyStore {
             self.heal_orphan_auth_tokens_from_logs().await?;
         }
 
+        // Cut over business quota counters from legacy "requests" units to "credits".
+        // This is intentionally a one-time reset: historical data cannot be converted safely.
+        if self
+            .get_meta_i64(META_KEY_BUSINESS_QUOTA_CREDITS_CUTOVER_V1)
+            .await?
+            .is_none()
+        {
+            self.reset_business_quota_counters_for_credits_cutover_v1()
+                .await?;
+            self.set_meta_i64(
+                META_KEY_BUSINESS_QUOTA_CREDITS_CUTOVER_V1,
+                Utc::now().timestamp(),
+            )
+            .await?;
+        }
+
         if self
             .get_meta_i64(META_KEY_ACCOUNT_QUOTA_BACKFILL_V1)
             .await?
@@ -3540,6 +3570,34 @@ impl KeyStore {
         self.set_meta_i64(META_KEY_HEAL_ORPHAN_TOKENS_V1, now)
             .await?;
 
+        Ok(())
+    }
+
+    async fn reset_business_quota_counters_for_credits_cutover_v1(&self) -> Result<(), ProxyError> {
+        // These tables previously stored *request counts* for business quota enforcement.
+        // After the credits cutover, they represent *credits*. We cannot safely convert
+        // legacy request counts into credits, so we reset once and start fresh.
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM token_usage_buckets WHERE granularity IN (?, ?)")
+            .bind(GRANULARITY_MINUTE)
+            .bind(GRANULARITY_HOUR)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM auth_token_quota")
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM account_usage_buckets WHERE granularity IN (?, ?)")
+            .bind(GRANULARITY_MINUTE)
+            .bind(GRANULARITY_HOUR)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM account_monthly_quota")
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -8879,7 +8937,12 @@ fn analyze_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis {
     if messages.is_empty()
         && let Ok(value) = serde_json::from_str::<Value>(text)
     {
-        messages.push(value);
+        match value {
+            // JSON-RPC batch responses return an array of message envelopes. Treat each element
+            // as its own message so we can correctly detect success/error and enforce billing.
+            Value::Array(items) => messages.extend(items),
+            other => messages.push(other),
+        }
     }
 
     for message in messages {
@@ -9232,6 +9295,32 @@ pub fn extract_usage_credits_from_json_bytes(body: &[u8]) -> Option<i64> {
     extract_usage_credits_from_value(&parsed)
 }
 
+/// Best-effort extraction of Tavily `usage.credits` from an upstream JSON response body,
+/// summing across JSON-RPC batch responses (top-level arrays).
+///
+/// For non-batch responses, this matches `extract_usage_credits_from_json_bytes()`.
+pub fn extract_usage_credits_total_from_json_bytes(body: &[u8]) -> Option<i64> {
+    let parsed = serde_json::from_slice::<Value>(body).ok()?;
+    extract_usage_credits_total_from_value(&parsed)
+}
+
+fn extract_usage_credits_total_from_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Array(items) => {
+            let mut total = 0i64;
+            let mut found = false;
+            for item in items {
+                if let Some(credits) = extract_usage_credits_from_value(item) {
+                    total = total.saturating_add(credits);
+                    found = true;
+                }
+            }
+            found.then_some(total)
+        }
+        other => extract_usage_credits_from_value(other),
+    }
+}
+
 fn extract_usage_credits_from_value(value: &Value) -> Option<i64> {
     match value {
         Value::Object(map) => {
@@ -9441,6 +9530,12 @@ mod tests {
     fn extract_usage_credits_from_json_bytes_parses_string_float_and_rounds_up() {
         let body = br#"{"usage":{"credits":"1.2"}}"#;
         assert_eq!(extract_usage_credits_from_json_bytes(body), Some(2));
+    }
+
+    #[test]
+    fn extract_usage_credits_total_from_json_bytes_sums_across_arrays() {
+        let body = br#"[{"result":{"structuredContent":{"usage":{"credits":1}}}},{"result":{"structuredContent":{"usage":{"credits":2.1}}}}]"#;
+        assert_eq!(extract_usage_credits_total_from_json_bytes(body), Some(4));
     }
 
     #[test]
@@ -11335,6 +11430,257 @@ mod tests {
             token_minute_sum, 0,
             "bound token should no longer mutate token-level buckets"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn business_quota_credits_cutover_resets_legacy_counters_once() {
+        let db_path = temp_db_path("business-quota-credits-cutover");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // First start: create schema + seed token/user rows for FK constraints.
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let unbound_token = proxy
+            .create_access_token(Some("cutover-unbound-token"))
+            .await
+            .expect("create token");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "cutover-user".to_string(),
+                username: Some("cutover".to_string()),
+                name: Some("Cutover User".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(1),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+        let bound_token = proxy
+            .ensure_user_token_binding(&user.user_id, Some("linuxdo:cutover"))
+            .await
+            .expect("bind token");
+
+        // Simulate an older DB (pre-cutover) by clearing the cutover meta key and writing
+        // legacy request-count counters into the buckets/quota tables.
+        sqlx::query("DELETE FROM meta WHERE key = ?")
+            .bind(META_KEY_BUSINESS_QUOTA_CREDITS_CUTOVER_V1)
+            .execute(&proxy.key_store.pool)
+            .await
+            .expect("reset cutover meta");
+
+        let now = Utc::now();
+        let now_ts = now.timestamp();
+        let minute_bucket = now_ts - (now_ts % SECS_PER_MINUTE);
+        let hour_bucket = now_ts - (now_ts % SECS_PER_HOUR);
+        let month_start = start_of_month(now).timestamp();
+
+        // Token-scoped legacy counters.
+        sqlx::query(
+            "INSERT INTO token_usage_buckets (token_id, bucket_start, granularity, count) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&unbound_token.id)
+        .bind(minute_bucket)
+        .bind(GRANULARITY_MINUTE)
+        .bind(9_i64)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed token minute bucket");
+        sqlx::query(
+            "INSERT INTO token_usage_buckets (token_id, bucket_start, granularity, count) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&unbound_token.id)
+        .bind(hour_bucket)
+        .bind(GRANULARITY_HOUR)
+        .bind(11_i64)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed token hour bucket");
+        // Ensure the request limiter bucket is not affected by the cutover reset.
+        sqlx::query(
+            "INSERT INTO token_usage_buckets (token_id, bucket_start, granularity, count) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&unbound_token.id)
+        .bind(minute_bucket)
+        .bind(GRANULARITY_REQUEST_MINUTE)
+        .bind(5_i64)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed token request_minute bucket");
+        sqlx::query(
+            "INSERT INTO auth_token_quota (token_id, month_start, month_count) VALUES (?, ?, ?)",
+        )
+        .bind(&unbound_token.id)
+        .bind(month_start)
+        .bind(13_i64)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed token monthly quota");
+
+        // Account-scoped legacy counters (e.g. from old backfill).
+        sqlx::query(
+            "INSERT INTO account_usage_buckets (user_id, bucket_start, granularity, count) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&user.user_id)
+        .bind(minute_bucket)
+        .bind(GRANULARITY_MINUTE)
+        .bind(7_i64)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed account minute bucket");
+        sqlx::query(
+            "INSERT INTO account_usage_buckets (user_id, bucket_start, granularity, count) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&user.user_id)
+        .bind(hour_bucket)
+        .bind(GRANULARITY_HOUR)
+        .bind(8_i64)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed account hour bucket");
+        sqlx::query(
+            "INSERT INTO account_monthly_quota (user_id, month_start, month_count) VALUES (?, ?, ?)",
+        )
+        .bind(&user.user_id)
+        .bind(month_start)
+        .bind(14_i64)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed account monthly quota");
+
+        drop(proxy);
+
+        // Second start: cutover migration should clear legacy counters exactly once.
+        let proxy_after =
+            TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+                .await
+                .expect("proxy restarted");
+
+        let token_minute_sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(count), 0) FROM token_usage_buckets WHERE token_id = ? AND granularity = ?",
+        )
+        .bind(&unbound_token.id)
+        .bind(GRANULARITY_MINUTE)
+        .fetch_one(&proxy_after.key_store.pool)
+        .await
+        .expect("read token minute buckets");
+        assert_eq!(
+            token_minute_sum, 0,
+            "cutover should clear token minute buckets"
+        );
+
+        let token_hour_sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(count), 0) FROM token_usage_buckets WHERE token_id = ? AND granularity = ?",
+        )
+        .bind(&unbound_token.id)
+        .bind(GRANULARITY_HOUR)
+        .fetch_one(&proxy_after.key_store.pool)
+        .await
+        .expect("read token hour buckets");
+        assert_eq!(token_hour_sum, 0, "cutover should clear token hour buckets");
+
+        let token_request_minute_sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(count), 0) FROM token_usage_buckets WHERE token_id = ? AND granularity = ?",
+        )
+        .bind(&unbound_token.id)
+        .bind(GRANULARITY_REQUEST_MINUTE)
+        .fetch_one(&proxy_after.key_store.pool)
+        .await
+        .expect("read token request_minute buckets");
+        assert_eq!(
+            token_request_minute_sum, 5,
+            "cutover must not clear raw request limiter buckets"
+        );
+
+        let token_monthly_count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(month_count, 0) FROM auth_token_quota WHERE token_id = ?",
+        )
+        .bind(&unbound_token.id)
+        .fetch_optional(&proxy_after.key_store.pool)
+        .await
+        .expect("read token monthly quota")
+        .unwrap_or(0);
+        assert_eq!(
+            token_monthly_count, 0,
+            "cutover should clear token monthly quota"
+        );
+
+        let account_minute_sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(count), 0) FROM account_usage_buckets WHERE user_id = ? AND granularity = ?",
+        )
+        .bind(&user.user_id)
+        .bind(GRANULARITY_MINUTE)
+        .fetch_one(&proxy_after.key_store.pool)
+        .await
+        .expect("read account minute buckets");
+        assert_eq!(
+            account_minute_sum, 0,
+            "cutover should clear account minute buckets"
+        );
+
+        let account_hour_sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(count), 0) FROM account_usage_buckets WHERE user_id = ? AND granularity = ?",
+        )
+        .bind(&user.user_id)
+        .bind(GRANULARITY_HOUR)
+        .fetch_one(&proxy_after.key_store.pool)
+        .await
+        .expect("read account hour buckets");
+        assert_eq!(
+            account_hour_sum, 0,
+            "cutover should clear account hour buckets"
+        );
+
+        let account_monthly_count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(month_count, 0) FROM account_monthly_quota WHERE user_id = ?",
+        )
+        .bind(&user.user_id)
+        .fetch_optional(&proxy_after.key_store.pool)
+        .await
+        .expect("read account monthly quota")
+        .unwrap_or(0);
+        assert_eq!(
+            account_monthly_count, 0,
+            "cutover should clear account monthly quota"
+        );
+
+        // Third start: cutover meta key exists, so counters should not be cleared again.
+        sqlx::query(
+            "INSERT INTO token_usage_buckets (token_id, bucket_start, granularity, count) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&unbound_token.id)
+        .bind(minute_bucket)
+        .bind(GRANULARITY_MINUTE)
+        .bind(2_i64)
+        .execute(&proxy_after.key_store.pool)
+        .await
+        .expect("seed post-cutover token bucket");
+        drop(proxy_after);
+
+        let proxy_third =
+            TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+                .await
+                .expect("proxy restarted again");
+
+        let token_minute_sum_after: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(count), 0) FROM token_usage_buckets WHERE token_id = ? AND granularity = ?",
+        )
+        .bind(&unbound_token.id)
+        .bind(GRANULARITY_MINUTE)
+        .fetch_one(&proxy_third.key_store.pool)
+        .await
+        .expect("read token minute buckets after third start");
+        assert_eq!(
+            token_minute_sum_after, 2,
+            "cutover migration must not rerun after meta is set"
+        );
+
+        // Silence unused warning for the bound token variable; it exists only for FK seeding.
+        assert!(!bound_token.id.is_empty());
 
         let _ = std::fs::remove_file(db_path);
     }
