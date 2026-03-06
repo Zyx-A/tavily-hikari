@@ -6101,6 +6101,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_resources_subscribe_and_unsubscribe_are_ignored_by_business_quota() {
+        let db_path = temp_db_path("mcp-resources-subscribe-ignored");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // Tighten business hourly quota to 1 so that the token is quickly exhausted.
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1");
+
+        let expected_api_key = "tvly-mcp-resources-subscribe-key";
+        let upstream_addr = spawn_mock_upstream(expected_api_key.to_string()).await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+
+        let access_token = proxy
+            .create_access_token(Some("mcp-resources-subscribe"))
+            .await
+            .expect("create access token");
+
+        // Pre-exhaust business quota for this token.
+        let hourly_limit = effective_token_hourly_limit();
+        for _ in 0..=hourly_limit {
+            let _ = proxy
+                .check_token_quota(&access_token.id)
+                .await
+                .expect("quota check ok");
+        }
+
+        let proxy_addr =
+            spawn_proxy_server(proxy.clone(), "https://api.tavily.com".to_string()).await;
+
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let subscribe = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "method": "resources/subscribe",
+                "params": { "uri": "file:///tmp/demo.txt" }
+            }))
+            .send()
+            .await
+            .expect("subscribe request");
+        assert!(
+            subscribe.status().is_success(),
+            "resources/subscribe should not be blocked by business quota, got {}",
+            subscribe.status()
+        );
+
+        let unsubscribe = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "method": "resources/unsubscribe",
+                "params": { "uri": "file:///tmp/demo.txt" }
+            }))
+            .send()
+            .await
+            .expect("unsubscribe request");
+        assert!(
+            unsubscribe.status().is_success(),
+            "resources/unsubscribe should not be blocked by business quota, got {}",
+            unsubscribe.status()
+        );
+
+        // Verify that the most recent auth_token_logs entries are not billable.
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("connect to sqlite");
+
+        let rows = sqlx::query(
+            r#"
+            SELECT counts_business_quota
+            FROM auth_token_logs
+            WHERE token_id = ?
+            ORDER BY id DESC
+            LIMIT 2
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_all(&pool)
+        .await
+        .expect("token log rows exist");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let counts_business_quota: i64 = row.try_get("counts_business_quota").unwrap();
+            assert_eq!(counts_business_quota, 0);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_non_tavily_tool_is_ignored_by_business_quota() {
+        let db_path = temp_db_path("mcp-tools-call-non-tavily-ignored");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // Tighten business hourly quota to 1 so that the token is quickly exhausted.
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1");
+
+        let expected_api_key = "tvly-mcp-tools-call-non-tavily-key";
+        let (upstream_addr, hits) =
+            spawn_mock_upstream_with_hits(expected_api_key.to_string()).await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+
+        let access_token = proxy
+            .create_access_token(Some("mcp-tools-call-non-tavily"))
+            .await
+            .expect("create access token");
+
+        // Pre-exhaust business quota for this token.
+        let hourly_limit = effective_token_hourly_limit();
+        for _ in 0..=hourly_limit {
+            let _ = proxy
+                .check_token_quota(&access_token.id)
+                .await
+                .expect("quota check ok");
+        }
+
+        let proxy_addr =
+            spawn_proxy_server(proxy.clone(), "https://api.tavily.com".to_string()).await;
+
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "non-tavily-tool",
+                    "arguments": { "hello": "world" }
+                }
+            }))
+            .send()
+            .await
+            .expect("non-tavily tools/call request");
+        assert!(
+            resp.status().is_success(),
+            "non-tavily tools/call should not be blocked by business quota, got {}",
+            resp.status()
+        );
+
+        // Still forwards to upstream.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Verify that the most recent auth_token_logs entry is not billable.
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("connect to sqlite");
+
+        let row = sqlx::query(
+            r#"
+            SELECT counts_business_quota
+            FROM auth_token_logs
+            WHERE token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("token log row exists");
+
+        let counts_business_quota: i64 = row.try_get("counts_business_quota").unwrap();
+        assert_eq!(counts_business_quota, 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn mcp_initialize_and_ping_are_ignored_by_business_quota() {
         let db_path = temp_db_path("mcp-initialize-ping-ignored");
         let db_str = db_path.to_string_lossy().to_string();

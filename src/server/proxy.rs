@@ -220,17 +220,10 @@ async fn proxy_handler(
                 let mut expected_search_total = 0i64;
 
                 let is_non_billable_method = |method: &str| {
-                    matches!(
-                        method,
-                        "initialize"
-                            | "ping"
-                            | "tools/list"
-                            | "resources/list"
-                            | "resources/templates/list"
-                            | "resources/read"
-                            | "prompts/list"
-                            | "prompts/get"
-                    ) || method.starts_with("notifications/")
+                    matches!(method, "initialize" | "ping" | "tools/list")
+                        || method.starts_with("resources/")
+                        || method.starts_with("prompts/")
+                        || method.starts_with("notifications/")
                 };
 
                 let handle_tool_call = |map: &mut serde_json::Map<String, Value>,
