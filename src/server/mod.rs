@@ -39,10 +39,10 @@ use tavily_hikari::{
     ApiKeyMetrics, AuthToken, OAuthAccountProfile, ProxyError, ProxyRequest, ProxyResponse,
     ProxySummary, QuotaWindow, RequestLogRecord, TavilyProxy, TokenHourlyBucket,
     TokenHourlyRequestVerdict, TokenLogRecord, TokenQuotaVerdict, TokenSummary, TokenUsageBucket,
-    UserTokenLookup, effective_request_logs_gc_at, effective_request_logs_retention_days,
-    effective_token_daily_limit, effective_token_hourly_limit,
-    effective_token_hourly_request_limit, effective_token_monthly_limit,
-    extract_usage_credits_from_json_bytes,
+    UserTokenLookup, analyze_mcp_attempt, effective_request_logs_gc_at,
+    effective_request_logs_retention_days, effective_token_daily_limit,
+    effective_token_hourly_limit, effective_token_hourly_request_limit,
+    effective_token_monthly_limit, extract_usage_credits_from_json_bytes,
 };
 use tokio::signal;
 #[cfg(unix)]

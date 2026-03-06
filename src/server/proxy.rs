@@ -204,59 +204,92 @@ async fn proxy_handler(
     // - Non-business whitelist methods are ignored by business quota.
     // - tools/call for tavily-* injects include_usage=true so upstream returns usage.credits.
     // - Only tavily-search uses a predictable cost check (search_depth -> expected credits).
-    // NOTE: For /mcp we only treat supported `tools/call` Tavily tools as billable; all other
-    // MCP control plane methods should not be blocked by business quota.
+    // - For unknown / batch / positional request shapes, default to billable to avoid bypass.
     let mut billable_flag = false;
     let mut mcp_tool_name: Option<String> = None;
     let mut expected_search_credits: Option<i64> = None;
     let mut forwarded_body = body_bytes.clone();
     let mut lockable_tool = false;
-    let mut unsupported_tool: Option<String> = None;
-    if path.starts_with("/mcp")
-        && let Ok(mut value) = serde_json::from_slice::<Value>(&body_bytes)
-        && let Some(map) = value.as_object_mut()
-    {
-        let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
-        if method == "tools/call"
-            && let Some(Value::Object(params)) = map.get_mut("params")
-        {
-            let tool = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !tool.is_empty() {
-                mcp_tool_name = Some(tool.clone());
+    if path.starts_with("/mcp") {
+        match serde_json::from_slice::<Value>(&body_bytes) {
+            Ok(mut value) => {
+                // Default to billable unless we can *prove* it's a non-billable control plane call.
+                let mut non_billable = false;
+
+                if let Some(map) = value.as_object_mut() {
+                    let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                    non_billable = matches!(
+                        method,
+                        "tools/list"
+                            | "resources/list"
+                            | "resources/templates/list"
+                            | "resources/read"
+                            | "prompts/list"
+                            | "prompts/get"
+                    ) || method.starts_with("notifications/");
+
+                    if method == "tools/call" {
+                        // Tools/call is treated as billable by default unless we can prove it's
+                        // a non-Tavily tool call (name does not start with `tavily-`).
+                        billable_flag = true;
+                        lockable_tool = true;
+
+                        if let Some(Value::Object(params)) = map.get_mut("params") {
+                            let tool = params
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            if !tool.is_empty() {
+                                mcp_tool_name = Some(tool.clone());
+                            }
+
+                            if tool.starts_with("tavily-") {
+                                let args_entry = params
+                                    .entry("arguments".to_string())
+                                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                                if !args_entry.is_object() {
+                                    *args_entry = Value::Object(serde_json::Map::new());
+                                }
+                                if let Value::Object(args) = args_entry {
+                                    args.insert("include_usage".to_string(), Value::Bool(true));
+                                }
+
+                                if tool == "tavily-search" {
+                                    expected_search_credits =
+                                        Some(tavily_search_expected_credits(args_entry));
+                                }
+
+                                if let Ok(encoded) = serde_json::to_vec(&value) {
+                                    forwarded_body = bytes::Bytes::from(encoded);
+                                }
+                            } else if !tool.is_empty() {
+                                // Proven non-Tavily tool call: do not charge business quota.
+                                billable_flag = false;
+                                lockable_tool = false;
+                            }
+                        }
+                    } else if !non_billable {
+                        // Unknown object-shaped method: treat as billable (safe default).
+                        billable_flag = true;
+                        lockable_tool = true;
+                    }
+                } else {
+                    // JSON-RPC batch or positional params: treat as billable to avoid bypass.
+                    billable_flag = true;
+                    lockable_tool = true;
+                }
+
+                if non_billable {
+                    billable_flag = false;
+                    lockable_tool = false;
+                }
             }
-
-            let supported_tool = matches!(
-                tool.as_str(),
-                "tavily-search" | "tavily-extract" | "tavily-crawl" | "tavily-map"
-            );
-
-            if supported_tool {
+            Err(_) => {
+                // Non-JSON / unparseable: treat as billable to avoid bypass.
                 billable_flag = true;
                 lockable_tool = true;
-                let args_entry = params
-                    .entry("arguments".to_string())
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                if !args_entry.is_object() {
-                    *args_entry = Value::Object(serde_json::Map::new());
-                }
-                if let Value::Object(args) = args_entry {
-                    args.insert("include_usage".to_string(), Value::Bool(true));
-                }
-
-                if tool == "tavily-search" {
-                    expected_search_credits = Some(tavily_search_expected_credits(args_entry));
-                }
-
-                if let Ok(encoded) = serde_json::to_vec(&value) {
-                    forwarded_body = bytes::Bytes::from(encoded);
-                }
-            } else if tool.starts_with("tavily-") {
-                unsupported_tool = Some(tool);
             }
         }
     }
@@ -332,35 +365,6 @@ async fn proxy_handler(
             }
         }
 
-        if let Some(tool) = unsupported_tool.as_deref() {
-            let msg = format!("unsupported mcp tool: {}", tool);
-            let _ = state
-                .proxy
-                .record_token_attempt(
-                    tid,
-                    &method,
-                    &path,
-                    parts.uri.query(),
-                    Some(StatusCode::BAD_REQUEST.as_u16() as i64),
-                    None,
-                    false,
-                    "error",
-                    Some(msg.as_str()),
-                )
-                .await;
-
-            let payload = json!({
-                "error": "unsupported_tool",
-                "message": msg,
-            });
-            let resp = Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                .body(Body::from(payload.to_string()))
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            return Ok(resp);
-        }
-
         // 2) 业务配额（小时 / 日 / 月）只对 MCP 工具调用生效。
         if billable_flag {
             match state.proxy.peek_token_quota(tid).await {
@@ -406,58 +410,14 @@ async fn proxy_handler(
         Ok(resp) => {
             let mut billing_error: Option<String> = None;
             if let Some(tid) = token_id.as_deref() {
-                // 尝试从 Tavily JSON 回复中解析结构化状态码
-                let mut tavily_code: Option<i64> = None;
-                let mut result_status = "success";
-                #[allow(clippy::collapsible_if)]
-                {
-                    if let Ok(text) = std::str::from_utf8(&resp.body) {
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                            if value.get("error").is_some_and(|v| !v.is_null()) {
-                                // JSON-RPC error (HTTP 200) should not be treated as a successful Tavily call.
-                                result_status = "error";
-                            } else if let Some(sc) = value
-                                .get("result")
-                                .and_then(|v| v.get("structuredContent"))
-                                .and_then(|v| v.get("status"))
-                                .and_then(|v| v.as_i64())
-                            {
-                                tavily_code = Some(sc);
-                                result_status = if sc == 432 {
-                                    "quota_exhausted"
-                                } else if sc >= 400 {
-                                    "error"
-                                } else {
-                                    "success"
-                                };
-                            } else if value
-                                .get("result")
-                                .and_then(|v| v.get("structuredContent"))
-                                .and_then(|v| v.get("isError"))
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                            {
-                                result_status = "error";
-                            }
-                        }
-                    }
-                }
-
-                if result_status == "success" && !resp.status.is_success() {
-                    result_status = "error";
-                }
+                let analysis = analyze_mcp_attempt(resp.status, &resp.body);
+                let tavily_code: Option<i64> = analysis.tavily_status_code;
+                let mut result_status = analysis.status;
 
                 // Charge credits after a successful billable Tavily tool call.
                 if billable_flag
                     && result_status == "success"
                     && resp.status.is_success()
-                    && matches!(
-                        mcp_tool_name.as_deref(),
-                        Some("tavily-search")
-                            | Some("tavily-extract")
-                            | Some("tavily-crawl")
-                            | Some("tavily-map")
-                    )
                 {
                     let credits = if mcp_tool_name.as_deref() == Some("tavily-search") {
                         extract_usage_credits_from_json_bytes(&resp.body)

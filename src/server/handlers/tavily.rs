@@ -44,7 +44,7 @@ impl TavilyEndpointConfig {
         Self {
             upstream_path: "/map",
             mode: TavilyUpstreamMode::Json,
-            enforce_hourly_any_limit: false,
+            enforce_hourly_any_limit: true,
             validate_max_results: false,
         }
     }

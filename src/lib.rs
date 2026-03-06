@@ -1119,7 +1119,7 @@ impl TavilyProxy {
                     .await
                     .ok();
                 let delta = match (before_usage, after_usage) {
-                    (Some(before), Some(after)) => Some((after - before).max(0)),
+                    (Some(before), Some(after)) if after > before => Some(after - before),
                     _ => None,
                 };
 
@@ -8968,6 +8968,12 @@ pub fn analyze_http_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis 
     }
 }
 
+/// Analyze a Tavily MCP JSON-RPC response (e.g. `/mcp tools/call`) using the same heuristics
+/// as the core proxy request logger (supports JSON-RPC envelopes and SSE message streams).
+pub fn analyze_mcp_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis {
+    analyze_attempt(status, body)
+}
+
 fn sanitize_headers_inner(
     headers: &HeaderMap,
     upstream: &Url,
@@ -9077,7 +9083,7 @@ fn parse_header_list(raw: Option<String>) -> Vec<String> {
 }
 
 fn analyze_json_message(value: &Value) -> Option<(MessageOutcome, Option<i64>)> {
-    if value.get("error").is_some() {
+    if value.get("error").is_some_and(|v| !v.is_null()) {
         return Some((MessageOutcome::Error, None));
     }
 
@@ -9108,7 +9114,7 @@ fn analyze_result_payload(result: &Value) -> Option<(MessageOutcome, Option<i64>
         }
     }
 
-    if result.get("error").is_some() {
+    if result.get("error").is_some_and(|v| !v.is_null()) {
         return Some((MessageOutcome::Error, None));
     }
 
@@ -9127,7 +9133,18 @@ fn analyze_structured_content(result: &Value) -> Option<(MessageOutcome, Option<
     let structured = result.get("structuredContent")?;
 
     if let Some(code) = extract_status_code(structured) {
-        return Some((classify_status_code(code), Some(code)));
+        let code_outcome = classify_status_code(code);
+        if matches!(code_outcome, MessageOutcome::Success)
+            && let Some(text_outcome) =
+                extract_status_text(structured).and_then(classify_status_text)
+        {
+            return Some((text_outcome, Some(code)));
+        }
+        return Some((code_outcome, Some(code)));
+    }
+
+    if let Some(text_outcome) = extract_status_text(structured).and_then(classify_status_text) {
+        return Some((text_outcome, None));
     }
 
     if structured
@@ -9248,7 +9265,19 @@ fn parse_credits_value(value: &Value) -> Option<i64> {
             }
             number.as_f64().map(|v| v.ceil() as i64).filter(|v| *v >= 0)
         }
-        Value::String(raw) => raw.trim().parse::<i64>().ok().filter(|v| *v >= 0),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if let Ok(v) = trimmed.parse::<i64>()
+                && v >= 0
+            {
+                return Some(v);
+            }
+            trimmed
+                .parse::<f64>()
+                .ok()
+                .map(|v| v.ceil() as i64)
+                .filter(|v| *v >= 0)
+        }
         _ => None,
     }
 }
@@ -9405,6 +9434,12 @@ mod tests {
     #[test]
     fn extract_usage_credits_from_json_bytes_finds_nested_usage_and_rounds_up() {
         let body = br#"{"result":{"structuredContent":{"usage":{"credits":1.2}}}}"#;
+        assert_eq!(extract_usage_credits_from_json_bytes(body), Some(2));
+    }
+
+    #[test]
+    fn extract_usage_credits_from_json_bytes_parses_string_float_and_rounds_up() {
+        let body = br#"{"usage":{"credits":"1.2"}}"#;
         assert_eq!(extract_usage_credits_from_json_bytes(body), Some(2));
     }
 
