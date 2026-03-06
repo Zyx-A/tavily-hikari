@@ -1,6 +1,6 @@
 use std::{
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
@@ -20,8 +20,6 @@ use reqwest::{
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
-#[cfg(test)]
-use std::collections::HashSet;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use url::form_urlencoded;
@@ -119,7 +117,8 @@ const TOKEN_BINDING_CACHE_MAX_ENTRIES: usize = 10_000;
 // by the next in-flight request instead of blocking the subject for minutes.
 const QUOTA_SUBJECT_LOCK_TTL_SECS: u64 = 20;
 const QUOTA_SUBJECT_LOCK_ACQUIRE_TIMEOUT_SECS: u64 = 30;
-const QUOTA_SUBJECT_LOCK_REFRESH_SECS: u64 = 10;
+const QUOTA_SUBJECT_LOCK_REFRESH_SECS: u64 = 5;
+const QUOTA_SUBJECT_LOCK_REFRESH_RETRY_SECS: u64 = 1;
 
 const REQUEST_LOGS_MIN_RETENTION_DAYS: i64 = 7;
 
@@ -139,6 +138,8 @@ const SECS_PER_HOUR: i64 = 3600;
 const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
 const TOKEN_USAGE_STATS_BUCKET_SECS: i64 = SECS_PER_HOUR;
 const USAGE_PROBE_TIMEOUT_SECS: u64 = 8;
+const USAGE_PROBE_RETRY_ATTEMPTS: usize = 3;
+const USAGE_PROBE_RETRY_DELAY_MS: u64 = 200;
 
 // Time-based retention for per-token access logs (auth_token_logs).
 // This is purely time-driven and must not depend on access token enable/disable/delete status,
@@ -518,28 +519,52 @@ struct QuotaSubjectLockGuard {
     store: Arc<KeyStore>,
     lease: QuotaSubjectDbLease,
     refresh_stop: Arc<AtomicBool>,
+    lease_lost: Arc<AtomicBool>,
     refresh_task: tokio::task::JoinHandle<()>,
 }
 
 impl QuotaSubjectLockGuard {
     fn new(store: Arc<KeyStore>, lease: QuotaSubjectDbLease) -> Self {
         let refresh_stop = Arc::new(AtomicBool::new(false));
+        let lease_lost = Arc::new(AtomicBool::new(false));
         let refresh_task = {
             let store = Arc::clone(&store);
             let lease = lease.clone();
             let refresh_stop = Arc::clone(&refresh_stop);
+            let lease_lost = Arc::clone(&lease_lost);
             tokio::spawn(async move {
                 let refresh_every = Duration::from_secs(QUOTA_SUBJECT_LOCK_REFRESH_SECS);
+                let retry_every = Duration::from_secs(QUOTA_SUBJECT_LOCK_REFRESH_RETRY_SECS);
                 while !refresh_stop.load(AtomicOrdering::Relaxed) {
                     tokio::time::sleep(refresh_every).await;
                     if refresh_stop.load(AtomicOrdering::Relaxed) {
                         break;
                     }
-                    if let Err(err) = store.refresh_quota_subject_lock(&lease).await {
-                        eprintln!(
-                            "quota subject lock refresh failed (subject={} owner={}): {}",
-                            lease.subject, lease.owner, err
-                        );
+
+                    let retry_budget = lease.ttl.saturating_sub(refresh_every);
+                    let retry_deadline = Instant::now() + retry_budget.max(retry_every);
+                    loop {
+                        match store.refresh_quota_subject_lock(&lease).await {
+                            Ok(()) => break,
+                            Err(err) => {
+                                if refresh_stop.load(AtomicOrdering::Relaxed) {
+                                    return;
+                                }
+                                if Instant::now() >= retry_deadline {
+                                    lease_lost.store(true, AtomicOrdering::Relaxed);
+                                    eprintln!(
+                                        "quota subject lock refresh exhausted retries (subject={} owner={}): {}",
+                                        lease.subject, lease.owner, err
+                                    );
+                                    return;
+                                }
+                                eprintln!(
+                                    "quota subject lock refresh failed (subject={} owner={}): {}; retrying",
+                                    lease.subject, lease.owner, err
+                                );
+                                tokio::time::sleep(retry_every).await;
+                            }
+                        }
                     }
                 }
             })
@@ -549,8 +574,30 @@ impl QuotaSubjectLockGuard {
             store,
             lease,
             refresh_stop,
+            lease_lost,
             refresh_task,
         }
+    }
+
+    fn ensure_live(&self) -> Result<(), ProxyError> {
+        if self.lease_lost.load(AtomicOrdering::Relaxed) {
+            return Err(ProxyError::Other(format!(
+                "quota subject lock lost for {}",
+                self.lease.subject,
+            )));
+        }
+        let mut forced = self
+            .store
+            .forced_quota_subject_lock_loss_subjects
+            .lock()
+            .expect("forced quota subject lock loss mutex poisoned");
+        if forced.remove(&self.lease.subject) {
+            return Err(ProxyError::Other(format!(
+                "quota subject lock lost for {}",
+                self.lease.subject,
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -582,6 +629,10 @@ pub struct TokenBillingGuard {
 impl TokenBillingGuard {
     pub fn billing_subject(&self) -> &str {
         &self.billing_subject
+    }
+
+    pub fn ensure_live(&self) -> Result<(), ProxyError> {
+        self._subject_lock.ensure_live()
     }
 }
 
@@ -674,22 +725,14 @@ impl TavilyProxy {
         )
     }
 
-    async fn reconcile_pending_billing_for_token(
+    async fn reconcile_pending_billing_for_subject(
         &self,
-        token_id: &str,
         billing_subject: &str,
     ) -> Result<(), ProxyError> {
-        let mut pending = self
+        let pending = self
             .key_store
-            .list_pending_billing_log_ids_for_token(token_id)
+            .list_pending_billing_log_ids(billing_subject)
             .await?;
-        pending.extend(
-            self.key_store
-                .list_pending_billing_log_ids(billing_subject)
-                .await?,
-        );
-        pending.sort_unstable();
-        pending.dedup();
         for log_id in pending {
             // `lock_token_billing()` already holds the per-subject lock at this point, so a
             // retry-later miss here is unexpected. We retry once to tolerate edge timing around
@@ -718,25 +761,21 @@ impl TavilyProxy {
         Ok(())
     }
 
-    /// Serialize quota/billing work per effective quota subject across both the local process
-    /// and any other instances sharing the same SQLite database.
-    pub async fn lock_token_billing(
+    async fn lock_billing_subject(
         &self,
-        token_id: &str,
+        billing_subject: &str,
     ) -> Result<TokenBillingGuard, ProxyError> {
-        let billing_subject = self.billing_subject_for_token(token_id).await?;
-
         let lock = {
             let mut locks = self.token_billing_locks.lock().await;
             if locks.len() > 1024 {
                 locks.retain(|_, lock| lock.strong_count() > 0);
             }
 
-            if let Some(existing) = locks.get(&billing_subject).and_then(|lock| lock.upgrade()) {
+            if let Some(existing) = locks.get(billing_subject).and_then(|lock| lock.upgrade()) {
                 existing
             } else {
                 let lock = Arc::new(Mutex::new(()));
-                locks.insert(billing_subject.clone(), Arc::downgrade(&lock));
+                locks.insert(billing_subject.to_string(), Arc::downgrade(&lock));
                 lock
             }
         };
@@ -744,20 +783,52 @@ impl TavilyProxy {
         let lease = self
             .key_store
             .acquire_quota_subject_lock(
-                &billing_subject,
+                billing_subject,
                 Duration::from_secs(QUOTA_SUBJECT_LOCK_TTL_SECS),
                 Duration::from_secs(QUOTA_SUBJECT_LOCK_ACQUIRE_TIMEOUT_SECS),
             )
             .await?;
-        let guard = TokenBillingGuard {
-            billing_subject,
+        Ok(TokenBillingGuard {
+            billing_subject: billing_subject.to_string(),
             _local: local_guard,
             _subject_lock: QuotaSubjectLockGuard::new(self.key_store.clone(), lease),
-        };
-        self.reconcile_pending_billing_for_token(token_id, guard.billing_subject())
-            .await?;
+        })
+    }
 
-        Ok(guard)
+    /// Serialize quota/billing work per effective quota subject across both the local process
+    /// and any other instances sharing the same SQLite database.
+    pub async fn lock_token_billing(
+        &self,
+        token_id: &str,
+    ) -> Result<TokenBillingGuard, ProxyError> {
+        let current_subject = self.billing_subject_for_token(token_id).await?;
+        let mut subjects = self
+            .key_store
+            .list_pending_billing_subjects_for_token(token_id)
+            .await?;
+        subjects.push(current_subject.clone());
+        subjects.sort();
+        subjects.dedup();
+
+        let mut current_guard: Option<TokenBillingGuard> = None;
+        let mut extra_guards: Vec<TokenBillingGuard> = Vec::new();
+        for subject in subjects {
+            let guard = self.lock_billing_subject(&subject).await?;
+            self.reconcile_pending_billing_for_subject(guard.billing_subject())
+                .await?;
+            if subject == current_subject {
+                current_guard = Some(guard);
+            } else {
+                extra_guards.push(guard);
+            }
+        }
+        drop(extra_guards);
+
+        current_guard.ok_or_else(|| {
+            ProxyError::Other(format!(
+                "failed to acquire billing guard for current subject {current_subject}",
+            ))
+        })
     }
 
     async fn lock_research_key_usage(&self, key_id: &str) -> Result<TokenBillingGuard, ProxyError> {
@@ -1228,13 +1299,8 @@ impl TavilyProxy {
         let _key_guard = self.lock_research_key_usage(&lease.id).await?;
 
         let before_usage = self
-            .fetch_research_usage_for_secret(
-                &lease.secret,
-                usage_base,
-                Some(Duration::from_secs(USAGE_PROBE_TIMEOUT_SECS)),
-            )
-            .await
-            .ok();
+            .fetch_research_usage_for_secret_with_retries(&lease.secret, usage_base)
+            .await?;
 
         let base = Url::parse(usage_base).map_err(|source| ProxyError::InvalidEndpoint {
             endpoint: usage_base.to_owned(),
@@ -1324,15 +1390,11 @@ impl TavilyProxy {
                 }
 
                 let after_usage = self
-                    .fetch_research_usage_for_secret(
-                        &lease.secret,
-                        usage_base,
-                        Some(Duration::from_secs(USAGE_PROBE_TIMEOUT_SECS)),
-                    )
+                    .fetch_research_usage_for_secret_with_retries(&lease.secret, usage_base)
                     .await
                     .ok();
-                let delta = match (before_usage, after_usage) {
-                    (Some(before), Some(after)) if after > before => Some(after - before),
+                let delta = match after_usage {
+                    Some(after) if after >= before_usage => Some(after - before_usage),
                     _ => None,
                 };
 
@@ -2080,6 +2142,17 @@ impl TavilyProxy {
             .lock()
             .await;
         forced.insert(log_id);
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn force_quota_subject_lock_loss_once_for_subject(&self, billing_subject: &str) {
+        let mut forced = self
+            .key_store
+            .forced_quota_subject_lock_loss_subjects
+            .lock()
+            .expect("forced quota subject lock loss mutex poisoned");
+        forced.insert(billing_subject.to_string());
     }
 
     /// Token summary since a timestamp
@@ -3005,6 +3078,35 @@ impl TavilyProxy {
         })
     }
 
+    async fn fetch_research_usage_for_secret_with_retries(
+        &self,
+        secret: &str,
+        usage_base: &str,
+    ) -> Result<i64, ProxyError> {
+        let mut last_error: Option<ProxyError> = None;
+        for attempt in 0..USAGE_PROBE_RETRY_ATTEMPTS {
+            match self
+                .fetch_research_usage_for_secret(
+                    secret,
+                    usage_base,
+                    Some(Duration::from_secs(USAGE_PROBE_TIMEOUT_SECS)),
+                )
+                .await
+            {
+                Ok(usage) => return Ok(usage),
+                Err(err) => last_error = Some(err),
+            }
+
+            if attempt + 1 < USAGE_PROBE_RETRY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(USAGE_PROBE_RETRY_DELAY_MS)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            ProxyError::Other("research usage probe failed without error".to_owned())
+        }))
+    }
+
     /// Aggregate per-token usage logs into token_usage_stats for UI metrics.
     /// Used by background schedulers to keep usage charts up to date.
     pub async fn rollup_token_usage_stats(&self) -> Result<(i64, Option<i64>), ProxyError> {
@@ -3098,6 +3200,9 @@ struct KeyStore {
     token_binding_cache: RwLock<HashMap<String, TokenBindingCacheEntry>>,
     #[cfg(test)]
     forced_pending_claim_miss_log_ids: Mutex<HashSet<i64>>,
+    // Lightweight failpoint registry used by integration tests to simulate a lost quota
+    // subject lease after precheck but before settlement.
+    forced_quota_subject_lock_loss_subjects: std::sync::Mutex<HashSet<String>>,
 }
 
 impl KeyStore {
@@ -3119,6 +3224,7 @@ impl KeyStore {
             token_binding_cache: RwLock::new(HashMap::new()),
             #[cfg(test)]
             forced_pending_claim_miss_log_ids: Mutex::new(HashSet::new()),
+            forced_quota_subject_lock_loss_subjects: std::sync::Mutex::new(HashSet::new()),
         };
         store.initialize_schema().await?;
         Ok(store)
@@ -7497,16 +7603,19 @@ impl KeyStore {
         .map_err(ProxyError::from)
     }
 
-    async fn list_pending_billing_log_ids_for_token(
+    async fn list_pending_billing_subjects_for_token(
         &self,
         token_id: &str,
-    ) -> Result<Vec<i64>, ProxyError> {
+    ) -> Result<Vec<String>, ProxyError> {
         sqlx::query_scalar(
             r#"
-            SELECT id
+            SELECT DISTINCT billing_subject
             FROM auth_token_logs
-            WHERE billing_state = ? AND token_id = ? AND COALESCE(business_credits, 0) > 0
-            ORDER BY id ASC
+            WHERE billing_state = ?
+              AND token_id = ?
+              AND billing_subject IS NOT NULL
+              AND COALESCE(business_credits, 0) > 0
+            ORDER BY billing_subject ASC
             "#,
         )
         .bind(BILLING_STATE_PENDING)
@@ -9351,8 +9460,30 @@ impl TokenQuotaVerdict {
         None
     }
 
+    fn projected_window(&self, delta: i64) -> Option<QuotaWindow> {
+        if let Some(window) = self.effective_window() {
+            return Some(window);
+        }
+        if delta > 0 {
+            if self.monthly_used.saturating_add(delta) > self.monthly_limit {
+                return Some(QuotaWindow::Month);
+            }
+            if self.daily_used.saturating_add(delta) > self.daily_limit {
+                return Some(QuotaWindow::Day);
+            }
+            if self.hourly_used.saturating_add(delta) > self.hourly_limit {
+                return Some(QuotaWindow::Hour);
+            }
+        }
+        None
+    }
+
     pub fn window_name(&self) -> Option<&'static str> {
         self.effective_window().map(|w| w.as_str())
+    }
+
+    pub fn window_name_for_delta(&self, delta: i64) -> Option<&'static str> {
+        self.projected_window(delta).map(|w| w.as_str())
     }
 
     pub fn state_key(&self) -> &'static str {
@@ -12795,7 +12926,8 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
     }
 
     #[tokio::test]
-    async fn pending_billing_replays_after_token_binding_changes_subject() {
+    async fn pending_billing_for_previous_subject_stays_pending_after_token_binding_changes_subject()
+     {
         let db_path = temp_db_path("pending-billing-subject-flip");
         let db_str = db_path.to_string_lossy().to_string();
 
@@ -12872,7 +13004,8 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
     }
 
     #[tokio::test]
-    async fn pending_billing_replays_after_bound_token_becomes_unbound() {
+    async fn pending_billing_for_previous_account_subject_stays_pending_after_token_becomes_unbound()
+     {
         let db_path = temp_db_path("pending-billing-account-to-token-subject-flip");
         let db_str = db_path.to_string_lossy().to_string();
 

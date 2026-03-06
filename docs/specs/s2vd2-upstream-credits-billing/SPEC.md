@@ -17,7 +17,7 @@
 ### Goals
 
 - 将 `/api/tavily/*` 与 `/mcp` 的业务配额切换为 Tavily credits 口径，并按上游真实消耗 1:1 扣减。
-- Search / Research 采用“先检查再放行”；Extract / Crawl / Map 采用“先放行、回包前按实际扣费”。
+- Search / Research 采用“先检查再放行”；Extract / Crawl / Map 采用“按保守预估 credits 先检查再放行，回包前仍以上游实际 `usage.credits` 扣费”。
 - 保持 `counts_business_quota` 语义不变，只调整 business quota 的计数单位。
 - 所有验证必须走本地 mock upstream，避免触达 Tavily 生产端点。
 
@@ -53,23 +53,25 @@
   - `search_depth=advanced` 视为 expected cost 2；其它低成本档按 1 处理。
   - 若 `used + expected > limit`，直接 429 且不上游。
 - `/api/tavily/extract|crawl|map`
-  - 仅在 `used >= limit` 时阻断。
-  - 成功回包后仅在上游返回 `usage.credits` 时扣费。
+  - 先按保守预估 credits 做前置阻断；成功回包后仍仅按上游返回的 `usage.credits` 扣费。
+  - 若上游未返回 `usage.credits`，只记 warning，不猜测补扣。
 - `/api/tavily/research`
   - `model=mini/auto` 最小成本 4；`pro` 最小成本 15。
-  - 回包前按 `/usage.key.research_usage` 差分扣费；usage 失败则按最小成本扣费并记录错误信息。
+  - 初始 `/usage` 探针失败时直接阻断，不触发上游 `/research`。
+  - 上游 `/research` 已成功返回后，若后续 `/usage` 差分不可得或计数回退，则继续把成功响应返回给客户端，并仅记录 billing warning（不返回 5xx、不做最小值兜底扣费）。
 - `/mcp`
   - 白名单非业务方法不计 business quota。
   - `tools/call` + `tavily-search|extract|crawl|map` 注入 `include_usage=true`。
-  - `tavily-search` 按 expected cost 先验阻断；其余 tavily 工具仅在已耗尽时阻断。
+  - `tavily-search|extract|crawl|map` 均按 reserved credits 先验阻断；回包前再按可观测到的实际 credits 扣费。
+  - 未知的 `tavily-*` 工具默认按 billable safe-default 处理（reserved credits 至少按 1 预留），避免新上游工具绕过 quota。
 
 ## 验收标准（Acceptance Criteria）
 
 - HTTP Search：`usage.credits=1/2` 能正确扣费；额度不足时先验 429，且阻断请求不命中 upstream。
-- HTTP Extract / Crawl / Map：请求体被注入 `include_usage=true`，并按 `usage.credits` 扣费；`credits=0` 不扣费。
+- HTTP Extract / Crawl / Map：请求体被注入 `include_usage=true`；reserved credits 超额时会先验 429，成功回包后按 `usage.credits` 扣费，`credits=0` 不扣费。
 - MCP 非工具调用继续保持 0 成本，`counts_business_quota=0`。
 - MCP `tavily-search`：支持嵌套 `usage.credits`、SSE/JSON-RPC 包装、expected cost fallback 与先验阻断。
-- Research：`/usage` 差分正确计费；最小成本阻断与 usage 失败 fallback 生效。
+- Research：初始 `/usage` 探针失败会在打上游前阻断；若上游成功但 follow-up `/usage` 差分不可得，则继续返回成功响应、记录 billing warning、且不重复创建 research 任务。
 - 绑定账户的 token 继续只写 account counters，不回退到 token counters。
 
 ## 质量门槛（Quality Gates）
@@ -103,3 +105,7 @@
 - 2026-03-06: review fix：锁定后的 billing subject 贯穿 precheck 与 pending billing 落账，billing-critical subject lookup 改为跨实例 fresh DB 读取，且 SQLite quota subject lease 在 replay 前即启动续租；pending settle 改为原子 claim，跨月 replay 的旧 log 也不再回灌到当前月 quota，避免并发或 crash recovery 下的误扣/重扣。
 - 2026-03-06: review fix：`/mcp` 使用 query 参数鉴权时，日志与 pending billing 落盘统一改写为脱敏后的 query，避免 `tavilyApiKey=<access token>` 被持久化；新增回归测试覆盖。
 - 2026-03-06: review fix：pending billing 的 `claim miss` 区分“回包后 settle”与“precheck 前 replay”两条路径：前者返回 `RetryLater` 并留下可观测告警，后者在 `lock_token_billing()` 内做重试并在仍未结算时 fail-closed，避免静默漏扣或绕过 quota；新增故障注入回归测试覆盖。
+- 2026-03-06: review fix：Extract / Crawl / Map 与 MCP billable Tavily 工具统一改为 reserved credits 先验阻断；token 发生绑定/解绑后会按历史 pending subject 的稳定顺序逐个加锁回放，既避免跨 subject 并发误扣，也不丢失旧 subject 上的挂账。
+- 2026-03-06: review fix：Research 初始 `/usage` 探针继续 fail-closed，但上游成功后的 follow-up `/usage` 不可用时改为返回成功响应并记录 billing warning，避免把已创建的 research 任务翻译成 5xx 重试。
+- 2026-03-06: review fix：SQLite quota subject lease 刷新改为更早调度并在过期前重试；若续租耗尽则后续计费改为 deferred pending settle。
+- 2026-03-06: review fix：未知 `tavily-*` MCP 工具改为默认 billable safe-default，避免未来上游新增工具时绕过 quota；reserved precheck 的 429 也会回传投影后的 `window`。

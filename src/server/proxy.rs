@@ -203,9 +203,10 @@ async fn proxy_handler(
     // Billing plan (1:1 upstream credits):
     // - Non-business whitelist methods are ignored by business quota.
     // - tools/call for tavily-* injects include_usage=true so upstream returns usage.credits.
-    // - Only tavily-search uses a predictable cost check (search_depth -> expected credits).
+    // - Known Tavily tools use a reserved-credit precheck derived from request parameters.
     // - For unknown / batch / positional request shapes, default to billable to avoid bypass.
     let mut billable_flag = false;
+    let mut reserved_billable_credits: Option<i64> = None;
     let mut expected_search_credits: Option<i64> = None;
     let mut forwarded_body = body_bytes.clone();
     let mut lockable_tool = false;
@@ -224,6 +225,7 @@ async fn proxy_handler(
                 let mut any_lockable = false;
                 let mut all_non_billable = true;
                 let mut mutated = false;
+                let mut reserved_billable_total = 0i64;
                 let mut expected_search_total = 0i64;
 
                 let is_non_billable_method = |method: &str| {
@@ -238,6 +240,7 @@ async fn proxy_handler(
                                         any_lockable: &mut bool,
                                         all_non_billable: &mut bool,
                                         mutated: &mut bool,
+                                        reserved_billable_total: &mut i64,
                                         expected_search_total: &mut i64,
                                         billable_mcp_ids: &mut HashSet<String>,
                                         billable_search_mcp_ids: &mut HashSet<String>,
@@ -266,8 +269,9 @@ async fn proxy_handler(
                             tool.as_str(),
                             "tavily-search" | "tavily-extract" | "tavily-crawl" | "tavily-map"
                         );
+                        let is_tavily_tool = tool.starts_with("tavily-");
 
-                        if supported_billable_tool {
+                        if supported_billable_tool || is_tavily_tool {
                             *any_billable = true;
                             *all_non_billable = false;
 
@@ -283,46 +287,57 @@ async fn proxy_handler(
                                 }
                             }
 
-                            let mut injected_include_usage = false;
-                            if !params.contains_key("arguments") {
-                                params.insert(
-                                    "arguments".to_string(),
-                                    Value::Object(serde_json::Map::new()),
-                                );
-                                injected_include_usage = true;
-                            }
-
-                            let args_entry = params
-                                .get_mut("arguments")
-                                .expect("arguments must exist after insertion when absent");
-                            if let Value::Object(args) = args_entry {
-                                let already_true = args
-                                    .get("include_usage")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                if !already_true {
-                                    args.insert("include_usage".to_string(), Value::Bool(true));
+                            if supported_billable_tool {
+                                let mut injected_include_usage = false;
+                                if !params.contains_key("arguments") {
+                                    params.insert(
+                                        "arguments".to_string(),
+                                        Value::Object(serde_json::Map::new()),
+                                    );
                                     injected_include_usage = true;
                                 }
-                            }
-                            *mutated |= injected_include_usage;
 
-                            if tool == "tavily-search" {
-                                let expected = tavily_search_expected_credits(args_entry);
-                                *expected_search_total =
-                                    (*expected_search_total).saturating_add(expected);
-                                if let Some(id_key) = id_key.as_ref() {
-                                    expected_search_credits_by_id
-                                        .entry(id_key.clone())
-                                        .and_modify(|current| {
-                                            *current = (*current).saturating_add(expected)
-                                        })
-                                        .or_insert(expected);
-                                } else {
-                                    *expected_search_credits_without_id_total =
-                                        (*expected_search_credits_without_id_total)
-                                            .saturating_add(expected);
+                                let args_entry = params
+                                    .get_mut("arguments")
+                                    .expect("arguments must exist after insertion when absent");
+                                if let Value::Object(args) = args_entry {
+                                    let already_true = args
+                                        .get("include_usage")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    if !already_true {
+                                        args.insert("include_usage".to_string(), Value::Bool(true));
+                                        injected_include_usage = true;
+                                    }
                                 }
+                                *mutated |= injected_include_usage;
+
+                                let reserved = tavily_mcp_reserved_credits(tool.as_str(), args_entry);
+                                *reserved_billable_total =
+                                    (*reserved_billable_total).saturating_add(reserved);
+
+                                if tool == "tavily-search" {
+                                    let expected = tavily_search_expected_credits(args_entry);
+                                    *expected_search_total =
+                                        (*expected_search_total).saturating_add(expected);
+                                    if let Some(id_key) = id_key.as_ref() {
+                                        expected_search_credits_by_id
+                                            .entry(id_key.clone())
+                                            .and_modify(|current| {
+                                                *current = (*current).saturating_add(expected)
+                                            })
+                                            .or_insert(expected);
+                                    } else {
+                                        *expected_search_credits_without_id_total =
+                                            (*expected_search_credits_without_id_total)
+                                                .saturating_add(expected);
+                                    }
+                                }
+                            } else {
+                                // Unknown `tavily-*` tool: keep the original arguments/body shape,
+                                // but still treat it as billable so new upstream tools cannot bypass quota.
+                                *reserved_billable_total =
+                                    (*reserved_billable_total).saturating_add(1);
                             }
                         } else if tool.is_empty() {
                             // Unknown tool name: billable safe default.
@@ -365,6 +380,7 @@ async fn proxy_handler(
                                 &mut any_lockable,
                                 &mut all_non_billable,
                                 &mut mutated,
+                                &mut reserved_billable_total,
                                 &mut expected_search_total,
                                 &mut billable_mcp_ids,
                                 &mut billable_search_mcp_ids,
@@ -417,6 +433,7 @@ async fn proxy_handler(
                                     &mut any_lockable,
                                     &mut all_non_billable,
                                     &mut mutated,
+                                    &mut reserved_billable_total,
                                     &mut expected_search_total,
                                     &mut billable_mcp_ids,
                                     &mut billable_search_mcp_ids,
@@ -441,6 +458,9 @@ async fn proxy_handler(
 
                 billable_flag = any_billable && !all_non_billable;
                 lockable_tool = any_lockable && billable_flag;
+                if reserved_billable_total > 0 {
+                    reserved_billable_credits = Some(reserved_billable_total);
+                }
                 if expected_search_total > 0 {
                     expected_search_credits = Some(expected_search_total);
                 }
@@ -509,6 +529,12 @@ async fn proxy_handler(
     let billing_subject = token_billing_guard
         .as_ref()
         .map(|guard| guard.billing_subject().to_string());
+    if let Some(guard) = token_billing_guard.as_ref() {
+        guard.ensure_live().map_err(|err| {
+            eprintln!("token billing lock lost before precheck: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
 
     let mut _quota_verdict: Option<TokenQuotaVerdict> = None;
     if let Some(tid) = token_id.as_deref() {
@@ -590,14 +616,14 @@ async fn proxy_handler(
             } {
                 Ok(verdict) => {
                     if !state.dev_open_admin {
-                        let blocked = if let Some(expected) = expected_search_credits {
+                        let blocked = if let Some(expected) = reserved_billable_credits {
                             quota_would_exceed(&verdict, expected)
                         } else {
                             quota_exhausted_now(&verdict)
                         };
 
                         if blocked {
-                            let message = build_quota_error_message(&verdict);
+                            let message = build_quota_error_message(&verdict, reserved_billable_credits);
                             let _ = state
                                 .proxy
                                 .record_token_attempt(
@@ -612,7 +638,7 @@ async fn proxy_handler(
                                     Some(&message),
                                 )
                                 .await;
-                            let response = quota_exceeded_response(&verdict)?;
+                            let response = quota_exceeded_response(&verdict, reserved_billable_credits)?;
                             return Ok(response);
                         }
                     }
@@ -752,7 +778,23 @@ async fn proxy_handler(
                         {
                             Ok(log_id) => {
                                 attempt_logged = true;
-                                match state.proxy.settle_pending_billing_attempt(log_id).await {
+                                let lock_lost_msg = token_billing_guard
+                                    .as_ref()
+                                    .and_then(|guard| guard.ensure_live().err())
+                                    .map(|err| {
+                                        format!(
+                                            "charge_token_quota deferred for {path}: {err}; pending billing will retry"
+                                        )
+                                    });
+                                if let Some(msg) = lock_lost_msg {
+                                    eprintln!("{msg}");
+                                    let _ = state
+                                        .proxy
+                                        .annotate_pending_billing_attempt(log_id, &msg)
+                                        .await;
+                                    billing_error = Some(msg);
+                                } else {
+                                    match state.proxy.settle_pending_billing_attempt(log_id).await {
                                     Ok(PendingBillingSettleOutcome::Charged)
                                     | Ok(PendingBillingSettleOutcome::AlreadySettled) => {}
                                     Ok(PendingBillingSettleOutcome::RetryLater) => {
@@ -775,6 +817,7 @@ async fn proxy_handler(
                                             .await;
                                         billing_error = Some(msg);
                                     }
+                                }
                                 }
                             }
                             Err(err) => {
@@ -894,10 +937,14 @@ fn request_limit_exceeded_response(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-fn quota_exceeded_response(verdict: &TokenQuotaVerdict) -> Result<Response<Body>, StatusCode> {
+fn quota_exceeded_response(
+    verdict: &TokenQuotaVerdict,
+    projected_delta: Option<i64>,
+) -> Result<Response<Body>, StatusCode> {
+    let window = verdict.window_name_for_delta(projected_delta.unwrap_or(0));
     let payload = json!({
         "error": "quota_exceeded",
-        "window": verdict.window_name(),
+        "window": window,
         "hourly": {
             "limit": verdict.hourly_limit,
             "used": verdict.hourly_used,
@@ -926,14 +973,15 @@ fn build_request_limit_error_message(verdict: &TokenHourlyRequestVerdict) -> Str
     )
 }
 
-fn build_quota_error_message(verdict: &TokenQuotaVerdict) -> String {
-    let (limit, used) = quota_window_stats(verdict);
-    let window = verdict.window_name().unwrap_or("unknown");
+fn build_quota_error_message(verdict: &TokenQuotaVerdict, projected_delta: Option<i64>) -> String {
+    let delta = projected_delta.unwrap_or(0);
+    let (limit, used) = quota_window_stats(verdict, delta);
+    let window = verdict.window_name_for_delta(delta).unwrap_or("unknown");
     format!("token quota exceeded on {window} window (limit {limit}, used {used})")
 }
 
-fn quota_window_stats(verdict: &TokenQuotaVerdict) -> (i64, i64) {
-    match verdict.window_name().unwrap_or("hour") {
+fn quota_window_stats(verdict: &TokenQuotaVerdict, projected_delta: i64) -> (i64, i64) {
+    match verdict.window_name_for_delta(projected_delta).unwrap_or("hour") {
         "month" => (verdict.monthly_limit, verdict.monthly_used),
         "day" => (verdict.daily_limit, verdict.daily_used),
         _ => (verdict.hourly_limit, verdict.hourly_used),
