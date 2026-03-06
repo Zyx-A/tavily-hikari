@@ -15,6 +15,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tavily_hikari::DEFAULT_UPSTREAM;
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
 
     fn temp_db_path(prefix: &str) -> PathBuf {
         let file = format!("{}-{}.db", prefix, nanoid!(8));
@@ -169,6 +170,96 @@ mod tests {
                         } else {
                             1
                         };
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!(1)),
+                                "result": {
+                                    "structuredContent": {
+                                        "status": 200,
+                                        "usage": { "credits": credits },
+                                    }
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
+    async fn spawn_mock_mcp_upstream_for_tavily_search_delayed(
+        expected_api_key: String,
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/mcp",
+            any({
+                let hits = hits.clone();
+                move |Query(params): Query<HashMap<String, String>>, Json(body): Json<Value>| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    let arrived = arrived.clone();
+                    let release = release.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let received = params.get("tavilyApiKey").cloned();
+                        assert_eq!(
+                            received.as_deref(),
+                            Some(expected_api_key.as_str()),
+                            "missing or incorrect tavilyApiKey"
+                        );
+
+                        assert_eq!(
+                            body.get("method").and_then(|v| v.as_str()),
+                            Some("tools/call"),
+                            "expected MCP tools/call"
+                        );
+                        assert_eq!(
+                            body.get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str()),
+                            Some("tavily-search"),
+                            "expected tavily-search tool call"
+                        );
+                        assert_eq!(
+                            body.get("params")
+                                .and_then(|p| p.get("arguments"))
+                                .and_then(|a| a.get("include_usage"))
+                                .and_then(|v| v.as_bool()),
+                            Some(true),
+                            "proxy should inject include_usage=true"
+                        );
+
+                        let args = body
+                            .get("params")
+                            .and_then(|p| p.get("arguments"))
+                            .unwrap_or(&Value::Null);
+                        let depth = args
+                            .get("search_depth")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let credits = if depth.eq_ignore_ascii_case("advanced") {
+                            2
+                        } else {
+                            1
+                        };
+
+                        arrived.notify_one();
+                        release.notified().await;
 
                         (
                             StatusCode::OK,
@@ -445,6 +536,61 @@ mod tests {
                         } else {
                             1
                         };
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": 200,
+                                "results": [],
+                                "usage": { "credits": credits },
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
+    async fn spawn_http_search_mock_with_usage_delayed(
+        expected_api_key: String,
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/search",
+            post({
+                let hits = hits.clone();
+                move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    let arrived = arrived.clone();
+                    let release = release.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        assert_upstream_json_auth(&headers, &body, &expected_api_key, "/search");
+
+                        let search_depth = body
+                            .get("search_depth")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let credits = if search_depth.eq_ignore_ascii_case("advanced") {
+                            2
+                        } else {
+                            1
+                        };
+
+                        arrived.notify_one();
+                        release.notified().await;
 
                         (
                             StatusCode::OK,
@@ -3232,6 +3378,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tavily_http_search_returns_500_when_billing_write_fails_after_upstream_success() {
+        let db_path = temp_db_path("http-search-billing-write-fails");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1000");
+
+        let expected_api_key = "tvly-http-search-billing-write-fails-key";
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (upstream_addr, hits) = spawn_http_search_mock_with_usage_delayed(
+            expected_api_key.to_string(),
+            arrived.clone(),
+            release.clone(),
+        )
+        .await;
+        let usage_base = format!("http://{}", upstream_addr);
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("http-search-billing-write-fails"))
+            .await
+            .expect("create token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+        let client = Client::new();
+        let url = format!("http://{}/api/tavily/search", proxy_addr);
+
+        let handle = tokio::spawn({
+            let client = client.clone();
+            let url = url.clone();
+            let token = token.token.clone();
+            async move {
+                client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({ "query": "billing-fail", "search_depth": "basic" }))
+                    .send()
+                    .await
+                    .expect("request")
+            }
+        });
+
+        // Wait until upstream is hit (after preflight checks), then break quota tables before
+        // the proxy attempts to charge credits.
+        arrived.notified().await;
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("connect to sqlite");
+        sqlx::query("DROP TABLE token_usage_buckets")
+            .execute(&pool)
+            .await
+            .expect("drop token_usage_buckets");
+
+        release.notify_one();
+
+        let resp = handle.await.expect("task join");
+        assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn tavily_http_search_hourly_any_limit_429_is_non_billable_and_excluded_from_rollup() {
         let db_path = temp_db_path("http-search-hourly-any-nonbillable");
         let db_str = db_path.to_string_lossy().to_string();
@@ -4912,6 +5136,90 @@ mod tests {
             .await
             .expect("second request");
         assert_eq!(second.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_tavily_search_returns_500_when_billing_write_fails_after_upstream_success(
+    ) {
+        let db_path = temp_db_path("mcp-tools-call-search-billing-write-fails");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1000");
+
+        let expected_api_key = "tvly-mcp-tools-call-search-billing-write-fails-key";
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (upstream_addr, hits) = spawn_mock_mcp_upstream_for_tavily_search_delayed(
+            expected_api_key.to_string(),
+            arrived.clone(),
+            release.clone(),
+        )
+        .await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("mcp-tools-call-search-billing-write-fails"))
+            .await
+            .expect("create access token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), upstream.clone()).await;
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let handle = tokio::spawn({
+            let client = client.clone();
+            let url = url.clone();
+            async move {
+                client
+                    .post(&url)
+                    .json(&serde_json::json!({
+                        "method": "tools/call",
+                        "params": {
+                            "name": "tavily-search",
+                            "arguments": {
+                                "query": "mcp billing fail",
+                                "search_depth": "basic"
+                            }
+                        }
+                    }))
+                    .send()
+                    .await
+                    .expect("request")
+            }
+        });
+
+        arrived.notified().await;
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("connect to sqlite");
+        sqlx::query("DROP TABLE token_usage_buckets")
+            .execute(&pool)
+            .await
+            .expect("drop token_usage_buckets");
+
+        release.notify_one();
+
+        let resp = handle.await.expect("task join");
+        assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_file(db_path);

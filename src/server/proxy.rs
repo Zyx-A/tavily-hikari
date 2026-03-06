@@ -204,27 +204,19 @@ async fn proxy_handler(
     // - Non-business whitelist methods are ignored by business quota.
     // - tools/call for tavily-* injects include_usage=true so upstream returns usage.credits.
     // - Only tavily-search uses a predictable cost check (search_depth -> expected credits).
-    let mut billable_flag = true;
+    // NOTE: For /mcp we only treat supported `tools/call` Tavily tools as billable; all other
+    // MCP control plane methods should not be blocked by business quota.
+    let mut billable_flag = false;
     let mut mcp_tool_name: Option<String> = None;
     let mut expected_search_credits: Option<i64> = None;
     let mut forwarded_body = body_bytes.clone();
     let mut lockable_tool = false;
+    let mut unsupported_tool: Option<String> = None;
     if path.starts_with("/mcp")
         && let Ok(mut value) = serde_json::from_slice::<Value>(&body_bytes)
         && let Some(map) = value.as_object_mut()
     {
         let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
-        let is_non_business = matches!(
-            method,
-            "tools/list"
-                | "resources/list"
-                | "resources/templates/list"
-                | "resources/read"
-                | "prompts/list"
-                | "prompts/get"
-        ) || method.starts_with("notifications/");
-        billable_flag = !is_non_business;
-
         if method == "tools/call"
             && let Some(Value::Object(params)) = map.get_mut("params")
         {
@@ -238,10 +230,13 @@ async fn proxy_handler(
                 mcp_tool_name = Some(tool.clone());
             }
 
-            if matches!(
+            let supported_tool = matches!(
                 tool.as_str(),
                 "tavily-search" | "tavily-extract" | "tavily-crawl" | "tavily-map"
-            ) {
+            );
+
+            if supported_tool {
+                billable_flag = true;
                 lockable_tool = true;
                 let args_entry = params
                     .entry("arguments".to_string())
@@ -260,6 +255,8 @@ async fn proxy_handler(
                 if let Ok(encoded) = serde_json::to_vec(&value) {
                     forwarded_body = bytes::Bytes::from(encoded);
                 }
+            } else if tool.starts_with("tavily-") {
+                unsupported_tool = Some(tool);
             }
         }
     }
@@ -335,6 +332,35 @@ async fn proxy_handler(
             }
         }
 
+        if let Some(tool) = unsupported_tool.as_deref() {
+            let msg = format!("unsupported mcp tool: {}", tool);
+            let _ = state
+                .proxy
+                .record_token_attempt(
+                    tid,
+                    &method,
+                    &path,
+                    parts.uri.query(),
+                    Some(StatusCode::BAD_REQUEST.as_u16() as i64),
+                    None,
+                    false,
+                    "error",
+                    Some(msg.as_str()),
+                )
+                .await;
+
+            let payload = json!({
+                "error": "unsupported_tool",
+                "message": msg,
+            });
+            let resp = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/json; charset=utf-8")
+                .body(Body::from(payload.to_string()))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(resp);
+        }
+
         // 2) 业务配额（小时 / 日 / 月）只对 MCP 工具调用生效。
         if billable_flag {
             match state.proxy.peek_token_quota(tid).await {
@@ -378,6 +404,7 @@ async fn proxy_handler(
 
     match state.proxy.proxy_request(proxy_request).await {
         Ok(resp) => {
+            let mut billing_error: Option<String> = None;
             if let Some(tid) = token_id.as_deref() {
                 // 尝试从 Tavily JSON 回复中解析结构化状态码
                 let mut tavily_code: Option<i64> = None;
@@ -450,11 +477,21 @@ async fn proxy_handler(
                     if credits > 0
                         && let Err(err) = state.proxy.charge_token_quota(tid, credits).await
                     {
-                        eprintln!("charge_token_quota failed for {path}: {err}");
+                        let msg = format!("charge_token_quota failed for {path}: {err}");
+                        eprintln!("{msg}");
+                        billing_error = Some(msg);
                     }
                 }
 
-                let http_code = resp.status.as_u16() as i64;
+                if billing_error.is_some() {
+                    result_status = "error";
+                }
+
+                let http_code = if billing_error.is_some() {
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i64
+                } else {
+                    resp.status.as_u16() as i64
+                };
                 let _ = state
                     .proxy
                     .record_token_attempt(
@@ -466,11 +503,15 @@ async fn proxy_handler(
                         tavily_code,
                         billable_flag,
                         result_status,
-                        None,
+                        billing_error.as_deref(),
                     )
                     .await;
             }
-            Ok(build_response(resp))
+            if billing_error.is_some() {
+                Ok(billing_write_failed_response()?)
+            } else {
+                Ok(build_response(resp))
+            }
         }
         Err(err) => {
             eprintln!("proxy error: {err}");

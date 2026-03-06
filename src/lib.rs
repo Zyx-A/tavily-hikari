@@ -1,7 +1,7 @@
 use std::{
     cmp::min,
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -461,8 +461,8 @@ pub struct TavilyProxy {
     research_request_owner_affinity: Arc<Mutex<TokenAffinityState>>,
     // In-process mutexes to keep quota enforcement and /usage-diff billing consistent under
     // concurrency. These do NOT provide cross-instance guarantees.
-    token_billing_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    research_key_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    token_billing_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    research_key_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,10 +546,18 @@ impl TavilyProxy {
     pub async fn lock_token_billing(&self, token_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.token_billing_locks.lock().await;
-            locks
-                .entry(token_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+            // Opportunistic cleanup: drop dead weak refs when the map starts growing.
+            if locks.len() > 1024 {
+                locks.retain(|_, lock| lock.strong_count() > 0);
+            }
+
+            if let Some(existing) = locks.get(token_id).and_then(|lock| lock.upgrade()) {
+                existing
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(token_id.to_string(), Arc::downgrade(&lock));
+                lock
+            }
         };
         lock.lock_owned().await
     }
@@ -557,10 +565,17 @@ impl TavilyProxy {
     async fn lock_research_key_usage(&self, key_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.research_key_locks.lock().await;
-            locks
-                .entry(key_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+            if locks.len() > 256 {
+                locks.retain(|_, lock| lock.strong_count() > 0);
+            }
+
+            if let Some(existing) = locks.get(key_id).and_then(|lock| lock.upgrade()) {
+                existing
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key_id.to_string(), Arc::downgrade(&lock));
+                lock
+            }
         };
         lock.lock_owned().await
     }
