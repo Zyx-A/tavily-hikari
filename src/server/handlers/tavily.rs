@@ -104,18 +104,6 @@ fn quota_would_exceed(verdict: &TokenQuotaVerdict, delta: i64) -> bool {
         || verdict.monthly_used + delta > verdict.monthly_limit
 }
 
-fn billing_write_failed_response() -> Result<Response<Body>, StatusCode> {
-    let payload = json!({
-        "error": "billing_error",
-        "message": "failed to record credits usage",
-    });
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header(CONTENT_TYPE, "application/json; charset=utf-8")
-        .body(Body::from(payload.to_string()))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
 #[axum::debug_handler]
 async fn tavily_http_search(
     State(state): State<Arc<AppState>>,
@@ -704,11 +692,7 @@ async fn proxy_tavily_http_endpoint(
                 }
 
                 if let Some(tid) = token_id_for_logs.as_deref() {
-                    let http_code = if billing_error.is_some() {
-                        StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i64
-                    } else {
-                        resp.status.as_u16() as i64
-                    };
+                    let http_code = resp.status.as_u16() as i64;
                     let _ = state
                         .proxy
                         .record_token_attempt(
@@ -719,18 +703,13 @@ async fn proxy_tavily_http_endpoint(
                             Some(http_code),
                             analysis.tavily_status_code,
                             true,
-                            if billing_error.is_some() {
-                                "error"
-                            } else {
-                                analysis.status
-                            },
+                            analysis.status,
                             billing_error.as_deref().or(usage_probe_warning),
                         )
                         .await;
                 }
-                if billing_error.is_some() {
-                    return billing_write_failed_response();
-                }
+                // Always return the upstream response, even if local billing persistence fails.
+                // Returning a 5xx here can trigger client retries and cause duplicate upstream charges.
                 return Ok(build_response(resp));
             }
             Err(err) => {
@@ -839,11 +818,7 @@ async fn proxy_tavily_http_endpoint(
             }
 
             if let Some(tid) = token_id_for_logs.as_deref() {
-                let http_code = if billing_error.is_some() {
-                    StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i64
-                } else {
-                    resp.status.as_u16() as i64
-                };
+                let http_code = resp.status.as_u16() as i64;
                 let _ = state
                     .proxy
                     .record_token_attempt(
@@ -854,20 +829,14 @@ async fn proxy_tavily_http_endpoint(
                         Some(http_code),
                         analysis.tavily_status_code,
                         true,
-                        if billing_error.is_some() {
-                            "error"
-                        } else {
-                            analysis.status
-                        },
+                        analysis.status,
                         billing_error.as_deref(),
                     )
                     .await;
             }
-            if billing_error.is_some() {
-                billing_write_failed_response()
-            } else {
-                Ok(build_response(resp))
-            }
+            // Always return the upstream response, even if local billing persistence fails.
+            // Returning a 5xx here can trigger client retries and cause duplicate upstream charges.
+            Ok(build_response(resp))
         }
         Err(err) => {
             eprintln!("tavily http {} proxy error: {err}", config.upstream_path);

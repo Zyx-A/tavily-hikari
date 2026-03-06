@@ -427,6 +427,106 @@ mod tests {
         (addr, hits)
     }
 
+    async fn spawn_mock_mcp_upstream_for_tavily_search_batch_with_quota_exhausted(
+        expected_api_key: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/mcp",
+            any({
+                let hits = hits.clone();
+                move |Query(params): Query<HashMap<String, String>>, Json(body): Json<Value>| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let received = params.get("tavilyApiKey").cloned();
+                        assert_eq!(
+                            received.as_deref(),
+                            Some(expected_api_key.as_str()),
+                            "missing or incorrect tavilyApiKey"
+                        );
+
+                        let items = body
+                            .as_array()
+                            .expect("expected JSON-RPC batch body (array)");
+                        assert_eq!(items.len(), 2, "expected 2-item batch");
+
+                        for item in items {
+                            let map = item
+                                .as_object()
+                                .expect("expected JSON-RPC object item in batch");
+                            assert_eq!(
+                                map.get("method").and_then(|v| v.as_str()),
+                                Some("tools/call"),
+                                "expected MCP tools/call in batch"
+                            );
+                            assert_eq!(
+                                map.get("params")
+                                    .and_then(|p| p.get("name"))
+                                    .and_then(|v| v.as_str()),
+                                Some("tavily-search"),
+                                "expected tavily-search tool call"
+                            );
+                            assert_eq!(
+                                map.get("params")
+                                    .and_then(|p| p.get("arguments"))
+                                    .and_then(|a| a.get("include_usage"))
+                                    .and_then(|v| v.as_bool()),
+                                Some(true),
+                                "proxy should inject include_usage=true"
+                            );
+                        }
+
+                        // 1st item succeeds with usage.credits, 2nd item returns quota exhausted.
+                        let id1 = items[0]
+                            .get("id")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!(1));
+                        let id2 = items[1]
+                            .get("id")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!(2));
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!([
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": id1,
+                                    "result": {
+                                        "structuredContent": {
+                                            "status": 200,
+                                            "usage": { "credits": 1 },
+                                        }
+                                    }
+                                },
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": id2,
+                                    "result": {
+                                        "structuredContent": {
+                                            "status": 432
+                                        }
+                                    }
+                                }
+                            ])),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
     async fn spawn_mock_mcp_upstream_for_tavily_search_batch_partial_usage(
         expected_api_key: String,
     ) -> (SocketAddr, Arc<AtomicUsize>) {
@@ -4037,7 +4137,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tavily_http_search_returns_500_when_billing_write_fails_after_upstream_success() {
+    async fn tavily_http_search_returns_upstream_response_when_billing_write_fails_after_upstream_success(
+    ) {
         let db_path = temp_db_path("http-search-billing-write-fails");
         let db_str = db_path.to_string_lossy().to_string();
 
@@ -4108,8 +4209,31 @@ mod tests {
         release.notify_one();
 
         let resp = handle.await.expect("task join");
-        assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let row = sqlx::query(
+            r#"
+            SELECT result_status, error_message
+            FROM auth_token_logs
+            WHERE token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("token log row exists");
+        let status: String = row.try_get("result_status").unwrap();
+        let message: Option<String> = row.try_get("error_message").unwrap();
+        assert_eq!(status, "success");
+        assert!(
+            message
+                .unwrap_or_default()
+                .contains("charge_token_quota failed"),
+            "expected charge_token_quota failure to be logged"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -6600,6 +6724,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_batch_tools_call_tavily_search_charges_usage_credits_even_when_sibling_quota_exhausted(
+    ) {
+        let db_path = temp_db_path("mcp-batch-search-charges-with-quota-exhausted");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1000");
+
+        let expected_api_key = "tvly-mcp-batch-search-charges-with-quota-exhausted-key";
+        let (upstream_addr, hits) =
+            spawn_mock_mcp_upstream_for_tavily_search_batch_with_quota_exhausted(
+                expected_api_key.to_string(),
+            )
+            .await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("mcp-batch-search-charges-with-quota-exhausted"))
+            .await
+            .expect("create access token");
+
+        let proxy_addr =
+            spawn_proxy_server(proxy.clone(), "https://api.tavily.com".to_string()).await;
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        // Second item is quota exhausted, but the successful item still consumes credits upstream;
+        // we must bill based on usage.credits.
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!([
+                {
+                    "method": "tools/call",
+                    "params": { "name": "tavily-search", "arguments": { "query": "ok", "search_depth": "basic" } }
+                },
+                {
+                    "method": "tools/call",
+                    "params": { "name": "tavily-search", "arguments": { "query": "quota", "search_depth": "basic" } }
+                }
+            ]))
+            .send()
+            .await
+            .expect("batch request");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let verdict = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek quota");
+        assert_eq!(verdict.hourly_used, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn mcp_batch_tools_call_tavily_search_charges_expected_total_when_usage_missing_for_some_items(
     ) {
         let db_path = temp_db_path("mcp-batch-search-partial-usage");
@@ -6732,7 +6918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_tools_call_tavily_search_returns_500_when_billing_write_fails_after_upstream_success(
+    async fn mcp_tools_call_tavily_search_returns_upstream_response_when_billing_write_fails_after_upstream_success(
     ) {
         let db_path = temp_db_path("mcp-tools-call-search-billing-write-fails");
         let db_str = db_path.to_string_lossy().to_string();
@@ -6809,8 +6995,31 @@ mod tests {
         release.notify_one();
 
         let resp = handle.await.expect("task join");
-        assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let row = sqlx::query(
+            r#"
+            SELECT result_status, error_message
+            FROM auth_token_logs
+            WHERE token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("token log row exists");
+        let status: String = row.try_get("result_status").unwrap();
+        let message: Option<String> = row.try_get("error_message").unwrap();
+        assert_eq!(status, "success");
+        assert!(
+            message
+                .unwrap_or_default()
+                .contains("charge_token_quota failed"),
+            "expected charge_token_quota failure to be logged"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

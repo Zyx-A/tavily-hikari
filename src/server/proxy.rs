@@ -481,10 +481,18 @@ async fn proxy_handler(
             if let Some(tid) = token_id.as_deref() {
                 let analysis = analyze_mcp_attempt(resp.status, &resp.body);
                 let tavily_code: Option<i64> = analysis.tavily_status_code;
-                let mut result_status = analysis.status;
+                let result_status = analysis.status;
 
                 // Charge credits after a successful billable Tavily tool call.
-                if billable_flag && result_status == "success" && resp.status.is_success() {
+                //
+                // NOTE: We also charge when the overall attempt is marked `quota_exhausted`,
+                // because JSON-RPC batches can contain a mix of successes and quota errors. In
+                // that case we only charge credits we can actually observe from `usage.credits`
+                // to avoid guessing partial failures.
+                if billable_flag
+                    && resp.status.is_success()
+                    && matches!(result_status, "success" | "quota_exhausted")
+                {
                     let response_has_error = mcp_response_has_any_error(&resp.body);
                     let credits = match extract_usage_credits_total_from_json_bytes(&resp.body) {
                         Some(credits) => {
@@ -520,16 +528,7 @@ async fn proxy_handler(
                         billing_error = Some(msg);
                     }
                 }
-
-                if billing_error.is_some() {
-                    result_status = "error";
-                }
-
-                let http_code = if billing_error.is_some() {
-                    StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i64
-                } else {
-                    resp.status.as_u16() as i64
-                };
+                let http_code = resp.status.as_u16() as i64;
                 let _ = state
                     .proxy
                     .record_token_attempt(
@@ -545,11 +544,9 @@ async fn proxy_handler(
                     )
                     .await;
             }
-            if billing_error.is_some() {
-                Ok(billing_write_failed_response()?)
-            } else {
-                Ok(build_response(resp))
-            }
+            // Always return the upstream response, even if local billing persistence fails.
+            // Returning a 5xx here can trigger client retries and cause duplicate upstream charges.
+            Ok(build_response(resp))
         }
         Err(err) => {
             eprintln!("proxy error: {err}");
@@ -675,10 +672,10 @@ fn build_quota_error_message(verdict: &TokenQuotaVerdict) -> String {
 }
 
 fn quota_window_stats(verdict: &TokenQuotaVerdict) -> (i64, i64) {
-    match verdict.exceeded_window.unwrap_or(QuotaWindow::Hour) {
-        QuotaWindow::Hour => (verdict.hourly_limit, verdict.hourly_used),
-        QuotaWindow::Day => (verdict.daily_limit, verdict.daily_used),
-        QuotaWindow::Month => (verdict.monthly_limit, verdict.monthly_used),
+    match verdict.window_name().unwrap_or("hour") {
+        "month" => (verdict.monthly_limit, verdict.monthly_used),
+        "day" => (verdict.daily_limit, verdict.daily_used),
+        _ => (verdict.hourly_limit, verdict.hourly_used),
     }
 }
 

@@ -8478,8 +8478,27 @@ impl TokenQuotaVerdict {
         }
     }
 
+    fn effective_window(&self) -> Option<QuotaWindow> {
+        if let Some(window) = self.exceeded_window {
+            return Some(window);
+        }
+
+        // Snapshot-based enforcement blocks when counters are *at* the limit (>=),
+        // so expose the same "exhausted window" for reporting/UI consistency.
+        if self.monthly_used >= self.monthly_limit {
+            return Some(QuotaWindow::Month);
+        }
+        if self.daily_used >= self.daily_limit {
+            return Some(QuotaWindow::Day);
+        }
+        if self.hourly_used >= self.hourly_limit {
+            return Some(QuotaWindow::Hour);
+        }
+        None
+    }
+
     pub fn window_name(&self) -> Option<&'static str> {
-        self.exceeded_window.map(|w| w.as_str())
+        self.effective_window().map(|w| w.as_str())
     }
 
     pub fn state_key(&self) -> &'static str {
@@ -10041,6 +10060,14 @@ mod tests {
         assert_eq!(verdict.exceeded_window, Some(QuotaWindow::Hour));
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn quota_window_name_reports_exhausted_when_at_limit() {
+        let verdict = TokenQuotaVerdict::new(2, 2, 0, 10, 0, 100);
+        assert!(verdict.allowed, "at-limit is not considered exceeded");
+        assert_eq!(verdict.window_name(), Some("hour"));
+        assert_eq!(verdict.state_key(), "hour");
     }
 
     #[tokio::test]
