@@ -5558,6 +5558,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_initialize_and_ping_are_ignored_by_business_quota() {
+        let db_path = temp_db_path("mcp-initialize-ping-ignored");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1");
+
+        let expected_api_key = "tvly-mcp-initialize-ping-key";
+        let (upstream_addr, hits) = spawn_mock_upstream_with_hits(expected_api_key.to_string()).await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("mcp-initialize-ping"))
+            .await
+            .expect("create access token");
+
+        // Pre-exhaust business quota for this token.
+        let hourly_limit = effective_token_hourly_limit();
+        for _ in 0..=hourly_limit {
+            let _ = proxy
+                .check_token_quota(&access_token.id)
+                .await
+                .expect("quota check ok");
+        }
+
+        let proxy_addr =
+            spawn_proxy_server(proxy.clone(), "https://api.tavily.com".to_string()).await;
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let init = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "method": "initialize",
+                "params": { "capabilities": {} }
+            }))
+            .send()
+            .await
+            .expect("initialize request");
+        assert!(init.status().is_success());
+
+        let ping = client
+            .post(&url)
+            .json(&serde_json::json!({ "method": "ping" }))
+            .send()
+            .await
+            .expect("ping request");
+        assert!(ping.status().is_success());
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Verify that the most recent auth_token_logs entry is not billable.
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("connect to sqlite");
+
+        let row = sqlx::query(
+            r#"
+            SELECT counts_business_quota
+            FROM auth_token_logs
+            WHERE token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("token log row exists");
+
+        let counts_business_quota: i64 = row.try_get("counts_business_quota").unwrap();
+        assert_eq!(counts_business_quota, 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn mcp_batch_body_is_treated_as_billable_and_blocked_when_quota_exhausted() {
         let db_path = temp_db_path("mcp-batch-body-blocked");
         let db_str = db_path.to_string_lossy().to_string();

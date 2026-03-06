@@ -220,7 +220,9 @@ async fn proxy_handler(
                     let method = map.get("method").and_then(|v| v.as_str()).unwrap_or("");
                     non_billable = matches!(
                         method,
-                        "tools/list"
+                        "initialize"
+                            | "ping"
+                            | "tools/list"
                             | "resources/list"
                             | "resources/templates/list"
                             | "resources/read"

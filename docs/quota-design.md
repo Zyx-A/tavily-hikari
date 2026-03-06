@@ -98,7 +98,7 @@
 - **计入业务配额：**
   - `method = "tools/call"` 且 `params.name` 以 `tavily-` 开头（例如 `tavily-search` / `tavily-extract` / `tavily-crawl` / `tavily-map` 等）。
 - **不计入业务配额（仍计入“任意请求”限频）：**
-  - MCP control plane 方法：`tools/list`、`resources/*`、`prompts/*`、`notifications/*` 等；
+  - MCP control plane 方法：`initialize`、`ping`、`tools/list`、`resources/*`、`prompts/*`、`notifications/*` 等；
   - `tools/call` 但 tool name 非 `tavily-` 的调用（透传，不做 credits 扣减）。
 
 实现上，`src/server/proxy.rs` 的 MCP proxy handler 会解析 JSON body 决定是否 `billable`；
@@ -177,7 +177,7 @@
 ### 现状问题
 
 - 业务配额（小时/日/月）已经通过 `mcp_request_counts_toward_business_quota` 对
-  `/mcp` 的非业务方法（`tools/list`、`resources/*`、`prompts/*`、`notifications/*`）
+  `/mcp` 的非业务方法（`initialize`、`ping`、`tools/list`、`resources/*`、`prompts/*`、`notifications/*`）
   做了白名单剔除；
 - 但 `token_usage_stats` 的 rollup 过去聚合 `auth_token_logs` 全量记录，
   仍包含上述无成本调用，导致 UI 的今日/本月/总量虚高；
