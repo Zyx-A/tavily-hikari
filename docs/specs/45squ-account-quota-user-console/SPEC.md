@@ -78,11 +78,11 @@
 
 - Given 用户在 `/console#/tokens/:id` 点击 `检测 MCP`
   When 浏览器发起 `tools/list` 探测
-  Then 请求必须显式声明 `Accept: application/json, text/event-stream`，且前端可同时解析 JSON 与 SSE `data:` 响应体。
+  Then 请求必须显式声明 `Accept: application/json, text/event-stream`，且前端可同时解析 JSON 与 SSE `data:` 响应体、从 SSE 中提取真正的 JSON-RPC response envelope，并把格式损坏的 2xx 响应判为失败。
 
 - Given token 已达业务配额上限（hour/day/month 任一窗口）
   When 用户在 `/console#/tokens/:id` 点击 `检测 MCP`
-  Then UI 不再盲发 billable `ping`，而是将该步标记为“受阻/blocked”，继续执行 `tools/list` 做非计费连通验证，并给出部分通过或受阻状态。
+  Then UI 先用详情页 quota snapshot 做前置判定；若缓存命中 blocked，会先复核最新 token detail 再决定是否跳过 billable `ping`，并继续执行 `tools/list` 做非计费连通验证，最终给出部分通过或受阻状态。
 
 ## 质量门槛（Quality Gates）
 
@@ -101,7 +101,7 @@
 
 ## 变更记录
 
-- 2026-03-06: 修复用户控制台 MCP 探测合同：浏览器 probe 显式发送双 Accept，兼容 SSE `tools/list`，并在 token 配额耗尽时前置标记为受阻而非误报全失败。
+- 2026-03-06: 修复用户控制台 MCP 探测合同：浏览器 probe 显式发送双 Accept，兼容 SSE `tools/list`（含通知夹杂场景）并拒绝格式损坏的 2xx 成功体，同时在 token 配额耗尽时前置标记为受阻而非误报全失败，并在缓存配额可能过期时先复核最新 detail。
 - 2026-03-02: 初始化规格，冻结范围、接口与验收口径。
 - 2026-03-02: 完成账户级配额迁移与用户控制台交付，补齐登录跳转与用户接口链路。
 - 2026-03-02: 完成 review-loop 收敛，修复快照查询批量化、详情页切换闪旧数据与登录回退边界。

@@ -30,10 +30,11 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
 }
 
-function extractSseDataPayload(raw: string): string | null {
+function extractSseDataPayloads(raw: string): string[] {
+  const payloads: string[] = []
   const chunks = raw.split(/\r?\n\r?\n/)
-  for (let index = chunks.length - 1; index >= 0; index -= 1) {
-    const chunk = chunks[index]?.trim()
+  for (const part of chunks) {
+    const chunk = part.trim()
     if (!chunk) continue
     const dataLines = chunk
       .split(/\r?\n/)
@@ -41,26 +42,42 @@ function extractSseDataPayload(raw: string): string | null {
       .map((line) => line.slice('data:'.length).trim())
       .filter((line) => line.length > 0)
     if (dataLines.length > 0) {
-      return dataLines.join('\n')
+      payloads.push(dataLines.join('\n'))
     }
   }
-  return null
+  return payloads
+}
+
+function isMcpProbeEnvelope(value: unknown): value is Record<string, unknown> {
+  const map = asRecord(value)
+  return !!map && ('result' in map || 'error' in map)
 }
 
 export function parseMcpProbePayload(raw: string): unknown {
   const trimmed = raw.trim()
   if (trimmed.length === 0) {
-    return {}
+    throw new Error('Empty MCP probe payload')
   }
 
   try {
     return JSON.parse(trimmed) as unknown
   } catch {
-    const ssePayload = extractSseDataPayload(trimmed)
-    if (!ssePayload) {
+    const ssePayloads = extractSseDataPayloads(trimmed)
+    if (ssePayloads.length === 0) {
       throw new Error('Invalid MCP probe payload')
     }
-    return parseMcpProbePayload(ssePayload)
+
+    const parsedPayloads = ssePayloads.map((payload) => parseMcpProbePayload(payload))
+    const responsePayload = parsedPayloads.find((payload) => isMcpProbeEnvelope(payload))
+    if (responsePayload !== undefined) {
+      return responsePayload
+    }
+
+    const lastPayload = parsedPayloads.at(-1)
+    if (lastPayload === undefined) {
+      throw new Error('Invalid MCP probe payload')
+    }
+    return lastPayload
   }
 }
 
@@ -120,6 +137,23 @@ export function getTokenBusinessQuotaWindow(token: QuotaSnapshotLike | null | un
   return null
 }
 
+export async function revalidateBlockedQuotaWindow<T extends QuotaSnapshotLike | null | undefined>(
+  token: T,
+  loadLatest: () => Promise<T>,
+): Promise<{ token: T; window: ProbeQuotaWindow | null }> {
+  const currentWindow = getTokenBusinessQuotaWindow(token)
+  if (!currentWindow) {
+    return { token, window: null }
+  }
+
+  const refreshedToken = await loadLatest()
+  const nextToken = refreshedToken ?? token
+  return {
+    token: nextToken,
+    window: getTokenBusinessQuotaWindow(nextToken),
+  }
+}
+
 export function resolveMcpProbeButtonState(stepStates: readonly McpProbeStepState[]): 'success' | 'partial' | 'failed' {
   const passed = stepStates.filter((state) => state === 'success').length
   if (passed === stepStates.length) return 'success'
@@ -143,12 +177,16 @@ export async function requestMcpProbeWithToken<T>(
   const rawBody = await response.text().catch(() => '')
 
   let payload: unknown = {}
+  let parseError: Error | null = null
   if (rawBody.trim().length > 0) {
     try {
       payload = parseMcpProbePayload(rawBody)
-    } catch {
+    } catch (err) {
+      parseError = err instanceof Error ? err : new Error('Invalid MCP probe payload')
       payload = rawBody
     }
+  } else if (response.ok) {
+    parseError = new Error('Empty MCP probe payload')
   }
 
   if (!response.ok) {
@@ -156,6 +194,14 @@ export async function requestMcpProbeWithToken<T>(
       ?? (typeof payload === 'string' && payload.trim().length > 0 ? payload : null)
       ?? `Request failed with status ${response.status}`
     throw new McpProbeRequestError(message, response.status, payload, rawBody)
+  }
+
+  if (parseError) {
+    throw new McpProbeRequestError(parseError.message, response.status, payload, rawBody)
+  }
+
+  if (!isMcpProbeEnvelope(payload)) {
+    throw new McpProbeRequestError('Invalid MCP probe payload', response.status, payload, rawBody)
   }
 
   return payload as T

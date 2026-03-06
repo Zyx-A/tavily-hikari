@@ -7,6 +7,7 @@ import {
   getTokenBusinessQuotaWindow,
   parseMcpProbePayload,
   requestMcpProbeWithToken,
+  revalidateBlockedQuotaWindow,
   resolveMcpProbeButtonState,
 } from './mcpProbe'
 
@@ -25,6 +26,17 @@ describe('mcpProbe helpers', () => {
     const payload = parseMcpProbePayload(
       'event: message\n' +
       'data: {"jsonrpc":"2.0","id":"tools","result":{"tools":[{"name":"tavily_search"}]}}\n\n',
+    )
+
+    expect(payload.result.tools[0]?.name).toBe('tavily_search')
+  })
+
+  it('prefers the response envelope when SSE includes trailing notifications', () => {
+    const payload = parseMcpProbePayload(
+      'event: message\n' +
+      'data: {"jsonrpc":"2.0","id":"tools","result":{"tools":[{"name":"tavily_search"}]}}\n\n' +
+      'event: message\n' +
+      'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"done"}}\n\n',
     )
 
     expect(payload.result.tools[0]?.name).toBe('tavily_search')
@@ -62,6 +74,56 @@ describe('mcpProbe helpers', () => {
     expect(resolveMcpProbeButtonState(['success', 'success'])).toBe('success')
   })
 
+  it('revalidates blocked snapshots against a fresh quota read', async () => {
+    let calls = 0
+    const blocked = {
+      quotaHourlyUsed: 100,
+      quotaHourlyLimit: 100,
+      quotaDailyUsed: 100,
+      quotaDailyLimit: 500,
+      quotaMonthlyUsed: 100,
+      quotaMonthlyLimit: 5000,
+    }
+    const fresh = {
+      quotaHourlyUsed: 0,
+      quotaHourlyLimit: 100,
+      quotaDailyUsed: 100,
+      quotaDailyLimit: 500,
+      quotaMonthlyUsed: 100,
+      quotaMonthlyLimit: 5000,
+    }
+
+    const result = await revalidateBlockedQuotaWindow(blocked, async () => {
+      calls += 1
+      return fresh
+    })
+
+    expect(calls).toBe(1)
+    expect(result.token).toBe(fresh)
+    expect(result.window).toBeNull()
+  })
+
+  it('skips quota revalidation when the cached snapshot is already available', async () => {
+    let calls = 0
+    const available = {
+      quotaHourlyUsed: 0,
+      quotaHourlyLimit: 100,
+      quotaDailyUsed: 100,
+      quotaDailyLimit: 500,
+      quotaMonthlyUsed: 100,
+      quotaMonthlyLimit: 5000,
+    }
+
+    const result = await revalidateBlockedQuotaWindow(available, async () => {
+      calls += 1
+      return available
+    })
+
+    expect(calls).toBe(0)
+    expect(result.token).toBe(available)
+    expect(result.window).toBeNull()
+  })
+
   it('sends MCP Accept headers and parses SSE success responses', async () => {
     let headers = null
     globalThis.fetch = async (_input, init) => {
@@ -85,6 +147,26 @@ describe('mcpProbe helpers', () => {
     expect(headers?.get('Accept')).toBe(MCP_PROBE_ACCEPT_HEADER)
     expect(headers?.get('Content-Type')).toBe('application/json')
     expect(payload.result.tools[0]?.name).toBe('tavily_search')
+  })
+
+  it('rejects malformed 2xx probe payloads instead of treating them as success', async () => {
+    globalThis.fetch = async () => {
+      return new Response('<html>oops</html>', {
+        status: 200,
+        headers: { 'Content-Type': 'text/html' },
+      })
+    }
+
+    try {
+      await requestMcpProbeWithToken('/mcp', 'th-a1b2-secret', {
+        method: 'POST',
+        body: JSON.stringify({ method: 'tools/list' }),
+      })
+      throw new Error('expected requestMcpProbeWithToken to throw')
+    } catch (err) {
+      expect(err).toBeInstanceOf(McpProbeRequestError)
+      expect(err.message).toContain('Invalid MCP probe payload')
+    }
   })
 
   it('throws parsed quota errors for non-2xx MCP responses', async () => {

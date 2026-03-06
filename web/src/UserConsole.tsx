@@ -34,6 +34,7 @@ import {
   getProbeEnvelopeError,
   getQuotaExceededWindow,
   getTokenBusinessQuotaWindow,
+  revalidateBlockedQuotaWindow,
   resolveMcpProbeButtonState,
 } from './lib/mcpProbe'
 import { useResponsiveModes } from './lib/responsive'
@@ -466,7 +467,22 @@ export default function UserConsole(): JSX.Element {
       return
     }
 
-    const quotaBlockedWindow = getTokenBusinessQuotaWindow(detail)
+    let quotaBlockedWindow = getTokenBusinessQuotaWindow(detail)
+    if (quotaBlockedWindow) {
+      try {
+        const revalidatedQuota = await revalidateBlockedQuotaWindow(detail, async () => {
+          return await fetchUserTokenDetail(route.id)
+        })
+        if (!isActiveRun()) return
+        quotaBlockedWindow = revalidatedQuota.window
+        if (revalidatedQuota.token) {
+          setDetail(revalidatedQuota.token)
+        }
+      } catch {
+        if (!isActiveRun()) return
+      }
+    }
+
     const completedItems: ProbeBubbleItem[] = []
     const stepStates: McpProbeStepState[] = []
 
