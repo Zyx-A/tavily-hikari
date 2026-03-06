@@ -1373,7 +1373,7 @@ function UserDetailPageCanvas(): JSX.Element {
                           getQuotaSliderStageValue(sliderSeed.stages, Number.parseInt(event.target.value, 10)),
                         ),
                       }))}
-                      style={{ background: buildQuotaSliderTrack(sliderSeed.used, parsedDraft, sliderSeed.stableMax) }}
+                      style={{ background: buildQuotaSliderTrack(sliderSeed.stages, sliderSeed.used, parsedDraft) }}
                       aria-label={item.label}
                     />
                     <span className="panel-description">

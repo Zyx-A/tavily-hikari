@@ -2470,7 +2470,7 @@ function AdminDashboard(): JSX.Element {
                               const nextIndex = Number.parseInt(event.target.value, 10)
                               updateQuotaDraftField(item.field, String(getQuotaSliderStageValue(sliderSeed.stages, nextIndex)))
                             }}
-                            style={{ background: buildQuotaSliderTrack(sliderSeed.used, parsedDraft, sliderSeed.stableMax) }}
+                            style={{ background: buildQuotaSliderTrack(sliderSeed.stages, sliderSeed.used, parsedDraft) }}
                             aria-label={item.label}
                           />
                           <span className="panel-description">

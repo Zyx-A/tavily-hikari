@@ -103,20 +103,39 @@ export function findNearestQuotaSliderStageIndex(stages: readonly number[], valu
   return bestIndex
 }
 
+export function getQuotaSliderStagePosition(stages: readonly number[], value: number): number {
+  if (stages.length <= 1) return 0
+
+  const resolvedValue = coerceQuotaInteger(value, 0)
+  if (resolvedValue <= stages[0]) return 0
+
+  for (let index = 0; index < stages.length - 1; index += 1) {
+    const left = stages[index] ?? 0
+    const right = stages[index + 1] ?? left
+
+    if (resolvedValue <= right) {
+      if (right <= left) return index + 1
+      return index + (resolvedValue - left) / (right - left)
+    }
+  }
+
+  return stages.length - 1
+}
+
 export function getQuotaSliderStageValue(stages: readonly number[], index: number): number {
   if (stages.length === 0) return 1
   const resolvedIndex = Math.min(stages.length - 1, Math.max(0, coerceQuotaInteger(index, 0)))
   return stages[resolvedIndex] ?? stages[stages.length - 1] ?? 1
 }
 
-function toQuotaRatioPercent(value: number, stableMax: number): number {
-  const resolvedMax = coerceQuotaInteger(stableMax, 1)
-  return Math.min(100, Math.max(0, (coerceQuotaInteger(value, 0) / resolvedMax) * 100))
+function toQuotaRatioPercent(stages: readonly number[], value: number): number {
+  if (stages.length <= 1) return coerceQuotaInteger(value, 0) > 0 ? 100 : 0
+  return Math.min(100, Math.max(0, (getQuotaSliderStagePosition(stages, value) / (stages.length - 1)) * 100))
 }
 
-export function buildQuotaSliderTrack(used: number, draftLimit: number, stableMax: number): string {
-  const usedRatio = toQuotaRatioPercent(used, stableMax)
-  const draftRatio = toQuotaRatioPercent(draftLimit, stableMax)
+export function buildQuotaSliderTrack(stages: readonly number[], used: number, draftLimit: number): string {
+  const usedRatio = toQuotaRatioPercent(stages, used)
+  const draftRatio = toQuotaRatioPercent(stages, draftLimit)
   const start = Math.min(usedRatio, draftRatio)
   const end = Math.max(usedRatio, draftRatio)
   return `linear-gradient(to right, hsl(var(--warning) / 0.34) 0% ${start}%, hsl(var(--primary) / 0.44) ${start}% ${end}%, hsl(var(--muted) / 0.5) ${end}% 100%)`
