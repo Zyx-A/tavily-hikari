@@ -372,7 +372,7 @@ async fn tavily_http_research_result(
                         None,
                         None,
                         None,
-                        true,
+                        false,
                         "error",
                         Some(msg.as_str()),
                     )
@@ -655,6 +655,7 @@ async fn proxy_tavily_http_endpoint(
         match result {
             Ok((resp, analysis, usage_delta)) => {
                 if resp.status.is_success()
+                    && analysis.status == "success"
                     && let Some(tid) = token_id_for_logs.as_deref()
                 {
                     let credits = usage_delta.unwrap_or_else(|| {
@@ -764,6 +765,7 @@ async fn proxy_tavily_http_endpoint(
     match result {
         Ok((resp, analysis)) => {
             if resp.status.is_success()
+                && analysis.status == "success"
                 && let Some(tid) = token_id_for_logs.as_deref()
             {
                 let credits = if config.upstream_path == "/search" {

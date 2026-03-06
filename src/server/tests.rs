@@ -507,6 +507,56 @@ mod tests {
         (addr, hits)
     }
 
+    async fn spawn_http_search_mock_with_usage_and_failed_status(
+        expected_api_key: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/search",
+            post({
+                let hits = hits.clone();
+                move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        assert_upstream_json_auth(&headers, &body, &expected_api_key, "/search");
+
+                        let search_depth = body
+                            .get("search_depth")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let credits = if search_depth.eq_ignore_ascii_case("advanced") {
+                            2
+                        } else {
+                            1
+                        };
+
+                        // Simulate "HTTP 200 but structured failure" so AttemptAnalysis.status != "success".
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": "failed",
+                                "results": [],
+                                "usage": { "credits": credits },
+                                "message": "mock structured failure",
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
     async fn spawn_http_json_endpoints_mock_with_usage(
         expected_api_key: String,
         extract_credits: i64,
@@ -3135,6 +3185,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tavily_http_search_does_not_charge_when_structured_status_failed() {
+        let db_path = temp_db_path("http-search-failed-status-no-charge");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1000");
+
+        let expected_api_key = "tvly-http-search-failed-status-key";
+        let (upstream_addr, hits) =
+            spawn_http_search_mock_with_usage_and_failed_status(expected_api_key.to_string()).await;
+        let usage_base = format!("http://{}", upstream_addr);
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("http-search-failed-status"))
+            .await
+            .expect("create token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+        let client = Client::new();
+        let url = format!("http://{}/api/tavily/search", proxy_addr);
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.token))
+            .json(&serde_json::json!({ "query": "structured-failure", "search_depth": "basic" }))
+            .send()
+            .await
+            .expect("request");
+
+        // Upstream returns HTTP 200 but `status: failed` in the body.
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Structured failure should not charge credits quota.
+        let verdict = proxy.peek_token_quota(&token.id).await.expect("peek quota");
+        assert_eq!(verdict.hourly_used, 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn tavily_http_search_hourly_any_limit_429_is_non_billable_and_excluded_from_rollup() {
         let db_path = temp_db_path("http-search-hourly-any-nonbillable");
         let db_str = db_path.to_string_lossy().to_string();
@@ -4449,6 +4546,95 @@ mod tests {
         let result_status: String = row.try_get("result_status").unwrap();
 
         assert_eq!(http_status, Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i64));
+        assert_eq!(counts_business_quota, 0);
+        assert_eq!(result_status, "error");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tavily_http_research_result_proxy_error_is_non_billable() {
+        let db_path = temp_db_path("http-research-result-no-keys-nonbillable");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // No keys in the pool => proxy_http_get_endpoint returns ProxyError::NoAvailableKeys.
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let access_token = proxy
+            .create_access_token(Some("http-research-result-no-keys"))
+            .await
+            .expect("create token");
+
+        // Insert ownership record so the handler reaches proxy_http_get_endpoint.
+        let request_id = "req-no-keys";
+        let now = chrono::Utc::now().timestamp();
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("connect to sqlite");
+
+        sqlx::query(
+            r#"
+            INSERT INTO research_requests (
+                request_id, key_id, token_id,
+                expires_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(request_id)
+        .bind("fake-key")
+        .bind(&access_token.id)
+        .bind(now + 3600)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert research request affinity");
+
+        let usage_base = "http://127.0.0.1:58088".to_string();
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+
+        let client = Client::new();
+        let result_resp = client
+            .get(format!(
+                "http://{}/api/tavily/research/{}",
+                proxy_addr, request_id
+            ))
+            .header("Authorization", format!("Bearer {}", access_token.token))
+            .send()
+            .await
+            .expect("request to proxy succeeds");
+
+        assert_eq!(result_resp.status(), StatusCode::BAD_GATEWAY);
+
+        // Ensure the error path logs as non-billable for business quota rollups.
+        let row = sqlx::query(
+            r#"
+            SELECT counts_business_quota, result_status
+            FROM auth_token_logs
+            WHERE token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("token log row exists");
+
+        let counts_business_quota: i64 = row.try_get("counts_business_quota").unwrap();
+        let result_status: String = row.try_get("result_status").unwrap();
         assert_eq!(counts_business_quota, 0);
         assert_eq!(result_status, "error");
 
