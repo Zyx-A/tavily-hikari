@@ -340,12 +340,11 @@ mod tests {
                         let sse = format!(
                             "data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"structuredContent\":{{\"status\":200,\"usage\":{{\"credits\":2}}}}}}}}\n\n"
                         );
-                        let resp = Response::builder()
+                        Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, "text/event-stream")
                             .body(Body::from(sse))
-                            .expect("build response");
-                        resp
+                            .expect("build response")
                     }
                 }
             }),
