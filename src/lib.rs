@@ -636,22 +636,20 @@ impl TavilyProxy {
         )
     }
 
-    async fn reconcile_pending_billing_for_subjects<I, S>(
+    async fn reconcile_pending_billing_for_token(
         &self,
-        billing_subjects: I,
-    ) -> Result<(), ProxyError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut pending = Vec::new();
-        for billing_subject in billing_subjects {
-            pending.extend(
-                self.key_store
-                    .list_pending_billing_log_ids(billing_subject.as_ref())
-                    .await?,
-            );
-        }
+        token_id: &str,
+        billing_subject: &str,
+    ) -> Result<(), ProxyError> {
+        let mut pending = self
+            .key_store
+            .list_pending_billing_log_ids_for_token(token_id)
+            .await?;
+        pending.extend(
+            self.key_store
+                .list_pending_billing_log_ids(billing_subject)
+                .await?,
+        );
         pending.sort_unstable();
         pending.dedup();
         for log_id in pending {
@@ -691,12 +689,7 @@ impl TavilyProxy {
                 Duration::from_secs(QUOTA_SUBJECT_LOCK_ACQUIRE_TIMEOUT_SECS),
             )
             .await?;
-        let token_subject = format!("token:{token_id}");
-        let mut pending_subjects = vec![token_subject];
-        if billing_subject != pending_subjects[0] {
-            pending_subjects.push(billing_subject.clone());
-        }
-        self.reconcile_pending_billing_for_subjects(pending_subjects)
+        self.reconcile_pending_billing_for_token(token_id, &billing_subject)
             .await?;
 
         Ok(TokenBillingGuard {
@@ -7379,6 +7372,25 @@ impl KeyStore {
         .map_err(ProxyError::from)
     }
 
+    async fn list_pending_billing_log_ids_for_token(
+        &self,
+        token_id: &str,
+    ) -> Result<Vec<i64>, ProxyError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM auth_token_logs
+            WHERE billing_state = ? AND token_id = ? AND COALESCE(business_credits, 0) > 0
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(BILLING_STATE_PENDING)
+        .bind(token_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(ProxyError::from)
+    }
+
     async fn apply_pending_billing_log(&self, log_id: i64) -> Result<(), ProxyError> {
         let mut tx = self.pool.begin().await?;
         let Some((credits, billing_subject, billing_state, created_at)) =
@@ -12690,6 +12702,81 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         .await
         .expect("read token minute buckets");
         assert_eq!(token_minute_sum, 3);
+
+        let billing_state: String =
+            sqlx::query_scalar("SELECT billing_state FROM auth_token_logs WHERE id = ? LIMIT 1")
+                .bind(log_id)
+                .fetch_one(&proxy.key_store.pool)
+                .await
+                .expect("read billing state");
+        assert_eq!(billing_state, BILLING_STATE_CHARGED);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn pending_billing_replays_after_bound_token_becomes_unbound() {
+        let db_path = temp_db_path("pending-billing-account-to-token-subject-flip");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "pending-billing-account-user".to_string(),
+                username: Some("pending_billing_account".to_string()),
+                name: Some("Pending Billing Account".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(1),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+        let token = proxy
+            .ensure_user_token_binding(&user.user_id, Some("linuxdo:pending_billing_account"))
+            .await
+            .expect("bind token");
+
+        let log_id = proxy
+            .record_pending_billing_attempt(
+                &token.id,
+                &Method::POST,
+                "/api/tavily/search",
+                None,
+                Some(StatusCode::OK.as_u16() as i64),
+                Some(200),
+                true,
+                OUTCOME_SUCCESS,
+                Some("simulated pending charge"),
+                4,
+            )
+            .await
+            .expect("record pending billing attempt");
+
+        sqlx::query("DELETE FROM user_token_bindings WHERE token_id = ?")
+            .bind(&token.id)
+            .execute(&proxy.key_store.pool)
+            .await
+            .expect("unbind token");
+        proxy.key_store.cache_token_binding(&token.id, None).await;
+
+        let _guard = proxy
+            .lock_token_billing(&token.id)
+            .await
+            .expect("reconcile pending billing after unbind");
+
+        let account_minute_sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(count), 0) FROM account_usage_buckets WHERE user_id = ? AND granularity = ?",
+        )
+        .bind(&user.user_id)
+        .bind(GRANULARITY_MINUTE)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("read account minute buckets");
+        assert_eq!(account_minute_sum, 4);
 
         let billing_state: String =
             sqlx::query_scalar("SELECT billing_state FROM auth_token_logs WHERE id = ? LIMIT 1")
