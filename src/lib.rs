@@ -691,6 +691,10 @@ impl TavilyProxy {
         pending.sort_unstable();
         pending.dedup();
         for log_id in pending {
+            // `lock_token_billing()` already holds the per-subject lock at this point, so a
+            // retry-later miss here is unexpected. We retry once to tolerate edge timing around
+            // SQLite statement visibility, then fail closed so stale pending charges cannot bypass
+            // the quota precheck for the current request.
             let mut retry_later_attempts = 0;
             loop {
                 match self.key_store.apply_pending_billing_log(log_id).await? {
@@ -13432,6 +13436,50 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             .await
             .expect("peek quota after replay");
         assert_eq!(verdict.hourly_used, 3);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn token_billing_lock_serializes_across_proxy_instances() {
+        let db_path = temp_db_path("billing-lock-cross-instance");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy_a = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy a created");
+        let proxy_b = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy b created");
+        let token = proxy_a
+            .create_access_token(Some("billing-lock-cross-instance"))
+            .await
+            .expect("create token");
+
+        let guard = proxy_a
+            .lock_token_billing(&token.id)
+            .await
+            .expect("acquire first billing lock");
+
+        let token_id = token.id.clone();
+        let waiter = tokio::spawn(async move {
+            let _guard = proxy_b
+                .lock_token_billing(&token_id)
+                .await
+                .expect("acquire second billing lock");
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiter.is_finished(),
+            "second proxy instance should wait for the shared billing lock"
+        );
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("second proxy acquires after release")
+            .expect("waiter joins");
 
         let _ = std::fs::remove_file(db_path);
     }
