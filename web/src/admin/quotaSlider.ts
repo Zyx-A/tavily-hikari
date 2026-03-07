@@ -15,7 +15,8 @@ const QUOTA_SLIDER_DEFAULT_BASELINES: Readonly<Record<QuotaSliderField, number>>
   monthlyLimit: 100_000,
 }
 
-const QUOTA_STAGE_MULTIPLIERS = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10] as const
+const QUOTA_LINEAR_STAGE_VALUES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100] as const
+const QUOTA_EXP_STAGE_VALUES = [100, 120, 150, 200, 250, 300, 400, 500, 600, 800, 1_000] as const
 
 function coerceQuotaInteger(value: number, minimum: number): number {
   if (!Number.isFinite(value)) return minimum
@@ -43,13 +44,19 @@ export function resolveQuotaSliderStableMax(field: QuotaSliderField, initialLimi
 
 export function buildQuotaSliderStages(stableMax: number, extras: number[] = []): number[] {
   const resolvedMax = coerceQuotaInteger(stableMax, 1)
-  const stages = new Set<number>([1])
+  const stages = new Set<number>()
 
-  for (let exp = 0; exp <= 12; exp += 1) {
-    const base = 10 ** exp
-    if (base > resolvedMax) break
-    for (const multiplier of QUOTA_STAGE_MULTIPLIERS) {
-      const value = Math.round(multiplier * base)
+  for (const value of QUOTA_LINEAR_STAGE_VALUES) {
+    if (value <= resolvedMax) {
+      stages.add(value)
+    }
+  }
+
+  for (let scale = 1; scale <= 10 ** 9; scale *= 10) {
+    const firstValue = QUOTA_EXP_STAGE_VALUES[0] * scale
+    if (firstValue > resolvedMax) break
+    for (const baseValue of QUOTA_EXP_STAGE_VALUES) {
+      const value = baseValue * scale
       if (value <= resolvedMax) {
         stages.add(value)
       }
@@ -57,10 +64,10 @@ export function buildQuotaSliderStages(stableMax: number, extras: number[] = [])
   }
 
   for (const extra of extras) {
-    const value = coerceQuotaInteger(extra, 1)
-    if (value <= resolvedMax) {
-      stages.add(value)
-    }
+    if (!Number.isFinite(extra)) continue
+    const value = Math.trunc(extra)
+    if (value < 1 || value > resolvedMax) continue
+    stages.add(value)
   }
 
   stages.add(resolvedMax)
