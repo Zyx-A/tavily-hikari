@@ -15,7 +15,9 @@ import {
   buildQuotaSliderTrack,
   createQuotaSliderSeed,
   findNearestQuotaSliderStageIndex,
+  formatQuotaDraftInput,
   getQuotaSliderStageValue,
+  normalizeQuotaDraftInput,
   parseQuotaDraftValue,
   type QuotaSliderField,
   type QuotaSliderSeed,
@@ -1982,9 +1984,10 @@ function AdminDashboard(): JSX.Element {
   }
 
   const updateQuotaDraftField = (field: QuotaSliderField, value: string) => {
+    const normalizedValue = normalizeQuotaDraftInput(value)
     setUserQuotaDraft((previous) => {
       if (!previous) return previous
-      return { ...previous, [field]: value }
+      return { ...previous, [field]: normalizedValue }
     })
     setUserQuotaSavedAt(null)
     setUserQuotaError(null)
@@ -2478,12 +2481,14 @@ function AdminDashboard(): JSX.Element {
                           </span>
                         </div>
                         <input
-                          type="number"
+                          type="text"
                           name={item.field}
-                          min={1}
+                          inputMode="numeric"
+                          autoComplete="off"
                           className="input input-bordered quota-input"
-                          value={draftValue}
+                          value={formatQuotaDraftInput(draftValue)}
                           onChange={(event) => updateQuotaDraftField(item.field, event.target.value)}
+                          aria-label={`${item.label} input`}
                         />
                       </div>
                     </label>

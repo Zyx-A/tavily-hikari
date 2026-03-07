@@ -18,6 +18,10 @@ const QUOTA_SLIDER_DEFAULT_BASELINES: Readonly<Record<QuotaSliderField, number>>
 const QUOTA_LINEAR_STAGE_VALUES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100] as const
 const QUOTA_EXP_STAGE_VALUES = [100, 120, 150, 200, 250, 300, 400, 500, 600, 800, 1_000] as const
 
+const quotaDraftFormatter = new Intl.NumberFormat('en-US', {
+  maximumFractionDigits: 0,
+})
+
 function coerceQuotaInteger(value: number, minimum: number): number {
   if (!Number.isFinite(value)) return minimum
   return Math.max(minimum, Math.trunc(value))
@@ -27,8 +31,23 @@ export function getQuotaSliderDefaultBaseline(field: QuotaSliderField): number {
   return QUOTA_SLIDER_DEFAULT_BASELINES[field]
 }
 
+export function normalizeQuotaDraftInput(value: string | undefined): string {
+  const digitsOnly = (value ?? '').replace(/[^\d]/g, '')
+  if (!digitsOnly) return ''
+  const normalized = digitsOnly.replace(/^0+(?=\d)/, '')
+  return normalized || '0'
+}
+
+export function formatQuotaDraftInput(value: string | undefined): string {
+  const normalized = normalizeQuotaDraftInput(value)
+  if (!normalized) return ''
+  const parsed = Number.parseInt(normalized, 10)
+  if (!Number.isFinite(parsed)) return normalized
+  return quotaDraftFormatter.format(parsed)
+}
+
 export function parseQuotaDraftValue(value: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(value ?? '', 10)
+  const parsed = Number.parseInt(normalizeQuotaDraftInput(value), 10)
   if (!Number.isFinite(parsed)) return coerceQuotaInteger(fallback, 1)
   return coerceQuotaInteger(parsed, 1)
 }

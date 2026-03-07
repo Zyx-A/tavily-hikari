@@ -23,7 +23,9 @@ import {
   buildQuotaSliderTrack,
   createQuotaSliderSeed,
   findNearestQuotaSliderStageIndex,
+  formatQuotaDraftInput,
   getQuotaSliderStageValue,
+  normalizeQuotaDraftInput,
   parseQuotaDraftValue,
   type QuotaSliderField,
   type QuotaSliderSeed,
@@ -1381,12 +1383,17 @@ function UserDetailPageCanvas(): JSX.Element {
                     </span>
                   </div>
                   <input
-                    type="number"
+                    type="text"
                     name={item.field}
+                    inputMode="numeric"
+                    autoComplete="off"
                     className="input input-bordered quota-input"
-                    min={1}
-                    value={draftValue}
-                    onChange={(event) => setQuotaDraft((prev) => ({ ...prev, [item.field]: event.target.value }))}
+                    value={formatQuotaDraftInput(draftValue)}
+                    onChange={(event) => setQuotaDraft((prev) => ({
+                      ...prev,
+                      [item.field]: normalizeQuotaDraftInput(event.target.value),
+                    }))}
+                    aria-label={`${item.label} input`}
                   />
                 </div>
               </label>
