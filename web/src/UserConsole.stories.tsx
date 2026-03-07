@@ -8,6 +8,7 @@ type Scenario =
   | 'dashboard'
   | 'dashboard-admin'
   | 'tokens-admin'
+  | 'token-detail-admin'
   | 'tokens'
   | 'tokens-empty'
   | 'token-detail'
@@ -177,7 +178,8 @@ function scenarioHash(scenario: Scenario): string {
   if (scenario === 'tokens' || scenario === 'tokens-admin') return '#/tokens'
   if (scenario === 'tokens-empty') return '#/tokens'
   if (
-    scenario === 'token-detail'
+    scenario === 'token-detail-admin'
+    || scenario === 'token-detail'
     || scenario === 'token-detail-probe-running'
     || scenario === 'token-detail-probe-success'
     || scenario === 'token-detail-probe-partial'
@@ -193,7 +195,8 @@ function installUserConsoleFetchMock(scenario: Scenario): () => void {
   const originalFetch = window.fetch.bind(window)
   const probeMode = probeModeFromScenario(scenario)
   const researchRequestId = 'rq-story-001'
-  const isAdminScenario = scenario === 'dashboard-admin' || scenario === 'tokens-admin'
+  const isAdminScenario =
+    scenario === 'dashboard-admin' || scenario === 'tokens-admin' || scenario === 'token-detail-admin'
 
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = input instanceof Request
@@ -420,6 +423,15 @@ export const DashboardAdminMobile: Story = {
 export const TokensAdmin: Story = {
   args: {
     scenario: 'tokens-admin',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+  },
+}
+
+export const TokenDetailAdmin: Story = {
+  args: {
+    scenario: 'token-detail-admin',
   },
   parameters: {
     viewport: { defaultViewport: '1440-device-desktop' },
