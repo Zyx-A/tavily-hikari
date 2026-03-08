@@ -231,7 +231,7 @@ function TokenDetailStoryCanvas({
 }
 
 const meta = {
-  title: "Pages/TokenDetail",
+  title: "Admin/Pages/TokenDetail",
   parameters: {
     layout: "fullscreen",
   },
