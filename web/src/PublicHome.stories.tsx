@@ -5,21 +5,31 @@ import type { Meta, StoryObj } from '@storybook/react-vite'
 import PublicHomeHeroCard from './components/PublicHomeHeroCard'
 import LanguageSwitcher from './components/LanguageSwitcher'
 import ThemeToggle from './components/ThemeToggle'
+import { Button } from './components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from './components/ui/dialog'
+import { Input } from './components/ui/input'
 import { useTranslate } from './i18n'
-
-const ICONIFY_ENDPOINT = 'https://api.iconify.design'
 
 type CopyState = 'idle' | 'copied' | 'error'
 
 interface PublicHomeStoryArgs {
   showAdminAction: boolean
+  defaultViewport: string
 }
 
-function PublicHomeTokenModalStory(args: PublicHomeStoryArgs): JSX.Element {
+function PublicHomeStoryCanvas(args: PublicHomeStoryArgs): JSX.Element {
   const strings = useTranslate().public
-  const [tokenDraft, setTokenDraft] = useState('')
+  const [tokenDraft, setTokenDraft] = useState('th-storybook-demo-token')
   const [tokenVisible, setTokenVisible] = useState(false)
   const [copyState, setCopyState] = useState<CopyState>('idle')
+  const [isDialogOpen, setIsDialogOpen] = useState(true)
 
   const copyToken = async () => {
     const next = tokenDraft.trim()
@@ -54,51 +64,59 @@ function PublicHomeTokenModalStory(args: PublicHomeStoryArgs): JSX.Element {
           </>
         )}
       />
-      <dialog open className="modal token-access-modal">
-        <div className="modal-box">
-          <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>
-            {strings.tokenAccess.dialog.title}
-          </h3>
-          <p className="opacity-80" style={{ marginTop: 8 }}>
-            {strings.tokenAccess.dialog.description}
-          </p>
+      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+        <DialogContent className="token-access-modal modal-box max-w-2xl [&>button]:hidden">
+          <DialogHeader>
+            <DialogTitle>{strings.tokenAccess.dialog.title}</DialogTitle>
+            <DialogDescription className="opacity-80">
+              {strings.tokenAccess.dialog.description}
+            </DialogDescription>
+          </DialogHeader>
           <div className="token-input-wrapper" style={{ marginTop: 14 }}>
             <label htmlFor="story-token-input" className="token-label">
               {strings.accessToken.label}
             </label>
             <div className="token-input-row">
               <div className="token-input-shell">
-                <input
+                <Input
                   id="story-token-input"
-                  name="story-token-input"
+                  name="not-a-login-field"
                   className={`token-input${tokenVisible ? '' : ' masked'}`}
                   type="text"
                   value={tokenDraft}
                   onChange={(event) => setTokenDraft(event.target.value)}
                   placeholder={strings.accessToken.placeholder}
                   autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  aria-autocomplete="none"
+                  inputMode="text"
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  data-form-type="other"
                 />
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
                   className="token-visibility-button"
                   onClick={() => setTokenVisible((prev) => !prev)}
                   aria-label={tokenVisible ? strings.accessToken.toggle.hide : strings.accessToken.toggle.show}
                 >
-                  <img
-                    src={`${ICONIFY_ENDPOINT}/mdi/${tokenVisible ? 'eye-off-outline' : 'eye-outline'}.svg?color=%236b7280`}
-                    alt={strings.accessToken.toggle.iconAlt}
+                  <Icon
+                    icon={tokenVisible ? 'mdi:eye-off-outline' : 'mdi:eye-outline'}
+                    width={22}
+                    height={22}
+                    aria-hidden="true"
                   />
-                </button>
+                </Button>
               </div>
-              <button
+              <Button
                 type="button"
-                className={`btn token-copy-button${
-                  copyState === 'copied'
-                    ? ' btn-success'
-                    : copyState === 'error'
-                      ? ' btn-warning'
-                      : ' btn-outline'
-                }`}
+                variant={copyState === 'copied' ? 'success' : copyState === 'error' ? 'warning' : 'outline'}
+                className="token-copy-button"
+                data-copy-state={copyState === 'idle' ? undefined : copyState}
                 onClick={() => void copyToken()}
                 disabled={tokenDraft.trim().length === 0}
               >
@@ -120,7 +138,7 @@ function PublicHomeTokenModalStory(args: PublicHomeStoryArgs): JSX.Element {
                       ? strings.copyToken.error
                       : strings.copyToken.copy}
                 </span>
-              </button>
+              </Button>
             </div>
           </div>
           <p className="opacity-80" style={{ marginTop: 14, marginBottom: 0 }}>
@@ -129,46 +147,65 @@ function PublicHomeTokenModalStory(args: PublicHomeStoryArgs): JSX.Element {
               {strings.linuxDoLogin.button}
             </a>
           </p>
-          <div className="modal-action">
-            <button type="button" className="btn">
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>
               {strings.tokenAccess.dialog.actions.cancel}
-            </button>
-            <button type="button" className="btn btn-primary" disabled={tokenDraft.trim().length === 0}>
+            </Button>
+            <Button type="button" disabled={tokenDraft.trim().length === 0}>
               {strings.tokenAccess.dialog.actions.confirm}
-            </button>
-          </div>
-        </div>
-      </dialog>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </main>
   )
 }
 
 const meta = {
   title: 'Public/PublicHome',
+  component: PublicHomeStoryCanvas,
   parameters: {
     layout: 'fullscreen',
+    docs: {
+      description: {
+        component:
+          'Public home fixture covering the shadcn token access path: hero actions, controlled `Input`, `Button`-based copy and visibility actions, plus the Radix `Dialog` shell used by the production flow.',
+      },
+    },
   },
-  render: (args) => <PublicHomeTokenModalStory {...args} />,
-} satisfies Meta<PublicHomeStoryArgs>
+  render: (args) => <PublicHomeStoryCanvas {...args} />,
+} satisfies Meta<typeof PublicHomeStoryCanvas>
 
 export default meta
 
 type Story = StoryObj<typeof meta>
 
-export const TokenModalOpen: Story = {
+export const TokenAccessDesktop: Story = {
   args: {
     showAdminAction: false,
+    defaultViewport: '1440-device-desktop',
   },
   parameters: {
     viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: 'Desktop state with the token dialog already open so keyboard focus, copy feedback, and password-manager escape attributes can be reviewed quickly.',
+      },
+    },
   },
 }
 
-export const TokenModalOpenWithAdminAction: Story = {
+export const TokenAccessMobile: Story = {
   args: {
     showAdminAction: true,
+    defaultViewport: '0390-device-iphone-14',
   },
   parameters: {
-    viewport: { defaultViewport: '1440-device-desktop' },
+    viewport: { defaultViewport: '0390-device-iphone-14' },
+    docs: {
+      description: {
+        story: 'Mobile-width variant that keeps the same shadcn dialog controls while exposing the admin CTA alongside the hero card actions.',
+      },
+    },
   },
 }

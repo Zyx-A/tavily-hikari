@@ -1,6 +1,8 @@
 import { Icon } from '@iconify/react'
 import { type PropsWithChildren, useEffect, useRef, useState } from 'react'
+import { Button } from '../components/ui/button'
 import { ADMIN_SIDEBAR_STACK_MAX, useResponsiveModes } from '../lib/responsive'
+import AdminNavButton from './AdminNavButton'
 
 import type { AdminModuleId } from './routes'
 
@@ -91,8 +93,10 @@ export default function AdminShell({
             <span>Tavily Hikari</span>
           </div>
           {isStackedSidebar && (
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               className={`admin-menu-toggle${isMenuOpen ? ' is-open' : ''}`}
               aria-expanded={isMenuOpen}
               aria-controls="admin-sidebar-nav"
@@ -100,7 +104,7 @@ export default function AdminShell({
             >
               <Icon icon={isMenuOpen ? 'mdi:close' : 'mdi:menu'} width={18} height={18} aria-hidden="true" />
               <span>{isMenuOpen ? 'Close' : 'Menu'}</span>
-            </button>
+            </Button>
           )}
         </div>
         <div className={`admin-sidebar-menu${!isStackedSidebar || isMenuOpen ? ' is-open' : ''}`}>
@@ -108,16 +112,16 @@ export default function AdminShell({
             {navItems.map((item) => {
               const active = item.module === activeModule
               return (
-                <button
+                <AdminNavButton
                   key={item.module}
                   type="button"
-                  className={`admin-nav-item${active ? ' admin-nav-item-active' : ''}`}
+                  active={active}
                   onClick={() => onSelectModule(item.module)}
                   aria-current={active ? 'page' : undefined}
                 >
                   <Icon icon={item.icon} width={18} height={18} aria-hidden="true" />
                   <span>{item.label}</span>
-                </button>
+                </AdminNavButton>
               )
             })}
           </nav>

@@ -65,14 +65,8 @@ function installFetchMock(): () => void {
     const request = input instanceof Request ? input : new Request(input, init)
     const url = new URL(request.url, window.location.origin)
 
-    if (url.pathname === `/api/tokens/${tokenId}`) {
-      return jsonResponse(tokenDetailMock)
-    }
-
-    if (url.pathname === `/api/tokens/${tokenId}/metrics`) {
-      return jsonResponse(metricsMock)
-    }
-
+    if (url.pathname === `/api/tokens/${tokenId}`) return jsonResponse(tokenDetailMock)
+    if (url.pathname === `/api/tokens/${tokenId}/metrics`) return jsonResponse(metricsMock)
     if (url.pathname === `/api/tokens/${tokenId}/logs/page`) {
       const perPage = Number(url.searchParams.get('per_page') ?? '20')
       const page = Number(url.searchParams.get('page') ?? '1')
@@ -83,11 +77,7 @@ function installFetchMock(): () => void {
         total: logsMock.length,
       })
     }
-
-    if (url.pathname === `/api/tokens/${tokenId}/metrics/usage-series`) {
-      return jsonResponse(usageSeriesMock)
-    }
-
+    if (url.pathname === `/api/tokens/${tokenId}/metrics/usage-series`) return jsonResponse(usageSeriesMock)
     if (url.pathname === `/api/tokens/${tokenId}/secret/rotate`) {
       return jsonResponse({ token: 'th-a1b2-1234567890abcdef' })
     }
@@ -125,9 +115,7 @@ function installEventSourceMock(): () => void {
     }
 
     addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
-      if (!this.listeners.has(type)) {
-        this.listeners.set(type, new Set())
-      }
+      if (!this.listeners.has(type)) this.listeners.set(type, new Set())
       this.listeners.get(type)?.add(listener)
     }
 
@@ -153,8 +141,7 @@ function installEventSourceMock(): () => void {
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ;(window as any).EventSource = MockEventSource
+  ;(window as typeof window & { EventSource: typeof EventSource }).EventSource = MockEventSource as unknown as typeof EventSource
 
   return () => {
     window.EventSource = OriginalEventSource
@@ -176,27 +163,48 @@ function TokenDetailStoryCanvas(): JSX.Element {
     }
   }, [])
 
-  if (!ready) {
-    return <div style={{ minHeight: '100vh' }} />
-  }
+  if (!ready) return <div style={{ minHeight: '100vh' }} />
 
   return <TokenDetail id={tokenId} onBack={() => undefined} />
 }
 
 const meta = {
   title: 'Pages/TokenDetail',
+  component: TokenDetailStoryCanvas,
   parameters: {
     layout: 'fullscreen',
+    docs: {
+      description: {
+        component:
+          'Token detail page harness with mocked fetch and SSE data. The story exercises the migrated shadcn filter bar, pagination buttons, desktop `Table`, and Radix dialog flow without touching backend APIs.',
+      },
+    },
   },
   render: () => <TokenDetailStoryCanvas />,
-} satisfies Meta
+} satisfies Meta<typeof TokenDetailStoryCanvas>
 
 export default meta
 
 type Story = StoryObj<typeof meta>
 
-export const Default: Story = {
+export const DesktopDefault: Story = {
   parameters: {
     viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: 'Desktop fixture for the main request-log workflow, including Select-based period controls and the table/pagination path.',
+      },
+    },
+  },
+}
+
+export const MobileLayout: Story = {
+  parameters: {
+    viewport: { defaultViewport: '0390-device-iphone-14' },
+    docs: {
+      description: {
+        story: 'Mobile viewport for verifying stacked filters, responsive cards, and keyboard-safe controls after the shadcn migration.',
+      },
+    },
   },
 }

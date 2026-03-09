@@ -1242,7 +1242,7 @@
   cursor: pointer;
 }
 
-.token-visibility-button img {
+.token-visibility-button :where(img, svg) {
   width: 22px;
   height: 22px;
 }
@@ -1255,7 +1255,8 @@
   justify-content: center;
 }
 
-.token-copy-button.btn-outline {
+.token-copy-button:not([data-copy-state]),
+.token-copy-button[data-copy-state="loading"] {
   border-color: hsl(var(--primary) / 0.34);
   background:
     linear-gradient(180deg, hsl(var(--primary) / 0.14) 0%, hsl(var(--primary) / 0.08) 100%),
@@ -1266,7 +1267,8 @@
     inset 0 1px 0 hsl(var(--background) / 0.82);
 }
 
-.token-copy-button.btn-outline:hover {
+.token-copy-button:not([data-copy-state]):hover,
+.token-copy-button[data-copy-state="loading"]:hover {
   border-color: hsl(var(--primary) / 0.54);
   background:
     linear-gradient(180deg, hsl(var(--primary) / 0.2) 0%, hsl(var(--primary) / 0.12) 100%),
@@ -2861,7 +2863,7 @@ table {
   place-items: start center;
 }
 .key-validation-modal .modal-box,
-.key-validation-modal .key-validation-modal-box {
+.key-validation-modal.key-validation-modal-box {
   width: min(calc(100vw - 2rem), 1120px);
   max-width: min(calc(100vw - 2rem), 1120px);
   height: auto;
@@ -2871,7 +2873,7 @@ table {
   border-radius: 20px;
 }
 
-.key-validation-modal .key-validation-modal-box > .flex {
+.key-validation-modal.key-validation-modal-box > .flex {
   max-height: inherit;
   min-height: 0;
 }
@@ -3122,13 +3124,13 @@ table {
   flex-shrink: 0;
 }
 
-.key-validation-footer-actions .btn {
+.key-validation-footer-actions button {
   white-space: nowrap;
   min-height: 46px;
   line-height: 1.2;
 }
 
-.key-validation-footer-primary .btn {
+.key-validation-footer-primary > button {
   min-width: 0;
 }
 
@@ -3215,7 +3217,7 @@ table {
   }
 
   .key-validation-modal .modal-box,
-  .key-validation-modal .key-validation-modal-box {
+  .key-validation-modal.key-validation-modal-box {
     width: 100%;
     max-width: 100%;
     height: 100%;
@@ -3240,7 +3242,7 @@ table {
     gap: 8px;
   }
 
-  .key-validation-footer-actions > .btn.btn-outline {
+  .key-validation-retry-button {
     flex: 0 0 auto;
     padding-inline: 0.68rem;
   }
@@ -3254,18 +3256,18 @@ table {
     align-items: stretch;
   }
 
-  .key-validation-footer-primary .btn {
+  .key-validation-footer-primary > button {
     width: 100%;
     justify-content: center;
     padding-inline: 0.75rem;
   }
 
-  .key-validation-footer-primary .btn.btn-primary {
+  .key-validation-import-button {
     min-width: 0;
     overflow: visible;
   }
 
-  .key-validation-footer-primary .btn.btn-primary .key-validation-import-count-badge {
+  .key-validation-import-button .key-validation-import-count-badge {
     top: -6px;
     right: -6px;
   }
@@ -3412,7 +3414,7 @@ tbody tr:hover {
   gap: 2px;
 }
 
-.tokens-table .token-action-button.btn-circle {
+.tokens-table .token-action-button {
   width: 1.75rem;
   min-width: 1.75rem;
   height: 1.75rem;
@@ -3626,7 +3628,7 @@ tbody tr:hover {
   flex-wrap: wrap;
 }
 
-.user-console-tokens-table .table-actions .btn {
+.user-console-tokens-table .table-actions button {
   white-space: nowrap;
 }
 

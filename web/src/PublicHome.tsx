@@ -17,6 +17,9 @@ import {
 } from './api'
 import LanguageSwitcher from './components/LanguageSwitcher'
 import ThemeToggle from './components/ThemeToggle'
+import { Button } from './components/ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from './components/ui/dialog'
+import { Input } from './components/ui/input'
 import useUpdateAvailable from './hooks/useUpdateAvailable'
 import RollingNumber from './components/RollingNumber'
 import PublicHomeHeroCard from './components/PublicHomeHeroCard'
@@ -50,9 +53,6 @@ const REPO_URL = 'https://github.com/IvanLi-CN/tavily-hikari'
 const ICONIFY_ENDPOINT = 'https://api.iconify.design'
 const STORAGE_LAST_TOKEN = 'tavily-hikari-last-token'
 const STORAGE_TOKEN_MAP = 'tavily-hikari-token-map'
-const SUPPORTS_NATIVE_DIALOG =
-  typeof HTMLDialogElement !== 'undefined' &&
-  typeof HTMLDialogElement.prototype.showModal === 'function'
 // Keep in sync with backend constants in src/lib.rs
 const TOKEN_HOURLY_LIMIT = 100
 const TOKEN_DAILY_LIMIT = 500
@@ -85,7 +85,7 @@ function PublicHome(): JSX.Element {
   const [token, setToken] = useState('')
   const [tokenDraft, setTokenDraft] = useState('')
   const [tokenVisible, setTokenVisible] = useState(false)
-  const tokenAccessDialogRef = useRef<HTMLDialogElement>(null)
+  const [isTokenAccessDialogOpen, setIsTokenAccessDialogOpen] = useState(false)
   const [metrics, setMetrics] = useState<PublicMetrics | null>(null)
   const [tokenMetrics, setTokenMetrics] = useState<TokenMetrics | null>(null)
   const [publicLogs, setPublicLogs] = useState<PublicTokenLog[]>([])
@@ -252,7 +252,7 @@ function PublicHome(): JSX.Element {
   const isAdmin = profile?.isAdmin ?? false
   const builtinAuthEnabled = profile?.builtinAuthEnabled ?? false
   const isLoggedOut = profile?.userLoggedIn === false
-  const canUseTokenAccessModal = SUPPORTS_NATIVE_DIALOG
+  const canUseTokenAccessModal = true
   const showLinuxDoLogin = isLoggedOut
   const hasTokenInfo = token.trim().length > 0
   const hasValidTokenForLogs = isFullToken(token) && !invalidToken
@@ -355,13 +355,11 @@ function PublicHome(): JSX.Element {
     // Ensure the modal starts masked and doesn't leak into the main input after confirm.
     setTokenVisible(false)
     setCopyState('idle')
-    const dialog = tokenAccessDialogRef.current
-    if (!dialog) return
-    if (!dialog.open) dialog.showModal()
+    setIsTokenAccessDialogOpen(true)
   }, [canUseTokenAccessModal, token])
 
   const closeTokenAccessDialog = useCallback(() => {
-    tokenAccessDialogRef.current?.close()
+    setIsTokenAccessDialogOpen(false)
     setTokenVisible(false)
     setCopyState('idle')
   }, [])
@@ -370,7 +368,7 @@ function PublicHome(): JSX.Element {
     const next = tokenDraft.trim()
     if (!isFullToken(next)) return
     persistToken(next)
-    tokenAccessDialogRef.current?.close()
+    setIsTokenAccessDialogOpen(false)
     setTokenVisible(false)
     setCopyState('idle')
   }, [persistToken, tokenDraft])
@@ -446,12 +444,12 @@ function PublicHome(): JSX.Element {
             </span>
           </div>
           <div className="update-banner-actions">
-            <button type="button" className="btn btn-primary" onClick={updateBanner.reload}>
+            <Button type="button" onClick={updateBanner.reload}>
               {publicStrings.updateBanner.refresh}
-            </button>
-            <button type="button" className="btn btn-ghost" onClick={updateBanner.dismiss}>
+            </Button>
+            <Button type="button" variant="ghost" onClick={updateBanner.dismiss}>
               {publicStrings.updateBanner.dismiss}
-            </button>
+            </Button>
           </div>
         </section>
       )}
@@ -531,7 +529,7 @@ function PublicHome(): JSX.Element {
                 </label>
                 <div className="token-input-row">
                   <div className="token-input-shell">
-                    <input
+                    <Input
                       id="access-token"
                       name="not-a-login-field"
                       className={`token-input${tokenVisible ? '' : ' masked'}`}
@@ -568,27 +566,27 @@ function PublicHome(): JSX.Element {
                       data-lpignore="true"
                       data-form-type="other"
                     />
-                    <button
+                    <Button
                       type="button"
+                      variant="ghost"
+                      size="icon"
                       className="token-visibility-button"
                       onClick={() => setTokenVisible((prev) => !prev)}
                       aria-label={tokenVisible ? publicStrings.accessToken.toggle.hide : publicStrings.accessToken.toggle.show}
                     >
-                      <img
-                        src={`${ICONIFY_ENDPOINT}/mdi/${tokenVisible ? 'eye-off-outline' : 'eye-outline'}.svg?color=%236b7280`}
-                        alt={publicStrings.accessToken.toggle.iconAlt}
+                      <Icon
+                        icon={tokenVisible ? 'mdi:eye-off-outline' : 'mdi:eye-outline'}
+                        width={22}
+                        height={22}
+                        aria-hidden="true"
                       />
-                    </button>
+                    </Button>
                   </div>
-                  <button
+                  <Button
                     type="button"
-                    className={`btn token-copy-button${
-                      copyState === 'copied'
-                        ? ' btn-success'
-                        : copyState === 'error'
-                          ? ' btn-warning'
-                          : ' btn-outline'
-                    }`}
+                    variant={copyState === 'copied' ? 'success' : copyState === 'error' ? 'warning' : 'outline'}
+                    className="token-copy-button"
+                    data-copy-state={copyState}
                     onClick={() => void handleCopyToken(token)}
                     aria-label={publicStrings.copyToken.iconAlt}
                   >
@@ -610,7 +608,7 @@ function PublicHome(): JSX.Element {
                           ? publicStrings.copyToken.error
                           : publicStrings.copyToken.copy}
                     </span>
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>
@@ -826,33 +824,28 @@ function PublicHome(): JSX.Element {
         </div>
       </footer>
       {canUseTokenAccessModal && (
-        <dialog
-          ref={tokenAccessDialogRef}
-          className="modal token-access-modal"
-          onClick={(event) => {
-            // Close when clicking on the backdrop (not inside the modal box).
-            if (event.target === event.currentTarget) closeTokenAccessDialog()
-          }}
-          onClose={() => {
-            // Dialog can also be closed via ESC; keep sensitive states reset.
-            setTokenVisible(false)
-            setCopyState('idle')
+        <Dialog
+          open={isTokenAccessDialogOpen}
+          onOpenChange={(open) => {
+            if (open) {
+              setIsTokenAccessDialogOpen(true)
+              return
+            }
+            closeTokenAccessDialog()
           }}
         >
-          <div className="modal-box">
-            <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>
-              {publicStrings.tokenAccess.dialog.title}
-            </h3>
-            <p className="opacity-80" style={{ marginTop: 8 }}>
-              {publicStrings.tokenAccess.dialog.description}
-            </p>
+          <DialogContent className="token-access-modal modal-box max-w-2xl" onPointerDownOutside={closeTokenAccessDialog}>
+            <DialogHeader>
+              <DialogTitle>{publicStrings.tokenAccess.dialog.title}</DialogTitle>
+              <DialogDescription className="opacity-80">{publicStrings.tokenAccess.dialog.description}</DialogDescription>
+            </DialogHeader>
             <div className="token-input-wrapper" style={{ marginTop: 14 }}>
               <label htmlFor="access-token-modal" className="token-label">
                 {publicStrings.accessToken.label}
               </label>
               <div className="token-input-row">
                 <div className="token-input-shell">
-                  <input
+                  <Input
                     id="access-token-modal"
                     name="not-a-login-field"
                     className={`token-input${tokenVisible ? '' : ' masked'}`}
@@ -871,27 +864,27 @@ function PublicHome(): JSX.Element {
                     data-lpignore="true"
                     data-form-type="other"
                   />
-                  <button
+                  <Button
                     type="button"
+                    variant="ghost"
+                    size="icon"
                     className="token-visibility-button"
                     onClick={() => setTokenVisible((prev) => !prev)}
                     aria-label={tokenVisible ? publicStrings.accessToken.toggle.hide : publicStrings.accessToken.toggle.show}
                   >
-                    <img
-                      src={`${ICONIFY_ENDPOINT}/mdi/${tokenVisible ? 'eye-off-outline' : 'eye-outline'}.svg?color=%236b7280`}
-                      alt={publicStrings.accessToken.toggle.iconAlt}
+                    <Icon
+                      icon={tokenVisible ? 'mdi:eye-off-outline' : 'mdi:eye-outline'}
+                      width={22}
+                      height={22}
+                      aria-hidden="true"
                     />
-                  </button>
+                  </Button>
                 </div>
-                <button
+                <Button
                   type="button"
-                  className={`btn token-copy-button${
-                    copyState === 'copied'
-                      ? ' btn-success'
-                      : copyState === 'error'
-                        ? ' btn-warning'
-                        : ' btn-outline'
-                  }`}
+                  variant={copyState === 'copied' ? 'success' : copyState === 'error' ? 'warning' : 'outline'}
+                  className="token-copy-button"
+                  data-copy-state={copyState}
                   onClick={() => void handleCopyToken(tokenDraft.trim())}
                   aria-label={publicStrings.copyToken.iconAlt}
                   disabled={tokenDraft.trim().length === 0}
@@ -914,7 +907,7 @@ function PublicHome(): JSX.Element {
                         ? publicStrings.copyToken.error
                         : publicStrings.copyToken.copy}
                   </span>
-                </button>
+                </Button>
               </div>
             </div>
             <p className="opacity-80" style={{ marginTop: 14, marginBottom: 0 }}>
@@ -930,23 +923,16 @@ function PublicHome(): JSX.Element {
                 {publicStrings.linuxDoLogin.button}
               </a>
             </p>
-            <div className="modal-action">
-              <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <button type="button" className="btn" onClick={closeTokenAccessDialog}>
-                  {publicStrings.tokenAccess.dialog.actions.cancel}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={confirmTokenAccessDialog}
-                  disabled={!isFullToken(tokenDraft.trim())}
-                >
-                  {publicStrings.tokenAccess.dialog.actions.confirm}
-                </button>
-              </form>
-            </div>
-          </div>
-        </dialog>
+            <DialogFooter className="modal-action flex-wrap gap-2 sm:justify-end sm:space-x-0">
+              <Button type="button" variant="outline" onClick={closeTokenAccessDialog}>
+                {publicStrings.tokenAccess.dialog.actions.cancel}
+              </Button>
+              <Button type="button" onClick={confirmTokenAccessDialog} disabled={!isFullToken(tokenDraft.trim())}>
+                {publicStrings.tokenAccess.dialog.actions.confirm}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </main>
   )
@@ -982,13 +968,17 @@ function MobileGuideDropdown({
   const current = labels.find((l) => l.id === active)
   return (
     <div className="dropdown w-full">
-      <div tabIndex={0} role="button" className="btn btn-outline w-full justify-between btn-sm md:btn-md">
+      <Button
+        type="button"
+        variant="outline"
+        className="w-full justify-between h-9 px-3 md:h-10 public-home-guide-client-trigger"
+      >
         <span className="inline-flex items-center gap-2">
           <img src={icon(active)} alt="client" width={18} height={18} />
           {current?.label ?? active}
         </span>
         <img src={`${ICONIFY_ENDPOINT}/mdi/chevron-down.svg?color=%23647589`} alt="open" width={16} height={16} />
-      </div>
+      </Button>
       <ul tabIndex={0} className="menu dropdown-content bg-base-100 rounded-box z-[1] w-60 p-2 shadow mt-2">
         {labels.map((tab) => (
           <li key={tab.id}>

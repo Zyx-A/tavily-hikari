@@ -3,6 +3,11 @@ import { Icon } from '@iconify/react'
 import { Chart as ChartJS, BarElement, CategoryScale, Legend, LinearScale, Tooltip, type ChartOptions } from 'chart.js'
 import { Bar } from 'react-chartjs-2'
 import { fetchTokenUsageSeries, rotateTokenSecret, type TokenUsageBucket } from '../api'
+import { Button } from '../components/ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../components/ui/dialog'
+import { Input } from '../components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import ThemeToggle from '../components/ThemeToggle'
 import { StatusBadge, type StatusTone } from '../components/StatusBadge'
 import { useResponsiveModes } from '../lib/responsive'
@@ -309,8 +314,8 @@ export default function TokenDetail({ id, onBack }: { id: string; onBack?: () =>
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(() => new Set())
   const warningTimerRef = useRef<number | null>(null)
   const sinceDebounceRef = useRef<number | null>(null)
-  const rotateDialogRef = useRef<HTMLDialogElement | null>(null)
-  const rotatedDialogRef = useRef<HTMLDialogElement | null>(null)
+  const [isRotateDialogOpen, setIsRotateDialogOpen] = useState(false)
+  const [isRotatedDialogOpen, setIsRotatedDialogOpen] = useState(false)
   const [rotating, setRotating] = useState(false)
   const [rotatedToken, setRotatedToken] = useState<string | null>(null)
   const [sseConnected, setSseConnected] = useState(false)
@@ -621,6 +626,26 @@ export default function TokenDetail({ id, onBack }: { id: string; onBack?: () =>
     })
   }
 
+  const handleRotateSecret = async () => {
+    try {
+      setRotating(true)
+      const res = await rotateTokenSecret(id)
+      setRotatedToken(res.token)
+      try {
+        await navigator.clipboard?.writeText(res.token)
+      } catch {
+        // Clipboard failures should not block the rotate flow.
+      }
+      setIsRotateDialogOpen(false)
+      setIsRotatedDialogOpen(true)
+    } catch (e) {
+      setIsRotateDialogOpen(false)
+      alert((e as Error)?.message || 'Failed to regenerate token secret')
+    } finally {
+      setRotating(false)
+    }
+  }
+
   return (
     <div
       ref={pageRef}
@@ -638,19 +663,19 @@ export default function TokenDetail({ id, onBack }: { id: string; onBack?: () =>
           <span className={`sse-chip ${sseConnected ? 'sse-chip-ok' : 'sse-chip-warn'}`} title="Live updates via SSE">
             <span className="sse-dot" aria-hidden="true" /> {sseConnected ? 'Live' : 'Offline'}
           </span>
-          <button type="button" className="btn" onClick={() => (onBack ? onBack() : window.history.back())}>
+          <Button type="button" variant="outline" onClick={() => (onBack ? onBack() : window.history.back())}>
             <Icon icon="mdi:arrow-left" width={18} height={18} />
             &nbsp;Back
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
-            className="btn btn-warning"
-            onClick={() => rotateDialogRef.current?.showModal()}
+            variant="warning"
+            onClick={() => setIsRotateDialogOpen(true)}
             aria-label="Regenerate secret"
           >
             <Icon icon="mdi:key-change" width={18} height={18} />
             &nbsp;Regenerate Secret
-          </button>
+          </Button>
         </div>
       </section>
 
@@ -730,44 +755,41 @@ export default function TokenDetail({ id, onBack }: { id: string; onBack?: () =>
           <div className="token-period-controls" role="group" aria-label="Period filter">
             <div className="token-period-control">
               <label htmlFor={periodSelectId}>Period</label>
-              <select
-                id={periodSelectId}
-                className="select select-bordered"
-                value={period}
-                onChange={(e) => { const next = e.target.value as Period; setPeriod(next); applyStartInput('', next) }}
-              >
-                <option value="day">Day</option>
-                <option value="week">Week</option>
-                <option value="month">Month</option>
-              </select>
+              <Select value={period} onValueChange={(value) => { const next = value as Period; setPeriod(next); applyStartInput('', next) }}>
+                <SelectTrigger id={periodSelectId} className="min-w-[132px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent align="start">
+                  <SelectItem value="day">Day</SelectItem>
+                  <SelectItem value="week">Week</SelectItem>
+                  <SelectItem value="month">Month</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <div className="token-period-control">
               <label htmlFor={sinceInputId}>Start</label>
               {period === 'day' && (
-                <input
+                <Input
                   id={sinceInputId}
                   type="date"
-                  className="input input-bordered"
                   max={defaultInputValue('day')}
                   value={sinceInput}
                   onChange={(e) => handleStartChange(period, e.target.value)}
                 />
               )}
               {period === 'week' && (
-                <input
+                <Input
                   id={sinceInputId}
                   type="week"
-                  className="input input-bordered"
                   max={defaultInputValue('week')}
                   value={sinceInput}
                   onChange={(e) => handleStartChange(period, e.target.value)}
                 />
               )}
               {period === 'month' && (
-                <input
+                <Input
                   id={sinceInputId}
                   type="month"
-                  className="input input-bordered"
                   max={defaultInputValue('month')}
                   value={sinceInput}
                   onChange={(e) => handleStartChange(period, e.target.value)}
@@ -806,24 +828,24 @@ export default function TokenDetail({ id, onBack }: { id: string; onBack?: () =>
           </div>
         </div>
         <div className="table-wrapper token-detail-md-up">
-          <table className="token-detail-table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>HTTP Status</th>
-                <th>MCP Status</th>
-                <th>Result</th>
-                <th>Error</th>
-              </tr>
-            </thead>
-            <tbody>
+          <Table className="token-detail-table">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Time</TableHead>
+                <TableHead>HTTP Status</TableHead>
+                <TableHead>MCP Status</TableHead>
+                <TableHead>Result</TableHead>
+                <TableHead>Error</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {logs.map((l) => (
                 <Fragment key={l.id}>
-                  <tr>
-                    <td>{formatLogTime(l.created_at, period)}</td>
-                    <td>{l.http_status ?? '—'}</td>
-                    <td>{l.mcp_status ?? '—'}</td>
-                    <td>
+                  <TableRow>
+                    <TableCell>{formatLogTime(l.created_at, period)}</TableCell>
+                    <TableCell>{l.http_status ?? '—'}</TableCell>
+                    <TableCell>{l.mcp_status ?? '—'}</TableCell>
+                    <TableCell>
                       <button
                         type="button"
                         className={`log-result-button${expandedLogs.has(l.id) ? ' log-result-button-active' : ''}`}
@@ -842,25 +864,27 @@ export default function TokenDetail({ id, onBack }: { id: string; onBack?: () =>
                           aria-hidden="true"
                         />
                       </button>
-                    </td>
-                    <td>{l.error_message ?? '—'}</td>
-                  </tr>
+                    </TableCell>
+                    <TableCell>{l.error_message ?? '—'}</TableCell>
+                  </TableRow>
                   {expandedLogs.has(l.id) && (
-                    <tr className="log-details-row">
-                      <td colSpan={5} id={`token-log-details-${l.id}`}>
+                    <TableRow className="log-details-row">
+                      <TableCell colSpan={5} id={`token-log-details-${l.id}`}>
                         <TokenLogDetails log={l} period={period} />
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   )}
                 </Fragment>
               ))}
               {logs.length === 0 && (
-                <tr><td colSpan={5} style={{ padding: 12 }}>
+                <TableRow>
+                  <TableCell colSpan={5} style={{ padding: 12 }}>
                   <div className="empty-state alert" style={{ padding: 12 }}>{loading ? 'Loading…' : 'No logs yet.'}</div>
-                </td></tr>
+                  </TableCell>
+                </TableRow>
               )}
-            </tbody>
-          </table>
+            </TableBody>
+          </Table>
         </div>
         <div className="token-detail-mobile-list token-detail-md-down">
           {logs.length === 0 ? (
@@ -900,88 +924,81 @@ export default function TokenDetail({ id, onBack }: { id: string; onBack?: () =>
         </div>
         <div className="table-pagination">
           <span>Per page</span>
-          <select className="select select-bordered" value={perPage} onChange={(e) => { setPerPage(Number(e.target.value)); void goToPage(1) }}>
-            {[10, 20, 50, 100].map((v) => <option key={v} value={v}>{v}</option>)}
-          </select>
-          <button
+          <Select value={String(perPage)} onValueChange={(value) => { setPerPage(Number(value)); void goToPage(1) }}>
+            <SelectTrigger className="min-w-[96px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="start">
+              {[10, 20, 50, 100].map((v) => <SelectItem key={v} value={String(v)}>{v}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Button
             type="button"
-            className="btn btn-outline"
+            variant="outline"
             onClick={() => void goToPage(page - 1)}
             disabled={page <= 1 || loadingMore}
           >
             Previous
-          </button>
+          </Button>
           <span>Page {page} / {totalPages}</span>
-          <button
+          <Button
             type="button"
-            className="btn btn-outline"
+            variant="outline"
             onClick={() => void goToPage(page + 1)}
             disabled={page >= totalPages || loadingMore}
           >
             Next
-          </button>
+          </Button>
         </div>
       </section>
     
-    <dialog id="confirm_rotate_token_modal" ref={rotateDialogRef} className="modal">
-      <div className="modal-box">
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>Regenerate Token Secret</h3>
-        <p className="py-2">
-          This will invalidate the current token secret and generate a new one. The 4-char token ID will remain the same.
-          Clients must be updated to use the new token.
-        </p>
-        <div className="modal-action">
-          <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn" onClick={() => rotateDialogRef.current?.close()}>Cancel</button>
-            <button
-              type="button"
-              className={`btn ${rotating ? 'btn-disabled' : ''}`}
-              onClick={async () => {
-                try {
-                  setRotating(true)
-                  const res = await rotateTokenSecret(id)
-                  setRotatedToken(res.token)
-                  try { await navigator.clipboard?.writeText(res.token) } catch {}
-                  rotateDialogRef.current?.close()
-                  window.requestAnimationFrame(() => rotatedDialogRef.current?.showModal())
-                } catch (e) {
-                  // Fallback: close dialog and surface error inline
-                  rotateDialogRef.current?.close()
-                  alert((e as Error)?.message || 'Failed to regenerate token secret')
-                } finally {
-                  setRotating(false)
-                }
-              }}
-              disabled={rotating}
-            >
-              {rotating ? 'Regenerating…' : 'Regenerate'}
-            </button>
-          </form>
-        </div>
-      </div>
-    </dialog>
+    <Dialog open={isRotateDialogOpen} onOpenChange={setIsRotateDialogOpen}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Regenerate Token Secret</DialogTitle>
+          <DialogDescription>
+            This will invalidate the current token secret and generate a new one. The 4-char token ID will remain the
+            same. Clients must be updated to use the new token.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="gap-2 sm:justify-end sm:space-x-0">
+          <Button type="button" variant="outline" onClick={() => setIsRotateDialogOpen(false)}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={() => void handleRotateSecret()} disabled={rotating}>
+            {rotating ? 'Regenerating…' : 'Regenerate'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
-    <dialog id="rotated_token_modal" ref={rotatedDialogRef} className="modal">
-      <div className="modal-box">
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>New Token Generated</h3>
-        <div className="py-2">
-          <p className="panel-description" style={{ marginBottom: 8 }}>Full token (copied to clipboard):</p>
-          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{rotatedToken ?? '—'}</pre>
-        </div>
-        <div className="modal-action">
-          <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn" onClick={() => rotatedDialogRef.current?.close()}>Close</button>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={async () => { if (rotatedToken) { try { await navigator.clipboard?.writeText(rotatedToken) } catch {} } }}
-            >
-              Copy
-            </button>
-          </form>
-        </div>
-      </div>
-    </dialog>
+    <Dialog open={isRotatedDialogOpen} onOpenChange={setIsRotatedDialogOpen}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>New Token Generated</DialogTitle>
+          <DialogDescription>Full token (copied to clipboard):</DialogDescription>
+        </DialogHeader>
+        <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{rotatedToken ?? '—'}</pre>
+        <DialogFooter className="gap-2 sm:justify-end sm:space-x-0">
+          <Button type="button" variant="outline" onClick={() => setIsRotatedDialogOpen(false)}>
+            Close
+          </Button>
+          <Button
+            type="button"
+            onClick={async () => {
+              if (!rotatedToken) return
+              try {
+                await navigator.clipboard?.writeText(rotatedToken)
+              } catch {
+                // Ignore clipboard failure and keep the dialog open.
+              }
+            }}
+          >
+            Copy
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
     </div>
   )
 }

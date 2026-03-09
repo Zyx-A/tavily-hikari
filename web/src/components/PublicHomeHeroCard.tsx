@@ -4,6 +4,7 @@ import { Icon } from '@iconify/react'
 import type { PublicMetrics } from '../api'
 import type { Translations } from '../i18n'
 import RollingNumber from './RollingNumber'
+import { Button } from './ui/button'
 
 export interface PublicHomeHeroCardProps {
   publicStrings: Translations['public']
@@ -76,33 +77,36 @@ function PublicHomeHeroCard({
           {showLinuxDoLogin && (
             onLinuxDoLogin
               ? (
-                  <button
+                  <Button
                     type="button"
+                    variant="secondary"
                     className="linuxdo-login-button"
                     aria-label={publicStrings.linuxDoLogin.button}
                     onClick={onLinuxDoLogin}
                   >
                     <img src="/linuxdo-logo.svg" alt={publicStrings.linuxDoLogin.logoAlt} width={20} height={20} />
                     <span>{publicStrings.linuxDoLogin.button}</span>
-                  </button>
+                  </Button>
                 )
               : (
-                  <a href={linuxDoHref} className="linuxdo-login-button" aria-label={publicStrings.linuxDoLogin.button}>
-                    <img src="/linuxdo-logo.svg" alt={publicStrings.linuxDoLogin.logoAlt} width={20} height={20} />
-                    <span>{publicStrings.linuxDoLogin.button}</span>
-                  </a>
+                  <Button asChild variant="secondary" className="linuxdo-login-button">
+                    <a href={linuxDoHref} aria-label={publicStrings.linuxDoLogin.button}>
+                      <img src="/linuxdo-logo.svg" alt={publicStrings.linuxDoLogin.logoAlt} width={20} height={20} />
+                      <span>{publicStrings.linuxDoLogin.button}</span>
+                    </a>
+                  </Button>
                 )
           )}
           {showTokenAccessButton && (
-            <button type="button" className="token-access-button" onClick={onTokenAccessClick}>
+            <Button type="button" className="token-access-button" onClick={onTokenAccessClick}>
               <Icon icon="mdi:key-outline" aria-hidden="true" className="token-access-icon" />
               <span>{publicStrings.tokenAccess.button}</span>
-            </button>
+            </Button>
           )}
           {showAdminAction && (
-            <button type="button" className="btn btn-primary public-home-admin-button" onClick={onAdminActionClick}>
+            <Button type="button" className="public-home-admin-button" onClick={onAdminActionClick}>
               {adminActionLabel}
-            </button>
+            </Button>
           )}
         </div>
       )}

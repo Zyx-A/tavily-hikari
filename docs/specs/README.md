@@ -9,6 +9,7 @@
 
 |    ID | Title                                                  | Status           | Spec                                                  | Last       | Notes                                                                                                       |
 | ----: | ------------------------------------------------------ | ---------------- | ----------------------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------- |
+| vv7uf | Web 前端 shadcn/ui 剩余主通路收敛与 Storybook 补档     | 待实现           | `vv7uf-web-shadcn-mainline-convergence/SPEC.md`       | 2026-03-09 | 仅收敛当前仍存在的 shadcn 主通路缺口，并补齐 Storybook autodocs/docs entries                                |
 | bcpru | Web 响应式双设备与 Storybook 断点验收收敛              | 已完成（6/6）    | `bcpru-web-responsive-breakpoint-convergence/SPEC.md` | 2026-03-04 | fast-track: responsive convergence, Storybook coverage, and boundary validation completed                   |
 | vr67d | LinuxDo 登录复用既有 Token + 强制重登录 + 历史误建自愈 | 已完成（快车道） | `vr67d-linuxdo-token-rebind-relogin/SPEC.md`          | 2026-03-05 | hotfix: `/auth/linuxdo` use 303 to avoid POST body leak + fix upstream 405                                  |
 | 6xeyh | 多 Token 绑定保留已分配 token（不做历史回补）          | 进行中（快车道） | `6xeyh-multi-token-binding-preserve/SPEC.md`          | 2026-03-06 | PR #95；共享测试机 E2E 回归通过；review-loop 已完成并按契约保留“最新绑定优先”语义                           |
