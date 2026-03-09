@@ -4774,6 +4774,18 @@ tbody .log-details-row:hover {
   background: rgba(37, 99, 235, 0.08);
 }
 
+.user-console-probe-hint-bubble,
+.user-console-probe-bubble {
+  --user-console-probe-surface: hsl(var(--popover) / 0.98);
+  --user-console-probe-border: hsl(var(--border) / 0.94);
+  --user-console-probe-shadow: 0 14px 30px rgba(15, 23, 42, 0.2);
+}
+
+.dark .user-console-probe-hint-bubble,
+.dark .user-console-probe-bubble {
+  --user-console-probe-shadow: 0 18px 38px rgba(2, 6, 23, 0.5);
+}
+
 .user-console-probe-hint-bubble {
   position: absolute;
   left: 50%;
@@ -4781,11 +4793,11 @@ tbody .log-details-row:hover {
   transform: translateX(-50%) translateY(2px);
   min-width: 210px;
   max-width: min(320px, calc(100vw - 48px));
-  border: 1px solid rgba(37, 99, 235, 0.22);
+  border: 1px solid var(--user-console-probe-border);
   border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.14);
-  color: hsl(var(--foreground) / 0.82);
+  background: var(--user-console-probe-surface);
+  box-shadow: var(--user-console-probe-shadow);
+  color: hsl(var(--popover-foreground) / 0.82);
   font-size: 0.78rem;
   font-weight: 500;
   line-height: 1.36;
@@ -4803,9 +4815,9 @@ tbody .log-details-row:hover {
   bottom: -6px;
   width: 10px;
   height: 10px;
-  border-right: 1px solid rgba(37, 99, 235, 0.22);
-  border-bottom: 1px solid rgba(37, 99, 235, 0.22);
-  background: #ffffff;
+  border-right: 1px solid var(--user-console-probe-border);
+  border-bottom: 1px solid var(--user-console-probe-border);
+  background: var(--user-console-probe-surface);
   transform: translateX(-50%) rotate(45deg);
 }
 
@@ -4887,10 +4899,10 @@ tbody .log-details-row:hover {
   z-index: 8;
   min-width: 220px;
   max-width: min(360px, calc(100vw - 28px));
-  border: 1px solid rgba(37, 99, 235, 0.22);
+  border: 1px solid var(--user-console-probe-border);
   border-radius: 14px;
-  background: #ffffff;
-  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.14);
+  background: var(--user-console-probe-surface);
+  box-shadow: var(--user-console-probe-shadow);
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
@@ -4913,10 +4925,10 @@ tbody .log-details-row:hover {
   bottom: -7px;
   width: 12px;
   height: 12px;
-  background: #ffffff;
-  border-right: 1px solid rgba(148, 163, 184, 0.64);
-  border-bottom: 1px solid rgba(148, 163, 184, 0.64);
-  box-shadow: 3px 3px 8px rgba(15, 23, 42, 0.08);
+  background: var(--user-console-probe-surface);
+  border-right: 1px solid var(--user-console-probe-border);
+  border-bottom: 1px solid var(--user-console-probe-border);
+  box-shadow: 3px 3px 8px rgba(15, 23, 42, 0.14);
   transform: rotate(45deg);
 }
 
@@ -4980,13 +4992,13 @@ tbody .log-details-row:hover {
 }
 
 .user-console-probe-bubble-item-label {
-  color: hsl(var(--foreground) / 0.9);
+  color: hsl(var(--popover-foreground) / 0.92);
   font-weight: 500;
   line-height: 1.32;
 }
 
 .user-console-probe-bubble-item-detail {
-  color: hsl(var(--foreground) / 0.68);
+  color: hsl(var(--popover-foreground) / 0.7);
   font-size: 0.76rem;
   line-height: 1.35;
 }
