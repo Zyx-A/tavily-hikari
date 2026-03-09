@@ -30,6 +30,16 @@ const meta = {
   parameters: {
     layout: 'padded',
   },
+  args: {
+    page: 2,
+    totalPages: 6,
+    perPage: 20,
+    onPerPageChange: () => undefined,
+    onPrevious: () => undefined,
+    onNext: () => undefined,
+    previousDisabled: false,
+    nextDisabled: false,
+  },
   render: () => <PaginationStory />,
 } satisfies Meta<typeof AdminTablePagination>
 

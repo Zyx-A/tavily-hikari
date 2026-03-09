@@ -9,6 +9,9 @@ const meta = {
   parameters: {
     layout: 'padded',
   },
+  args: {
+    children: null,
+  },
   render: () => (
     <div style={{ maxWidth: 920, margin: '0 auto' }}>
       <AdminTableShell tableClassName="admin-users-table">

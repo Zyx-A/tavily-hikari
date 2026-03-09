@@ -3,6 +3,7 @@ import { Icon } from '@iconify/react'
 import { Chart as ChartJS, BarElement, CategoryScale, Legend, LinearScale, Tooltip, type ChartOptions } from 'chart.js'
 import { Bar } from 'react-chartjs-2'
 import { fetchTokenUsageSeries, rotateTokenSecret, type TokenOwnerSummary, type TokenUsageBucket } from '../api'
+import AdminReturnToConsoleLink from '../components/AdminReturnToConsoleLink'
 import AdminTablePagination from '../components/AdminTablePagination'
 import AdminTableShell from '../components/AdminTableShell'
 import ThemeToggle from '../components/ThemeToggle'
@@ -19,6 +20,7 @@ import { Input } from '../components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import { useTranslate } from '../i18n'
+import { ADMIN_USER_CONSOLE_HREF } from '../lib/adminUserConsoleEntry'
 import { useResponsiveModes } from '../lib/responsive'
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend)
@@ -724,8 +726,13 @@ export default function TokenDetail({
           <h1>Access Token Detail</h1>
           <div className="subtitle">Token <code>{id}</code></div>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="controls token-detail-controls">
           <ThemeToggle />
+          <AdminReturnToConsoleLink
+            label={translations.admin.header.returnToConsole}
+            href={ADMIN_USER_CONSOLE_HREF}
+            className="admin-return-link--detail"
+          />
           <span className={`sse-chip ${sseConnected ? 'sse-chip-ok' : 'sse-chip-warn'}`} title="Live updates via SSE">
             <span className="sse-dot" aria-hidden="true" /> {sseConnected ? 'Live' : 'Offline'}
           </span>

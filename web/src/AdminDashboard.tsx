@@ -7,6 +7,7 @@ import QuotaRangeField from './components/QuotaRangeField'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import ThemeToggle from './components/ThemeToggle'
+import AdminReturnToConsoleLink from './components/AdminReturnToConsoleLink'
 import AdminPanelHeader from './components/AdminPanelHeader'
 import { Button } from './components/ui/button'
 import {
@@ -52,6 +53,7 @@ import {
 } from './admin/routes'
 import { useTranslate, type AdminTranslations } from './i18n'
 import { extractTvlyDevApiKeysFromText } from './lib/api-key-extract'
+import { ADMIN_USER_CONSOLE_HREF } from './lib/adminUserConsoleEntry'
 import {
   fetchApiKeys,
   fetchApiKeySecret,
@@ -459,6 +461,7 @@ function AdminDashboard(): JSX.Element {
   const translations = useTranslate()
   const adminStrings = translations.admin
   const headerStrings = adminStrings.header
+  const userConsoleHref = ADMIN_USER_CONSOLE_HREF
   const tokenStrings = adminStrings.tokens
   const tokenLeaderboardStrings = adminStrings.tokenLeaderboard
   const quotaLabels = tokenStrings.quotaStates ?? {
@@ -2387,9 +2390,16 @@ function AdminDashboard(): JSX.Element {
                 {usersStrings.detail.subtitle.replace('{id}', route.id)}
               </p>
             </div>
-<Button type="button" variant="outline" onClick={() => navigateModule('users')}>
-  {usersStrings.detail.back}
-</Button>
+            <div className="admin-inline-actions">
+              <AdminReturnToConsoleLink
+                label={headerStrings.returnToConsole}
+                href={userConsoleHref}
+                className="admin-return-link--detail"
+              />
+              <Button type="button" variant="outline" onClick={() => navigateModule('users')}>
+                {usersStrings.detail.back}
+              </Button>
+            </div>
           </div>
         </section>
 
@@ -2695,6 +2705,8 @@ function AdminDashboard(): JSX.Element {
           backLabel={tokenLeaderboardStrings.back}
           refreshLabel={headerStrings.refreshNow}
           refreshingLabel={headerStrings.refreshing}
+          userConsoleLabel={headerStrings.returnToConsole}
+          userConsoleHref={userConsoleHref}
           isRefreshing={tokenLeaderboardLoading}
           period={tokenLeaderboardPeriod}
           focus={tokenLeaderboardFocus}
@@ -3010,6 +3022,8 @@ function AdminDashboard(): JSX.Element {
         isRefreshing={loading}
         refreshLabel={headerStrings.refreshNow}
         refreshingLabel={headerStrings.refreshing}
+        userConsoleLabel={headerStrings.returnToConsole}
+        userConsoleHref={userConsoleHref}
         onRefresh={handleManualRefresh}
       />
 
@@ -4944,29 +4958,34 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
         </div>
         <div className="controls">
           <ThemeToggle />
-<Button
-  type="button"
-  variant={syncState === 'success' ? 'success' : 'default'}
-  onClick={() => void syncUsage()}
-  disabled={syncState === 'syncing'}
-  aria-busy={syncState === 'syncing'}
->
-  <Icon
-    icon={syncState === 'syncing' ? 'mdi:loading' : syncState === 'success' ? 'mdi:check-bold' : 'mdi:refresh'}
-    width={18}
-    height={18}
-    className={syncState === 'syncing' ? 'icon-spin' : undefined}
-  />
-  {syncState === 'syncing'
-    ? keyDetailsStrings.syncing
-    : syncState === 'success'
-      ? keyDetailsStrings.syncSuccess
-      : keyDetailsStrings.syncAction}
-</Button>
-<Button type="button" variant="ghost" onClick={onBack}>
-  <Icon icon="mdi:arrow-left" width={18} height={18} />
-  {keyDetailsStrings.back}
-</Button>
+          <AdminReturnToConsoleLink
+            label={adminStrings.header.returnToConsole}
+            href={ADMIN_USER_CONSOLE_HREF}
+            className="admin-return-link--detail"
+          />
+          <Button
+            type="button"
+            variant={syncState === 'success' ? 'success' : 'default'}
+            onClick={() => void syncUsage()}
+            disabled={syncState === 'syncing'}
+            aria-busy={syncState === 'syncing'}
+          >
+            <Icon
+              icon={syncState === 'syncing' ? 'mdi:loading' : syncState === 'success' ? 'mdi:check-bold' : 'mdi:refresh'}
+              width={18}
+              height={18}
+              className={syncState === 'syncing' ? 'icon-spin' : undefined}
+            />
+            {syncState === 'syncing'
+              ? keyDetailsStrings.syncing
+              : syncState === 'success'
+                ? keyDetailsStrings.syncSuccess
+                : keyDetailsStrings.syncAction}
+          </Button>
+          <Button type="button" variant="ghost" onClick={onBack}>
+            <Icon icon="mdi:arrow-left" width={18} height={18} />
+            {keyDetailsStrings.back}
+          </Button>
         </div>
       </section>
 

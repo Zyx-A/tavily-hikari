@@ -37,6 +37,20 @@ const meta = {
   parameters: {
     layout: 'padded',
   },
+  args: {
+    label: 'Hourly quota',
+    sliderName: 'hourly-quota-stage',
+    sliderMin: 0,
+    sliderMax: 6,
+    sliderValue: 3,
+    sliderAriaLabel: 'Hourly quota stage',
+    helperText: 'Stage 3 maps to a quota bucket around 1000 requests.',
+    onSliderChange: () => undefined,
+    inputName: 'hourly-quota-input',
+    inputValue: '1000',
+    inputAriaLabel: 'Hourly quota input',
+    onInputChange: () => undefined,
+  },
   render: () => <QuotaRangeFieldStory />,
 } satisfies Meta<typeof QuotaRangeField>
 
