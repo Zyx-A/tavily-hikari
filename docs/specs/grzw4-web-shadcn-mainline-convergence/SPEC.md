@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 进行中（本地验证完成）
+- Status: 进行中（PR #110 checks green）
 - Created: 2026-03-09
 - Last: 2026-03-09
 
@@ -91,9 +91,10 @@
 - [x] M2: P0 页面（`PublicHome` / `TokenDetail` / `ApiKeysValidationDialog`）迁移
 - [x] M3: P1 页面（`AdminShell` / `AdminDashboard`）迁移
 - [x] M4: build / storybook / browser 验证
-- [ ] M5: PR / checks / review-loop / spec-sync 收敛
+- [x] M5: PR / checks / review-loop / spec-sync 收敛
 
 ## 变更记录
 
 - 2026-03-09: 创建规格，冻结 shadcn 主通路收敛范围、约束与验收口径。
 - 2026-03-09: 完成 shared wrappers、P0/P1 页面迁移，并通过 `bun run build`、`bun run build-storybook` 与浏览器 smoke。
+- 2026-03-09: PR #110 已创建；review-loop 无 findings；GitHub checks 全绿；spec drift check 通过。
