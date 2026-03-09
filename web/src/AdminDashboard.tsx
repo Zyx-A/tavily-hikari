@@ -1,12 +1,28 @@
 import { Icon } from '@iconify/react'
 import { StatusBadge, type StatusTone } from './components/StatusBadge'
+import AdminTablePagination from './components/AdminTablePagination'
+import AdminTableShell from './components/AdminTableShell'
 import { ApiKeysValidationDialog } from './components/ApiKeysValidationDialog'
+import QuotaRangeField from './components/QuotaRangeField'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import ThemeToggle from './components/ThemeToggle'
 import AdminReturnToConsoleLink from './components/AdminReturnToConsoleLink'
 import AdminPanelHeader from './components/AdminPanelHeader'
+import { Button } from './components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from './components/ui/dialog'
+import { Input } from './components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './components/ui/select'
 import SegmentedTabs from './components/ui/SegmentedTabs'
+import { Table } from './components/ui/table'
+import { Textarea } from './components/ui/textarea'
 import TokenUsageHeader from './components/TokenUsageHeader'
 import TokenDetail from './pages/TokenDetail'
 import AdminShell, { type AdminNavItem } from './admin/AdminShell'
@@ -542,7 +558,6 @@ function AdminDashboard(): JSX.Element {
   const keysBatchTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const keysBatchFooterRef = useRef<HTMLDivElement | null>(null)
   const keysBatchOverlayRef = useRef<HTMLDivElement | null>(null)
-  const keysBatchReportDialogRef = useRef<HTMLDialogElement | null>(null)
   const [keysBatchReport, setKeysBatchReport] = useState<AddKeysBatchReportState | null>(null)
 
   type KeyValidationStatus =
@@ -579,7 +594,6 @@ function AdminDashboard(): JSX.Element {
     importError?: string
   }
 
-  const keysValidateDialogRef = useRef<HTMLDialogElement | null>(null)
   const keysValidateAbortRef = useRef<AbortController | null>(null)
   const keysValidateRunIdRef = useRef(0)
   const [keysValidation, setKeysValidation] = useState<KeysValidationState | null>(null)
@@ -587,20 +601,16 @@ function AdminDashboard(): JSX.Element {
   const [submitting, setSubmitting] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [togglingId, setTogglingId] = useState<string | null>(null)
-  const deleteDialogRef = useRef<HTMLDialogElement | null>(null)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
-  const disableDialogRef = useRef<HTMLDialogElement | null>(null)
   const [pendingDisableId, setPendingDisableId] = useState<string | null>(null)
-  const tokenDeleteDialogRef = useRef<HTMLDialogElement | null>(null)
   const [pendingTokenDeleteId, setPendingTokenDeleteId] = useState<string | null>(null)
-  const tokenNoteDialogRef = useRef<HTMLDialogElement | null>(null)
   const [editingTokenId, setEditingTokenId] = useState<string | null>(null)
   const [editingTokenNote, setEditingTokenNote] = useState('')
   const [savingTokenNote, setSavingTokenNote] = useState(false)
   const [sseConnected, setSseConnected] = useState(false)
   const [expandedJobs, setExpandedJobs] = useState<Set<number>>(() => new Set())
   // Batch dialog state
-  const batchDialogRef = useRef<HTMLDialogElement | null>(null)
+  const [batchDialogOpen, setBatchDialogOpen] = useState(false)
   const [batchGroup, setBatchGroup] = useState('')
   const [batchCount, setBatchCount] = useState(10)
   const [batchCreating, setBatchCreating] = useState(false)
@@ -1669,9 +1679,6 @@ function AdminDashboard(): JSX.Element {
   const closeKeysValidationDialog = useCallback(() => {
     keysValidateAbortRef.current?.abort()
     keysValidateAbortRef.current = null
-    const dialog = keysValidateDialogRef.current
-    // onClose fires after the dialog is closed (ESC/backdrop); avoid InvalidStateError.
-    if (dialog?.open) dialog.close()
     setKeysValidation(null)
   }, [])
 
@@ -1815,13 +1822,7 @@ function AdminDashboard(): JSX.Element {
       imported_api_keys: [],
     })
 
-    window.requestAnimationFrame(() => {
-      const dialog = keysValidateDialogRef.current
-      if (!dialog) return
-      if (!dialog.open) dialog.showModal()
-    })
-
-    // Collapse the in-place overlay once we hand off to the modal.
+    // Collapse the in-place overlay once we hand off to the dialog.
     setNewKeysText('')
     setNewKeysGroup('')
     beginKeysBatchClose()
@@ -2127,7 +2128,7 @@ function AdminDashboard(): JSX.Element {
     setBatchGroup('')
     setBatchCount(10)
     setBatchShareText(null)
-    window.requestAnimationFrame(() => batchDialogRef.current?.showModal())
+    setBatchDialogOpen(true)
   }
   const submitBatchCreate = async () => {
     const group = batchGroup.trim()
@@ -2151,11 +2152,10 @@ function AdminDashboard(): JSX.Element {
     }
   }
   const closeBatchDialog = () => {
-    batchDialogRef.current?.close()
+    setBatchDialogOpen(false)
   }
 
   const closeKeysBatchReportDialog = () => {
-    keysBatchReportDialogRef.current?.close()
     setKeysBatchReport(null)
   }
 
@@ -2207,7 +2207,6 @@ function AdminDashboard(): JSX.Element {
   const openTokenDeleteConfirm = (id: string) => {
     if (!id) return
     setPendingTokenDeleteId(id)
-    window.requestAnimationFrame(() => tokenDeleteDialogRef.current?.showModal())
   }
 
   const confirmTokenDelete = async () => {
@@ -2216,7 +2215,6 @@ function AdminDashboard(): JSX.Element {
     setDeletingId(id)
     try {
       await deleteToken(id)
-      tokenDeleteDialogRef.current?.close()
       setPendingTokenDeleteId(null)
       const controller = new AbortController()
       setLoading(true)
@@ -2231,14 +2229,12 @@ function AdminDashboard(): JSX.Element {
   }
 
   const cancelTokenDelete = () => {
-    tokenDeleteDialogRef.current?.close()
     setPendingTokenDeleteId(null)
   }
 
   const openTokenNoteEdit = (id: string, current: string | null) => {
     setEditingTokenId(id)
     setEditingTokenNote(current ?? '')
-    window.requestAnimationFrame(() => tokenNoteDialogRef.current?.showModal())
   }
 
   const saveTokenNote = async () => {
@@ -2246,7 +2242,6 @@ function AdminDashboard(): JSX.Element {
     setSavingTokenNote(true)
     try {
       await updateTokenNote(editingTokenId, editingTokenNote)
-      tokenNoteDialogRef.current?.close()
       setEditingTokenId(null)
       setEditingTokenNote('')
       const controller = new AbortController()
@@ -2262,7 +2257,6 @@ function AdminDashboard(): JSX.Element {
   }
 
   const cancelTokenNote = () => {
-    tokenNoteDialogRef.current?.close()
     setEditingTokenId(null)
     setEditingTokenNote('')
   }
@@ -2270,7 +2264,6 @@ function AdminDashboard(): JSX.Element {
   const openDeleteConfirm = (id: string) => {
     if (!id) return
     setPendingDeleteId(id)
-    window.requestAnimationFrame(() => deleteDialogRef.current?.showModal())
   }
 
   const confirmDelete = async () => {
@@ -2279,7 +2272,6 @@ function AdminDashboard(): JSX.Element {
     setDeletingId(id)
     try {
       await deleteApiKey(id)
-      deleteDialogRef.current?.close()
       setPendingDeleteId(null)
       const controller = new AbortController()
       setLoading(true)
@@ -2294,7 +2286,6 @@ function AdminDashboard(): JSX.Element {
   }
 
   const cancelDelete = () => {
-    deleteDialogRef.current?.close()
     setPendingDeleteId(null)
   }
 
@@ -2319,19 +2310,16 @@ function AdminDashboard(): JSX.Element {
   const openDisableConfirm = (id: string) => {
     if (!id) return
     setPendingDisableId(id)
-    window.requestAnimationFrame(() => disableDialogRef.current?.showModal())
   }
 
   const confirmDisable = async () => {
     if (!pendingDisableId) return
     const id = pendingDisableId
     await handleToggleDisable(id, true)
-    disableDialogRef.current?.close()
     setPendingDisableId(null)
   }
 
   const cancelDisable = () => {
-    disableDialogRef.current?.close()
     setPendingDisableId(null)
   }
 
@@ -2408,13 +2396,9 @@ function AdminDashboard(): JSX.Element {
                 href={userConsoleHref}
                 className="admin-return-link--detail"
               />
-              <button
-                type="button"
-                className="btn btn-outline"
-                onClick={() => navigateModule('users')}
-              >
+              <Button type="button" variant="outline" onClick={() => navigateModule('users')}>
                 {usersStrings.detail.back}
-              </button>
+              </Button>
             </div>
           </div>
         </section>
@@ -2509,44 +2493,29 @@ function AdminDashboard(): JSX.Element {
                   const parsedDraft = parseQuotaDraftValue(draftValue, sliderSeed.initialLimit)
                   const sliderPosition = getQuotaSliderStagePosition(sliderSeed.stages, parsedDraft)
                   return (
-                    <label className="form-control quota-control" key={item.field}>
-                      <span className="label-text">{item.label}</span>
-                      <div className="quota-control-row">
-                        <div className="quota-slider-wrap">
-                          <input
-                            type="range"
-                            name={`${item.field}-slider`}
-                            min={0}
-                            max={Math.max(0, sliderSeed.stages.length - 1)}
-                            step="any"
-                            className="range quota-slider"
-                            value={sliderPosition}
-                            onChange={(event) => {
-                              const nextIndex = clampQuotaSliderStageIndex(
-                                sliderSeed.stages,
-                                Number.parseFloat(event.target.value),
-                              )
-                              updateQuotaDraftField(item.field, String(getQuotaSliderStageValue(sliderSeed.stages, nextIndex)))
-                            }}
-                            style={{ background: buildQuotaSliderTrack(sliderSeed.stages, sliderSeed.used, parsedDraft) }}
-                            aria-label={item.label}
-                          />
-                          <span className="panel-description">
-                            {formatNumber(sliderSeed.used)} / {formatNumber(parsedDraft)}
-                          </span>
-                        </div>
-                        <input
-                          type="text"
-                          name={item.field}
-                          inputMode="numeric"
-                          autoComplete="off"
-                          className="input input-bordered quota-input"
-                          value={formatQuotaDraftInput(draftValue)}
-                          onChange={(event) => updateQuotaDraftField(item.field, event.target.value)}
-                          aria-label={`${item.label} input`}
-                        />
-                      </div>
-                    </label>
+                    <QuotaRangeField
+                      key={item.field}
+                      label={item.label}
+                      sliderName={`${item.field}-slider`}
+                      sliderMin={0}
+                      sliderMax={Math.max(0, sliderSeed.stages.length - 1)}
+                      sliderValue={sliderPosition}
+                      sliderAriaLabel={item.label}
+                      sliderStyle={{ background: buildQuotaSliderTrack(sliderSeed.stages, sliderSeed.used, parsedDraft) }}
+                      onSliderChange={(nextValue) => {
+                        const nextIndex = clampQuotaSliderStageIndex(sliderSeed.stages, nextValue)
+                        updateQuotaDraftField(item.field, String(getQuotaSliderStageValue(sliderSeed.stages, nextIndex)))
+                      }}
+                      helperText={
+                        <>
+                          {formatNumber(sliderSeed.used)} / {formatNumber(parsedDraft)}
+                        </>
+                      }
+                      inputName={item.field}
+                      inputValue={formatQuotaDraftInput(draftValue)}
+                      inputAriaLabel={`${item.label} input`}
+                      onInputChange={(nextValue) => updateQuotaDraftField(item.field, nextValue)}
+                    />
                   )
                 })}
               </div>
@@ -2568,14 +2537,9 @@ function AdminDashboard(): JSX.Element {
                       )
                     : usersStrings.quota.hint}
                 </span>
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={() => void saveUserQuota()}
-                  disabled={savingUserQuota}
-                >
+                <Button type="button" onClick={() => void saveUserQuota()} disabled={savingUserQuota}>
                   {savingUserQuota ? usersStrings.quota.saving : usersStrings.quota.save}
-                </button>
+                </Button>
               </div>
             </section>
 
@@ -2590,7 +2554,7 @@ function AdminDashboard(): JSX.Element {
                 {tokenItems.length === 0 ? (
                   <div className="empty-state alert">{usersStrings.empty.noTokens}</div>
                 ) : (
-                  <table className="jobs-table admin-users-table admin-user-tokens-table">
+                  <Table className="jobs-table admin-users-table admin-user-tokens-table">
                     <thead>
                       <tr>
                         <th>{`${usersStrings.tokens.table.id} · ${usersStrings.tokens.table.note}`}</th>
@@ -2670,21 +2634,23 @@ function AdminDashboard(): JSX.Element {
                               </div>
                             </td>
                             <td>
-                              <button
-                                type="button"
-                                className="btn btn-circle btn-ghost btn-sm"
-                                title={usersStrings.tokens.actions.view}
-                                aria-label={usersStrings.tokens.actions.view}
-                                onClick={() => navigateToken(token.tokenId)}
-                              >
-                                <Icon icon="mdi:eye-outline" width={16} height={16} />
-                              </button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="h-8 w-8 rounded-full p-0 shadow-none"
+  title={usersStrings.tokens.actions.view}
+  aria-label={usersStrings.tokens.actions.view}
+  onClick={() => navigateToken(token.tokenId)}
+>
+  <Icon icon="mdi:eye-outline" width={16} height={16} />
+</Button>
                             </td>
                           </tr>
                         )
                       })}
                     </tbody>
-                  </table>
+                  </Table>
                 )}
               </div>
             </section>
@@ -2766,7 +2732,7 @@ function AdminDashboard(): JSX.Element {
               {tokenLeaderboardLoading ? tokenLeaderboardStrings.empty.loading : tokenLeaderboardStrings.empty.none}
             </div>
           ) : (
-            <table className="jobs-table token-leaderboard-table">
+            <Table className="jobs-table token-leaderboard-table">
               <thead>
                 <tr>
                   <th>{tokenLeaderboardStrings.table.token}</th>
@@ -2830,7 +2796,7 @@ function AdminDashboard(): JSX.Element {
                     </tr>
                   ))}
                 </tbody>
-              </table>
+              </Table>
             )}
           </div>
           <div className="admin-mobile-list admin-responsive-down">
@@ -2880,9 +2846,9 @@ function AdminDashboard(): JSX.Element {
                     <strong>{`${formatDateOnly(item.last_used_at)} ${formatClockTime(item.last_used_at)}`}</strong>
                   </div>
                   <div className="admin-mobile-actions">
-                    <button type="button" className="btn btn-outline btn-sm" onClick={() => navigateToken(item.id)}>
-                      {keyStrings.actions.details}
-                    </button>
+<Button type="button" variant="outline" size="sm" onClick={() => navigateToken(item.id)}>
+  {keyStrings.actions.details}
+</Button>
                   </div>
                 </article>
               ))
@@ -2986,9 +2952,9 @@ function AdminDashboard(): JSX.Element {
             }}
           >
             <div className="card-body" style={{ padding: 16 }}>
-              <textarea
+              <Textarea
                 ref={keysBatchTextareaRef}
-                className="textarea textarea-bordered textarea-sm w-full"
+                className="min-h-[112px] w-full text-sm"
                 rows={4}
                 placeholder={keyStrings.batch.placeholder}
                 aria-label={keyStrings.batch.placeholder}
@@ -3017,24 +2983,23 @@ function AdminDashboard(): JSX.Element {
 	                  <div>{keyStrings.batch.count.replace('{count}', formatNumber(keysBatchParsed.length))}</div>
 	                </div>
 	                <div className="flex gap-2 items-center justify-end flex-wrap sm:flex-nowrap sm:flex-shrink-0">
-	                  <input
-	                    type="text"
-	                    className="input input-bordered"
-	                    placeholder={keyStrings.batch.groupPlaceholder}
-	                    aria-label={keyStrings.batch.groupPlaceholder}
-	                    value={newKeysGroup}
-	                    onChange={(e) => setNewKeysGroup(e.target.value)}
-	                    list="api-key-group-datalist"
-	                    style={{ flex: '1 1 220px', minWidth: 160, maxWidth: '100%' }}
-	                  />
-	                  <button
-	                    type="button"
-	                    className="btn btn-primary"
-	                    onClick={() => void handleAddKey()}
-	                    disabled={submitting || keysBatchParsed.length === 0}
-	                  >
-	                    {submitting ? keyStrings.adding : keyStrings.addButton}
-	                  </button>
+<Input
+  type="text"
+  name="new-keys-group"
+  placeholder={keyStrings.batch.groupPlaceholder}
+  aria-label={keyStrings.batch.groupPlaceholder}
+  value={newKeysGroup}
+  onChange={(e) => setNewKeysGroup(e.target.value)}
+  list="api-key-group-datalist"
+  style={{ flex: '1 1 220px', minWidth: 160, maxWidth: '100%' }}
+/>
+<Button
+  type="button"
+  onClick={() => void handleAddKey()}
+  disabled={submitting || keysBatchParsed.length === 0}
+>
+  {submitting ? keyStrings.adding : keyStrings.addButton}
+</Button>
 	                </div>
 	              </div>
 	            </div>
@@ -3086,14 +3051,16 @@ function AdminDashboard(): JSX.Element {
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               <h2 style={{ margin: 0 }}>{tokenStrings.title}</h2>
               <div className="tooltip" data-tip={tokenStrings.actions.viewLeaderboard}>
-                <button
-                  type="button"
-                  className="btn btn-circle btn-ghost btn-sm"
-                  aria-label={tokenStrings.actions.viewLeaderboard}
-                  onClick={navigateTokenLeaderboard}
-                >
-                  <Icon icon="mdi:chart-timeline-variant" width={20} height={20} />
-                </button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="h-8 w-8 rounded-full p-0 shadow-none"
+  aria-label={tokenStrings.actions.viewLeaderboard}
+  onClick={navigateTokenLeaderboard}
+>
+  <Icon icon="mdi:chart-timeline-variant" width={20} height={20} />
+</Button>
               </div>
             </div>
             <p className="panel-description">{tokenStrings.description}</p>
@@ -3112,31 +3079,30 @@ function AdminDashboard(): JSX.Element {
                 marginLeft: 'auto',
               }}
             >
-              <input
-                type="text"
-                className="input input-bordered"
-                placeholder={tokenStrings.notePlaceholder}
-                value={newTokenNote}
-                onChange={(e) => setNewTokenNote(e.target.value)}
-                style={{ minWidth: 0, flex: '1 1 240px' }}
-                aria-label={tokenStrings.notePlaceholder}
-              />
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => void handleAddToken()}
-                disabled={submitting}
-              >
-                {submitting ? tokenStrings.creating : tokenStrings.newToken}
-              </button>
-              <button
-                type="button"
-                className="btn btn-outline"
-                onClick={openBatchDialog}
-                disabled={submitting}
-              >
-                {tokenStrings.batchCreate}
-              </button>
+<Input
+  type="text"
+  name="new-token-note"
+  placeholder={tokenStrings.notePlaceholder}
+  value={newTokenNote}
+  onChange={(e) => setNewTokenNote(e.target.value)}
+  style={{ minWidth: 0, flex: '1 1 240px' }}
+  aria-label={tokenStrings.notePlaceholder}
+/>
+<Button
+  type="button"
+  onClick={() => void handleAddToken()}
+  disabled={submitting}
+>
+  {submitting ? tokenStrings.creating : tokenStrings.newToken}
+</Button>
+<Button
+  type="button"
+  variant="outline"
+  onClick={openBatchDialog}
+  disabled={submitting}
+>
+  {tokenStrings.batchCreate}
+</Button>
             </div>
           )}
         </div>
@@ -3208,7 +3174,7 @@ function AdminDashboard(): JSX.Element {
           {tokenList.length === 0 ? (
             <div className="empty-state alert">{loading ? tokenStrings.empty.loading : tokenStrings.empty.none}</div>
           ) : (
-            <table className="jobs-table tokens-table">
+            <Table className="jobs-table tokens-table">
               <thead>
                 <tr>
                   <th>{tokenStrings.table.id}</th>
@@ -3275,73 +3241,81 @@ function AdminDashboard(): JSX.Element {
                       {isAdmin && (
                         <td className="jobs-message-cell">
                           <div className="table-actions">
-                            <button
-                              type="button"
-                              className={`token-action-button btn btn-circle btn-ghost btn-sm${
-                                state === 'copied' ? ' btn-success' : ''
-                              }`}
-                              title={tokenStrings.actions.copy}
-                              aria-label={tokenStrings.actions.copy}
-                              onClick={() => void handleCopyToken(t.id, stateKey)}
-                              disabled={state === 'loading'}
-                            >
-                              <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={16} height={16} />
-                            </button>
-                            <button
-                              type="button"
-                              className={`token-action-button btn btn-circle btn-ghost btn-sm${
-                                shareState === 'copied' ? ' btn-success' : ''
-                              }`}
-                              title={tokenStrings.actions.share}
-                              aria-label={tokenStrings.actions.share}
-                              onClick={() => void handleShareToken(t.id, shareStateKey)}
-                              disabled={shareState === 'loading'}
-                            >
-                              <Icon icon={shareState === 'copied' ? 'mdi:check' : 'mdi:share-variant'} width={16} height={16} />
-                            </button>
-                            <button
-                              type="button"
-                              className="token-action-button btn btn-circle btn-ghost btn-sm"
-                              title={keyStrings.actions.details}
-                              aria-label={keyStrings.actions.details}
-                              onClick={() => navigateToken(t.id)}
-                            >
-                              <Icon icon="mdi:eye-outline" width={16} height={16} />
-                            </button>
-                            <button
-                              type="button"
-                              className="token-action-button btn btn-circle btn-ghost btn-sm"
-                              title={t.enabled ? tokenStrings.actions.disable : tokenStrings.actions.enable}
-                              aria-label={t.enabled ? tokenStrings.actions.disable : tokenStrings.actions.enable}
-                              onClick={() => void toggleToken(t.id, t.enabled)}
-                              disabled={togglingId === t.id}
-                            >
-                              <Icon icon={t.enabled ? 'mdi:pause-circle-outline' : 'mdi:play-circle-outline'} width={16} height={16} />
-                            </button>
-                            <button
-                              type="button"
-                              className="token-action-button btn btn-circle btn-ghost btn-sm"
-                              title={tokenStrings.actions.edit}
-                              aria-label={tokenStrings.actions.edit}
-                              onClick={() => openTokenNoteEdit(t.id, t.note)}
-                            >
-                              <Icon icon="mdi:pencil-outline" width={16} height={16} />
-                            </button>
-                            <button
-                              type="button"
-                              className="token-action-button btn btn-circle btn-ghost btn-sm"
-                              title={tokenStrings.actions.delete}
-                              aria-label={tokenStrings.actions.delete}
-                              onClick={() => openTokenDeleteConfirm(t.id)}
-                              disabled={deletingId === t.id}
-                            >
-                              <Icon
-                                icon={deletingId === t.id ? 'mdi:progress-helper' : 'mdi:trash-outline'}
-                                width={16}
-                                height={16}
-                                color="#ef4444"
-                              />
-                            </button>
+<Button
+  type="button"
+  variant={state === 'copied' ? 'success' : 'ghost'}
+  size="icon"
+  className="token-action-button shadow-none"
+  title={tokenStrings.actions.copy}
+  aria-label={tokenStrings.actions.copy}
+  onClick={() => void handleCopyToken(t.id, stateKey)}
+  disabled={state === 'loading'}
+>
+  <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={16} height={16} />
+</Button>
+<Button
+  type="button"
+  variant={shareState === 'copied' ? 'success' : 'ghost'}
+  size="icon"
+  className="token-action-button shadow-none"
+  title={tokenStrings.actions.share}
+  aria-label={tokenStrings.actions.share}
+  onClick={() => void handleShareToken(t.id, shareStateKey)}
+  disabled={shareState === 'loading'}
+>
+  <Icon icon={shareState === 'copied' ? 'mdi:check' : 'mdi:share-variant'} width={16} height={16} />
+</Button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="token-action-button shadow-none"
+  title={keyStrings.actions.details}
+  aria-label={keyStrings.actions.details}
+  onClick={() => navigateToken(t.id)}
+>
+  <Icon icon="mdi:eye-outline" width={16} height={16} />
+</Button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="token-action-button shadow-none"
+  title={t.enabled ? tokenStrings.actions.disable : tokenStrings.actions.enable}
+  aria-label={t.enabled ? tokenStrings.actions.disable : tokenStrings.actions.enable}
+  onClick={() => void toggleToken(t.id, t.enabled)}
+  disabled={togglingId === t.id}
+>
+  <Icon icon={t.enabled ? 'mdi:pause-circle-outline' : 'mdi:play-circle-outline'} width={16} height={16} />
+</Button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="token-action-button shadow-none"
+  title={tokenStrings.actions.edit}
+  aria-label={tokenStrings.actions.edit}
+  onClick={() => openTokenNoteEdit(t.id, t.note)}
+>
+  <Icon icon="mdi:pencil-outline" width={16} height={16} />
+</Button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="token-action-button shadow-none"
+  title={tokenStrings.actions.delete}
+  aria-label={tokenStrings.actions.delete}
+  onClick={() => openTokenDeleteConfirm(t.id)}
+  disabled={deletingId === t.id}
+>
+  <Icon
+    icon={deletingId === t.id ? 'mdi:progress-helper' : 'mdi:trash-outline'}
+    width={16}
+    height={16}
+    color="#ef4444"
+  />
+</Button>
                           </div>
                         </td>
                       )}
@@ -3349,7 +3323,7 @@ function AdminDashboard(): JSX.Element {
                   )
                 })}
               </tbody>
-            </table>
+            </Table>
           )}
         </div>
         <div className="admin-mobile-list admin-responsive-down">
@@ -3395,44 +3369,48 @@ function AdminDashboard(): JSX.Element {
                   </div>
                   {isAdmin && (
                     <div className="admin-mobile-actions">
-                      <button
-                        type="button"
-                        className={`btn btn-outline btn-sm${state === 'copied' ? ' btn-success' : ''}`}
-                        onClick={() => void handleCopyToken(t.id, stateKey)}
-                        disabled={state === 'loading'}
-                      >
-                        {tokenStrings.actions.copy}
-                      </button>
-                      <button
-                        type="button"
-                        className={`btn btn-outline btn-sm${shareState === 'copied' ? ' btn-success' : ''}`}
-                        onClick={() => void handleShareToken(t.id, shareStateKey)}
-                        disabled={shareState === 'loading'}
-                      >
-                        {tokenStrings.actions.share}
-                      </button>
-                      <button type="button" className="btn btn-outline btn-sm" onClick={() => navigateToken(t.id)}>
-                        {keyStrings.actions.details}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline btn-sm"
-                        onClick={() => void toggleToken(t.id, t.enabled)}
-                        disabled={togglingId === t.id}
-                      >
-                        {t.enabled ? tokenStrings.actions.disable : tokenStrings.actions.enable}
-                      </button>
-                      <button type="button" className="btn btn-outline btn-sm" onClick={() => openTokenNoteEdit(t.id, t.note)}>
-                        {tokenStrings.actions.edit}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-warning btn-sm"
-                        onClick={() => openTokenDeleteConfirm(t.id)}
-                        disabled={deletingId === t.id}
-                      >
-                        {tokenStrings.actions.delete}
-                      </button>
+<Button
+  type="button"
+  variant={state === 'copied' ? 'success' : 'outline'}
+  size="sm"
+  onClick={() => void handleCopyToken(t.id, stateKey)}
+  disabled={state === 'loading'}
+>
+  {tokenStrings.actions.copy}
+</Button>
+<Button
+  type="button"
+  variant={shareState === 'copied' ? 'success' : 'outline'}
+  size="sm"
+  onClick={() => void handleShareToken(t.id, shareStateKey)}
+  disabled={shareState === 'loading'}
+>
+  {tokenStrings.actions.share}
+</Button>
+<Button type="button" variant="outline" size="sm" onClick={() => navigateToken(t.id)}>
+  {keyStrings.actions.details}
+</Button>
+<Button
+  type="button"
+  variant="outline"
+  size="sm"
+  onClick={() => void toggleToken(t.id, t.enabled)}
+  disabled={togglingId === t.id}
+>
+  {t.enabled ? tokenStrings.actions.disable : tokenStrings.actions.enable}
+</Button>
+<Button type="button" variant="outline" size="sm" onClick={() => openTokenNoteEdit(t.id, t.note)}>
+  {tokenStrings.actions.edit}
+</Button>
+<Button
+  type="button"
+  variant="warning"
+  size="sm"
+  onClick={() => openTokenDeleteConfirm(t.id)}
+  disabled={deletingId === t.id}
+>
+  {tokenStrings.actions.delete}
+</Button>
                     </div>
                   )}
                 </article>
@@ -3441,21 +3419,23 @@ function AdminDashboard(): JSX.Element {
           )}
         </div>
         {tokensTotal > tokensPerPage && (
-          <div className="table-pagination">
-            <span className="panel-description">
-              {tokenStrings.pagination.page
-                .replace('{page}', String(tokensPage))
-                .replace('{total}', String(totalPages))}
-            </span>
-            <div style={{ display: 'inline-flex', gap: 8 }}>
-              <button className="btn btn-outline" onClick={goPrevPage} disabled={tokensPage <= 1}>
-                {tokenStrings.pagination.prev}
-              </button>
-              <button className="btn btn-outline" onClick={goNextPage} disabled={tokensPage >= totalPages}>
-                {tokenStrings.pagination.next}
-              </button>
-            </div>
-          </div>
+          <AdminTablePagination
+            page={tokensPage}
+            totalPages={totalPages}
+            pageSummary={
+              <span className="panel-description">
+                {tokenStrings.pagination.page
+                  .replace('{page}', String(tokensPage))
+                  .replace('{total}', String(totalPages))}
+              </span>
+            }
+            previousLabel={tokenStrings.pagination.prev}
+            nextLabel={tokenStrings.pagination.next}
+            previousDisabled={tokensPage <= 1}
+            nextDisabled={tokensPage >= totalPages}
+            onPrevious={goPrevPage}
+            onNext={goNextPage}
+          />
         )}
       </section>
       )}
@@ -3508,26 +3488,25 @@ function AdminDashboard(): JSX.Element {
                     maxWidth: 'min(520px, 100%)',
                   }}
                 >
-	                  <input
-	                    ref={keysBatchCollapsedInputRef}
-	                    type="text"
-	                    className="input input-bordered"
-	                    placeholder={keyStrings.placeholder}
-	                    aria-label={keyStrings.placeholder}
-	                    value={keysBatchFirstLine}
-	                    onChange={(e) => setNewKeysText(e.target.value)}
-	                    disabled={keysBatchVisible}
-	                    style={{ flex: '1 1 160px', minWidth: 160, maxWidth: '100%' }}
-	                  />
-	                  <button
-	                    type="button"
-	                    className="btn btn-primary"
-	                    onClick={() => void handleAddKey()}
-	                    disabled={keysBatchVisible || submitting || keysBatchParsed.length === 0}
-                    style={{ flexShrink: 0 }}
-                  >
-	                    {submitting ? keyStrings.adding : keyStrings.addButton}
-	                  </button>
+<Input
+  ref={keysBatchCollapsedInputRef}
+  type="text"
+  name="collapsed-key-input"
+  placeholder={keyStrings.placeholder}
+  aria-label={keyStrings.placeholder}
+  value={keysBatchFirstLine}
+  onChange={(e) => setNewKeysText(e.target.value)}
+  disabled={keysBatchVisible}
+  style={{ flex: '1 1 160px', minWidth: 160, maxWidth: '100%' }}
+/>
+<Button
+  type="button"
+  onClick={() => void handleAddKey()}
+  disabled={keysBatchVisible || submitting || keysBatchParsed.length === 0}
+  style={{ flexShrink: 0 }}
+>
+  {submitting ? keyStrings.adding : keyStrings.addButton}
+</Button>
 	                </div>
 	                <datalist id="api-key-group-datalist">
 	                  {namedKeyGroups.map((group) => (
@@ -3608,7 +3587,7 @@ function AdminDashboard(): JSX.Element {
 	              {loading ? keyStrings.empty.loading : sortedKeys.length === 0 ? keyStrings.empty.none : keyStrings.empty.filtered}
 	            </div>
 	          ) : (
-	            <table>
+	            <Table>
 	              <thead>
                 <tr>
                   <th>{keyStrings.table.keyId}</th>
@@ -3641,18 +3620,18 @@ function AdminDashboard(): JSX.Element {
                             <code>{item.id}</code>
                           </button>
                           {isAdmin && (
-                            <button
-                              type="button"
-                              className={`btn btn-circle btn-ghost btn-sm${
-                                state === 'copied' ? ' btn-success' : ''
-                              }`}
-                              title={keyStrings.actions.copy}
-                              aria-label={keyStrings.actions.copy}
-                              onClick={() => void handleCopySecret(item.id, stateKey)}
-                              disabled={state === 'loading'}
-                            >
-                              <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={18} height={18} />
-                            </button>
+<Button
+  type="button"
+  variant={state === 'copied' ? 'success' : 'ghost'}
+  size="icon"
+  className="h-8 w-8 rounded-full p-0 shadow-none"
+  title={keyStrings.actions.copy}
+  aria-label={keyStrings.actions.copy}
+  onClick={() => void handleCopySecret(item.id, stateKey)}
+  disabled={state === 'loading'}
+>
+  <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={18} height={18} />
+</Button>
                           )}
                         </div>
                       </td>
@@ -3675,52 +3654,60 @@ function AdminDashboard(): JSX.Element {
                         <td>
                           <div className="table-actions">
                             {item.status === 'disabled' ? (
-                              <button
-                                type="button"
-                                className="btn btn-circle btn-ghost btn-sm"
-                                title={keyStrings.actions.enable}
-                                aria-label={keyStrings.actions.enable}
-                                onClick={() => void handleToggleDisable(item.id, false)}
-                                disabled={togglingId === item.id}
-                              >
-                                <Icon icon={togglingId === item.id ? 'mdi:progress-helper' : 'mdi:play-circle-outline'} width={18} height={18} />
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                className="btn btn-circle btn-ghost btn-sm"
-                                title={keyStrings.actions.disable}
-                                aria-label={keyStrings.actions.disable}
-                                onClick={() => openDisableConfirm(item.id)}
-                                disabled={togglingId === item.id}
-                              >
-                                <Icon icon={togglingId === item.id ? 'mdi:progress-helper' : 'mdi:pause-circle-outline'} width={18} height={18} />
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              className="btn btn-circle btn-ghost btn-sm"
-                              title={keyStrings.actions.delete}
-                              aria-label={keyStrings.actions.delete}
-                              onClick={() => openDeleteConfirm(item.id)}
-                              disabled={deletingId === item.id}
-                            >
-                              <Icon
-                                icon={deletingId === item.id ? 'mdi:progress-helper' : 'mdi:trash-outline'}
-                                width={18}
-                                height={18}
-                                color="#ef4444"
-                              />
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-circle btn-ghost btn-sm"
-                              title={keyStrings.actions.details}
-                              aria-label={keyStrings.actions.details}
-                              onClick={() => navigateKey(item.id)}
-                            >
-                              <Icon icon="mdi:eye-outline" width={18} height={18} />
-                            </button>
+  <Button
+    type="button"
+    variant="ghost"
+    size="icon"
+    className="h-8 w-8 rounded-full p-0 shadow-none"
+    title={keyStrings.actions.enable}
+    aria-label={keyStrings.actions.enable}
+    onClick={() => void handleToggleDisable(item.id, false)}
+    disabled={togglingId === item.id}
+  >
+    <Icon icon={togglingId === item.id ? 'mdi:progress-helper' : 'mdi:play-circle-outline'} width={18} height={18} />
+  </Button>
+) : (
+  <Button
+    type="button"
+    variant="ghost"
+    size="icon"
+    className="h-8 w-8 rounded-full p-0 shadow-none"
+    title={keyStrings.actions.disable}
+    aria-label={keyStrings.actions.disable}
+    onClick={() => openDisableConfirm(item.id)}
+    disabled={togglingId === item.id}
+  >
+    <Icon icon={togglingId === item.id ? 'mdi:progress-helper' : 'mdi:pause-circle-outline'} width={18} height={18} />
+  </Button>
+)}
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="h-8 w-8 rounded-full p-0 shadow-none"
+  title={keyStrings.actions.delete}
+  aria-label={keyStrings.actions.delete}
+  onClick={() => openDeleteConfirm(item.id)}
+  disabled={deletingId === item.id}
+>
+  <Icon
+    icon={deletingId === item.id ? 'mdi:progress-helper' : 'mdi:trash-outline'}
+    width={18}
+    height={18}
+    color="#ef4444"
+  />
+</Button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="h-8 w-8 rounded-full p-0 shadow-none"
+  title={keyStrings.actions.details}
+  aria-label={keyStrings.actions.details}
+  onClick={() => navigateKey(item.id)}
+>
+  <Icon icon="mdi:eye-outline" width={18} height={18} />
+</Button>
                           </div>
                         </td>
                       )}
@@ -3728,7 +3715,7 @@ function AdminDashboard(): JSX.Element {
                   )
                 })}
               </tbody>
-	            </table>
+	            </Table>
 	          )}
 	        </div>
         <div className="admin-mobile-list admin-responsive-down">
@@ -3785,44 +3772,48 @@ function AdminDashboard(): JSX.Element {
                   </div>
                   {isAdmin && (
                     <div className="admin-mobile-actions">
-                      <button
-                        type="button"
-                        className={`btn btn-outline btn-sm${state === 'copied' ? ' btn-success' : ''}`}
-                        onClick={() => void handleCopySecret(item.id, stateKey)}
-                        disabled={state === 'loading'}
-                      >
-                        {keyStrings.actions.copy}
-                      </button>
-                      {item.status === 'disabled' ? (
-                        <button
-                          type="button"
-                          className="btn btn-outline btn-sm"
-                          onClick={() => void handleToggleDisable(item.id, false)}
-                          disabled={togglingId === item.id}
-                        >
-                          {keyStrings.actions.enable}
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn btn-outline btn-sm"
-                          onClick={() => openDisableConfirm(item.id)}
-                          disabled={togglingId === item.id}
-                        >
-                          {keyStrings.actions.disable}
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        className="btn btn-warning btn-sm"
-                        onClick={() => openDeleteConfirm(item.id)}
-                        disabled={deletingId === item.id}
-                      >
-                        {keyStrings.actions.delete}
-                      </button>
-                      <button type="button" className="btn btn-outline btn-sm" onClick={() => navigateKey(item.id)}>
-                        {keyStrings.actions.details}
-                      </button>
+<Button
+  type="button"
+  variant={state === 'copied' ? 'success' : 'outline'}
+  size="sm"
+  onClick={() => void handleCopySecret(item.id, stateKey)}
+  disabled={state === 'loading'}
+>
+  {keyStrings.actions.copy}
+</Button>
+{item.status === 'disabled' ? (
+  <Button
+    type="button"
+    variant="outline"
+    size="sm"
+    onClick={() => void handleToggleDisable(item.id, false)}
+    disabled={togglingId === item.id}
+  >
+    {keyStrings.actions.enable}
+  </Button>
+) : (
+  <Button
+    type="button"
+    variant="outline"
+    size="sm"
+    onClick={() => openDisableConfirm(item.id)}
+    disabled={togglingId === item.id}
+  >
+    {keyStrings.actions.disable}
+  </Button>
+)}
+<Button
+  type="button"
+  variant="warning"
+  size="sm"
+  onClick={() => openDeleteConfirm(item.id)}
+  disabled={deletingId === item.id}
+>
+  {keyStrings.actions.delete}
+</Button>
+<Button type="button" variant="outline" size="sm" onClick={() => navigateKey(item.id)}>
+  {keyStrings.actions.details}
+</Button>
                     </div>
                   )}
                 </article>
@@ -3861,7 +3852,7 @@ function AdminDashboard(): JSX.Element {
           {logs.length === 0 ? (
             <div className="empty-state alert">{loading ? logStrings.empty.loading : logStrings.empty.none}</div>
           ) : (
-            <table className="admin-logs-table">
+            <Table className="admin-logs-table">
               <thead>
                 <tr>
                   <th>{logStrings.table.time}</th>
@@ -3886,7 +3877,7 @@ function AdminDashboard(): JSX.Element {
                   />
                 ))}
               </tbody>
-            </table>
+            </Table>
           )}
         </div>
         <div className="admin-mobile-list admin-responsive-down">
@@ -3934,23 +3925,17 @@ function AdminDashboard(): JSX.Element {
           )}
         </div>
         {hasLogsPagination && (
-          <div className="table-pagination">
-            <span className="panel-description">
-              {logStrings.description} ({safeLogsPage} / {logsTotalPages})
-            </span>
-            <div style={{ display: 'inline-flex', gap: 8 }}>
-              <button className="btn btn-outline" onClick={goPrevLogsPage} disabled={safeLogsPage <= 1}>
-                {tokenStrings.pagination.prev}
-              </button>
-              <button
-                className="btn btn-outline"
-                onClick={goNextLogsPage}
-                disabled={safeLogsPage >= logsTotalPages}
-              >
-                {tokenStrings.pagination.next}
-              </button>
-            </div>
-          </div>
+          <AdminTablePagination
+            page={safeLogsPage}
+            totalPages={logsTotalPages}
+            pageSummary={<span className="panel-description">{logStrings.description} ({safeLogsPage} / {logsTotalPages})</span>}
+            previousLabel={tokenStrings.pagination.prev}
+            nextLabel={tokenStrings.pagination.next}
+            previousDisabled={safeLogsPage <= 1}
+            nextDisabled={safeLogsPage >= logsTotalPages}
+            onPrevious={goPrevLogsPage}
+            onNext={goNextLogsPage}
+          />
         )}
       </section>
       )}
@@ -3982,7 +3967,7 @@ function AdminDashboard(): JSX.Element {
               {loading ? jobsStrings.empty.loading : jobsStrings.empty.none}
             </div>
           ) : (
-            <table className="jobs-table jobs-module-table">
+            <Table className="jobs-table jobs-module-table">
               <thead>
                 <tr>
                   <th>{jobsStrings.table.id}</th>
@@ -4146,7 +4131,7 @@ function AdminDashboard(): JSX.Element {
                   return rows
                 })}
               </tbody>
-            </table>
+            </Table>
           )}
         </div>
         <div className="admin-mobile-list admin-responsive-down">
@@ -4198,27 +4183,21 @@ function AdminDashboard(): JSX.Element {
           )}
         </div>
         {jobsTotal > jobsPerPage && (
-          <div className="table-pagination">
-            <span className="panel-description">
-              {jobsStrings.description} ({jobsPage} / {Math.max(1, Math.ceil(jobsTotal / jobsPerPage))})
-            </span>
-            <div style={{ display: 'inline-flex', gap: 8 }}>
-              <button
-                className="btn btn-outline"
-                onClick={() => setJobsPage((p) => Math.max(1, p - 1))}
-                disabled={jobsPage <= 1}
-              >
-                {tokenStrings.pagination.prev}
-              </button>
-              <button
-                className="btn btn-outline"
-                onClick={() => setJobsPage((p) => p + 1)}
-                disabled={jobsPage >= Math.ceil(jobsTotal / jobsPerPage)}
-              >
-                {tokenStrings.pagination.next}
-              </button>
-            </div>
-          </div>
+          <AdminTablePagination
+            page={jobsPage}
+            totalPages={Math.max(1, Math.ceil(jobsTotal / jobsPerPage))}
+            pageSummary={
+              <span className="panel-description">
+                {jobsStrings.description} ({jobsPage} / {Math.max(1, Math.ceil(jobsTotal / jobsPerPage))})
+              </span>
+            }
+            previousLabel={tokenStrings.pagination.prev}
+            nextLabel={tokenStrings.pagination.next}
+            previousDisabled={jobsPage <= 1}
+            nextDisabled={jobsPage >= Math.ceil(jobsTotal / jobsPerPage)}
+            onPrevious={() => setJobsPage((page) => Math.max(1, page - 1))}
+            onNext={() => setJobsPage((page) => page + 1)}
+          />
         )}
       </section>
       )}
@@ -4231,27 +4210,28 @@ function AdminDashboard(): JSX.Element {
               <p className="panel-description">{adminStrings.users.description}</p>
             </div>
             <div className="users-search-controls">
-              <input
-                type="text"
-                className="input input-bordered users-search-input"
-                placeholder={adminStrings.users.searchPlaceholder}
-                value={usersQueryInput}
-                onChange={(event) => setUsersQueryInput(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    event.preventDefault()
-                    applyUserSearch()
-                  }
-                }}
-              />
-              <button type="button" className="btn btn-outline" onClick={applyUserSearch}>
-                {adminStrings.users.search}
-              </button>
-              {(usersQueryInput.length > 0 || usersQuery.length > 0) && (
-                <button type="button" className="btn btn-ghost" onClick={resetUserSearch}>
-                  {adminStrings.users.clear}
-                </button>
-              )}
+<Input
+  type="text"
+  name="users-search"
+  className="users-search-input"
+  placeholder={adminStrings.users.searchPlaceholder}
+  value={usersQueryInput}
+  onChange={(event) => setUsersQueryInput(event.target.value)}
+  onKeyDown={(event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      applyUserSearch()
+    }
+  }}
+/>
+<Button type="button" variant="outline" onClick={applyUserSearch}>
+  {adminStrings.users.search}
+</Button>
+{(usersQueryInput.length > 0 || usersQuery.length > 0) && (
+  <Button type="button" variant="ghost" onClick={resetUserSearch}>
+    {adminStrings.users.clear}
+  </Button>
+)}
             </div>
           </div>
 
@@ -4261,7 +4241,7 @@ function AdminDashboard(): JSX.Element {
                 {usersLoading ? adminStrings.users.empty.loading : adminStrings.users.empty.none}
               </div>
             ) : (
-              <table className="jobs-table admin-users-table admin-users-list-table">
+              <Table className="jobs-table admin-users-table admin-users-list-table">
                 <thead>
                   <tr>
                     <th>{adminStrings.users.table.user}</th>
@@ -4309,49 +4289,43 @@ function AdminDashboard(): JSX.Element {
                       <td>{formatTimestamp(item.lastActivity)}</td>
                       <td>{formatTimestamp(item.lastLoginAt)}</td>
                       <td>
-                        <button
-                          type="button"
-                          className="btn btn-circle btn-ghost btn-sm"
-                          title={adminStrings.users.actions.view}
-                          aria-label={adminStrings.users.actions.view}
-                          onClick={() => navigateUser(item.userId)}
-                        >
-                          <Icon icon="mdi:eye-outline" width={16} height={16} />
-                        </button>
+<Button
+  type="button"
+  variant="ghost"
+  size="icon"
+  className="h-8 w-8 rounded-full p-0 shadow-none"
+  title={adminStrings.users.actions.view}
+  aria-label={adminStrings.users.actions.view}
+  onClick={() => navigateUser(item.userId)}
+>
+  <Icon icon="mdi:eye-outline" width={16} height={16} />
+</Button>
                       </td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
+              </Table>
             )}
           </div>
 
           {usersTotal > USERS_PER_PAGE && (
-            <div className="table-pagination">
-              <span className="panel-description">
-                {adminStrings.users.pagination
-                  .replace('{page}', String(usersPage))
-                  .replace('{total}', String(usersTotalPages))}
-              </span>
-              <div style={{ display: 'inline-flex', gap: 8 }}>
-                <button
-                  type="button"
-                  className="btn btn-outline"
-                  onClick={goPrevUsersPage}
-                  disabled={usersPage <= 1}
-                >
-                  {tokenStrings.pagination.prev}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-outline"
-                  onClick={goNextUsersPage}
-                  disabled={usersPage >= usersTotalPages}
-                >
-                  {tokenStrings.pagination.next}
-                </button>
-              </div>
-            </div>
+            <AdminTablePagination
+              page={usersPage}
+              totalPages={usersTotalPages}
+              pageSummary={
+                <span className="panel-description">
+                  {adminStrings.users.pagination
+                    .replace('{page}', String(usersPage))
+                    .replace('{total}', String(usersTotalPages))}
+                </span>
+              }
+              previousLabel={tokenStrings.pagination.prev}
+              nextLabel={tokenStrings.pagination.next}
+              previousDisabled={usersPage <= 1}
+              nextDisabled={usersPage >= usersTotalPages}
+              onPrevious={goPrevUsersPage}
+              onNext={goNextUsersPage}
+            />
           )}
         </section>
       )}
@@ -4420,38 +4394,40 @@ function AdminDashboard(): JSX.Element {
       </div>
     </AdminShell>
     {/* Batch Create Tokens modal */}
-    <dialog id="batch_create_tokens_modal" ref={batchDialogRef} className="modal">
-      <div className="modal-box">
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>{tokenStrings.batchDialog.title}</h3>
+    <Dialog open={batchDialogOpen} onOpenChange={(open) => { if (!open) closeBatchDialog() }}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{tokenStrings.batchDialog.title}</DialogTitle>
+        </DialogHeader>
         {batchShareText == null ? (
           <>
-            <div className="py-2" style={{ display: 'flex', gap: 8 }}>
-              <input
+            <div className="flex flex-col gap-3 py-2 sm:flex-row">
+              <Input
                 type="text"
-                className="input"
+                name="batch-token-group"
                 placeholder={tokenStrings.batchDialog.groupPlaceholder}
                 value={batchGroup}
                 onChange={(e) => setBatchGroup(e.target.value)}
                 style={{ flex: 1 }}
               />
-              <input
+              <Input
                 type="number"
-                className="input"
+                name="batch-token-count"
                 min={1}
                 max={1000}
                 value={batchCount}
                 onChange={(e) => setBatchCount(Number(e.target.value) || 1)}
-                style={{ width: 120 }}
+                className="w-full sm:w-[120px]"
               />
             </div>
-            <div className="modal-action">
-              <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-                <button type="button" className="btn" onClick={closeBatchDialog}>{tokenStrings.batchDialog.cancel}</button>
-                <button type="button" className="btn btn-primary" onClick={() => void submitBatchCreate()} disabled={batchCreating}>
-                  {batchCreating ? tokenStrings.batchDialog.creating : tokenStrings.batchDialog.confirm}
-                </button>
-              </form>
-            </div>
+            <DialogFooter className="modal-action">
+              <Button type="button" variant="outline" onClick={closeBatchDialog}>
+                {tokenStrings.batchDialog.cancel}
+              </Button>
+              <Button type="button" onClick={() => void submitBatchCreate()} disabled={batchCreating}>
+                {batchCreating ? tokenStrings.batchDialog.creating : tokenStrings.batchDialog.confirm}
+              </Button>
+            </DialogFooter>
           </>
         ) : (
           <>
@@ -4462,11 +4438,11 @@ function AdminDashboard(): JSX.Element {
                   String((batchShareText ?? '').split('\n').filter((line) => line.length > 0).length),
                 )}
               </p>
-              <textarea
-                className="textarea"
+              <Textarea
                 readOnly
                 wrap="off"
                 rows={6}
+                className="min-h-[144px] resize-none"
                 style={{
                   width: '100%',
                   fontFamily:
@@ -4474,224 +4450,227 @@ function AdminDashboard(): JSX.Element {
                   whiteSpace: 'pre',
                   overflowX: 'auto',
                   overflowY: 'auto',
-                  resize: 'none',
                 }}
                 value={batchShareText ?? ''}
               />
             </div>
-            <div className="modal-action">
-              <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={() => {
-                    if (!batchShareText) return
-                    void copyToClipboard(batchShareText)
-                  }}
-                >
-                  {tokenStrings.batchDialog.copyAll}
-                </button>
-                <button type="button" className="btn" onClick={closeBatchDialog}>
-                  {tokenStrings.batchDialog.done}
-                </button>
-              </form>
-            </div>
+            <DialogFooter className="modal-action">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  if (!batchShareText) return
+                  void copyToClipboard(batchShareText)
+                }}
+              >
+                {tokenStrings.batchDialog.copyAll}
+              </Button>
+              <Button type="button" onClick={closeBatchDialog}>
+                {tokenStrings.batchDialog.done}
+              </Button>
+            </DialogFooter>
           </>
         )}
-      </div>
-    </dialog>
+      </DialogContent>
+    </Dialog>
 
-    {/* API Keys Validation modal */}
-    <ApiKeysValidationDialog
-      dialogRef={keysValidateDialogRef as any}
-      state={keysValidationVisibleState}
-      counts={keysValidationCounts}
-      validKeys={keysValidationValidKeys}
-      exhaustedKeys={keysValidationExhaustedKeys}
-      onClose={closeKeysValidationDialog}
-      onRetryFailed={() => void handleRetryFailedValidation()}
-      onRetryOne={(apiKey) => void handleRetryOneValidation(apiKey)}
-      onImportValid={() => void handleImportValidatedKeys()}
-    />
+{/* API Keys Validation modal */}
+<ApiKeysValidationDialog
+  open={keysValidationVisibleState != null}
+  state={keysValidationVisibleState}
+  counts={keysValidationCounts}
+  validKeys={keysValidationValidKeys}
+  exhaustedKeys={keysValidationExhaustedKeys}
+  onClose={closeKeysValidationDialog}
+  onRetryFailed={() => void handleRetryFailedValidation()}
+  onRetryOne={(apiKey) => void handleRetryOneValidation(apiKey)}
+  onImportValid={() => void handleImportValidatedKeys()}
+/>
 
-    {/* Batch Add API Keys Report modal */}
-    <dialog id="batch_add_keys_report_modal" ref={keysBatchReportDialogRef} className="modal">
-      <div className="modal-box" style={{ maxHeight: 'min(calc(100dvh - 6rem), calc(100vh - 6rem))', display: 'flex', flexDirection: 'column' }}>
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>{keyStrings.batch.report.title}</h3>
-        <div style={{ overflowY: 'auto', minHeight: 0, paddingTop: 12 }}>
-          {keysBatchReport?.kind === 'error' ? (
-            <>
-              <div className="alert alert-error">
-                {keysBatchReport.message}
-              </div>
-              <div className="py-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
-                <div>
-                  <span className="opacity-70">{keyStrings.batch.report.summary.inputLines}</span> {formatNumber(keysBatchReport.input_lines)}
-                </div>
-                <div>
-                  <span className="opacity-70">{keyStrings.batch.report.summary.validLines}</span> {formatNumber(keysBatchReport.valid_lines)}
-                </div>
-              </div>
-            </>
-          ) : keysBatchReport?.kind === 'success' ? (
-            <div className="grid gap-4 lg:grid-cols-2">
+{/* Batch Add API Keys Report modal */}
+<Dialog open={keysBatchReport != null} onOpenChange={(open) => { if (!open) closeKeysBatchReportDialog() }}>
+  <DialogContent className="max-w-4xl sm:max-h-[min(calc(100dvh-6rem),calc(100vh-6rem))]">
+    <DialogHeader>
+      <DialogTitle>{keyStrings.batch.report.title}</DialogTitle>
+    </DialogHeader>
+    <div style={{ overflowY: 'auto', minHeight: 0, paddingTop: 12 }}>
+      {keysBatchReport?.kind === 'error' ? (
+        <>
+          <div className="alert alert-error">
+            {keysBatchReport.message}
+          </div>
+          <div className="py-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
+            <div>
+              <span className="opacity-70">{keyStrings.batch.report.summary.inputLines}</span> {formatNumber(keysBatchReport.input_lines)}
+            </div>
+            <div>
+              <span className="opacity-70">{keyStrings.batch.report.summary.validLines}</span> {formatNumber(keysBatchReport.valid_lines)}
+            </div>
+          </div>
+        </>
+      ) : keysBatchReport?.kind === 'success' ? (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div>
+            <div className="py-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
               <div>
-                <div className="py-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.inputLines}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.input_lines)}
-                  </div>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.validLines}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.valid_lines)}
-                  </div>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.uniqueInInput}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.unique_in_input)}
-                  </div>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.duplicateInInput}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.duplicate_in_input)}
-                  </div>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.created}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.created)}
-                  </div>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.undeleted}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.undeleted)}
-                  </div>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.existed}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.existed)}
-                  </div>
-                  <div>
-                    <span className="opacity-70">{keyStrings.batch.report.summary.failed}</span>{' '}
-                    {formatNumber(keysBatchReport.response.summary.failed)}
-                  </div>
-                </div>
+                <span className="opacity-70">{keyStrings.batch.report.summary.inputLines}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.input_lines)}
               </div>
-
               <div>
-                <h4 className="font-bold">{keyStrings.batch.report.failures.title}</h4>
-                {keysBatchFailures.length === 0 ? (
-                  <div className="py-2">{keyStrings.batch.report.failures.none}</div>
-                ) : (
-                  <div
-                    className="overflow-x-auto"
-                    style={{
-                      marginTop: 8,
-                      maxHeight: 'min(calc(100dvh - 18rem), calc(100vh - 18rem))',
-                      overflowY: 'auto',
-                    }}
-                  >
-                    <table className="table table-zebra">
-                      <thead>
-                        <tr>
-                          <th>{keyStrings.batch.report.failures.table.apiKey}</th>
-                          <th>{keyStrings.batch.report.failures.table.error}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {keysBatchFailures.map((item, index) => (
-                          <tr key={`${item.api_key}-${index}`}>
-                            <td style={{ wordBreak: 'break-all' }}>
-                              <code>{item.api_key}</code>
-                            </td>
-                            <td style={{ wordBreak: 'break-word' }}>{item.error || '—'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                <span className="opacity-70">{keyStrings.batch.report.summary.validLines}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.valid_lines)}
+              </div>
+              <div>
+                <span className="opacity-70">{keyStrings.batch.report.summary.uniqueInInput}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.unique_in_input)}
+              </div>
+              <div>
+                <span className="opacity-70">{keyStrings.batch.report.summary.duplicateInInput}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.duplicate_in_input)}
+              </div>
+              <div>
+                <span className="opacity-70">{keyStrings.batch.report.summary.created}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.created)}
+              </div>
+              <div>
+                <span className="opacity-70">{keyStrings.batch.report.summary.undeleted}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.undeleted)}
+              </div>
+              <div>
+                <span className="opacity-70">{keyStrings.batch.report.summary.existed}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.existed)}
+              </div>
+              <div>
+                <span className="opacity-70">{keyStrings.batch.report.summary.failed}</span>{' '}
+                {formatNumber(keysBatchReport.response.summary.failed)}
               </div>
             </div>
-          ) : (
-            <div className="py-2">{keyStrings.batch.hint}</div>
-          )}
-        </div>
-        <div className="modal-action" style={{ marginTop: 12 }}>
-          <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn" onClick={closeKeysBatchReportDialog}>
-              {keyStrings.batch.report.close}
-            </button>
-          </form>
-        </div>
-      </div>
-    </dialog>
+          </div>
 
-    {/* Disable Confirmation modal */}
-    <dialog id="confirm_disable_modal" ref={disableDialogRef} className="modal">
-      <div className="modal-box">
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>{keyStrings.dialogs.disable.title}</h3>
-        <p className="py-2">{keyStrings.dialogs.disable.description}</p>
-        <div className="modal-action">
-          <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn" onClick={cancelDisable}>{keyStrings.dialogs.disable.cancel}</button>
-            <button type="button" className="btn" onClick={() => void confirmDisable()} disabled={!!togglingId}>
-              {keyStrings.dialogs.disable.confirm}
-            </button>
-          </form>
+          <div>
+            <h4 className="font-bold">{keyStrings.batch.report.failures.title}</h4>
+            {keysBatchFailures.length === 0 ? (
+              <div className="py-2">{keyStrings.batch.report.failures.none}</div>
+            ) : (
+              <div
+                className="overflow-x-auto"
+                style={{
+                  marginTop: 8,
+                  maxHeight: 'min(calc(100dvh - 18rem), calc(100vh - 18rem))',
+                  overflowY: 'auto',
+                }}
+              >
+                <Table className="table-zebra">
+                  <thead>
+                    <tr>
+                      <th>{keyStrings.batch.report.failures.table.apiKey}</th>
+                      <th>{keyStrings.batch.report.failures.table.error}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {keysBatchFailures.map((item, index) => (
+                      <tr key={`${item.api_key}-${index}`}>
+                        <td style={{ wordBreak: 'break-all' }}>
+                          <code>{item.api_key}</code>
+                        </td>
+                        <td style={{ wordBreak: 'break-word' }}>{item.error || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </Table>
+              </div>
+            )}
+          </div>
         </div>
-      </div>
-    </dialog>
+      ) : (
+        <div className="py-2">{keyStrings.batch.hint}</div>
+      )}
+    </div>
+    <DialogFooter className="modal-action" style={{ marginTop: 12 }}>
+      <Button type="button" variant="outline" onClick={closeKeysBatchReportDialog}>
+        {keyStrings.batch.report.close}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
 
-    {/* Delete Confirmation modal */}
-    <dialog id="confirm_delete_modal" ref={deleteDialogRef} className="modal">
-      <div className="modal-box">
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>{keyStrings.dialogs.delete.title}</h3>
-        <p className="py-2">{keyStrings.dialogs.delete.description}</p>
-        <div className="modal-action">
-          <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn" onClick={cancelDelete}>{keyStrings.dialogs.delete.cancel}</button>
-            <button type="button" className="btn btn-error" onClick={() => void confirmDelete()} disabled={!!deletingId}>
-              {keyStrings.dialogs.delete.confirm}
-            </button>
-          </form>
-        </div>
-      </div>
-    </dialog>
-    {/* Token Delete Confirmation */}
-    <dialog id="confirm_token_delete_modal" ref={tokenDeleteDialogRef} className="modal">
-      <div className="modal-box">
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>{tokenStrings.dialogs.delete.title}</h3>
-        <p className="py-2">{tokenStrings.dialogs.delete.description}</p>
-        <div className="modal-action">
-          <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn" onClick={cancelTokenDelete}>{tokenStrings.dialogs.delete.cancel}</button>
-            <button type="button" className="btn btn-error" onClick={() => void confirmTokenDelete()} disabled={!!deletingId}>
-              {tokenStrings.dialogs.delete.confirm}
-            </button>
-          </form>
-        </div>
-      </div>
-    </dialog>
+{/* Disable Confirmation modal */}
+<Dialog open={pendingDisableId != null} onOpenChange={(open) => { if (!open) cancelDisable() }}>
+  <DialogContent className="max-w-md">
+    <DialogHeader>
+      <DialogTitle>{keyStrings.dialogs.disable.title}</DialogTitle>
+      <DialogDescription>{keyStrings.dialogs.disable.description}</DialogDescription>
+    </DialogHeader>
+    <DialogFooter className="modal-action">
+      <Button type="button" variant="outline" onClick={cancelDisable}>
+        {keyStrings.dialogs.disable.cancel}
+      </Button>
+      <Button type="button" onClick={() => void confirmDisable()} disabled={!!togglingId}>
+        {keyStrings.dialogs.disable.confirm}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
 
-    {/* Token Edit Note modal */}
-    <dialog id="edit_token_note_modal" ref={tokenNoteDialogRef} className="modal">
-      <div className="modal-box">
-        <h3 className="font-bold text-lg" style={{ marginTop: 0 }}>{tokenStrings.dialogs.note.title}</h3>
-        <div className="py-2" style={{ display: 'flex', gap: 8 }}>
-          <input
-            type="text"
-            className="input"
-            placeholder={tokenStrings.dialogs.note.placeholder}
-            value={editingTokenNote}
-            onChange={(e) => setEditingTokenNote(e.target.value)}
-            style={{ flex: 1 }}
-          />
-        </div>
-        <div className="modal-action">
-          <form method="dialog" onSubmit={(e) => e.preventDefault()} style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn" onClick={cancelTokenNote}>{tokenStrings.dialogs.note.cancel}</button>
-            <button type="button" className="btn btn-primary" onClick={() => void saveTokenNote()} disabled={savingTokenNote}>
-              {savingTokenNote ? tokenStrings.dialogs.note.saving : tokenStrings.dialogs.note.confirm}
-            </button>
-          </form>
-        </div>
-      </div>
-    </dialog>
+{/* Delete Confirmation modal */}
+<Dialog open={pendingDeleteId != null} onOpenChange={(open) => { if (!open) cancelDelete() }}>
+  <DialogContent className="max-w-md">
+    <DialogHeader>
+      <DialogTitle>{keyStrings.dialogs.delete.title}</DialogTitle>
+      <DialogDescription>{keyStrings.dialogs.delete.description}</DialogDescription>
+    </DialogHeader>
+    <DialogFooter className="modal-action">
+      <Button type="button" variant="outline" onClick={cancelDelete}>
+        {keyStrings.dialogs.delete.cancel}
+      </Button>
+      <Button type="button" variant="destructive" onClick={() => void confirmDelete()} disabled={!!deletingId}>
+        {keyStrings.dialogs.delete.confirm}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+{/* Token Delete Confirmation */}
+<Dialog open={pendingTokenDeleteId != null} onOpenChange={(open) => { if (!open) cancelTokenDelete() }}>
+  <DialogContent className="max-w-md">
+    <DialogHeader>
+      <DialogTitle>{tokenStrings.dialogs.delete.title}</DialogTitle>
+      <DialogDescription>{tokenStrings.dialogs.delete.description}</DialogDescription>
+    </DialogHeader>
+    <DialogFooter className="modal-action">
+      <Button type="button" variant="outline" onClick={cancelTokenDelete}>
+        {tokenStrings.dialogs.delete.cancel}
+      </Button>
+      <Button type="button" variant="destructive" onClick={() => void confirmTokenDelete()} disabled={!!deletingId}>
+        {tokenStrings.dialogs.delete.confirm}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+{/* Token Edit Note modal */}
+<Dialog open={editingTokenId != null} onOpenChange={(open) => { if (!open) cancelTokenNote() }}>
+  <DialogContent className="max-w-lg">
+    <DialogHeader>
+      <DialogTitle>{tokenStrings.dialogs.note.title}</DialogTitle>
+    </DialogHeader>
+    <Input
+      type="text"
+      name="editing-token-note"
+      placeholder={tokenStrings.dialogs.note.placeholder}
+      value={editingTokenNote}
+      onChange={(e) => setEditingTokenNote(e.target.value)}
+    />
+    <DialogFooter className="modal-action">
+      <Button type="button" variant="outline" onClick={cancelTokenNote}>
+        {tokenStrings.dialogs.note.cancel}
+      </Button>
+      <Button type="button" onClick={() => void saveTokenNote()} disabled={savingTokenNote}>
+        {savingTokenNote ? tokenStrings.dialogs.note.saving : tokenStrings.dialogs.note.confirm}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
     </>
   )
 }
@@ -4984,9 +4963,9 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
             href={ADMIN_USER_CONSOLE_HREF}
             className="admin-return-link--detail"
           />
-          <button
+          <Button
             type="button"
-            className={`btn${syncState === 'success' ? ' btn-success' : ''}`}
+            variant={syncState === 'success' ? 'success' : 'default'}
             onClick={() => void syncUsage()}
             disabled={syncState === 'syncing'}
             aria-busy={syncState === 'syncing'}
@@ -4997,17 +4976,16 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
               height={18}
               className={syncState === 'syncing' ? 'icon-spin' : undefined}
             />
-            &nbsp;
             {syncState === 'syncing'
               ? keyDetailsStrings.syncing
               : syncState === 'success'
                 ? keyDetailsStrings.syncSuccess
                 : keyDetailsStrings.syncAction}
-          </button>
-          <button type="button" className="btn btn-ghost" onClick={onBack}>
+          </Button>
+          <Button type="button" variant="ghost" onClick={onBack}>
             <Icon icon="mdi:arrow-left" width={18} height={18} />
-            &nbsp;{keyDetailsStrings.back}
-          </button>
+            {keyDetailsStrings.back}
+          </Button>
         </div>
       </section>
 
@@ -5051,18 +5029,29 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
             <h2>{keyDetailsStrings.usageTitle}</h2>
             <p className="panel-description">{keyDetailsStrings.usageDescription}</p>
           </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <select value={period} onChange={(e) => setPeriod(e.target.value as any)} className="select select-bordered" aria-label={keyDetailsStrings.usageTitle}>
-              <option value="day">{keyDetailsStrings.periodOptions.day}</option>
-              <option value="week">{keyDetailsStrings.periodOptions.week}</option>
-              <option value="month">{keyDetailsStrings.periodOptions.month}</option>
-            </select>
-            <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="input input-bordered" />
-            <button type="button" className="btn btn-primary" onClick={() => void load()} disabled={loading}>
-              {keyDetailsStrings.apply}
-            </button>
+<div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+  <Select value={period} onValueChange={(value) => setPeriod(value as 'day' | 'week' | 'month')}>
+    <SelectTrigger className="w-[132px]" aria-label={keyDetailsStrings.usageTitle}>
+      <SelectValue />
+    </SelectTrigger>
+    <SelectContent align="end">
+      <SelectItem value="day">{keyDetailsStrings.periodOptions.day}</SelectItem>
+      <SelectItem value="week">{keyDetailsStrings.periodOptions.week}</SelectItem>
+      <SelectItem value="month">{keyDetailsStrings.periodOptions.month}</SelectItem>
+    </SelectContent>
+  </Select>
+  <Input
+    type="date"
+    name="key-usage-start-date"
+    value={startDate}
+    onChange={(e) => setStartDate(e.target.value)}
+    className="w-[176px]"
+  />
+  <Button type="button" onClick={() => void load()} disabled={loading}>
+    {keyDetailsStrings.apply}
+  </Button>
+</div>
           </div>
-        </div>
         <section className="metrics-grid">
           {(!summary || loading) ? (
             <div className="empty-state alert" style={{ gridColumn: '1 / -1' }}>{keyDetailsStrings.loading}</div>
@@ -5089,7 +5078,7 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
           {logs.length === 0 ? (
             <div className="empty-state alert">{loading ? keyDetailsStrings.loading : keyDetailsStrings.logsEmpty}</div>
           ) : (
-            <table className="admin-logs-table">
+            <Table className="admin-logs-table">
               <thead>
                 <tr>
                   <th>{logsTableStrings.time}</th>
@@ -5114,7 +5103,7 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </Table>
           )}
         </div>
         <div className="admin-mobile-list admin-responsive-down">

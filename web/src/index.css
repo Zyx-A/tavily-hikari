@@ -1233,7 +1233,9 @@
   top: 50%;
   right: 12px;
   transform: translateY(-50%);
-  border: none;
+  min-width: 32px;
+  width: 32px;
+  height: 32px;
   background: transparent;
   padding: 4px;
   display: inline-flex;
@@ -1242,7 +1244,7 @@
   cursor: pointer;
 }
 
-.token-visibility-button img {
+.token-visibility-button :where(img, svg) {
   width: 22px;
   height: 22px;
 }
@@ -1255,7 +1257,8 @@
   justify-content: center;
 }
 
-.token-copy-button.btn-outline {
+.token-copy-button:not([data-copy-state]),
+.token-copy-button[data-copy-state="loading"] {
   border-color: hsl(var(--primary) / 0.34);
   background:
     linear-gradient(180deg, hsl(var(--primary) / 0.14) 0%, hsl(var(--primary) / 0.08) 100%),
@@ -1266,7 +1269,8 @@
     inset 0 1px 0 hsl(var(--background) / 0.82);
 }
 
-.token-copy-button.btn-outline:hover {
+.token-copy-button:not([data-copy-state]):hover,
+.token-copy-button[data-copy-state="loading"]:hover {
   border-color: hsl(var(--primary) / 0.54);
   background:
     linear-gradient(180deg, hsl(var(--primary) / 0.2) 0%, hsl(var(--primary) / 0.12) 100%),
@@ -1282,6 +1286,11 @@
   height: 16px;
   color: currentColor;
   opacity: 1;
+}
+
+.token-copy-button-success,
+.token-copy-button-warning {
+  min-width: 132px;
 }
 
 /* Token access modal: let the token input row expand to the full modal width. */
@@ -2721,62 +2730,6 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.token-owner-block {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-}
-.token-owner-block-compact {
-  align-items: flex-end;
-  text-align: right;
-}
-.token-owner-link {
-  display: inline-block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 600;
-}
-
-.token-owner-trigger {
-  display: flex;
-  max-width: 100%;
-  min-width: 0;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  text-align: left;
-}
-.token-owner-trigger .token-owner-link {
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-.token-owner-trigger-compact {
-  align-items: flex-end;
-  text-align: right;
-}
-.token-owner-trigger:hover .token-owner-link,
-.token-owner-trigger:hover .token-owner-secondary,
-.token-owner-trigger:focus-visible .token-owner-link,
-.token-owner-trigger:focus-visible .token-owner-secondary {
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-.token-owner-secondary {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.82rem;
-  color: hsl(var(--muted-foreground));
-}
-.token-owner-empty {
-  color: hsl(var(--muted-foreground));
-  font-weight: 500;
-}
 .token-metric-card {
   gap: 10px;
 }
@@ -2974,7 +2927,7 @@ table {
   place-items: start center;
 }
 .key-validation-modal .modal-box,
-.key-validation-modal .key-validation-modal-box {
+.key-validation-modal.key-validation-modal-box {
   width: min(calc(100vw - 2rem), 1120px);
   max-width: min(calc(100vw - 2rem), 1120px);
   height: auto;
@@ -2984,7 +2937,7 @@ table {
   border-radius: 20px;
 }
 
-.key-validation-modal .key-validation-modal-box > .flex {
+.key-validation-modal.key-validation-modal-box > .flex {
   max-height: inherit;
   min-height: 0;
 }
@@ -3235,13 +3188,13 @@ table {
   flex-shrink: 0;
 }
 
-.key-validation-footer-actions .btn {
+.key-validation-footer-actions button {
   white-space: nowrap;
   min-height: 46px;
   line-height: 1.2;
 }
 
-.key-validation-footer-primary .btn {
+.key-validation-footer-primary > button {
   min-width: 0;
 }
 
@@ -3328,7 +3281,7 @@ table {
   }
 
   .key-validation-modal .modal-box,
-  .key-validation-modal .key-validation-modal-box {
+  .key-validation-modal.key-validation-modal-box {
     width: 100%;
     max-width: 100%;
     height: 100%;
@@ -3353,7 +3306,7 @@ table {
     gap: 8px;
   }
 
-  .key-validation-footer-actions > .btn.btn-outline {
+  .key-validation-retry-button {
     flex: 0 0 auto;
     padding-inline: 0.68rem;
   }
@@ -3367,18 +3320,18 @@ table {
     align-items: stretch;
   }
 
-  .key-validation-footer-primary .btn {
+  .key-validation-footer-primary > button {
     width: 100%;
     justify-content: center;
     padding-inline: 0.75rem;
   }
 
-  .key-validation-footer-primary .btn.btn-primary {
+  .key-validation-import-button {
     min-width: 0;
     overflow: visible;
   }
 
-  .key-validation-footer-primary .btn.btn-primary .key-validation-import-count-badge {
+  .key-validation-import-button .key-validation-import-count-badge {
     top: -6px;
     right: -6px;
   }
@@ -3405,8 +3358,13 @@ table {
 .table-pagination span {
   font-size: 0.92rem;
 }
-.table-pagination select {
+.table-pagination select,
+.table-pagination .table-pagination-select {
   min-width: 90px;
+}
+
+.table-pagination .table-pagination-button {
+  min-width: 88px;
 }
 
 thead {
@@ -3493,53 +3451,24 @@ tbody tr:hover {
   text-overflow: ellipsis;
 }
 
-
-.token-id-cell {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  flex-wrap: wrap;
-  white-space: normal;
-}
-
-.token-id-link {
-  display: inline-flex;
-  align-items: center;
-  min-width: 0;
-}
-
-.token-id-code {
-  display: inline-block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.token-id-cell .status-badge,
-.token-id-cell .token-status-slot {
-  flex-shrink: 0;
-}
-
 .tokens-table th:nth-child(1),
 .tokens-table td:nth-child(1) {
   width: 10%;
 }
 
-.tokens-table th:nth-child(4),
-.tokens-table td:nth-child(4) {
+.tokens-table th:nth-child(3),
+.tokens-table td:nth-child(3) {
   width: 12ch;
 }
 
-.tokens-table th:nth-child(6),
-.tokens-table td:nth-child(6) {
+.tokens-table th:nth-child(5),
+.tokens-table td:nth-child(5) {
   width: 21ch;
 }
 
 /* Token table: keep the actions column wide enough for icon buttons */
-.tokens-table th:nth-child(7),
-.tokens-table td:nth-child(7) {
+.tokens-table th:nth-child(6),
+.tokens-table td:nth-child(6) {
   width: 182px;
 }
 
@@ -3554,7 +3483,7 @@ tbody tr:hover {
   gap: 2px;
 }
 
-.tokens-table .token-action-button.btn-circle {
+.tokens-table .token-action-button {
   width: 1.75rem;
   min-width: 1.75rem;
   height: 1.75rem;
@@ -3768,7 +3697,7 @@ tbody tr:hover {
   flex-wrap: wrap;
 }
 
-.user-console-tokens-table .table-actions .btn {
+.user-console-tokens-table .table-actions button {
   white-space: nowrap;
 }
 
@@ -4366,38 +4295,6 @@ tbody .log-details-row:hover {
   color: hsl(var(--destructive));
   border: 1px solid hsl(var(--destructive) / 0.3);
   margin-top: -12px;
-}
-
-.console-unavailable-state {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.console-unavailable-icon {
-  width: 44px;
-  height: 44px;
-  border-radius: 14px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: hsl(var(--warning) / 0.14);
-  color: hsl(var(--warning));
-}
-
-.console-unavailable-copy h2 {
-  margin: 0;
-}
-
-.console-unavailable-copy p {
-  margin: 8px 0 0;
-  max-width: 60ch;
-  color: hsl(var(--muted-foreground));
-}
-
-.console-unavailable-actions {
-  gap: 8px;
-  flex-wrap: wrap;
 }
 
 .link-button {
