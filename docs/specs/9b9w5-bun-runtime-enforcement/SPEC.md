@@ -25,7 +25,7 @@
 ### Non-goals
 
 - 不替换 Vite、TypeScript、Storybook、commitlint、dprint 这些已经可由 Bun runtime 直接执行的现有工具。
-- 不为了“命名洁癖”重写所有 `node:` imports、`@types/node`、或 loader-sensitive 的 `.cjs` 配置入口。
+- 不为了“命名洁癖”一次性重写所有 `node:` imports、`@types/node`、或其余 loader-sensitive 配置入口。
 - 不改动 Rust 业务逻辑、数据库结构、HTTP API 契约或页面运行时产品行为。
 
 ## 范围（Scope）
@@ -42,6 +42,7 @@
   - `web/tsconfig.tooling.json` 的中性命名替换与引用同步。
 - Repo-owned Node naming cleanup
   - `tests/e2e/tavily_http_smoke.ts` 迁移为 Bun-native、中性命名的 smoke 脚本。
+  - `commitlint.config.mjs`、`web/tailwind.config.ts`、`web/scripts/write-version.mjs` 这类仓库自有、发现面稳定的配置/脚本入口适度去 Node 命名。
   - 相关 README / docs / spec 文案同步。
 - Validation and proof
   - root / `web/` 的 `bun install --frozen-lockfile`。
@@ -52,7 +53,7 @@
 ### Out of scope
 
 - 切换到 Bun bundler / Bun.serve 以替代现有 Vite dev server 或 Storybook。
-- 把 `commitlint.config.cjs`、`web/postcss.config.cjs`、`web/tailwind.config.cjs` 改写成其他配置格式。
+- 继续处理 `web/postcss.config.cjs`、`vite.config.ts`、`@types/node` 等仍可能影响加载器或类型面的残余 Node 痕迹。
 - 改变 Storybook 作为组件验收环境的角色与覆盖范围。
 - 移除系统层面的 Node 安装；本轮只证明仓库核心命令不再依赖它。
 
@@ -72,7 +73,7 @@
 
 - root / `web/` 继续使用 Bun lockfile 作为唯一 JS 依赖锁定基线。
 - 仓库所有由我们维护的脚本入口，凡是会命中 `.bin` shebang 的路径，都必须显式通过 Bun 执行（`bun --bun` / `bunx --bun`）。
-- loader-sensitive `.cjs` 配置文件允许保留，只要在实际执行链路中不再要求 `node` runtime。
+- loader-sensitive 配置文件允许按收益择机保留，只要在实际执行链路中不再要求 `node` runtime。
 
 ## 验收标准（Acceptance Criteria）
 
@@ -152,3 +153,4 @@
 - 2026-03-09: 已完成 root / web `bun --bun` 脚本收口、`bunfig.toml` 强制层、`lefthook` Bun runtime、`tsconfig.tooling.json` 重命名、`tavily_http_smoke.ts` 迁移与 README/AGENTS 文案同步。
 - 2026-03-09: 已通过 `bun install --frozen-lockfile`、`cd web && bun install --frozen-lockfile`、`cd web && bun run build`、`bun run validate:no-node-runtime`；浏览器确认 `/`、`/admin`、`/console`、`/login` 与 `/api/summary`、`/health`、`/mcp` 开发代理链路可用（`/mcp` 指向本地 mock upstream）。
 - 2026-03-09: PR #111 已补齐 `type:skip` + `channel:stable` 标签，CI checks 全绿；clean-room `codex review --base main` 复跑确认无阻塞缺陷，spec 与索引同步收口为已完成。
+- 2026-03-09: 按“适当消除、不硬改”继续收口：`commitlint.config.mjs` 改为 ESM、`web/tailwind.config.ts` 改为 TS config、`web/components.json` 同步新路径，`web/scripts/write-version.mjs` 改成 Bun-native 版本写入脚本；`web/postcss.config.cjs`、`vite.config.ts` 与 `@types/node` 暂保留。
