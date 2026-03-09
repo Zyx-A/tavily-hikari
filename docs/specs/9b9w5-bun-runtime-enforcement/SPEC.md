@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（5/6）
+- Status: 已完成（6/6）
 - Created: 2026-03-09
 - Last: 2026-03-09
 
@@ -136,7 +136,7 @@
 - [x] M3: repo-owned Node 命名痕迹收敛（tooling tsconfig + Tavily HTTP smoke）
 - [x] M4: README / dev script / docs 同步到 Bun-only 执行口径
 - [x] M5: no-node proof、本地 build、browser smoke 完成
-- [ ] M6: fast-track PR / checks / review-loop 收敛
+- [x] M6: fast-track PR / checks / review-loop 收敛
 
 ## 风险 / 开放问题 / 假设
 
@@ -151,3 +151,4 @@
 
 - 2026-03-09: 已完成 root / web `bun --bun` 脚本收口、`bunfig.toml` 强制层、`lefthook` Bun runtime、`tsconfig.tooling.json` 重命名、`tavily_http_smoke.ts` 迁移与 README/AGENTS 文案同步。
 - 2026-03-09: 已通过 `bun install --frozen-lockfile`、`cd web && bun install --frozen-lockfile`、`cd web && bun run build`、`bun run validate:no-node-runtime`；浏览器确认 `/`、`/admin`、`/console`、`/login` 与 `/api/summary`、`/health`、`/mcp` 开发代理链路可用（`/mcp` 指向本地 mock upstream）。
+- 2026-03-09: PR #111 已补齐 `type:skip` + `channel:stable` 标签，CI checks 全绿；clean-room `codex review --base main` 复跑确认无阻塞缺陷，spec 与索引同步收口为已完成。
