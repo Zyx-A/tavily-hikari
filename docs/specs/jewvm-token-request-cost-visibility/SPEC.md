@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 待实现
+- Status: 部分完成（4/5）
 - Created: 2026-03-10
 - Last: 2026-03-10
 
@@ -117,10 +117,10 @@
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
-- [ ] M1: 新 spec 与 README 索引落地，冻结字段/文案/范围边界
-- [ ] M2: 后端 token logs / page / events 透传 `business_credits` 并补齐测试
-- [ ] M3: Token detail 桌面/移动/详情新增 `Charged Credits` 展示并调稳布局
-- [ ] M4: 全站同类日志视图 `MCP Status` / `MCP` 正名为 `Tavily Status` / `Tavily`
+- [x] M1: 新 spec 与 README 索引落地，冻结字段/文案/范围边界
+- [x] M2: 后端 token logs / page / events 透传 `business_credits` 并补齐测试
+- [x] M3: Token detail 桌面/移动/详情新增 `Charged Credits` 展示并调稳布局
+- [x] M4: 全站同类日志视图 `MCP Status` / `MCP` 正名为 `Tavily Status` / `Tavily`
 - [ ] M5: 本地验证、快车道 PR、checks 与 review-loop 收敛完成
 
 ## 风险 / 开放问题 / 假设
@@ -133,3 +133,5 @@
 ## 变更记录（Change log）
 
 - 2026-03-10: 初始化快车道 spec，冻结 token detail 费用列、`Tavily Status` 文案正名，以及 `business_credits` 仅透传不改计费逻辑的边界。
+
+- 2026-03-10: 已完成后端 `business_credits` 透传、Token detail `Charged Credits` 展示、全站 `Tavily Status` 文案正名；`cargo test`、`cargo clippy -- -D warnings`、`cd web && bun run build` 通过，并以本地 seeded 数据确认 `/api/tokens/:id/logs`、`/logs/page`、`/events` 返回一致。
