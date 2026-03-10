@@ -4835,6 +4835,35 @@ mod tests {
             .expect("bind custom tag request");
         assert_eq!(bind_custom_resp.status(), reqwest::StatusCode::NO_CONTENT);
 
+        let filtered_users_resp = client
+            .get(format!(
+                "http://{}/api/users?page=1&per_page=20&q=Suspended%20Now&tagId={}",
+                addr, custom_tag_id
+            ))
+            .send()
+            .await
+            .expect("filtered users request");
+        assert_eq!(filtered_users_resp.status(), reqwest::StatusCode::OK);
+        let filtered_users_body: serde_json::Value = filtered_users_resp
+            .json()
+            .await
+            .expect("filtered users json");
+        assert_eq!(
+            filtered_users_body
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            filtered_users_body
+                .get("items")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|value| value.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(user.user_id.as_str())
+        );
+
         let detail_resp = client
             .get(format!("http://{}/api/users/{}", addr, user.user_id))
             .send()
@@ -4889,6 +4918,29 @@ mod tests {
             .await
             .expect("delete custom tag request");
         assert_eq!(delete_custom_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let filtered_users_after_delete_resp = client
+            .get(format!(
+                "http://{}/api/users?page=1&per_page=20&tagId={}",
+                addr, custom_tag_id
+            ))
+            .send()
+            .await
+            .expect("filtered users after delete request");
+        assert_eq!(
+            filtered_users_after_delete_resp.status(),
+            reqwest::StatusCode::OK
+        );
+        let filtered_users_after_delete: serde_json::Value = filtered_users_after_delete_resp
+            .json()
+            .await
+            .expect("filtered users after delete json");
+        assert_eq!(
+            filtered_users_after_delete
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
 
         let detail_after_resp = client
             .get(format!("http://{}/api/users/{}", addr, user.user_id))

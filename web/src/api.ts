@@ -746,6 +746,7 @@ export function fetchAdminUsers(
   page = 1,
   perPage = 20,
   query?: string,
+  tagId?: string | null,
   signal?: AbortSignal,
 ): Promise<Paginated<AdminUserSummary>> {
   const params = new URLSearchParams({
@@ -754,6 +755,9 @@ export function fetchAdminUsers(
   })
   if (query && query.trim().length > 0) {
     params.set('q', query.trim())
+  }
+  if (tagId && tagId.trim().length > 0) {
+    params.set('tagId', tagId.trim())
   }
   return requestJson(`/api/users?${params.toString()}`, { signal })
 }

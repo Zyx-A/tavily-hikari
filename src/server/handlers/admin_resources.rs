@@ -678,6 +678,8 @@ struct ListUsersQuery {
     page: Option<i64>,
     per_page: Option<i64>,
     q: Option<String>,
+    #[serde(rename = "tagId")]
+    tag_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1126,7 +1128,7 @@ async fn list_users(
     let per_page = q.per_page.unwrap_or(20).clamp(1, 100);
     let (users, total) = state
         .proxy
-        .list_admin_users_paged(page, per_page, q.q.as_deref())
+        .list_admin_users_paged(page, per_page, q.q.as_deref(), q.tag_id.as_deref())
         .await
         .map_err(|err| {
             eprintln!("list admin users error: {err}");

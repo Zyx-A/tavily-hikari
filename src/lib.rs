@@ -2240,9 +2240,10 @@ impl TavilyProxy {
         page: i64,
         per_page: i64,
         query: Option<&str>,
+        tag_id: Option<&str>,
     ) -> Result<(Vec<AdminUserIdentity>, i64), ProxyError> {
         self.key_store
-            .list_admin_users_paged(page, per_page, query)
+            .list_admin_users_paged(page, per_page, query, tag_id)
             .await
     }
 
@@ -7053,6 +7054,7 @@ impl KeyStore {
         page: i64,
         per_page: i64,
         query: Option<&str>,
+        tag_id: Option<&str>,
     ) -> Result<(Vec<AdminUserIdentity>, i64), ProxyError> {
         let page = page.max(1);
         let per_page = per_page.clamp(1, 100);
@@ -7061,114 +7063,265 @@ impl KeyStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| format!("%{value}%"));
+        let tag_id = tag_id.map(str::trim).filter(|value| !value.is_empty());
 
-        let total = if let Some(search) = search.as_ref() {
-            sqlx::query_scalar::<_, i64>(
-                r#"SELECT COUNT(*)
-                   FROM users u
-                   WHERE u.id LIKE ?
-                      OR COALESCE(u.display_name, '') LIKE ?
-                      OR COALESCE(u.username, '') LIKE ?
-                      OR EXISTS (
-                           SELECT 1
-                           FROM user_tag_bindings utb
-                           JOIN user_tags ut ON ut.id = utb.tag_id
-                           WHERE utb.user_id = u.id
-                             AND (
-                               ut.name LIKE ?
-                               OR COALESCE(ut.display_name, '') LIKE ?
-                             )
-                       )"#,
-            )
-            .bind(search)
-            .bind(search)
-            .bind(search)
-            .bind(search)
-            .bind(search)
-            .fetch_one(&self.pool)
-            .await?
-        } else {
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+        let total = match (search.as_ref(), tag_id) {
+            (Some(search), Some(tag_id)) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"SELECT COUNT(*)
+                       FROM users u
+                       WHERE EXISTS (
+                               SELECT 1
+                               FROM user_tag_bindings utb
+                               WHERE utb.user_id = u.id
+                                 AND utb.tag_id = ?
+                           )
+                         AND (
+                               u.id LIKE ?
+                               OR COALESCE(u.display_name, '') LIKE ?
+                               OR COALESCE(u.username, '') LIKE ?
+                               OR EXISTS (
+                                   SELECT 1
+                                   FROM user_tag_bindings utb
+                                   JOIN user_tags ut ON ut.id = utb.tag_id
+                                   WHERE utb.user_id = u.id
+                                     AND (
+                                         ut.name LIKE ?
+                                         OR COALESCE(ut.display_name, '') LIKE ?
+                                     )
+                               )
+                           )"#,
+                )
+                .bind(tag_id)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
                 .fetch_one(&self.pool)
                 .await?
-        };
-
-        let rows = if let Some(search) = search.as_ref() {
-            sqlx::query_as::<
-                _,
-                (
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    i64,
-                    Option<i64>,
-                    i64,
-                ),
-            >(
-                r#"SELECT
-                     u.id,
-                     u.display_name,
-                     u.username,
-                     u.active,
-                     u.last_login_at,
-                     COALESCE(COUNT(b.token_id), 0) AS token_count
-                   FROM users u
-                   LEFT JOIN user_token_bindings b ON b.user_id = u.id
-                   WHERE u.id LIKE ?
-                      OR COALESCE(u.display_name, '') LIKE ?
-                      OR COALESCE(u.username, '') LIKE ?
-                      OR EXISTS (
+            }
+            (Some(search), None) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"SELECT COUNT(*)
+                       FROM users u
+                       WHERE u.id LIKE ?
+                          OR COALESCE(u.display_name, '') LIKE ?
+                          OR COALESCE(u.username, '') LIKE ?
+                          OR EXISTS (
+                               SELECT 1
+                               FROM user_tag_bindings utb
+                               JOIN user_tags ut ON ut.id = utb.tag_id
+                               WHERE utb.user_id = u.id
+                                 AND (
+                                   ut.name LIKE ?
+                                   OR COALESCE(ut.display_name, '') LIKE ?
+                                 )
+                           )"#,
+                )
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            (None, Some(tag_id)) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"SELECT COUNT(*)
+                       FROM users u
+                       WHERE EXISTS (
                            SELECT 1
                            FROM user_tag_bindings utb
-                           JOIN user_tags ut ON ut.id = utb.tag_id
                            WHERE utb.user_id = u.id
-                             AND (
-                               ut.name LIKE ?
-                               OR COALESCE(ut.display_name, '') LIKE ?
-                             )
+                             AND utb.tag_id = ?
+                       )"#,
+                )
+                .bind(tag_id)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+        };
+
+        let rows = match (search.as_ref(), tag_id) {
+            (Some(search), Some(tag_id)) => {
+                sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        i64,
+                        Option<i64>,
+                        i64,
+                    ),
+                >(
+                    r#"SELECT
+                         u.id,
+                         u.display_name,
+                         u.username,
+                         u.active,
+                         u.last_login_at,
+                         COALESCE(COUNT(b.token_id), 0) AS token_count
+                       FROM users u
+                       LEFT JOIN user_token_bindings b ON b.user_id = u.id
+                       WHERE EXISTS (
+                               SELECT 1
+                               FROM user_tag_bindings utb
+                               WHERE utb.user_id = u.id
+                                 AND utb.tag_id = ?
+                           )
+                         AND (
+                               u.id LIKE ?
+                               OR COALESCE(u.display_name, '') LIKE ?
+                               OR COALESCE(u.username, '') LIKE ?
+                               OR EXISTS (
+                                   SELECT 1
+                                   FROM user_tag_bindings utb
+                                   JOIN user_tags ut ON ut.id = utb.tag_id
+                                   WHERE utb.user_id = u.id
+                                     AND (
+                                         ut.name LIKE ?
+                                         OR COALESCE(ut.display_name, '') LIKE ?
+                                     )
+                               )
+                           )
+                       GROUP BY u.id, u.display_name, u.username, u.active, u.last_login_at
+                       ORDER BY (u.last_login_at IS NULL) ASC, u.last_login_at DESC, u.id ASC
+                       LIMIT ? OFFSET ?"#,
+                )
+                .bind(tag_id)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(search), None) => {
+                sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        i64,
+                        Option<i64>,
+                        i64,
+                    ),
+                >(
+                    r#"SELECT
+                         u.id,
+                         u.display_name,
+                         u.username,
+                         u.active,
+                         u.last_login_at,
+                         COALESCE(COUNT(b.token_id), 0) AS token_count
+                       FROM users u
+                       LEFT JOIN user_token_bindings b ON b.user_id = u.id
+                       WHERE u.id LIKE ?
+                          OR COALESCE(u.display_name, '') LIKE ?
+                          OR COALESCE(u.username, '') LIKE ?
+                          OR EXISTS (
+                               SELECT 1
+                               FROM user_tag_bindings utb
+                               JOIN user_tags ut ON ut.id = utb.tag_id
+                               WHERE utb.user_id = u.id
+                                 AND (
+                                   ut.name LIKE ?
+                                   OR COALESCE(ut.display_name, '') LIKE ?
+                                 )
+                           )
+                       GROUP BY u.id, u.display_name, u.username, u.active, u.last_login_at
+                       ORDER BY (u.last_login_at IS NULL) ASC, u.last_login_at DESC, u.id ASC
+                       LIMIT ? OFFSET ?"#,
+                )
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(search)
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(tag_id)) => {
+                sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        i64,
+                        Option<i64>,
+                        i64,
+                    ),
+                >(
+                    r#"SELECT
+                         u.id,
+                         u.display_name,
+                         u.username,
+                         u.active,
+                         u.last_login_at,
+                         COALESCE(COUNT(b.token_id), 0) AS token_count
+                       FROM users u
+                       LEFT JOIN user_token_bindings b ON b.user_id = u.id
+                       WHERE EXISTS (
+                           SELECT 1
+                           FROM user_tag_bindings utb
+                           WHERE utb.user_id = u.id
+                             AND utb.tag_id = ?
                        )
-                   GROUP BY u.id, u.display_name, u.username, u.active, u.last_login_at
-                   ORDER BY (u.last_login_at IS NULL) ASC, u.last_login_at DESC, u.id ASC
-                   LIMIT ? OFFSET ?"#,
-            )
-            .bind(search)
-            .bind(search)
-            .bind(search)
-            .bind(search)
-            .bind(search)
-            .bind(per_page)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<
-                _,
-                (
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    i64,
-                    Option<i64>,
-                    i64,
-                ),
-            >(
-                r#"SELECT
-                     u.id,
-                     u.display_name,
-                     u.username,
-                     u.active,
-                     u.last_login_at,
-                     COALESCE(COUNT(b.token_id), 0) AS token_count
-                   FROM users u
-                   LEFT JOIN user_token_bindings b ON b.user_id = u.id
-                   GROUP BY u.id, u.display_name, u.username, u.active, u.last_login_at
-                   ORDER BY (u.last_login_at IS NULL) ASC, u.last_login_at DESC, u.id ASC
-                   LIMIT ? OFFSET ?"#,
-            )
-            .bind(per_page)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
+                       GROUP BY u.id, u.display_name, u.username, u.active, u.last_login_at
+                       ORDER BY (u.last_login_at IS NULL) ASC, u.last_login_at DESC, u.id ASC
+                       LIMIT ? OFFSET ?"#,
+                )
+                .bind(tag_id)
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        i64,
+                        Option<i64>,
+                        i64,
+                    ),
+                >(
+                    r#"SELECT
+                         u.id,
+                         u.display_name,
+                         u.username,
+                         u.active,
+                         u.last_login_at,
+                         COALESCE(COUNT(b.token_id), 0) AS token_count
+                       FROM users u
+                       LEFT JOIN user_token_bindings b ON b.user_id = u.id
+                       GROUP BY u.id, u.display_name, u.username, u.active, u.last_login_at
+                       ORDER BY (u.last_login_at IS NULL) ASC, u.last_login_at DESC, u.id ASC
+                       LIMIT ? OFFSET ?"#,
+                )
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
         };
 
         let items = rows

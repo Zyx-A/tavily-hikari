@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test'
 
-import { bindAdminUserTag, fetchAdminUserTags, updateAdminUserQuota } from './api'
+import { bindAdminUserTag, fetchAdminUsers, fetchAdminUserTags, updateAdminUserQuota } from './api'
 
 const originalFetch = globalThis.fetch
 
@@ -58,6 +58,29 @@ describe('admin user tag api helpers', () => {
     expect(input).toBe('/api/users/usr_alice/tags')
     expect(init.method).toBe('POST')
     expect(init.body).toBe(JSON.stringify({ tagId: 'team_lead' }))
+  })
+
+  it('sends exact tag filters when listing admin users', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            total: 0,
+            page: 1,
+            per_page: 20,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchAdminUsers(1, 20, 'L2', 'linuxdo_l2')
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [input] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(input).toBe('/api/users?page=1&per_page=20&q=L2&tagId=linuxdo_l2')
   })
 
   it('patches base quota through the existing user quota endpoint', async () => {

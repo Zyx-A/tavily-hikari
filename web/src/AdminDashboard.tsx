@@ -178,10 +178,22 @@ function getAdminUsersQueryFromLocation(): string {
   return new URLSearchParams(window.location.search).get('q')?.trim() ?? ''
 }
 
-function buildAdminUsersPath(query?: string): string {
-  const normalized = query?.trim() ?? ''
-  if (!normalized) return modulePath('users')
-  const params = new URLSearchParams({ q: normalized })
+function getAdminUsersTagFilterFromLocation(): string | null {
+  const tagId = new URLSearchParams(window.location.search).get('tagId')?.trim() ?? ''
+  return tagId.length > 0 ? tagId : null
+}
+
+function buildAdminUsersPath(query?: string, tagId?: string | null): string {
+  const normalizedQuery = query?.trim() ?? ''
+  const normalizedTagId = tagId?.trim() ?? ''
+  if (!normalizedQuery && !normalizedTagId) return modulePath('users')
+  const params = new URLSearchParams()
+  if (normalizedQuery) {
+    params.set('q', normalizedQuery)
+  }
+  if (normalizedTagId) {
+    params.set('tagId', normalizedTagId)
+  }
   return `${modulePath('users')}?${params.toString()}`
 }
 
@@ -653,6 +665,7 @@ function AdminDashboard(): JSX.Element {
   const [usersPage, setUsersPage] = useState(1)
   const [usersQueryInput, setUsersQueryInput] = useState('')
   const [usersQuery, setUsersQuery] = useState('')
+  const [usersTagFilterId, setUsersTagFilterId] = useState<string | null>(null)
   const [usersLoading, setUsersLoading] = useState(false)
   const [selectedUserDetail, setSelectedUserDetail] = useState<AdminUserDetail | null>(null)
   const [userDetailLoading, setUserDetailLoading] = useState(false)
@@ -1248,6 +1261,7 @@ function AdminDashboard(): JSX.Element {
       setUsersQuery((previous) => {
         if (previous === normalized) return previous
         setUsersPage(1)
+        setUsersTagFilterId(null)
         return normalized
       })
     }, 250)
@@ -1261,7 +1275,7 @@ function AdminDashboard(): JSX.Element {
 
     const controller = new AbortController()
     setUsersLoading(true)
-    fetchAdminUsers(usersPage, USERS_PER_PAGE, usersQuery, controller.signal)
+    fetchAdminUsers(usersPage, USERS_PER_PAGE, usersQuery, usersTagFilterId, controller.signal)
       .then((result) => {
         if (controller.signal.aborted) return
         setUsers(result.items)
@@ -1280,7 +1294,7 @@ function AdminDashboard(): JSX.Element {
       })
 
     return () => controller.abort()
-  }, [route, usersPage, usersQuery])
+  }, [route, usersPage, usersQuery, usersTagFilterId])
 
   useEffect(() => {
     const userTagRouteActive =
@@ -1316,9 +1330,11 @@ function AdminDashboard(): JSX.Element {
   useEffect(() => {
     if (!(route.name === 'module' && route.module === 'users')) return
     const locationQuery = getAdminUsersQueryFromLocation()
+    const locationTagFilterId = getAdminUsersTagFilterFromLocation()
     setUsersPage(1)
     setUsersQueryInput((previous) => (previous === locationQuery ? previous : locationQuery))
     setUsersQuery((previous) => (previous === locationQuery ? previous : locationQuery))
+    setUsersTagFilterId((previous) => (previous === locationTagFilterId ? previous : locationTagFilterId))
   }, [route])
 
   useEffect(() => {
@@ -1532,12 +1548,14 @@ function AdminDashboard(): JSX.Element {
   )
 
   const navigateUsersSearch = useCallback(
-    (query: string) => {
+    (query: string, options?: { tagId?: string | null }) => {
       const normalized = query.trim()
+      const normalizedTagId = options?.tagId?.trim() ?? null
       setUsersPage(1)
       setUsersQueryInput(normalized)
       setUsersQuery(normalized)
-      navigateToPath(buildAdminUsersPath(normalized))
+      setUsersTagFilterId(normalizedTagId)
+      navigateToPath(buildAdminUsersPath(normalized, normalizedTagId))
     },
     [navigateToPath],
   )
@@ -2306,7 +2324,7 @@ function AdminDashboard(): JSX.Element {
   }
 
   const refreshUsersList = async () => {
-    const pagedUsers = await fetchAdminUsers(usersPage, USERS_PER_PAGE, usersQuery)
+    const pagedUsers = await fetchAdminUsers(usersPage, USERS_PER_PAGE, usersQuery, usersTagFilterId)
     setUsers(pagedUsers.items)
     setUsersTotal(pagedUsers.total)
     return pagedUsers
@@ -3063,7 +3081,7 @@ function AdminDashboard(): JSX.Element {
             variant="secondary"
             size="xs"
             className="user-tag-catalog-users user-tag-catalog-users-button"
-            onClick={() => tag && navigateUsersSearch(tag.displayName)}
+            onClick={() => tag && navigateUsersSearch(tag.displayName, { tagId: tag.id })}
             disabled={isNewCard}
           >
             <span className="user-tag-catalog-users-label">{usersStrings.catalog.columns.users}</span>
@@ -5058,7 +5076,7 @@ function AdminDashboard(): JSX.Element {
                 <button type="button" className="btn btn-outline" onClick={applyUserSearch}>
                   {usersStrings.search}
                 </button>
-                {(usersQueryInput.length > 0 || usersQuery.length > 0) && (
+                {(usersQueryInput.length > 0 || usersQuery.length > 0 || usersTagFilterId != null) && (
                   <button type="button" className="btn btn-ghost" onClick={resetUserSearch}>
                     {usersStrings.clear}
                   </button>
