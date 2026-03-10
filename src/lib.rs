@@ -7245,6 +7245,55 @@ impl KeyStore {
         .bind(defaults.monthly_limit)
         .execute(&self.pool)
         .await?;
+
+        let total_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_quota_limits")
+            .fetch_one(&self.pool)
+            .await?;
+        if total_rows >= 2 {
+            let legacy_default_candidate = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+                r#"SELECT hourly_any_limit,
+                          hourly_limit,
+                          daily_limit,
+                          monthly_limit,
+                          COUNT(*) AS row_count
+                   FROM account_quota_limits
+                   WHERE NOT (
+                       hourly_any_limit = ?
+                       AND hourly_limit = ?
+                       AND daily_limit = ?
+                       AND monthly_limit = ?
+                   )
+                   GROUP BY hourly_any_limit, hourly_limit, daily_limit, monthly_limit
+                   ORDER BY row_count DESC
+                   LIMIT 1"#,
+            )
+            .bind(defaults.hourly_any_limit)
+            .bind(defaults.hourly_limit)
+            .bind(defaults.daily_limit)
+            .bind(defaults.monthly_limit)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some((hourly_any_limit, hourly_limit, daily_limit, monthly_limit, row_count)) =
+                legacy_default_candidate
+                && row_count >= 2
+                && row_count * 2 >= total_rows
+            {
+                sqlx::query(
+                    r#"UPDATE account_quota_limits
+                       SET inherits_defaults = 1
+                       WHERE hourly_any_limit = ?
+                         AND hourly_limit = ?
+                         AND daily_limit = ?
+                         AND monthly_limit = ?"#,
+                )
+                .bind(hourly_any_limit)
+                .bind(hourly_limit)
+                .bind(daily_limit)
+                .bind(monthly_limit)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -15686,6 +15735,153 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         .await
         .expect("read persisted legacy default limits");
         assert_eq!(limits, (21, 22, 23, 24, 1));
+
+        unsafe {
+            for (key, old_value) in env_keys.iter().zip(previous.into_iter()) {
+                if let Some(value) = old_value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn shared_legacy_default_account_quota_tuple_keeps_following_defaults() {
+        let _guard = env_lock().lock_owned().await;
+        let db_path = temp_db_path("account-limit-legacy-shared-default");
+        let db_str = db_path.to_string_lossy().to_string();
+        let env_keys = [
+            "TOKEN_HOURLY_REQUEST_LIMIT",
+            "TOKEN_HOURLY_LIMIT",
+            "TOKEN_DAILY_LIMIT",
+            "TOKEN_MONTHLY_LIMIT",
+        ];
+        let previous: Vec<Option<String>> =
+            env_keys.iter().map(|key| std::env::var(key).ok()).collect();
+
+        unsafe {
+            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "11");
+            std::env::set_var("TOKEN_HOURLY_LIMIT", "12");
+            std::env::set_var("TOKEN_DAILY_LIMIT", "13");
+            std::env::set_var("TOKEN_MONTHLY_LIMIT", "14");
+        }
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let default_alpha = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "legacy-default-alpha".to_string(),
+                username: Some("legacy_default_alpha".to_string()),
+                name: Some("Legacy Default Alpha".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(1),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert alpha");
+        let default_beta = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "legacy-default-beta".to_string(),
+                username: Some("legacy_default_beta".to_string()),
+                name: Some("Legacy Default Beta".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert beta");
+        let custom_user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "legacy-default-custom".to_string(),
+                username: Some("legacy_default_custom".to_string()),
+                name: Some("Legacy Default Custom".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(3),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert custom user");
+        for user in [&default_alpha, &default_beta, &custom_user] {
+            proxy
+                .ensure_user_token_binding(&user.user_id, Some("linuxdo:legacy_default"))
+                .await
+                .expect("bind token");
+            proxy
+                .user_dashboard_summary(&user.user_id)
+                .await
+                .expect("seed account quota row");
+        }
+        sqlx::query(
+            r#"UPDATE account_quota_limits
+               SET updated_at = created_at + 5
+               WHERE user_id IN (?, ?)"#,
+        )
+        .bind(&default_alpha.user_id)
+        .bind(&default_beta.user_id)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("simulate shared legacy default rows touched by restart");
+        sqlx::query(
+            r#"UPDATE account_quota_limits
+               SET hourly_any_limit = 101,
+                   hourly_limit = 102,
+                   daily_limit = 103,
+                   monthly_limit = 104,
+                   inherits_defaults = 1,
+                   updated_at = created_at + 9
+               WHERE user_id = ?"#,
+        )
+        .bind(&custom_user.user_id)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("simulate legacy custom row");
+        sqlx::query("DELETE FROM meta WHERE key = ?")
+            .bind(META_KEY_ACCOUNT_QUOTA_INHERITS_DEFAULTS_BACKFILL_V1)
+            .execute(&proxy.key_store.pool)
+            .await
+            .expect("clear inherits defaults backfill marker");
+
+        drop(proxy);
+
+        unsafe {
+            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "21");
+            std::env::set_var("TOKEN_HOURLY_LIMIT", "22");
+            std::env::set_var("TOKEN_DAILY_LIMIT", "23");
+            std::env::set_var("TOKEN_MONTHLY_LIMIT", "24");
+        }
+
+        let proxy_after =
+            TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+                .await
+                .expect("proxy reopened");
+        for user_id in [&default_alpha.user_id, &default_beta.user_id] {
+            let limits: (i64, i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults FROM account_quota_limits WHERE user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_one(&proxy_after.key_store.pool)
+            .await
+            .expect("read shared default limits");
+            assert_eq!(limits, (21, 22, 23, 24, 1));
+        }
+        let custom_limits: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults FROM account_quota_limits WHERE user_id = ?",
+        )
+        .bind(&custom_user.user_id)
+        .fetch_one(&proxy_after.key_store.pool)
+        .await
+        .expect("read shared custom limits");
+        assert_eq!(custom_limits, (101, 102, 103, 104, 0));
 
         unsafe {
             for (key, old_value) in env_keys.iter().zip(previous.into_iter()) {
