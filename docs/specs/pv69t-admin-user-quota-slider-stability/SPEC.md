@@ -127,7 +127,7 @@
   capture_scope: browser-viewport
   sensitive_exclusion: N/A
   submission_gate: approved
-  evidence_note: 聚焦用户详情页的配额设置面板，确认每行采用“尽量拉宽的滑块 + 可容纳千分符大数字的固定宽输入框”布局，避免输入框反向挤压滑块可用宽度。
+  evidence_note: 聚焦用户详情页的配额设置面板，确认每行采用“滑块优先占宽 + 固定宽数字输入列”的共享生产组件布局，避免输入框反向挤压滑块可用宽度。
   image:
   ![Admin 用户详情配额布局验收截图](./assets/admin-user-quota-layout-proof.png)
 
