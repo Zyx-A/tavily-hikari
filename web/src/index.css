@@ -1050,40 +1050,6 @@
   margin-top: 24px;
 }
 
-.linuxdo-login-button,
-.token-access-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0.72rem 1.05rem;
-  border-radius: 999px;
-  border: 1px solid hsl(var(--foreground) / 0.18);
-  background: hsl(var(--primary-foreground));
-  color: hsl(var(--foreground));
-  text-decoration: none;
-  font-weight: 600;
-  line-height: 1;
-  box-shadow: 0 1px 2px hsl(var(--border) / 0.82);
-  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
-}
-
-.token-access-button {
-  appearance: none;
-  cursor: pointer;
-  /* `font: inherit` resets weight/line-height, so re-apply to match the anchor. */
-  font: inherit;
-  font-weight: 600;
-  line-height: 1;
-}
-
-.public-home-admin-button {
-  border-radius: 999px;
-  height: auto;
-  min-height: 42px;
-  padding: 0.72rem 1.05rem;
-  line-height: 1;
-}
-
 .token-access-icon {
   width: 20px;
   height: 20px;
@@ -1094,19 +1060,6 @@
   width: 20px;
   height: 20px;
   border-radius: 50%;
-}
-
-.linuxdo-login-button:hover,
-.token-access-button:hover {
-  border-color: hsl(var(--foreground) / 0.32);
-  box-shadow: 0 6px 14px hsl(var(--border) / 0.96);
-  transform: translateY(-1px);
-}
-
-.linuxdo-login-button:active,
-.token-access-button:active {
-  transform: translateY(0);
-  box-shadow: 0 2px 6px hsl(var(--border) / 0.96);
 }
 
 .hero-metrics {
@@ -5700,20 +5653,6 @@ tbody .log-details-row:hover {
   .guide-tab:hover {
     border-color: hsl(var(--primary) / 0.4);
     color: hsl(var(--foreground));
-  }
-
-  .linuxdo-login-button,
-  .token-access-button {
-    border: 1px solid hsl(var(--border));
-    background: hsl(var(--card) / 0.95);
-    color: hsl(var(--foreground));
-    box-shadow: 0 10px 20px -18px hsl(var(--foreground) / 0.5);
-  }
-
-  .linuxdo-login-button:hover,
-  .token-access-button:hover {
-    border-color: hsl(var(--primary) / 0.5);
-    box-shadow: 0 14px 26px -20px hsl(var(--primary) / 0.45);
   }
 
   .table-wrapper {

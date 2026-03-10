@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 进行中（PR #110 checks green）
+- Status: 已完成
 - Created: 2026-03-09
-- Last: 2026-03-09
+- Last: 2026-03-10
 
 ## 背景 / 问题陈述
 
@@ -101,3 +101,4 @@
 - 2026-03-09: 根据 Storybook 验收反馈，恢复多个交互控件的 `border: none` 样式桥，修复 AdminShell active marker 缩成 32px 的回归。
 - 2026-03-09: 为 `TokenSecretField`、`AdminTableShell`、`AdminTablePagination`、`QuotaRangeField`、`AdminNavButton` 补充 direct Storybook stories。
 - 2026-03-09: 统一 Admin Storybook 信息架构，把共享复合组件归到 `Admin/Components/*`，wrappers 归到 `Admin/Wrappers/*` 与 `Public/Wrappers/*`。
+- 2026-03-09: PR #110 已合并到 `main`；主通路 shadcn 收敛、shared wrappers 与 Storybook 跟进项正式落地。

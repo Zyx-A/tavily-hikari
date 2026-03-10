@@ -162,11 +162,25 @@ function TokenUsageLayoutStory(): JSX.Element {
 }
 
 const meta = {
-  title: 'Admin/Layout',
+  title: 'Admin/AdminShell',
   parameters: {
     layout: 'fullscreen',
+    docs: {
+      description: {
+        component:
+          'Admin shell primitive that owns skip-link, responsive sidebar, stacked mobile menu, and the main content frame used by admin pages.',
+      },
+    },
   },
-} satisfies Meta
+  component: AdminShell,
+  tags: ['autodocs'],
+  args: {
+    activeModule: 'dashboard',
+    navItems: NAV_ITEMS,
+    skipToContentLabel: 'Skip to main content',
+    onSelectModule: () => undefined,
+  },
+} satisfies Meta<typeof AdminShell>
 
 export default meta
 
