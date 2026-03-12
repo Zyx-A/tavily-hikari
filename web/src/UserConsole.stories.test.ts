@@ -78,7 +78,7 @@ describe('UserConsole Storybook acceptance controls', () => {
     })
     expect(userConsoleStories.ConsoleHomeEmptyTokens).toMatchObject({
       name: 'Console Home Empty Tokens',
-      args: { consoleView: 'Console Home', landingFocus: 'Overview Focus', tokenListState: 'Empty' },
+      args: { consoleView: 'Console Home', landingFocus: 'Token Focus', tokenListState: 'Empty' },
     })
     expect(userConsoleStories.TokenDetailOverview).toMatchObject({
       name: 'Token Detail Overview',

@@ -411,6 +411,7 @@ export default function UserConsole(): JSX.Element {
   const anyProbeRunning = mcpProbe.state === 'running' || apiProbe.state === 'running'
   const adminHref = getUserConsoleAdminHref(profile)
   const consoleUnavailable = consoleAvailability === 'disabled'
+  const showEmptyTokens = !loading && tokens.length === 0
 
   const landingSection = route.name === 'landing' && route.section === 'tokens' ? 'tokens' : 'dashboard'
 
@@ -1095,7 +1096,7 @@ export default function UserConsole(): JSX.Element {
               </div>
             </div>
             <div className="table-wrapper jobs-table-wrapper user-console-md-up">
-              {tokens.length === 0 ? (
+              {showEmptyTokens ? (
                 <div className="empty-state alert">{text.tokens.empty}</div>
               ) : (
                 <table className="user-console-tokens-table">
@@ -1173,7 +1174,7 @@ export default function UserConsole(): JSX.Element {
               )}
             </div>
             <div className="user-console-mobile-list user-console-md-down">
-              {tokens.length === 0 ? (
+              {showEmptyTokens ? (
                 <div className="empty-state alert">{text.tokens.empty}</div>
               ) : (
                 tokens.map((item) => {

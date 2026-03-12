@@ -525,7 +525,7 @@ export const ConsoleHomeEmptyTokens: Story = {
   args: {
     consoleView: 'Console Home',
     isAdmin: false,
-    landingFocus: 'Overview Focus',
+    landingFocus: 'Token Focus',
     tokenListState: 'Empty',
   },
 }

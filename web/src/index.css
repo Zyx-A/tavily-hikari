@@ -4760,6 +4760,48 @@ tbody .log-details-row:hover {
   flex-shrink: 0;
 }
 
+.user-console-section-nav-panel {
+  margin-bottom: 18px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.user-console-section-nav-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.user-console-section-nav-copy h2 {
+  margin: 0;
+  font-size: 1.04rem;
+  font-weight: 700;
+}
+
+.user-console-section-nav-tabs {
+  flex: 0 0 auto;
+}
+
+.user-console-landing-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.user-console-landing-stack > .panel {
+  margin-top: 0;
+}
+
+.user-console-section {
+  scroll-margin-top: 28px;
+}
+
+.user-console-section-header {
+  align-items: flex-start;
+}
+
 @media (max-width: 767px) {
   .app-shell {
     padding: 20px 16px 36px;
@@ -5017,48 +5059,6 @@ tbody .log-details-row:hover {
 }
 .access-panel {
   margin-top: 16px;
-}
-
-.user-console-section-nav-panel {
-  margin-bottom: 18px;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.user-console-section-nav-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.user-console-section-nav-copy h2 {
-  margin: 0;
-  font-size: 1.04rem;
-  font-weight: 700;
-}
-
-.user-console-section-nav-tabs {
-  flex: 0 0 auto;
-}
-
-.user-console-landing-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-.user-console-landing-stack > .panel {
-  margin-top: 0;
-}
-
-.user-console-section {
-  scroll-margin-top: 28px;
-}
-
-.user-console-section-header {
-  align-items: flex-start;
 }
 
 .access-panel-grid {
