@@ -4,6 +4,7 @@ import AdminTablePagination from './components/AdminTablePagination'
 import AdminLoadingRegion from './components/AdminLoadingRegion'
 import AdminTableShell from './components/AdminTableShell'
 import { ApiKeysValidationDialog } from './components/ApiKeysValidationDialog'
+import ManualCopyBubble from './components/ManualCopyBubble'
 import QuotaRangeField from './components/QuotaRangeField'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -65,9 +66,10 @@ import {
   userTagEditPath,
   userTagsPath,
 } from './admin/routes'
-import { useTranslate, type AdminTranslations } from './i18n'
+import { useLanguage, useTranslate, type AdminTranslations } from './i18n'
 import { extractTvlyDevApiKeysFromText } from './lib/api-key-extract'
 import { ADMIN_USER_CONSOLE_HREF } from './lib/adminUserConsoleEntry'
+import { copyText, selectAllReadonlyText } from './lib/clipboard'
 import {
   fetchApiKeys,
   fetchApiKeySecret,
@@ -626,8 +628,18 @@ function formatErrorMessage(log: RequestLog, errorsStrings: AdminTranslations['l
   return errorsStrings.none
 }
 
+interface ManualCopyBubbleState {
+  anchorEl: HTMLElement | null
+  title: string
+  description: string
+  fieldLabel: string
+  value: string
+  multiline?: boolean
+}
+
 function AdminDashboard(): JSX.Element {
   const [route, setRoute] = useState<AdminPathRoute>(() => parseAdminPath(window.location.pathname))
+  const { language } = useLanguage()
   const translations = useTranslate()
   const adminStrings = translations.admin
   const headerStrings = adminStrings.header
@@ -736,6 +748,7 @@ function AdminDashboard(): JSX.Element {
   const tokenGroupsListRef = useRef<HTMLDivElement | null>(null)
   const keyGroupsListRef = useRef<HTMLDivElement | null>(null)
   const [copyState, setCopyState] = useState<Map<string, 'loading' | 'copied'>>(() => new Map())
+  const [manualCopyBubble, setManualCopyBubble] = useState<ManualCopyBubbleState | null>(null)
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(() => new Set())
   type AddKeysBatchReportState =
     | { kind: 'success'; response: AddApiKeysBatchResponse }
@@ -818,6 +831,40 @@ function AdminDashboard(): JSX.Element {
   const [batchShareText, setBatchShareText] = useState<string | null>(null)
   const isAdmin = profile?.isAdmin ?? false
   const keysBatchVisible = keysBatchExpanded || keysBatchClosing
+  const manualCopyText = useMemo(
+    () => (
+      language === 'zh'
+        ? {
+            title: '请手动复制',
+            description: '当前浏览器拦截了自动复制，下面已选中原文，可直接手动复制。',
+            close: '关闭',
+            fields: {
+              apiKey: '完整 API Key',
+              token: '完整 Token',
+              shareLink: '分享链接',
+            },
+            createToken: {
+              title: '令牌已创建，请手动复制',
+              description: '自动复制失败，下面保留了完整令牌，请先手动复制后再继续操作。',
+            },
+          }
+        : {
+            title: 'Manual copy required',
+            description: 'This browser blocked automatic copy. The original value is selected below for manual copy.',
+            close: 'Close',
+            fields: {
+              apiKey: 'Full API Key',
+              token: 'Full Token',
+              shareLink: 'Share Link',
+            },
+            createToken: {
+              title: 'Token created — copy manually',
+              description: 'Automatic copy failed. The full token is selected below so you can copy it before continuing.',
+            },
+          }
+    ),
+    [language],
+  )
 
   const clearKeysBatchAutoCollapseTimer = useCallback(() => {
     if (keysBatchAutoCollapseTimerRef.current != null) {
@@ -837,6 +884,10 @@ function AdminDashboard(): JSX.Element {
     clearKeysBatchAutoCollapseTimer()
     clearKeysBatchCloseTimer()
   }, [clearKeysBatchAutoCollapseTimer, clearKeysBatchCloseTimer])
+
+  useEffect(() => {
+    setManualCopyBubble(null)
+  }, [route])
 
   useEffect(() => {
     if (!keysBatchExpanded) return
@@ -987,21 +1038,11 @@ function AdminDashboard(): JSX.Element {
   }, [])
 
   const copyToClipboard = useCallback(async (value: string) => {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(value)
-      return
-    }
+    return await copyText(value)
+  }, [])
 
-    const textarea = document.createElement('textarea')
-    textarea.value = value
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    textarea.style.left = '-9999px'
-    document.body.appendChild(textarea)
-    textarea.focus()
-    textarea.select()
-    document.execCommand('copy')
-    document.body.removeChild(textarea)
+  const openManualCopyBubble = useCallback((state: ManualCopyBubbleState) => {
+    setManualCopyBubble(state)
   }, [])
 
   const resolveTokenSecret = useCallback(async (id: string) => {
@@ -1066,7 +1107,7 @@ function AdminDashboard(): JSX.Element {
   }, [])
 
   const handleCopySecret = useCallback(
-    async (id: string, stateKey: string) => {
+    async (id: string, stateKey: string, anchorEl?: HTMLElement | null) => {
       updateCopyState(stateKey, 'loading')
       try {
         let secret = secretCacheRef.current.get(id)
@@ -1076,7 +1117,20 @@ function AdminDashboard(): JSX.Element {
           secretCacheRef.current.set(id, secret)
         }
 
-        await copyToClipboard(secret)
+        const copyResult = await copyToClipboard(secret)
+        if (!copyResult.ok) {
+          updateCopyState(stateKey, null)
+          if (anchorEl) {
+            openManualCopyBubble({
+              anchorEl,
+              title: manualCopyText.title,
+              description: manualCopyText.description,
+              fieldLabel: manualCopyText.fields.apiKey,
+              value: secret,
+            })
+          }
+          return
+        }
         updateCopyState(stateKey, 'copied')
         window.setTimeout(() => updateCopyState(stateKey, null), 2000)
       } catch (err) {
@@ -1085,7 +1139,7 @@ function AdminDashboard(): JSX.Element {
         updateCopyState(stateKey, null)
       }
     },
-    [copyToClipboard, setError, updateCopyState],
+    [copyToClipboard, errorStrings.copyKey, manualCopyText, openManualCopyBubble, setError, updateCopyState],
   )
 
   const loadData = useCallback(
@@ -2500,13 +2554,22 @@ function AdminDashboard(): JSX.Element {
     }
   }
 
-  const handleAddToken = async () => {
+  const handleAddToken = async (anchorEl?: HTMLElement | null) => {
     const note = newTokenNote.trim()
     setSubmitting(true)
     try {
       const { token } = await createToken(note || undefined)
       setNewTokenNote('')
-      try { await navigator.clipboard?.writeText(token) } catch {}
+      const copyResult = await copyToClipboard(token)
+      if (!copyResult.ok && anchorEl) {
+        openManualCopyBubble({
+          anchorEl,
+          title: manualCopyText.createToken.title,
+          description: manualCopyText.createToken.description,
+          fieldLabel: manualCopyText.fields.token,
+          value: token,
+        })
+      }
       const controller = new AbortController()
       setLoading(true)
       await loadData({ signal: controller.signal, reason: 'refresh', showGlobalLoading: true })
@@ -2848,11 +2911,24 @@ function AdminDashboard(): JSX.Element {
     setKeysBatchReport(null)
   }
 
-  const handleCopyToken = async (id: string, stateKey: string) => {
+  const handleCopyToken = async (id: string, stateKey: string, anchorEl?: HTMLElement | null) => {
     updateCopyState(stateKey, 'loading')
     try {
       const token = await resolveTokenSecret(id)
-      await copyToClipboard(token)
+      const copyResult = await copyToClipboard(token)
+      if (!copyResult.ok) {
+        updateCopyState(stateKey, null)
+        if (anchorEl) {
+          openManualCopyBubble({
+            anchorEl,
+            title: manualCopyText.title,
+            description: manualCopyText.description,
+            fieldLabel: manualCopyText.fields.token,
+            value: token,
+          })
+        }
+        return
+      }
       updateCopyState(stateKey, 'copied')
       window.setTimeout(() => updateCopyState(stateKey, null), 2000)
     } catch (err) {
@@ -2862,12 +2938,25 @@ function AdminDashboard(): JSX.Element {
     }
   }
 
-  const handleShareToken = async (id: string, stateKey: string) => {
+  const handleShareToken = async (id: string, stateKey: string, anchorEl?: HTMLElement | null) => {
     updateCopyState(stateKey, 'loading')
     try {
       const token = await resolveTokenSecret(id)
       const shareUrl = `${window.location.origin}/#${encodeURIComponent(token)}`
-      await copyToClipboard(shareUrl)
+      const copyResult = await copyToClipboard(shareUrl)
+      if (!copyResult.ok) {
+        updateCopyState(stateKey, null)
+        if (anchorEl) {
+          openManualCopyBubble({
+            anchorEl,
+            title: manualCopyText.title,
+            description: manualCopyText.description,
+            fieldLabel: manualCopyText.fields.shareLink,
+            value: shareUrl,
+          })
+        }
+        return
+      }
       updateCopyState(stateKey, 'copied')
       window.setTimeout(() => updateCopyState(stateKey, null), 2000)
     } catch (err) {
@@ -4408,7 +4497,7 @@ function AdminDashboard(): JSX.Element {
 />
 <Button
   type="button"
-  onClick={() => void handleAddToken()}
+  onClick={(event) => void handleAddToken(event.currentTarget)}
   disabled={submitting}
 >
   {submitting ? tokenStrings.creating : tokenStrings.newToken}
@@ -4582,7 +4671,7 @@ function AdminDashboard(): JSX.Element {
   className="token-action-button shadow-none"
   title={tokenStrings.actions.copy}
   aria-label={tokenStrings.actions.copy}
-  onClick={() => void handleCopyToken(t.id, stateKey)}
+  onClick={(event) => void handleCopyToken(t.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={16} height={16} />
@@ -4594,7 +4683,7 @@ function AdminDashboard(): JSX.Element {
   className="token-action-button shadow-none"
   title={tokenStrings.actions.share}
   aria-label={tokenStrings.actions.share}
-  onClick={() => void handleShareToken(t.id, shareStateKey)}
+  onClick={(event) => void handleShareToken(t.id, shareStateKey, event.currentTarget)}
   disabled={shareState === 'loading'}
 >
   <Icon icon={shareState === 'copied' ? 'mdi:check' : 'mdi:share-variant'} width={16} height={16} />
@@ -4712,7 +4801,7 @@ function AdminDashboard(): JSX.Element {
   type="button"
   variant={state === 'copied' ? 'success' : 'outline'}
   size="sm"
-  onClick={() => void handleCopyToken(t.id, stateKey)}
+  onClick={(event) => void handleCopyToken(t.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   {tokenStrings.actions.copy}
@@ -4721,7 +4810,7 @@ function AdminDashboard(): JSX.Element {
   type="button"
   variant={shareState === 'copied' ? 'success' : 'outline'}
   size="sm"
-  onClick={() => void handleShareToken(t.id, shareStateKey)}
+  onClick={(event) => void handleShareToken(t.id, shareStateKey, event.currentTarget)}
   disabled={shareState === 'loading'}
 >
   {tokenStrings.actions.share}
@@ -4967,7 +5056,7 @@ function AdminDashboard(): JSX.Element {
   className="h-8 w-8 rounded-full p-0 shadow-none"
   title={keyStrings.actions.copy}
   aria-label={keyStrings.actions.copy}
-  onClick={() => void handleCopySecret(item.id, stateKey)}
+  onClick={(event) => void handleCopySecret(item.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={18} height={18} />
@@ -5116,7 +5205,7 @@ function AdminDashboard(): JSX.Element {
   type="button"
   variant={state === 'copied' ? 'success' : 'outline'}
   size="sm"
-  onClick={() => void handleCopySecret(item.id, stateKey)}
+  onClick={(event) => void handleCopySecret(item.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   {keyStrings.actions.copy}
@@ -5935,15 +6024,20 @@ function AdminDashboard(): JSX.Element {
                   overflowY: 'auto',
                 }}
                 value={batchShareText ?? ''}
+                onClick={(event) => selectAllReadonlyText(event.currentTarget)}
+                onFocus={(event) => selectAllReadonlyText(event.currentTarget)}
               />
             </div>
             <DialogFooter className="modal-action">
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => {
+                onClick={async () => {
                   if (!batchShareText) return
-                  void copyToClipboard(batchShareText)
+                  const copyResult = await copyToClipboard(batchShareText)
+                  if (!copyResult.ok) {
+                    setError(errorStrings.copyToken)
+                  }
                 }}
               >
                 {tokenStrings.batchDialog.copyAll}
@@ -6154,6 +6248,17 @@ function AdminDashboard(): JSX.Element {
     </DialogFooter>
   </DialogContent>
 </Dialog>
+      <ManualCopyBubble
+        open={manualCopyBubble != null}
+        anchorEl={manualCopyBubble?.anchorEl ?? null}
+        title={manualCopyBubble?.title ?? manualCopyText.title}
+        description={manualCopyBubble?.description ?? manualCopyText.description}
+        fieldLabel={manualCopyBubble?.fieldLabel ?? manualCopyText.fields.token}
+        value={manualCopyBubble?.value ?? ''}
+        multiline={manualCopyBubble?.multiline ?? false}
+        closeLabel={manualCopyText.close}
+        onClose={() => setManualCopyBubble(null)}
+      />
     </>
   )
 }

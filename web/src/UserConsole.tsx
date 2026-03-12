@@ -2,6 +2,7 @@ import React, { ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, use
 import { Icon } from '@iconify/react'
 import CherryStudioMock from './components/CherryStudioMock'
 import TokenSecretField, { type TokenSecretCopyState } from './components/TokenSecretField'
+import ManualCopyBubble from './components/ManualCopyBubble'
 
 import {
   fetchProfile,
@@ -29,6 +30,7 @@ import { StatusBadge, type StatusTone } from './components/StatusBadge'
 import ThemeToggle from './components/ThemeToggle'
 import { Button } from './components/ui/button'
 import { useLanguage, useTranslate, type Language } from './i18n'
+import { copyText } from './lib/clipboard'
 import {
   type McpProbeStepState,
   type ProbeQuotaWindow,
@@ -72,6 +74,11 @@ interface GuideContent {
   snippetLanguage?: GuideLanguage
   snippet?: string
   reference?: GuideReference
+}
+
+interface ManualCopyBubbleState {
+  anchorEl: HTMLElement | null
+  value: string
 }
 
 const GUIDE_KEY_ORDER: GuideKey[] = [
@@ -246,6 +253,9 @@ export default function UserConsole(): JSX.Element {
   const [probeBubble, setProbeBubble] = useState<ProbeBubbleModel | null>(null)
   const [probeBubbleShift, setProbeBubbleShift] = useState(0)
   const probeBubbleRef = useRef<HTMLDivElement | null>(null)
+  const [manualCopyBubble, setManualCopyBubble] = useState<ManualCopyBubbleState | null>(null)
+  const tokenSecretCacheRef = useRef<Map<string, string>>(new Map())
+  const tokenSecretRequestRef = useRef<Map<string, Promise<string>>>(new Map())
   const probeRunIdRef = useRef(0)
   const tokenSecretRunIdRef = useRef(0)
   const pageRef = useRef<HTMLElement>(null)
@@ -360,6 +370,7 @@ export default function UserConsole(): JSX.Element {
     setApiProbe(createProbeButtonModel(6))
     setProbeBubble(null)
     setProbeBubbleShift(0)
+    setManualCopyBubble(null)
   }, [route.name === 'token' ? route.id : route.section ?? 'landing'])
 
   useEffect(() => {
@@ -402,18 +413,76 @@ export default function UserConsole(): JSX.Element {
     }
   }, [probeBubble])
 
-  const copyToken = useCallback(async (tokenId: string) => {
-    try {
-      const cachedToken =
-        route.name === 'token' && route.id === tokenId && tokenSecretTokenId === tokenId
-          ? tokenSecretValue
-          : null
-      let token = cachedToken
-      if (!token) {
-        const secret = await fetchUserTokenSecret(tokenId)
-        token = secret.token
+  const resolveTokenSecret = useCallback(async (tokenId: string, signal?: AbortSignal) => {
+    const revealedToken =
+      route.name === 'token' && route.id === tokenId && tokenSecretTokenId === tokenId
+        ? tokenSecretValue
+        : null
+    if (revealedToken) {
+      return revealedToken
+    }
+
+    const cached = tokenSecretCacheRef.current.get(tokenId)
+    if (cached) {
+      return cached
+    }
+
+    const pending = tokenSecretRequestRef.current.get(tokenId)
+    if (pending) {
+      return await pending
+    }
+
+    const request = fetchUserTokenSecret(tokenId, signal)
+      .then(({ token }) => {
+        tokenSecretCacheRef.current.set(tokenId, token)
+        return token
+      })
+      .finally(() => {
+        tokenSecretRequestRef.current.delete(tokenId)
+      })
+
+    tokenSecretRequestRef.current.set(tokenId, request)
+    return await request
+  }, [route, tokenSecretTokenId, tokenSecretValue])
+
+  useEffect(() => {
+    if (consoleAvailability !== 'enabled') return
+
+    const controller = new AbortController()
+    const tokenIds = new Set(tokens.map((item) => item.tokenId))
+    if (route.name === 'token') {
+      tokenIds.add(route.id)
+    }
+
+    for (const tokenId of tokenIds) {
+      if (tokenSecretCacheRef.current.has(tokenId) || tokenSecretRequestRef.current.has(tokenId)) {
+        continue
       }
-      await navigator.clipboard.writeText(token)
+      void resolveTokenSecret(tokenId, controller.signal).catch(() => undefined)
+    }
+
+    return () => controller.abort()
+  }, [consoleAvailability, resolveTokenSecret, route, tokens])
+
+  const copyToken = useCallback(async (tokenId: string, anchorEl?: HTMLElement | null) => {
+    setManualCopyBubble(null)
+    try {
+      const hasCachedToken =
+        (route.name === 'token' && route.id === tokenId && tokenSecretTokenId === tokenId && tokenSecretValue != null)
+        || tokenSecretCacheRef.current.has(tokenId)
+      const token = await resolveTokenSecret(tokenId)
+      const result = await copyText(token, hasCachedToken ? { preferExecCommand: true } : { allowExecCommand: false })
+      if (!result.ok) {
+        if (anchorEl) {
+          setManualCopyBubble({ anchorEl, value: token })
+        }
+        setCopyState((prev) => ({ ...prev, [tokenId]: 'error' }))
+        window.setTimeout(() => {
+          setCopyState((prev) => ({ ...prev, [tokenId]: 'idle' }))
+        }, 1800)
+        return
+      }
+      setManualCopyBubble(null)
       setCopyState((prev) => ({ ...prev, [tokenId]: 'copied' }))
     } catch {
       setCopyState((prev) => ({ ...prev, [tokenId]: 'error' }))
@@ -421,7 +490,7 @@ export default function UserConsole(): JSX.Element {
     window.setTimeout(() => {
       setCopyState((prev) => ({ ...prev, [tokenId]: 'idle' }))
     }, 1800)
-  }, [route, tokenSecretTokenId, tokenSecretValue])
+  }, [resolveTokenSecret, route, tokenSecretTokenId, tokenSecretValue])
 
   const toggleTokenSecretVisibility = useCallback(async () => {
     if (route.name !== 'token') return
@@ -449,6 +518,7 @@ export default function UserConsole(): JSX.Element {
       if (tokenSecretRunIdRef.current !== runId) return
       setTokenSecretTokenId(route.id)
       setTokenSecretValue(secret.token)
+      tokenSecretCacheRef.current.set(route.id, secret.token)
       setTokenSecretVisible(true)
     } catch (err) {
       if (tokenSecretRunIdRef.current !== runId) return
@@ -1235,7 +1305,7 @@ export default function UserConsole(): JSX.Element {
                               <button
                                 type="button"
                                 className={`btn btn-outline btn-sm ${state === 'copied' ? 'btn-success' : state === 'error' ? 'btn-warning' : ''}`}
-                                onClick={() => void copyToken(item.tokenId)}
+                                onClick={(event) => void copyToken(item.tokenId, event.currentTarget)}
                               >
                                 {state === 'copied' ? text.tokens.copied : state === 'error' ? text.tokens.copyFailed : text.tokens.copy}
                               </button>
@@ -1297,7 +1367,7 @@ export default function UserConsole(): JSX.Element {
                         <button
                           type="button"
                           className={`btn btn-outline btn-sm ${state === 'copied' ? 'btn-success' : state === 'error' ? 'btn-warning' : ''}`}
-                          onClick={() => void copyToken(item.tokenId)}
+                          onClick={(event) => void copyToken(item.tokenId, event.currentTarget)}
                         >
                           {state === 'copied' ? text.tokens.copied : state === 'error' ? text.tokens.copyFailed : text.tokens.copy}
                         </button>
@@ -1379,7 +1449,7 @@ export default function UserConsole(): JSX.Element {
               copyState={detailTokenCopyState}
               onValueChange={() => undefined}
               onToggleVisibility={() => void toggleTokenSecretVisibility()}
-              onCopy={() => copyToken(route.id)}
+              onCopy={(anchorEl) => copyToken(route.id, anchorEl)}
               label={text.detail.tokenLabel}
               visibilityShowLabel={text.detail.tokenSecret.show}
               visibilityHideLabel={text.detail.tokenSecret.hide}
@@ -1606,6 +1676,16 @@ export default function UserConsole(): JSX.Element {
           </footer>
         </>
       )}
+      <ManualCopyBubble
+        open={manualCopyBubble != null}
+        anchorEl={manualCopyBubble?.anchorEl ?? null}
+        title={text.tokens.manualCopy.title}
+        description={text.tokens.manualCopy.description}
+        fieldLabel={text.tokens.manualCopy.fieldLabel}
+        value={manualCopyBubble?.value ?? ''}
+        closeLabel={text.tokens.manualCopy.close}
+        onClose={() => setManualCopyBubble(null)}
+      />
     </main>
   )
 }
@@ -1929,6 +2009,12 @@ const EN = {
     copied: 'Copied',
     copyFailed: 'Copy failed',
     detail: 'Details',
+    manualCopy: {
+      title: 'Manual copy required',
+      description: 'This browser blocked automatic copy. The full token is selected below for manual copy.',
+      fieldLabel: 'Full Token',
+      close: 'Close',
+    },
     table: {
       id: 'Token ID',
       quotas: 'Quota Windows',
@@ -2065,6 +2151,12 @@ const ZH = {
     copied: '已复制',
     copyFailed: '复制失败',
     detail: '详情',
+    manualCopy: {
+      title: '请手动复制',
+      description: '当前浏览器拦截了自动复制，下面已选中完整 Token，可直接手动复制。',
+      fieldLabel: '完整 Token',
+      close: '关闭',
+    },
     table: {
       id: 'Token ID',
       quotas: '配额窗口',

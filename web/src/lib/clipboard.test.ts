@@ -1,0 +1,96 @@
+import { describe, expect, it, mock } from 'bun:test'
+
+import { copyText, selectAllReadonlyText } from './clipboard'
+
+function createDocumentMock(execResult: boolean) {
+  const textarea = {
+    value: '',
+    style: {} as Record<string, string>,
+    setAttribute: mock(() => undefined),
+    focus: mock(() => undefined),
+    select: mock(() => undefined),
+    setSelectionRange: mock(() => undefined),
+  }
+
+  const body = {
+    appendChild: mock(() => textarea),
+    removeChild: mock(() => textarea),
+  }
+
+  const doc = {
+    body,
+    activeElement: null,
+    createElement: mock(() => textarea),
+    execCommand: mock(() => execResult),
+    getSelection: mock(() => null),
+  }
+
+  return { doc: doc as unknown as Document, textarea, body }
+}
+
+describe('clipboard helpers', () => {
+  it('uses the Clipboard API when available', async () => {
+    const writeText = mock(async () => undefined)
+    const { doc } = createDocumentMock(true)
+
+    const result = await copyText('th-a1b2-secret', {
+      nav: { clipboard: { writeText } } as unknown as Navigator,
+      doc,
+    })
+
+    expect(result).toEqual({ ok: true, method: 'clipboard' })
+    expect(writeText).toHaveBeenCalledWith('th-a1b2-secret')
+  })
+
+  it('falls back to execCommand when Clipboard API is rejected', async () => {
+    const writeText = mock(async () => {
+      throw new Error('NotAllowedError')
+    })
+    const { doc, textarea, body } = createDocumentMock(true)
+
+    const result = await copyText('th-a1b2-secret', {
+      nav: { clipboard: { writeText } } as unknown as Navigator,
+      doc,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.method).toBe('execCommand')
+    expect(result.errors?.clipboard).toBeInstanceOf(Error)
+    expect(textarea.select).toHaveBeenCalledTimes(1)
+    expect(textarea.setSelectionRange).toHaveBeenCalledWith(0, 'th-a1b2-secret'.length)
+    expect(body.appendChild).toHaveBeenCalledTimes(1)
+    expect(body.removeChild).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports failure when both Clipboard API and execCommand fail', async () => {
+    const writeText = mock(async () => {
+      throw new Error('Blocked')
+    })
+    const { doc } = createDocumentMock(false)
+
+    const result = await copyText('th-a1b2-secret', {
+      nav: { clipboard: { writeText } } as unknown as Navigator,
+      doc,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.method).toBeNull()
+    expect(result.errors?.clipboard).toBeInstanceOf(Error)
+    expect(result.errors?.execCommand).toBeInstanceOf(Error)
+  })
+
+  it('selects the full readonly value on focus', () => {
+    const target = {
+      value: 'https://example.com/#token',
+      focus: mock(() => undefined),
+      select: mock(() => undefined),
+      setSelectionRange: mock(() => undefined),
+    }
+
+    selectAllReadonlyText(target)
+
+    expect(target.focus).toHaveBeenCalledTimes(1)
+    expect(target.select).toHaveBeenCalledTimes(1)
+    expect(target.setSelectionRange).toHaveBeenCalledWith(0, target.value.length)
+  })
+})

@@ -30,6 +30,7 @@ import {
   DialogTitle,
 } from './components/ui/dialog'
 import { useLanguage, useTranslate, type Language } from './i18n'
+import { copyText } from './lib/clipboard'
 import { useResponsiveModes } from './lib/responsive'
 
 type GuideLanguage = 'toml' | 'json' | 'bash'
@@ -284,14 +285,14 @@ function PublicHome(): JSX.Element {
     : null
 
   const handleCopyToken = useCallback(async (value: string) => {
-    try {
-      await navigator.clipboard.writeText(value)
+    const result = await copyText(value)
+    if (result.ok) {
       setCopyState('copied')
       window.setTimeout(() => setCopyState('idle'), 2500)
-    } catch {
-      setCopyState('error')
-      window.setTimeout(() => setCopyState('idle'), 2500)
+      return
     }
+    setCopyState('error')
+    window.setTimeout(() => setCopyState('idle'), 2500)
   }, [])
 
   const startLinuxDoLogin = useCallback((candidateToken?: string) => {
