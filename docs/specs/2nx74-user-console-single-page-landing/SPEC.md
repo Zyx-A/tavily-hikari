@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 进行中（快车道）
+- Status: 已完成（5/5）
 - Created: 2026-03-12
 - Last: 2026-03-12
 
@@ -182,7 +182,7 @@ None
 - [x] M2: `/console` landing 重构为账户概览 + Token 列表单页
 - [x] M3: 旧 `#/dashboard` / `#/tokens` hash 收敛为同页自动定位
 - [x] M4: Storybook 与自动化测试更新到 merged landing 验收口径
-- [ ] M5: fast-track 验证、PR 与 review-loop 收敛
+- [x] M5: fast-track 验证、PR 与 review-loop 收敛
 
 ## 方案概述（Approach, high-level）
 
@@ -200,6 +200,7 @@ None
 
 - 2026-03-12: 创建 follow-up spec，冻结 `/console` landing 由双页面切换收敛为单页定位的实现边界。
 - 2026-03-12: 完成 `/console` merged landing 改造、legacy hash route helper、Storybook story/test 收口，以及 `cd web && bun test`、`cd web && bun run build`、`cd web && bun run build-storybook` 本地验证。
+- 2026-03-12: PR #117 已更新到 `f42e27f`，GitHub checks 全绿，fresh `codex review --base origin/main` 未发现阻塞性 findings，spec 收口为完成态。
 
 ## 参考（References）
 
