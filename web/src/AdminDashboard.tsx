@@ -35,6 +35,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import SegmentedTabs from './components/ui/SegmentedTabs'
 import { Card } from './components/ui/card'
 import { Badge } from './components/ui/badge'
+import { Switch } from './components/ui/switch'
 import { Table } from './components/ui/table'
 import { Textarea } from './components/ui/textarea'
 import TokenUsageHeader from './components/TokenUsageHeader'
@@ -3557,14 +3558,15 @@ function AdminDashboard(): JSX.Element {
           ? 'users'
           : 'tokens'
   const usersStrings = adminStrings.users
-  const registrationDescription =
-    registrationSettingsLoading && !registrationSettingsLoaded
-      ? usersStrings.registration.description
-      : registrationSettingsSaving
-        ? usersStrings.registration.saving
-        : allowRegistration
-          ? usersStrings.registration.enabled
-          : usersStrings.registration.disabled
+  const registrationStatusText = registrationSettingsLoading && !registrationSettingsLoaded
+    ? usersStrings.registration.description
+    : registrationSettingsSaving
+      ? usersStrings.registration.saving
+      : allowRegistration
+        ? usersStrings.registration.enabled
+        : usersStrings.registration.disabled
+
+  const registrationInlineStatus = registrationSettingsError ?? (registrationSettingsSaving ? registrationStatusText : null)
   const sortedTagCatalog = useMemo(
     () => [...tagCatalog].sort((left, right) => right.userCount - left.userCount || left.displayName.localeCompare(right.displayName)),
     [tagCatalog],
@@ -6273,40 +6275,49 @@ function AdminDashboard(): JSX.Element {
               </div>
               <div style={{ display: 'flex', flex: '1 1 520px', flexWrap: 'wrap', gap: 12, justifyContent: 'flex-end' }}>
                 <div
-                  className="rounded-2xl border border-border/70 bg-card/90 px-4 py-3 shadow-sm"
-                  style={{ display: 'flex', minWidth: 280, maxWidth: 420, flex: '1 1 320px', alignItems: 'center', gap: 14 }}
+                  className="rounded-xl border border-border/60 bg-background/55 px-4 py-3 shadow-sm backdrop-blur"
+                  style={{
+                    display: 'flex',
+                    minWidth: 260,
+                    maxWidth: 380,
+                    flex: '1 1 300px',
+                    alignItems: 'flex-start',
+                    justifyContent: 'space-between',
+                    gap: 12,
+                  }}
                 >
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={allowRegistration}
-                    aria-label={usersStrings.registration.title}
-                    disabled={registrationSettingsLoading || registrationSettingsSaving}
-                    onClick={() => void toggleAllowRegistration()}
-                    className={`relative h-8 w-14 rounded-full transition ${
-                      allowRegistration ? 'bg-emerald-500/90' : 'bg-slate-300'
-                    } ${registrationSettingsLoading || registrationSettingsSaving ? 'cursor-wait opacity-70' : ''}`}
-                  >
-                    <span
-                      className={`absolute top-1 h-6 w-6 rounded-full bg-white shadow transition ${
-                        allowRegistration ? 'left-7' : 'left-1'
-                      }`}
-                    />
-                  </button>
-                  <div style={{ minWidth: 0 }}>
-                    <div className="text-sm font-semibold">{usersStrings.registration.title}</div>
-                    <p className="panel-description" style={{ margin: '2px 0 0' }}>
-                      {usersStrings.registration.description}
-                    </p>
-                    <p
-                      className="text-xs font-medium"
-                      role="status"
-                      aria-live="polite"
-                      style={{ margin: '6px 0 0', color: registrationSettingsError ? 'hsl(var(--destructive))' : undefined }}
+                  <div style={{ minWidth: 0, flex: '1 1 auto' }}>
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        flexWrap: 'wrap',
+                      }}
                     >
-                      {registrationSettingsError ?? registrationDescription}
-                    </p>
+                      <div className="text-sm font-semibold">{usersStrings.registration.title}</div>
+                      <Badge variant={registrationSettingsError ? 'destructive' : allowRegistration ? 'success' : 'warning'}>
+                        {allowRegistration ? usersStrings.status.enabled : usersStrings.status.disabled}
+                      </Badge>
+                    </div>
+                    {registrationInlineStatus && (
+                      <p
+                        className="text-xs font-medium"
+                        role="status"
+                        aria-live="polite"
+                        style={{ margin: '6px 0 0', color: registrationSettingsError ? 'hsl(var(--destructive))' : undefined }}
+                      >
+                        {registrationInlineStatus}
+                      </p>
+                    )}
                   </div>
+                  <Switch
+                    disabled={registrationSettingsLoading || registrationSettingsSaving}
+                    checked={allowRegistration}
+                    aria-label={usersStrings.registration.title}
+                    onCheckedChange={() => void toggleAllowRegistration()}
+                    style={{ flex: '0 0 auto' }}
+                  />
                 </div>
                 <div className="users-search-controls">
                   <Input

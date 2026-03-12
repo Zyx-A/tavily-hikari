@@ -62,17 +62,26 @@ function PublicHomeHeroCard({
       {error && <div className="surface error-banner" role="status">{error}</div>}
       {showRegistrationPausedNotice && (
         <div
-          className="mt-4 rounded-3xl border border-amber-300/80 bg-amber-50/90 px-5 py-4 text-left text-amber-950 shadow-[0_12px_30px_-24px_rgba(180,83,9,0.9)]"
+          className="mx-auto mt-4 flex w-full max-w-5xl items-start gap-4 rounded-2xl border border-amber-300/65 bg-[linear-gradient(180deg,rgba(255,251,235,0.96),rgba(255,247,237,0.92))] px-4 py-3.5 text-left text-amber-950 shadow-[0_12px_24px_-24px_rgba(180,83,9,0.18)] dark:border-amber-300/28 dark:bg-[linear-gradient(180deg,rgba(120,53,15,0.28),rgba(69,38,10,0.78))] dark:text-amber-50 dark:backdrop-blur-sm dark:shadow-[0_16px_32px_-30px_rgba(245,158,11,0.2)]"
           role="status"
           aria-live="polite"
         >
-          <div className="mb-1 inline-flex items-center rounded-full bg-amber-200/80 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-amber-900">
-            {publicStrings.registrationPaused.badge}
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-amber-300/60 bg-amber-100/90 text-amber-700 shadow-inner dark:border-amber-200/16 dark:bg-amber-200/10 dark:text-amber-100">
+            <Icon icon="mdi:pause-circle-outline" width={22} height={22} aria-hidden="true" />
           </div>
-          <div className="text-base font-semibold">{publicStrings.registrationPausedNotice.title}</div>
-          <p className="mb-0 mt-1 text-sm leading-6 text-amber-900/80">
-            {publicStrings.registrationPausedNotice.description}
-          </p>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex items-center rounded-full bg-amber-200/82 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-950 dark:bg-amber-200/14 dark:text-amber-50">
+                {publicStrings.registrationPaused.badge}
+              </div>
+              <div className="text-base font-semibold tracking-[-0.01em] text-amber-950 dark:text-amber-50">
+                {publicStrings.registrationPausedNotice.title}
+              </div>
+            </div>
+            <p className="mb-0 mt-1.5 text-sm leading-6 text-amber-900/88 dark:text-amber-50/92">
+              {publicStrings.registrationPausedNotice.description}
+            </p>
+          </div>
         </div>
       )}
       <div className="metrics-grid hero-metrics">

@@ -127,6 +127,15 @@
 - [x] M4: `/registration-paused` 独立页面与静态入口完成
 - [ ] M5: 测试、浏览器验收、快车道 PR 与 review-loop 收敛完成
 
+## Visual Evidence (PR)
+
+- Admin 用户管理页中的注册开关（Storybook）
+  ![Admin 用户管理页中的注册开关](./artifacts/admin-users-registration-switch-storybook.png)
+- 公开首页的暂停注册提示条（暗色 Storybook）
+  ![公开首页的暂停注册提示条](./artifacts/public-home-registration-paused-alert-dark.png)
+- 独立暂停注册页（暗色 Storybook）
+  ![独立暂停注册页](./artifacts/registration-paused-page-dark.png)
+
 ## 风险 / 开放问题 / 假设
 
 - 风险：首页匿名态无法预先区分“老用户未登录”和“新用户未登录”，因此前端只能统一展示登录按钮；真正的老/新用户分流必须以后端 callback 判定为准。
@@ -138,6 +147,7 @@
 
 - 2026-03-13: 初版规格建立，冻结 admin 开关、公开首页提示、OAuth callback 拒绝与 `/registration-paused` 页面验收口径。
 - 2026-03-13: 已完成后端/前端实现、自动化测试、mock OAuth 浏览器验收与本地 review-loop；进入快车道 PR 收口阶段。
+- 2026-03-13: 补充 3 张 Storybook 视觉证据，覆盖 admin 注册开关、首页暂停注册提示条与独立暂停注册页。
 
 ## 参考（References）
 
