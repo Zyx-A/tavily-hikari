@@ -4400,7 +4400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linuxdo_callback_falls_back_when_registration_paused_page_is_missing() {
+    async fn linuxdo_callback_keeps_paused_route_when_registration_page_is_missing() {
         let db_path = temp_db_path("linuxdo-callback-registration-paused-fallback");
         let db_str = db_path.to_string_lossy().to_string();
         let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
@@ -4494,7 +4494,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok()),
-            Some("/")
+            Some("/registration-paused")
         );
 
         let _ = std::fs::remove_file(db_path);
