@@ -427,8 +427,10 @@ export default function TokenDetail({
   const snapshotUsageAbortRef = useRef<AbortController | null>(null)
   const detailAbortRef = useRef<AbortController | null>(null)
   const logsAbortRef = useRef<AbortController | null>(null)
+  const requestKindOptionsAbortRef = useRef<AbortController | null>(null)
   const summaryQueryKeyRef = useRef<string | null>(null)
   const logsQueryKeyRef = useRef<string | null>(null)
+  const logsQueryBaseKeyRef = useRef<string>('')
 
   useEffect(() => {
     setInfo(null)
@@ -505,7 +507,11 @@ export default function TokenDetail({
 
   useEffect(() => {
     setLogsContentMinHeight(320)
-  }, [id, period, sinceIso, untilIso, perPage])
+  }, [logsQueryBaseKey, page, perPage])
+
+  useEffect(() => {
+    logsQueryBaseKeyRef.current = logsQueryBaseKey
+  }, [logsQueryBaseKey])
 
   useLayoutEffect(() => {
     if (logsBlocking) return
@@ -701,6 +707,7 @@ export default function TokenDetail({
   useEffect(() => () => {
     detailAbortRef.current?.abort()
     logsAbortRef.current?.abort()
+    requestKindOptionsAbortRef.current?.abort()
   }, [])
 
   // load detail + summary when the time window changes
@@ -740,6 +747,7 @@ export default function TokenDetail({
   // load first-page logs when the time window or request-type filter changes
   useEffect(() => {
     logsAbortRef.current?.abort()
+    requestKindOptionsAbortRef.current?.abort()
     const logsController = new AbortController()
     logsAbortRef.current = logsController
     setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
@@ -787,6 +795,7 @@ export default function TokenDetail({
     const refreshLogs = async () => {
       if (page !== 1) return
       logsAbortRef.current?.abort()
+      requestKindOptionsAbortRef.current?.abort()
       const controller = new AbortController()
       logsAbortRef.current = controller
       setLogsLoadState(getRefreshingLoadState(logsQueryKeyRef.current != null))
@@ -810,8 +819,13 @@ export default function TokenDetail({
       }
     }
     const refreshRequestKindOptions = async () => {
+      requestKindOptionsAbortRef.current?.abort()
+      const controller = new AbortController()
+      requestKindOptionsAbortRef.current = controller
+      const requestQueryBaseKey = logsQueryBaseKeyRef.current
       try {
-        const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1))
+        const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1), controller.signal)
+        if (controller.signal.aborted || logsQueryBaseKeyRef.current !== requestQueryBaseKey) return
         setTotal(data.total)
         setPerPage(data.per_page ?? data.perPage ?? perPageRef.current)
         syncRequestKindState(data.request_kind_options ?? [], data.items)
@@ -859,6 +873,7 @@ export default function TokenDetail({
     const pageCount = Math.max(1, Math.ceil(total / nextPerPage) || 1)
     const p = Math.max(1, Math.min(next, pageCount))
     logsAbortRef.current?.abort()
+    requestKindOptionsAbortRef.current?.abort()
     const controller = new AbortController()
     logsAbortRef.current = controller
     setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
@@ -887,6 +902,7 @@ export default function TokenDetail({
 
   const changePerPage = async (nextPerPage: number) => {
     logsAbortRef.current?.abort()
+    requestKindOptionsAbortRef.current?.abort()
     const controller = new AbortController()
     logsAbortRef.current = controller
     setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))

@@ -159,6 +159,8 @@ const META_KEY_ACCOUNT_QUOTA_INHERITS_DEFAULTS_BACKFILL_V1: &str =
 const META_KEY_FORCE_USER_RELOGIN_V1: &str = "force_user_relogin_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_V1: &str = "linuxdo_system_tag_defaults_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_TUPLE_V1: &str = "linuxdo_system_tag_defaults_tuple_v1";
+const META_KEY_AUTH_TOKEN_LOG_REQUEST_KIND_BACKFILL_V1: &str =
+    "auth_token_log_request_kind_backfill_v1";
 // Cutover marker for switching business quota counters from "requests" to "credits".
 // We cannot retroactively convert legacy request counts into credits, so we reset the
 // lightweight counters once and start charging by upstream credits going forward.
@@ -4171,6 +4173,7 @@ impl KeyStore {
                 .await?;
         }
 
+        let mut request_kind_schema_changed = false;
         if !self
             .table_column_exists("auth_token_logs", "request_kind_key")
             .await?
@@ -4178,6 +4181,7 @@ impl KeyStore {
             sqlx::query("ALTER TABLE auth_token_logs ADD COLUMN request_kind_key TEXT")
                 .execute(&self.pool)
                 .await?;
+            request_kind_schema_changed = true;
         }
 
         if !self
@@ -4187,6 +4191,7 @@ impl KeyStore {
             sqlx::query("ALTER TABLE auth_token_logs ADD COLUMN request_kind_label TEXT")
                 .execute(&self.pool)
                 .await?;
+            request_kind_schema_changed = true;
         }
 
         if !self
@@ -4196,6 +4201,7 @@ impl KeyStore {
             sqlx::query("ALTER TABLE auth_token_logs ADD COLUMN request_kind_detail TEXT")
                 .execute(&self.pool)
                 .await?;
+            request_kind_schema_changed = true;
         }
 
         // Upgrade: add counts_business_quota column if missing
@@ -4259,8 +4265,6 @@ impl KeyStore {
         )
         .execute(&self.pool)
         .await?;
-
-        self.backfill_auth_token_log_request_kinds().await?;
 
         sqlx::query(
             r#"
@@ -4487,6 +4491,17 @@ impl KeyStore {
         )
         .execute(&self.pool)
         .await?;
+
+        if request_kind_schema_changed
+            || self
+                .get_meta_i64(META_KEY_AUTH_TOKEN_LOG_REQUEST_KIND_BACKFILL_V1)
+                .await?
+                .is_none()
+        {
+            self.backfill_auth_token_log_request_kinds().await?;
+            self.set_meta_i64(META_KEY_AUTH_TOKEN_LOG_REQUEST_KIND_BACKFILL_V1, 1)
+                .await?;
+        }
 
         // Backfill API key usage buckets exactly once. This enables safe request_logs retention
         // without changing the meaning of cumulative statistics.
