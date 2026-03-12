@@ -30,6 +30,10 @@ import TokenUsageHeader from './components/TokenUsageHeader'
 import TokenDetail from './pages/TokenDetail'
 import AdminShell, { type AdminNavItem } from './admin/AdminShell'
 import DashboardOverview from './admin/DashboardOverview'
+import ForwardProxySettingsModule, {
+  type ForwardProxyDraft,
+  type ForwardProxyValidationEntry,
+} from './admin/ForwardProxySettingsModule'
 import ModulePlaceholder from './admin/ModulePlaceholder'
 import {
   type QueryLoadState,
@@ -120,6 +124,13 @@ import {
   type AdminUserDetail,
   type AdminUserTag,
   type AdminUserTagBinding,
+  type ForwardProxySettings,
+  type ForwardProxyStatsResponse,
+  type ForwardProxyValidationKind,
+  fetchForwardProxySettings,
+  fetchForwardProxyStats,
+  updateForwardProxySettings,
+  validateForwardProxyCandidate,
 } from './api'
 
 const REFRESH_INTERVAL_MS = 30_000
@@ -168,6 +179,27 @@ const EMPTY_USER_TAG_FORM: UserTagFormState = {
   hourlyDelta: '0',
   dailyDelta: '0',
   monthlyDelta: '0',
+}
+
+function splitMultilineEntries(value: string): string[] {
+  const seen = new Set<string>()
+  const entries: string[] = []
+  for (const rawLine of value.split(/\r?\n/)) {
+    const normalized = rawLine.trim()
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    entries.push(normalized)
+  }
+  return entries
+}
+
+function createForwardProxyDraft(settings?: ForwardProxySettings | null): ForwardProxyDraft {
+  return {
+    proxyUrlsText: settings?.proxyUrls.join('\n') ?? '',
+    subscriptionUrlsText: settings?.subscriptionUrls.join('\n') ?? '',
+    subscriptionUpdateIntervalSecs: String(settings?.subscriptionUpdateIntervalSecs ?? 3600),
+    insertDirect: settings?.insertDirect ?? true,
+  }
 }
 
 function buildUserQuotaSnapshot(detail: AdminUserDetail): UserQuotaSnapshot {
@@ -645,6 +677,7 @@ function AdminDashboard(): JSX.Element {
   const keyStrings = adminStrings.keys
   const logStrings = adminStrings.logs
   const jobsStrings = adminStrings.jobs
+  const proxySettingsStrings = adminStrings.proxySettings
   const footerStrings = adminStrings.footer
   const errorStrings = adminStrings.errors
   const [summary, setSummary] = useState<Summary | null>(null)
@@ -710,6 +743,23 @@ function AdminDashboard(): JSX.Element {
   const [selectedBindableTagId, setSelectedBindableTagId] = useState('')
   const [savingUserTagBinding, setSavingUserTagBinding] = useState(false)
   const [userTagError, setUserTagError] = useState<string | null>(null)
+  const [forwardProxySettings, setForwardProxySettings] = useState<ForwardProxySettings | null>(null)
+  const [forwardProxyDraft, setForwardProxyDraft] = useState<ForwardProxyDraft>(() => createForwardProxyDraft())
+  const [forwardProxySettingsLoadState, setForwardProxySettingsLoadState] =
+    useState<QueryLoadState>('initial_loading')
+  const [forwardProxySettingsError, setForwardProxySettingsError] = useState<string | null>(null)
+  const [forwardProxyStats, setForwardProxyStats] = useState<ForwardProxyStatsResponse | null>(null)
+  const [forwardProxyStatsLoadState, setForwardProxyStatsLoadState] =
+    useState<QueryLoadState>('initial_loading')
+  const [forwardProxyStatsError, setForwardProxyStatsError] = useState<string | null>(null)
+  const [forwardProxySaving, setForwardProxySaving] = useState(false)
+  const [forwardProxySaveError, setForwardProxySaveError] = useState<string | null>(null)
+  const [forwardProxySavedAt, setForwardProxySavedAt] = useState<number | null>(null)
+  const [forwardProxyValidatingKind, setForwardProxyValidatingKind] =
+    useState<ForwardProxyValidationKind | null>(null)
+  const [forwardProxyValidationEntries, setForwardProxyValidationEntries] =
+    useState<ForwardProxyValidationEntry[]>([])
+  const [forwardProxyValidationError, setForwardProxyValidationError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const pollingTimerRef = useRef<number | null>(null)
@@ -728,6 +778,10 @@ function AdminDashboard(): JSX.Element {
   const requestsAbortRef = useRef<AbortController | null>(null)
   const jobsAbortRef = useRef<AbortController | null>(null)
   const usersAbortRef = useRef<AbortController | null>(null)
+  const forwardProxySettingsAbortRef = useRef<AbortController | null>(null)
+  const forwardProxyStatsAbortRef = useRef<AbortController | null>(null)
+  const forwardProxySettingsLoadedRef = useRef(false)
+  const forwardProxyStatsLoadedRef = useRef(false)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [version, setVersion] = useState<{ backend: string; frontend: string } | null>(null)
   const [profile, setProfile] = useState<Profile | null>(null)
@@ -1267,6 +1321,180 @@ function AdminDashboard(): JSX.Element {
     [tokenLeaderboardFocus, tokenLeaderboardNonce, tokenLeaderboardPeriod, tokenLeaderboardStrings.error],
   )
 
+  const loadForwardProxySettingsData = useCallback(
+    async ({
+      signal,
+      reason = 'refresh',
+    }: {
+      signal?: AbortSignal
+      reason?: 'initial' | 'switch' | 'refresh'
+    } = {}) => {
+      const request = beginManagedRequest(forwardProxySettingsAbortRef, signal)
+      setForwardProxySettingsLoadState(
+        reason === 'refresh'
+          ? getRefreshingLoadState(forwardProxySettingsLoadedRef.current)
+          : getBlockingLoadState(forwardProxySettingsLoadedRef.current),
+      )
+      setForwardProxySettingsError(null)
+
+      try {
+        const nextSettings = await fetchForwardProxySettings(request.signal)
+        if (request.signal.aborted) return
+        setForwardProxySettings(nextSettings)
+        setForwardProxyDraft(createForwardProxyDraft(nextSettings))
+        setForwardProxySettingsLoadState('ready')
+        setLastUpdated(new Date())
+        forwardProxySettingsLoadedRef.current = true
+      } catch (err) {
+        if (request.signal.aborted) return
+        console.error(err)
+        setForwardProxySettingsError(err instanceof Error ? err.message : loadingStateStrings.error)
+        setForwardProxySettingsLoadState('error')
+      } finally {
+        request.cleanup()
+      }
+    },
+    [beginManagedRequest, loadingStateStrings.error],
+  )
+
+  const loadForwardProxyStatsData = useCallback(
+    async ({
+      signal,
+      reason = 'refresh',
+    }: {
+      signal?: AbortSignal
+      reason?: 'initial' | 'switch' | 'refresh'
+    } = {}) => {
+      const request = beginManagedRequest(forwardProxyStatsAbortRef, signal)
+      setForwardProxyStatsLoadState(
+        reason === 'refresh'
+          ? getRefreshingLoadState(forwardProxyStatsLoadedRef.current)
+          : getBlockingLoadState(forwardProxyStatsLoadedRef.current),
+      )
+      setForwardProxyStatsError(null)
+
+      try {
+        const nextStats = await fetchForwardProxyStats(request.signal)
+        if (request.signal.aborted) return
+        setForwardProxyStats(nextStats)
+        setForwardProxyStatsLoadState('ready')
+        setLastUpdated(new Date())
+        forwardProxyStatsLoadedRef.current = true
+      } catch (err) {
+        if (request.signal.aborted) return
+        console.error(err)
+        setForwardProxyStatsError(err instanceof Error ? err.message : loadingStateStrings.error)
+        setForwardProxyStatsLoadState('error')
+      } finally {
+        request.cleanup()
+      }
+    },
+    [beginManagedRequest, loadingStateStrings.error],
+  )
+
+  const runForwardProxyValidation = useCallback(
+    async (kind: ForwardProxyValidationKind) => {
+      const rawValues =
+        kind === 'subscriptionUrl'
+          ? splitMultilineEntries(forwardProxyDraft.subscriptionUrlsText)
+          : splitMultilineEntries(forwardProxyDraft.proxyUrlsText)
+
+      if (rawValues.length === 0) {
+        setForwardProxyValidationEntries([])
+        setForwardProxyValidationError(
+          kind === 'subscriptionUrl'
+            ? proxySettingsStrings.validation.emptySubscriptions
+            : proxySettingsStrings.validation.emptyManual,
+        )
+        return
+      }
+
+      setForwardProxyValidationError(null)
+      setForwardProxyValidatingKind(kind)
+
+      try {
+        const results = await Promise.all(
+          rawValues.map(async (value, index) => {
+            try {
+              const result = await validateForwardProxyCandidate({ kind, value })
+              return {
+                id: `${kind}:${index}:${value}`,
+                kind,
+                value,
+                result,
+              } satisfies ForwardProxyValidationEntry
+            } catch (err) {
+              return {
+                id: `${kind}:${index}:${value}`,
+                kind,
+                value,
+                result: {
+                  ok: false,
+                  message:
+                    err instanceof Error ? err.message : proxySettingsStrings.validation.requestFailed,
+                  normalizedValue: value,
+                  discoveredNodes: 0,
+                  latencyMs: null,
+                },
+              } satisfies ForwardProxyValidationEntry
+            }
+          }),
+        )
+        setForwardProxyValidationEntries(results)
+      } finally {
+        setForwardProxyValidatingKind(null)
+      }
+    },
+    [
+      forwardProxyDraft.proxyUrlsText,
+      forwardProxyDraft.subscriptionUrlsText,
+      proxySettingsStrings.validation.emptyManual,
+      proxySettingsStrings.validation.emptySubscriptions,
+      proxySettingsStrings.validation.requestFailed,
+    ],
+  )
+
+  const saveForwardProxySettings = useCallback(async () => {
+    const parsedInterval = Number.parseInt(forwardProxyDraft.subscriptionUpdateIntervalSecs.trim(), 10)
+    if (!Number.isFinite(parsedInterval) || parsedInterval <= 0) {
+      setForwardProxySaveError(proxySettingsStrings.config.invalidInterval)
+      return
+    }
+
+    setForwardProxySaveError(null)
+    setForwardProxySaving(true)
+
+    try {
+      const nextSettings = await updateForwardProxySettings({
+        proxyUrls: splitMultilineEntries(forwardProxyDraft.proxyUrlsText),
+        subscriptionUrls: splitMultilineEntries(forwardProxyDraft.subscriptionUrlsText),
+        subscriptionUpdateIntervalSecs: parsedInterval,
+        insertDirect: forwardProxyDraft.insertDirect,
+      })
+      setForwardProxySettings(nextSettings)
+      setForwardProxyDraft(createForwardProxyDraft(nextSettings))
+      setForwardProxySettingsLoadState('ready')
+      setForwardProxySettingsError(null)
+      setForwardProxySavedAt(Date.now())
+      setLastUpdated(new Date())
+      forwardProxySettingsLoadedRef.current = true
+      await loadForwardProxyStatsData({ reason: 'refresh' })
+    } catch (err) {
+      console.error(err)
+      setForwardProxySaveError(err instanceof Error ? err.message : proxySettingsStrings.config.saveFailed)
+    } finally {
+      setForwardProxySaving(false)
+    }
+  }, [
+    forwardProxyDraft.insertDirect,
+    forwardProxyDraft.proxyUrlsText,
+    forwardProxyDraft.subscriptionUpdateIntervalSecs,
+    forwardProxyDraft.subscriptionUrlsText,
+    loadForwardProxyStatsData,
+    proxySettingsStrings.config.invalidInterval,
+    proxySettingsStrings.config.saveFailed,
+  ])
+
   useEffect(() => {
     const controller = new AbortController()
     if (!baseDataLoadedRef.current) {
@@ -1301,6 +1529,38 @@ function AdminDashboard(): JSX.Element {
     })
     return () => controller.abort()
   }, [loadTokenLeaderboard, tokenLeaderboardFocus, tokenLeaderboardNonce, tokenLeaderboardPeriod])
+
+  useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'proxy-settings')) {
+      return
+    }
+
+    const controller = new AbortController()
+    void Promise.all([
+      loadForwardProxySettingsData({
+        signal: controller.signal,
+        reason: forwardProxySettingsLoadedRef.current ? 'switch' : 'initial',
+      }),
+      loadForwardProxyStatsData({
+        signal: controller.signal,
+        reason: forwardProxyStatsLoadedRef.current ? 'switch' : 'initial',
+      }),
+    ])
+
+    return () => controller.abort()
+  }, [route, loadForwardProxySettingsData, loadForwardProxyStatsData])
+
+  useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'proxy-settings')) {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      void loadForwardProxyStatsData({ reason: 'refresh' })
+    }, REFRESH_INTERVAL_MS)
+
+    return () => window.clearInterval(timer)
+  }, [route, loadForwardProxyStatsData])
 
   // Logs list: backend pagination & result filter
   useEffect(() => {
@@ -1818,6 +2078,12 @@ function AdminDashboard(): JSX.Element {
         }),
       )
     }
+    if (route.name === 'module' && route.module === 'proxy-settings') {
+      tasks.push(
+        loadForwardProxySettingsData({ signal: controller.signal, reason: 'refresh' }),
+        loadForwardProxyStatsData({ signal: controller.signal, reason: 'refresh' }),
+      )
+    }
     if (route.name === 'module' && route.module === 'dashboard') {
       tasks.push(loadDashboardOverview(controller.signal))
     }
@@ -2174,11 +2440,15 @@ function AdminDashboard(): JSX.Element {
   const usersRefreshing = isRefreshingLoadState(usersLoadState)
   const tokenLeaderboardBlocking = isBlockingLoadState(tokenLeaderboardLoadState)
   const tokenLeaderboardRefreshing = isRefreshingLoadState(tokenLeaderboardLoadState)
+  const forwardProxySettingsBlocking = isBlockingLoadState(forwardProxySettingsLoadState)
+  const forwardProxyStatsBlocking = isBlockingLoadState(forwardProxyStatsLoadState)
   const activeModuleBlocking =
     (route.name === 'module' && route.module === 'tokens' && tokensBlocking)
     || (route.name === 'module' && route.module === 'requests' && requestsBlocking)
     || (route.name === 'module' && route.module === 'jobs' && jobsBlocking)
     || ((route.name === 'module' && route.module === 'users') || route.name === 'user') && usersBlocking
+    || (route.name === 'module' && route.module === 'proxy-settings'
+      && (forwardProxySettingsBlocking || forwardProxyStatsBlocking))
     || (route.name === 'token-usage' && tokenLeaderboardBlocking)
 
   const displayName = profile?.displayName ?? null
@@ -5827,15 +6097,37 @@ function AdminDashboard(): JSX.Element {
       )}
 
       {showProxySettings && (
-        <ModulePlaceholder
-          title={adminStrings.modules.proxySettings.title}
-          description={adminStrings.modules.proxySettings.description}
-          comingSoonLabel={adminStrings.modules.comingSoon}
-          sections={[
-            adminStrings.modules.proxySettings.sections.upstream,
-            adminStrings.modules.proxySettings.sections.routing,
-            adminStrings.modules.proxySettings.sections.rateLimit,
-          ]}
+        <ForwardProxySettingsModule
+          strings={proxySettingsStrings}
+          draft={forwardProxyDraft}
+          settings={forwardProxySettings}
+          stats={forwardProxyStats}
+          settingsLoadState={forwardProxySettingsLoadState}
+          statsLoadState={forwardProxyStatsLoadState}
+          settingsError={forwardProxySettingsError}
+          statsError={forwardProxyStatsError}
+          saveError={forwardProxySaveError}
+          validationError={forwardProxyValidationError}
+          saving={forwardProxySaving}
+          validatingKind={forwardProxyValidatingKind}
+          savedAt={forwardProxySavedAt}
+          validationEntries={forwardProxyValidationEntries}
+          onProxyUrlsTextChange={(value) =>
+            setForwardProxyDraft((previous) => ({ ...previous, proxyUrlsText: value }))
+          }
+          onSubscriptionUrlsTextChange={(value) =>
+            setForwardProxyDraft((previous) => ({ ...previous, subscriptionUrlsText: value }))
+          }
+          onIntervalChange={(value) =>
+            setForwardProxyDraft((previous) => ({ ...previous, subscriptionUpdateIntervalSecs: value }))
+          }
+          onInsertDirectChange={(value) =>
+            setForwardProxyDraft((previous) => ({ ...previous, insertDirect: value }))
+          }
+          onSave={() => void saveForwardProxySettings()}
+          onValidateSubscriptions={() => void runForwardProxyValidation('subscriptionUrl')}
+          onValidateManual={() => void runForwardProxyValidation('proxyUrl')}
+          onRefresh={handleManualRefresh}
         />
       )}
 

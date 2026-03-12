@@ -241,6 +241,112 @@ interface AdminTranslationsShape {
       }
     }
   }
+  proxySettings: {
+    title: string
+    description: string
+    actions: {
+      refresh: string
+      save: string
+      saving: string
+      validateSubscriptions: string
+      validatingSubscriptions: string
+      validateManual: string
+      validatingManual: string
+    }
+    summary: {
+      configuredNodes: string
+      configuredNodesHint: string
+      readyNodes: string
+      readyNodesHint: string
+      penalizedNodes: string
+      penalizedNodesHint: string
+      subscriptions: string
+      subscriptionsHint: string
+      manualNodes: string
+      manualNodesHint: string
+      assignmentSpread: string
+      assignmentSpreadHint: string
+      range: string
+      savedAt: string
+    }
+    config: {
+      title: string
+      description: string
+      loading: string
+      subscriptionsTitle: string
+      subscriptionsDescription: string
+      subscriptionsPlaceholder: string
+      manualTitle: string
+      manualDescription: string
+      manualPlaceholder: string
+      subscriptionIntervalLabel: string
+      subscriptionIntervalHint: string
+      invalidInterval: string
+      insertDirectLabel: string
+      insertDirectHint: string
+      saveFailed: string
+    }
+    validation: {
+      title: string
+      description: string
+      empty: string
+      emptySubscriptions: string
+      emptyManual: string
+      ok: string
+      failed: string
+      proxyKind: string
+      subscriptionKind: string
+      discoveredNodes: string
+      latency: string
+      requestFailed: string
+    }
+    nodes: {
+      title: string
+      description: string
+      loading: string
+      empty: string
+      table: {
+        node: string
+        source: string
+        endpoint: string
+        state: string
+        assignments: string
+        windows: string
+        activity24h: string
+        weight24h: string
+      }
+      weightLabel: string
+      primary: string
+      secondary: string
+      successRateLabel: string
+      latencyLabel: string
+      successCountLabel: string
+      failureCountLabel: string
+      lastWeightLabel: string
+      avgWeightLabel: string
+      minMaxWeightLabel: string
+    }
+    states: {
+      ready: string
+      readyHint: string
+      penalized: string
+      penalizedHint: string
+      direct: string
+    }
+    sources: {
+      manual: string
+      subscription: string
+      direct: string
+      unknown: string
+    }
+    windows: {
+      oneMinute: string
+      fifteenMinutes: string
+      oneHour: string
+      oneDay: string
+      sevenDays: string
+    }
+  }
   users: {
     title: string
     description: string
@@ -1092,6 +1198,112 @@ export const translations: Record<Language, TranslationShape> = {
           },
         },
       },
+      proxySettings: {
+        title: 'Forward Proxy Settings',
+        description: 'Manage subscription-first proxy pools, validate candidates, and inspect live node affinity.',
+        actions: {
+          refresh: 'Refresh stats',
+          save: 'Save settings',
+          saving: 'Saving…',
+          validateSubscriptions: 'Validate subscriptions',
+          validatingSubscriptions: 'Validating subscriptions…',
+          validateManual: 'Validate manual proxies',
+          validatingManual: 'Validating manual proxies…',
+        },
+        summary: {
+          configuredNodes: 'Configured nodes',
+          configuredNodesHint: 'Current selectable pool across manual, subscription, and Direct fallback.',
+          readyNodes: 'Ready nodes',
+          readyNodesHint: 'Nodes that are not currently penalized.',
+          penalizedNodes: 'Penalized nodes',
+          penalizedNodesHint: 'Nodes under temporary recovery or failure pressure.',
+          subscriptions: 'Subscriptions',
+          subscriptionsHint: 'Remote subscription sources currently persisted.',
+          manualNodes: 'Manual proxies',
+          manualNodesHint: 'Manually pinned proxy candidates kept outside subscriptions.',
+          assignmentSpread: 'Primary / secondary',
+          assignmentSpreadHint: 'How many upstream keys currently bind to each node tier.',
+          range: 'Stats range',
+          savedAt: 'Saved at {time}',
+        },
+        config: {
+          title: 'Configuration',
+          description: 'Subscriptions are the primary input. Manual proxies stay available for overrides, recovery, or staging.',
+          loading: 'Loading proxy settings…',
+          subscriptionsTitle: 'Subscription URLs',
+          subscriptionsDescription: 'One URL per line. Each subscription is refreshed and normalized by the backend.',
+          subscriptionsPlaceholder: 'https://example.com/subscription.base64',
+          manualTitle: 'Manual proxy URLs',
+          manualDescription: 'Optional newline-separated http / https / socks5 / share-link candidates.',
+          manualPlaceholder: 'http://127.0.0.1:8080\nsocks5h://127.0.0.1:1080\nvmess://…',
+          subscriptionIntervalLabel: 'Subscription refresh interval (seconds)',
+          subscriptionIntervalHint: 'Used by the backend refresh scheduler. Keep it high enough to avoid noisy churn.',
+          invalidInterval: 'Subscription refresh interval must be a positive integer.',
+          insertDirectLabel: 'Insert Direct fallback',
+          insertDirectHint: 'Keep Direct as a secondary or last-resort route when proxy nodes become unavailable.',
+          saveFailed: 'Failed to save forward proxy settings.',
+        },
+        validation: {
+          title: 'Validation results',
+          description: 'Run candidate probes before saving to understand parsing, Xray, and reachability failures.',
+          empty: 'No validation results yet. Trigger a validation action to inspect candidate health.',
+          emptySubscriptions: 'Add at least one subscription URL before validating subscriptions.',
+          emptyManual: 'Add at least one manual proxy URL before validating manual candidates.',
+          ok: 'Reachable',
+          failed: 'Failed',
+          proxyKind: 'Proxy candidate',
+          subscriptionKind: 'Subscription candidate',
+          discoveredNodes: 'Discovered nodes',
+          latency: 'Latency',
+          requestFailed: 'Validation request failed.',
+        },
+        nodes: {
+          title: 'Node pool & live stats',
+          description: 'Observe current node state, window metrics, 24-hour activity, and key affinity spread.',
+          loading: 'Loading forward proxy stats…',
+          empty: 'No forward proxy nodes are available yet.',
+          table: {
+            node: 'Node',
+            source: 'Source',
+            endpoint: 'Endpoint',
+            state: 'State',
+            assignments: 'Assignments',
+            windows: 'Window stats',
+            activity24h: '24h activity',
+            weight24h: '24h weight',
+          },
+          weightLabel: 'Current weight',
+          primary: 'Primary',
+          secondary: 'Secondary',
+          successRateLabel: 'Success',
+          latencyLabel: 'Latency',
+          successCountLabel: 'Successes',
+          failureCountLabel: 'Failures',
+          lastWeightLabel: 'Last',
+          avgWeightLabel: 'Average',
+          minMaxWeightLabel: 'Min / max',
+        },
+        states: {
+          ready: 'Ready',
+          readyHint: 'Eligible for new traffic within existing key affinity.',
+          penalized: 'Penalized',
+          penalizedHint: 'Temporarily deprioritized until recovery probes succeed.',
+          direct: 'Direct',
+        },
+        sources: {
+          manual: 'Manual',
+          subscription: 'Subscription',
+          direct: 'Direct',
+          unknown: 'Unknown',
+        },
+        windows: {
+          oneMinute: '1m',
+          fifteenMinutes: '15m',
+          oneHour: '1h',
+          oneDay: '1d',
+          sevenDays: '7d',
+        },
+      },
       users: {
         title: 'User Management',
         description: 'Account-level metrics, tag overlays, and shared quota controls.',
@@ -1929,6 +2141,112 @@ export const translations: Record<Language, TranslationShape> = {
             routing: '转发策略',
             rateLimit: '限流策略',
           },
+        },
+      },
+      proxySettings: {
+        title: '正向代理设置',
+        description: '以订阅为主配置代理节点，查看实时调度状态，并观察上游 Key 的主备节点亲和。',
+        actions: {
+          refresh: '刷新统计',
+          save: '保存设置',
+          saving: '保存中…',
+          validateSubscriptions: '验证订阅',
+          validatingSubscriptions: '正在验证订阅…',
+          validateManual: '验证手工节点',
+          validatingManual: '正在验证手工节点…',
+        },
+        summary: {
+          configuredNodes: '当前节点数',
+          configuredNodesHint: '包含手工节点、订阅节点与 Direct 兜底节点。',
+          readyNodes: '可用节点',
+          readyNodesHint: '当前未处于惩罚状态的节点数量。',
+          penalizedNodes: '惩罚中节点',
+          penalizedNodesHint: '等待恢复探测或刚发生失败的节点。',
+          subscriptions: '订阅源',
+          subscriptionsHint: '当前已保存的订阅 URL 数量。',
+          manualNodes: '手工节点',
+          manualNodesHint: '补充的固定代理 URL 数量。',
+          assignmentSpread: '主 / 备绑定',
+          assignmentSpreadHint: '所有上游 Key 当前分配到主节点与备用节点的总数。',
+          range: '统计范围',
+          savedAt: '已于 {time} 保存',
+        },
+        config: {
+          title: '配置',
+          description: '优先填写订阅；手工节点适合作为兜底、灰度或临时补位使用。',
+          loading: '正在加载代理设置…',
+          subscriptionsTitle: '订阅 URL',
+          subscriptionsDescription: '每行一个 URL。后端会负责刷新、解析与归一化。',
+          subscriptionsPlaceholder: 'https://example.com/subscription.base64',
+          manualTitle: '手工代理 URL',
+          manualDescription: '可选，支持换行输入 http / https / socks5 / share-link 候选。',
+          manualPlaceholder: 'http://127.0.0.1:8080\nsocks5h://127.0.0.1:1080\nvmess://…',
+          subscriptionIntervalLabel: '订阅刷新周期（秒）',
+          subscriptionIntervalHint: '由后端定时任务使用。周期过短会让节点列表更容易抖动。',
+          invalidInterval: '订阅刷新周期必须是大于 0 的整数。',
+          insertDirectLabel: '插入 Direct 兜底节点',
+          insertDirectHint: '当代理节点全部不可用时，保留 Direct 作为备用或最终回退路径。',
+          saveFailed: '保存正向代理设置失败。',
+        },
+        validation: {
+          title: '验证结果',
+          description: '在保存前探测候选连通性，提前暴露解析、Xray 或网络可达性问题。',
+          empty: '还没有验证结果，先执行一次订阅或手工节点验证吧。',
+          emptySubscriptions: '请至少填写一个订阅 URL 再执行验证。',
+          emptyManual: '请至少填写一个手工代理 URL 再执行验证。',
+          ok: '可达',
+          failed: '失败',
+          proxyKind: '代理候选',
+          subscriptionKind: '订阅候选',
+          discoveredNodes: '发现节点',
+          latency: '延迟',
+          requestFailed: '验证请求失败。',
+        },
+        nodes: {
+          title: '节点池与实时统计',
+          description: '查看当前节点状态、窗口统计、24 小时活动，以及主备绑定分布。',
+          loading: '正在加载正向代理统计…',
+          empty: '当前还没有可展示的正向代理节点。',
+          table: {
+            node: '节点',
+            source: '来源',
+            endpoint: '出口',
+            state: '状态',
+            assignments: '绑定数',
+            windows: '窗口统计',
+            activity24h: '24 小时活动',
+            weight24h: '24 小时权重',
+          },
+          weightLabel: '当前权重',
+          primary: '主节点',
+          secondary: '备用节点',
+          successRateLabel: '成功率',
+          latencyLabel: '平均延迟',
+          successCountLabel: '成功数',
+          failureCountLabel: '失败数',
+          lastWeightLabel: '最新',
+          avgWeightLabel: '平均',
+          minMaxWeightLabel: '最小 / 最大',
+        },
+        states: {
+          ready: '可用',
+          readyHint: '可继续承接已绑定上游 Key 的流量。',
+          penalized: '惩罚中',
+          penalizedHint: '暂时降权，等待恢复探测通过后再提升。',
+          direct: 'Direct',
+        },
+        sources: {
+          manual: '手工',
+          subscription: '订阅',
+          direct: '直连',
+          unknown: '未知',
+        },
+        windows: {
+          oneMinute: '1 分钟',
+          fifteenMinutes: '15 分钟',
+          oneHour: '1 小时',
+          oneDay: '1 天',
+          sevenDays: '7 天',
         },
       },
       users: {
