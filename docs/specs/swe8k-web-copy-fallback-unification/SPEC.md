@@ -175,6 +175,20 @@
 
 ## Visual Evidence (PR)
 
+- source_type: storybook_canvas
+  story_id_or_title: `User Console / UserConsole / Console Home Copy Failure Recovery`
+  state: `copy failure -> manual bubble`
+  evidence_note: 列表页属于“按钮独占原文”场景，复制双路径都失败后会在按钮旁弹出手动复制气泡，并把完整 token 放入只读输入框且保持选中态。
+
+![User Console list copy failure recovery](./assets/user-console-list-copy-failure-recovery.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: `User Console / UserConsole / Token Detail Copy Failure Recovery`
+  state: `copy failure -> inline reveal/select`
+  evidence_note: 详情页复制按钮旁已经有原文字段，因此失败后不再弹额外气泡，而是直接复用现有 Token 字段并自动选中。
+
+![User Console detail copy failure recovery](./assets/user-console-detail-copy-failure-recovery.png)
+
 - 2026-03-12: Chrome DevTools 手工冒烟
   - `http://127.0.0.1:55174/#a1b2`：可见原文入口在双路径复制失败后不重复弹 bubble，但会自动 reveal 并选中当前 token，便于立即手动复制。
   - `http://127.0.0.1:55174/console#/tokens`：列表复制失败后弹出手动复制气泡，输入框默认聚焦且全选；同一按钮下次复制成功后旧气泡会自动关闭。
