@@ -960,17 +960,6 @@ export default function UserConsole(): JSX.Element {
     navigateToRoute({ name: 'landing', section: 'tokens' })
   }
   const goTokenDetail = (tokenId: string) => {
-    if (route.name === 'landing') {
-      // Normalize the current entry so browser Back returns to the token section instead of a stale dashboard hash.
-      const landingTokensHash = userConsoleRouteToHash({ name: 'landing', section: 'tokens' })
-      if (window.location.hash !== landingTokensHash) {
-        window.history.replaceState(
-          window.history.state,
-          '',
-          `${window.location.pathname}${window.location.search}${landingTokensHash}`,
-        )
-      }
-    }
     navigateToRoute({ name: 'token', id: tokenId })
   }
 

@@ -166,11 +166,11 @@ None
 
 ## Visual Evidence (PR)
 
-- Chrome DevTools 实测 `http://127.0.0.1:58091/console`、`#/dashboard`、`#/tokens` 与 `#/tokens/tmK4`：
+- Chrome DevTools 实测 `/console`、`#/dashboard`、`#/tokens` 与 `#/tokens/tmK4`：
   - `/console` 与 `#/dashboard` 同页同时展示 `账户用量概览` 和 `Token 列表`，区块导航默认聚焦概览。
   - `#/tokens` 仍进入同一落地页，但区块导航与滚动焦点切到 Token 列表。
   - `#/tokens/tmK4` 保持独立 detail 页，点击 `返回 Token 列表` 后回到 `#/tokens` 并重新聚焦 Token 区块。
-  - 验证环境使用当前 worktree 后端 `127.0.0.1:58091`，上游与 OAuth 均为本地 mock，未触达 Tavily 生产端点。
+  - 从 `#/dashboard` 手动滚到 Token 区块进入 detail 后，浏览器 Back 会回到原始 `#/dashboard` 入口并保留滚动位置；detail 页顶部区块导航仍可直接切回概览区或 Token 区。
 
 ## 资产晋升（Asset promotion）
 
@@ -200,7 +200,7 @@ None
 
 - 2026-03-12: 创建 follow-up spec，冻结 `/console` landing 由双页面切换收敛为单页定位的实现边界。
 - 2026-03-12: 完成 `/console` merged landing 改造、legacy hash route helper、Storybook story/test 收口，以及 `cd web && bun test`、`cd web && bun run build`、`cd web && bun run build-storybook` 本地验证。
-- 2026-03-12: PR #117 已更新到 `f42e27f`，GitHub checks 全绿，fresh `codex review --base origin/main` 未发现阻塞性 findings，spec 收口为完成态。
+- 2026-03-12: 完成快车道验证、浏览器复核与 review-loop 收敛，spec 收口为完成态。
 
 ## 参考（References）
 
