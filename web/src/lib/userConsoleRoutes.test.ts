@@ -9,6 +9,12 @@ describe('userConsoleRoutes', () => {
     expect(parseUserConsoleHash('#/tokens')).toEqual({ name: 'landing', section: 'tokens' })
   })
 
+  it('falls back to the default landing view for unknown hash suffixes', () => {
+    expect(parseUserConsoleHash('#/dashboard-copy')).toEqual({ name: 'landing', section: null })
+    expect(parseUserConsoleHash('#/tokens-old')).toEqual({ name: 'landing', section: null })
+    expect(parseUserConsoleHash('#/tokens/')).toEqual({ name: 'landing', section: null })
+  })
+
   it('keeps token detail hashes on the dedicated detail route', () => {
     expect(parseUserConsoleHash('#/tokens/a1b2')).toEqual({ name: 'token', id: 'a1b2' })
     expect(parseUserConsoleHash('#/tokens/a%2Fb')).toEqual({ name: 'token', id: 'a/b' })

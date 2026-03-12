@@ -412,6 +412,7 @@ export default function UserConsole(): JSX.Element {
   const anyProbeRunning = mcpProbe.state === 'running' || apiProbe.state === 'running'
   const adminHref = getUserConsoleAdminHref(profile)
   const consoleUnavailable = consoleAvailability === 'disabled'
+  const showTokenListLoading = loading && tokens.length === 0
   const showEmptyTokens = !loading && tokens.length === 0
 
   const landingSection = route.name === 'landing' && route.section === 'tokens' ? 'tokens' : 'dashboard'
@@ -1106,7 +1107,9 @@ export default function UserConsole(): JSX.Element {
               </div>
             </div>
             <div className="table-wrapper jobs-table-wrapper user-console-md-up">
-              {showEmptyTokens ? (
+              {showTokenListLoading ? (
+                <div className="empty-state">{text.tokens.loading}</div>
+              ) : showEmptyTokens ? (
                 <div className="empty-state alert">{text.tokens.empty}</div>
               ) : (
                 <table className="user-console-tokens-table">
@@ -1184,7 +1187,9 @@ export default function UserConsole(): JSX.Element {
               )}
             </div>
             <div className="user-console-mobile-list user-console-md-down">
-              {showEmptyTokens ? (
+              {showTokenListLoading ? (
+                <div className="empty-state">{text.tokens.loading}</div>
+              ) : showEmptyTokens ? (
                 <div className="empty-state alert">{text.tokens.empty}</div>
               ) : (
                 tokens.map((item) => {
@@ -1845,6 +1850,7 @@ const EN = {
   tokens: {
     title: 'Token List',
     description: 'Copy any token or jump into its detail view from the same landing page.',
+    loading: 'Loading token list…',
     empty: 'No token available for this account.',
     copy: 'Copy',
     copied: 'Copied',
@@ -1982,6 +1988,7 @@ const ZH = {
   tokens: {
     title: 'Token 列表',
     description: '在同一落地页里完成复制 Token 与进入详情，不再切换独立列表页。',
+    loading: 'Token 列表加载中…',
     empty: '当前账户暂无 Token。',
     copy: '复制',
     copied: '已复制',

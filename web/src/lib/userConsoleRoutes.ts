@@ -15,10 +15,10 @@ export function parseUserConsoleHash(hash: string): UserConsoleRoute {
     }
   }
 
-  if (normalizedHash.startsWith('#/tokens')) {
+  if (normalizedHash === '#/tokens') {
     return { name: 'landing', section: 'tokens' }
   }
-  if (normalizedHash.startsWith('#/dashboard')) {
+  if (normalizedHash === '#/dashboard') {
     return { name: 'landing', section: 'dashboard' }
   }
 
