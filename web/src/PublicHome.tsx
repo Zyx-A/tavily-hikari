@@ -302,14 +302,18 @@ function PublicHome(): JSX.Element {
       return
     }
     if (normalizedValue.length > 0) {
-      setToken(normalizedValue)
-      setTokenDraft(normalizedValue)
+      if (isTokenAccessDialogOpen) {
+        setTokenDraft(normalizedValue)
+      } else {
+        setToken(normalizedValue)
+        setTokenDraft(normalizedValue)
+      }
       setTokenVisible(true)
       focusManualTokenField()
     }
     setCopyState('error')
     window.setTimeout(() => setCopyState('idle'), 2500)
-  }, [focusManualTokenField])
+  }, [focusManualTokenField, isTokenAccessDialogOpen])
 
   const startLinuxDoLogin = useCallback((candidateToken?: string) => {
     const form = document.createElement('form')

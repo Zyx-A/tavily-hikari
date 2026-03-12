@@ -261,6 +261,7 @@ export default function UserConsole(): JSX.Element {
   const tokenSecretWarmTimerRef = useRef<Map<string, number>>(new Map())
   const tokenSecretWarmAbortRef = useRef<Map<string, AbortController>>(new Map())
   const tokenSecretRequestRef = useRef<Map<string, Promise<string>>>(new Map())
+  const tokenSecretRequestAbortRef = useRef<Map<string, AbortController>>(new Map())
   const probeRunIdRef = useRef(0)
   const tokenSecretRunIdRef = useRef(0)
   const pageRef = useRef<HTMLElement>(null)
@@ -379,6 +380,23 @@ export default function UserConsole(): JSX.Element {
     setManualCopyBubble(null)
   }, [route.name === 'token' ? route.id : route.section ?? 'landing'])
 
+  const abortPendingTokenSecretRequest = useCallback((tokenId: string) => {
+    const controller = tokenSecretRequestAbortRef.current.get(tokenId)
+    if (controller) {
+      controller.abort()
+      tokenSecretRequestAbortRef.current.delete(tokenId)
+    }
+    tokenSecretRequestRef.current.delete(tokenId)
+  }, [])
+
+  const abortAllPendingTokenSecretRequests = useCallback(() => {
+    for (const controller of tokenSecretRequestAbortRef.current.values()) {
+      controller.abort()
+    }
+    tokenSecretRequestAbortRef.current.clear()
+    tokenSecretRequestRef.current.clear()
+  }, [])
+
   useEffect(() => {
     tokenSecretRunIdRef.current += 1
     setTokenSecretTokenId(null)
@@ -395,11 +413,12 @@ export default function UserConsole(): JSX.Element {
     for (const controller of tokenSecretWarmAbortRef.current.values()) {
       controller.abort()
     }
+    abortAllPendingTokenSecretRequests()
     tokenSecretWarmTimerRef.current.clear()
     tokenSecretCacheTimerRef.current.clear()
     tokenSecretWarmAbortRef.current.clear()
     tokenSecretCacheRef.current.clear()
-  }, [consoleAvailability, route.name === 'token' ? route.id : route.name])
+  }, [abortAllPendingTokenSecretRequests, consoleAvailability, route.name === 'token' ? route.id : route.name])
 
   useEffect(() => {
     return () => {
@@ -412,8 +431,9 @@ export default function UserConsole(): JSX.Element {
       for (const controller of tokenSecretWarmAbortRef.current.values()) {
         controller.abort()
       }
+      abortAllPendingTokenSecretRequests()
     }
-  }, [])
+  }, [abortAllPendingTokenSecretRequests])
 
   useLayoutEffect(() => {
     if (!probeBubble?.visible || probeBubble.items.length === 0) {
@@ -477,11 +497,10 @@ export default function UserConsole(): JSX.Element {
     clearWarmTokenSecretTimer(tokenId)
     const controller = tokenSecretWarmAbortRef.current.get(tokenId)
     if (controller) {
-      controller.abort()
       tokenSecretWarmAbortRef.current.delete(tokenId)
-      tokenSecretRequestRef.current.delete(tokenId)
+      abortPendingTokenSecretRequest(tokenId)
     }
-  }, [clearWarmTokenSecretTimer])
+  }, [abortPendingTokenSecretRequest, clearWarmTokenSecretTimer])
 
   const commitWarmTokenSecret = useCallback((tokenId: string) => {
     clearWarmTokenSecretTimer(tokenId)
@@ -505,13 +524,34 @@ export default function UserConsole(): JSX.Element {
       return await pending
     }
 
-    const request = fetchUserTokenSecret(tokenId, signal)
+    const requestController = new AbortController()
+    tokenSecretRequestAbortRef.current.set(tokenId, requestController)
+    const forwardAbort = () => requestController.abort()
+    if (signal) {
+      if (signal.aborted) {
+        requestController.abort()
+      } else {
+        signal.addEventListener('abort', forwardAbort, { once: true })
+      }
+    }
+    const requestRunId = tokenSecretRunIdRef.current
+    const request = fetchUserTokenSecret(tokenId, requestController.signal)
       .then(({ token }) => {
-        cacheTokenSecret(tokenId, token)
+        if (requestRunId === tokenSecretRunIdRef.current) {
+          cacheTokenSecret(tokenId, token)
+        }
         return token
       })
       .finally(() => {
-        tokenSecretRequestRef.current.delete(tokenId)
+        if (signal) {
+          signal.removeEventListener('abort', forwardAbort)
+        }
+        if (tokenSecretRequestRef.current.get(tokenId) === request) {
+          tokenSecretRequestRef.current.delete(tokenId)
+        }
+        if (tokenSecretRequestAbortRef.current.get(tokenId) === requestController) {
+          tokenSecretRequestAbortRef.current.delete(tokenId)
+        }
       })
 
     tokenSecretRequestRef.current.set(tokenId, request)
