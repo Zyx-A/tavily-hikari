@@ -10512,6 +10512,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_forward_proxy_validate_subscription_surfaces_probe_failure_reason() {
+        let db_path = temp_db_path("admin-forward-proxy-validate-subscription-failure");
+        let db_str = db_path.to_string_lossy().to_string();
+        let upstream_addr = spawn_forward_proxy_probe_upstream().await;
+        let fake_proxy_addr = spawn_fake_forward_proxy(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let subscription_addr = spawn_forward_proxy_subscription_server(format!(
+            "http://{}\n",
+            fake_proxy_addr
+        ))
+        .await;
+        let upstream = format!("http://{}/mcp", upstream_addr);
+        let usage_base = format!("http://{}", upstream_addr);
+        let proxy = TavilyProxy::with_endpoint::<Vec<String>, String>(Vec::new(), &upstream, &db_str)
+            .await
+            .expect("create proxy");
+        let addr = spawn_admin_forward_proxy_server(proxy, usage_base, true).await;
+
+        let client = Client::new();
+        let response = client
+            .post(format!("http://{addr}/api/settings/forward-proxy/validate"))
+            .json(&serde_json::json!({
+                "kind": "subscriptionUrl",
+                "value": format!("http://{}/subscription", subscription_addr),
+            }))
+            .send()
+            .await
+            .expect("validate subscription");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode validation");
+        assert_eq!(body["ok"].as_bool(), Some(false));
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("subscription proxy probe failed"),
+            "expected subscription probe failure context, got: {message}"
+        );
+        assert!(
+            message.contains("validation probe returned status 500 Internal Server Error"),
+            "expected concrete 500 failure context, got: {message}"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn admin_forward_proxy_settings_allow_disabling_direct_for_manual_nodes() {
         let db_path = temp_db_path("admin-forward-proxy-no-direct");
         let db_str = db_path.to_string_lossy().to_string();

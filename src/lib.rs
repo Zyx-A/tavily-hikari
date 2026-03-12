@@ -1274,14 +1274,28 @@ impl TavilyProxy {
         &self,
         subscription_url: &str,
     ) -> Result<(usize, f64, Vec<String>), ProxyError> {
-        let timeout =
+        let validation_timeout =
             Duration::from_secs(forward_proxy::FORWARD_PROXY_SUBSCRIPTION_VALIDATION_TIMEOUT_SECS);
-        let urls = forward_proxy::fetch_subscription_proxy_urls(
+        let validation_started = Instant::now();
+        let normalized_subscription =
+            forward_proxy::normalize_subscription_entries(vec![subscription_url.to_string()])
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    ProxyError::Other("subscription url must be a valid http/https url".to_string())
+                })?;
+        let urls = forward_proxy::fetch_subscription_proxy_urls_with_validation_budget(
             &self.forward_proxy_clients.direct_client(),
-            subscription_url,
-            timeout,
+            &normalized_subscription,
+            validation_timeout,
+            validation_started,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+            ProxyError::Other(format!(
+                "failed to fetch or decode subscription payload: {err}"
+            ))
+        })?;
         if urls.is_empty() {
             return Err(ProxyError::Other(
                 "subscription resolved zero proxy entries".to_string(),
@@ -1297,23 +1311,50 @@ impl TavilyProxy {
             ));
         }
         let probe_url = forward_proxy::derive_probe_url(&self.upstream);
+        let timeout_error = || {
+            ProxyError::Other(format!(
+                "validation timed out after {}ms",
+                validation_timeout.as_millis()
+            ))
+        };
+        let mut last_error: Option<ProxyError> = None;
         let mut best_latency: Option<f64> = None;
         for endpoint in endpoints.iter().take(3) {
-            if let Ok(latency_ms) = self
-                .probe_forward_proxy_endpoint(
-                    endpoint,
-                    Duration::from_secs(forward_proxy::FORWARD_PROXY_VALIDATION_TIMEOUT_SECS),
-                    &probe_url,
-                )
+            let Some(remaining_timeout) =
+                validation_timeout.checked_sub(validation_started.elapsed())
+            else {
+                last_error = Some(timeout_error());
+                break;
+            };
+            if remaining_timeout.is_zero() {
+                last_error = Some(timeout_error());
+                break;
+            }
+            match self
+                .probe_forward_proxy_endpoint(endpoint, remaining_timeout, &probe_url)
                 .await
             {
-                best_latency =
-                    Some(best_latency.map_or(latency_ms, |current| current.min(latency_ms)));
+                Ok(latency_ms) => {
+                    best_latency = Some(latency_ms);
+                    break;
+                }
+                Err(err) => {
+                    if validation_started.elapsed() >= validation_timeout {
+                        last_error = Some(timeout_error());
+                        break;
+                    }
+                    last_error = Some(err);
+                }
             }
         }
         let Some(latency_ms) = best_latency else {
+            if let Some(err) = last_error {
+                return Err(ProxyError::Other(format!(
+                    "subscription proxy probe failed: {err}; no entry passed validation"
+                )));
+            }
             return Err(ProxyError::Other(
-                "subscription proxy probe failed: no entry passed validation".to_string(),
+                "no subscription proxy entry passed validation".to_string(),
             ));
         };
         Ok((

@@ -2522,7 +2522,7 @@ pub async fn fetch_subscription_proxy_urls(
     Ok(parse_proxy_urls_from_subscription_body(&body))
 }
 
-async fn fetch_subscription_proxy_urls_with_validation_budget(
+pub(crate) async fn fetch_subscription_proxy_urls_with_validation_budget(
     client: &Client,
     subscription_url: &str,
     total_timeout: Duration,
