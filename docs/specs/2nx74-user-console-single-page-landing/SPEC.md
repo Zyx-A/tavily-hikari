@@ -57,7 +57,7 @@
 
 ### SHOULD
 
-- 顶部区块导航使用轻量、明确的单页定位控件，而不是“切页式”按钮容器。
+- merged landing 不再保留额外的区块说明/导航条，首屏直接进入账户概览内容。
 - 移动端继续沿用现有统计卡片与 token card 结构，不引入新布局分支。
 
 ### COULD
@@ -77,9 +77,6 @@
 - 用户访问 `/console#/tokens`
   - 进入 merged landing。
   - 页面自动定位到 Token 列表区块。
-- 用户在 merged landing 点击区块导航
-  - hash 更新为目标区块对应的 legacy hash。
-  - 页面平滑滚动到对应区块。
 - 用户在 Token 列表点击详情
   - 进入 `/console#/tokens/:id`。
   - detail 页继续保留 token probe、日志与客户端接入模块。
@@ -167,10 +164,10 @@ None
 ## Visual Evidence (PR)
 
 - Chrome DevTools 实测 `/console`、`#/dashboard`、`#/tokens` 与 `#/tokens/tmK4`：
-  - `/console` 与 `#/dashboard` 同页同时展示 `账户用量概览` 和 `Token 列表`，区块导航默认聚焦概览。
-  - `#/tokens` 仍进入同一落地页，但区块导航与滚动焦点切到 Token 列表。
+  - `/console` 与 `#/dashboard` 同页同时展示 `账户用量概览` 和 `Token 列表`，首屏不再插入额外说明/导航条。
+  - `#/tokens` 仍进入同一落地页，并自动滚动到 Token 列表区块。
   - `#/tokens/tmK4` 保持独立 detail 页，点击 `返回 Token 列表` 后回到 `#/tokens` 并重新聚焦 Token 区块。
-  - 从 `#/dashboard` 手动滚到 Token 区块进入 detail 后，浏览器 Back 会回到原始 `#/dashboard` 入口并保留滚动位置；detail 页顶部区块导航仍可直接切回概览区或 Token 区。
+  - 从 `#/dashboard` 手动滚到 Token 区块进入 detail 后，浏览器 Back 会回到原始 `#/dashboard` 入口并保留滚动位置。
 
 ## 资产晋升（Asset promotion）
 

@@ -4760,30 +4760,6 @@ tbody .log-details-row:hover {
   flex-shrink: 0;
 }
 
-.user-console-section-nav-panel {
-  margin-bottom: 18px;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.user-console-section-nav-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.user-console-section-nav-copy h2 {
-  margin: 0;
-  font-size: 1.04rem;
-  font-weight: 700;
-}
-
-.user-console-section-nav-tabs {
-  flex: 0 0 auto;
-}
-
 .user-console-landing-stack {
   display: flex;
   flex-direction: column;
@@ -4900,17 +4876,6 @@ tbody .log-details-row:hover {
   .admin-panel-refresh-button {
     align-self: flex-start;
     min-width: 104px;
-  }
-
-  .user-console-section-nav-panel {
-    margin-bottom: 14px;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 12px;
-  }
-
-  .user-console-section-nav-tabs {
-    width: 100%;
   }
 
   .user-console-landing-stack {

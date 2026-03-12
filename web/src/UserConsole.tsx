@@ -26,7 +26,6 @@ import LanguageSwitcher from './components/LanguageSwitcher'
 import RollingNumber from './components/RollingNumber'
 import { StatusBadge, type StatusTone } from './components/StatusBadge'
 import ThemeToggle from './components/ThemeToggle'
-import SegmentedTabs from './components/ui/SegmentedTabs'
 import { Button } from './components/ui/button'
 import { useLanguage, useTranslate, type Language } from './i18n'
 import {
@@ -431,8 +430,6 @@ export default function UserConsole(): JSX.Element {
   const consoleUnavailable = consoleAvailability === 'disabled'
   const showTokenListLoading = loading && tokens.length === 0
   const showEmptyTokens = !loading && tokens.length === 0
-
-  const landingSection = route.name === 'landing' && route.section === 'tokens' ? 'tokens' : 'dashboard'
 
   const scrollToLandingSection = useCallback((section: UserConsoleLandingSection, behavior: ScrollBehavior = 'auto') => {
     const target = section === 'dashboard' ? dashboardSectionRef.current : tokensSectionRef.current
@@ -946,11 +943,6 @@ export default function UserConsole(): JSX.Element {
     )
   }
 
-  const goDashboard = (behavior: ScrollBehavior = 'auto') => {
-    shouldScrollLandingSectionRef.current = true
-    landingScrollBehaviorRef.current = behavior
-    navigateToRoute({ name: 'landing', section: 'dashboard' })
-  }
   const goHome = () => {
     window.location.href = '/'
   }
@@ -980,15 +972,6 @@ export default function UserConsole(): JSX.Element {
     if (model.state === 'failed') return titles.failed
     return titles.idle
   }, [text.detail.probe])
-
-  const landingNavOptions = useMemo(
-    () => [
-      { value: 'dashboard' as const, label: text.nav.dashboard },
-      { value: 'tokens' as const, label: text.nav.tokens },
-    ],
-    [text.nav.dashboard, text.nav.tokens],
-  )
-  const activeLandingNavSection = route.name === 'token' ? 'tokens' : landingSection
 
   return (
     <main
@@ -1021,28 +1004,6 @@ export default function UserConsole(): JSX.Element {
           )}
         </div>
       </section>
-
-      {!consoleUnavailable && (
-        <section className="surface panel user-console-section-nav-panel">
-          <div className="user-console-section-nav-copy">
-            <h2>{text.landing.title}</h2>
-            <p className="panel-description">{text.landing.description}</p>
-          </div>
-          <SegmentedTabs<UserConsoleLandingSection>
-            value={activeLandingNavSection}
-            onChange={(section) => {
-              if (section === 'dashboard') {
-                goDashboard('smooth')
-                return
-              }
-              goTokens('smooth')
-            }}
-            options={landingNavOptions}
-            ariaLabel={text.landing.navAria}
-            className="user-console-section-nav-tabs"
-          />
-        </section>
-      )}
 
       {consoleUnavailable && (
         <section className="surface panel access-panel">
@@ -1858,15 +1819,6 @@ function buildCurlSnippet(baseUrl: string, prettyToken: string): string {
 const EN = {
   title: 'User Console',
   subtitle: 'Your account dashboard and token management',
-  landing: {
-    title: 'Overview & Tokens',
-    description: 'One landing page for your account summary and every token bound to this account.',
-    navAria: 'Console sections',
-  },
-  nav: {
-    dashboard: 'Dashboard',
-    tokens: 'Token Management',
-  },
   dashboard: {
     usage: 'Account Usage Overview',
     description: 'Track account-level throughput, failures, and quota windows without switching pages.',
@@ -1996,15 +1948,6 @@ const EN = {
 const ZH = {
   title: '用户控制台',
   subtitle: '账户仪表盘与 Token 管理',
-  landing: {
-    title: '概览与 Token 列表',
-    description: '把账户概览和 Token 列表收在同一页里，不用再来回切页。',
-    navAria: '控制台区块导航',
-  },
-  nav: {
-    dashboard: '控制台仪表盘',
-    tokens: 'Token 管理',
-  },
   dashboard: {
     usage: '账户用量概览',
     description: '在同一页集中查看账户级成功率、失败量与各配额窗口。',
