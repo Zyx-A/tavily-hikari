@@ -37,7 +37,7 @@ export async function copyText(value: string, options: CopyTextOptions = {}): Pr
 
   let execCommandError: unknown
   try {
-    if (copyTextWithExecCommand(value, doc)) {
+    if (copyTextWithExecCommand(value, doc, nav)) {
       return {
         ok: true,
         method: 'execCommand',
@@ -58,7 +58,7 @@ export async function copyText(value: string, options: CopyTextOptions = {}): Pr
   }
 }
 
-export function copyTextWithExecCommand(value: string, doc?: Document): boolean {
+export function copyTextWithExecCommand(value: string, doc?: Document, nav?: Navigator): boolean {
   if (!doc?.body) {
     throw new Error('Document body is unavailable for clipboard fallback')
   }
@@ -85,7 +85,7 @@ export function copyTextWithExecCommand(value: string, doc?: Document): boolean 
   doc.body.appendChild(textarea)
 
   try {
-    selectAllReadonlyText(textarea)
+    selectExecCommandTarget(textarea, doc, nav)
     const copied = doc.execCommand('copy')
     if (!copied) {
       throw new Error('document.execCommand("copy") returned false')
@@ -108,4 +108,43 @@ export function selectAllReadonlyText(target: SelectAllTextTarget | null | undef
   target.focus?.()
   target.select()
   target.setSelectionRange?.(0, target.value.length)
+}
+
+function selectExecCommandTarget(
+  target: HTMLTextAreaElement,
+  doc: Document,
+  nav?: Navigator,
+): void {
+  if (requiresIOSSelectionHack(nav)) {
+    const selection = doc.getSelection?.() ?? null
+    const range = doc.createRange()
+    const originalContentEditable = target.contentEditable
+    const originalReadOnly = target.readOnly
+
+    target.contentEditable = 'true'
+    target.readOnly = false
+    target.focus()
+    range.selectNodeContents(target)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+    target.setSelectionRange(0, target.value.length)
+    target.contentEditable = originalContentEditable
+    target.readOnly = originalReadOnly
+    return
+  }
+
+  selectAllReadonlyText(target)
+}
+
+function requiresIOSSelectionHack(nav?: Navigator): boolean {
+  if (!nav) return false
+  const userAgent = nav.userAgent ?? ''
+  const platform = nav.platform ?? ''
+  const maxTouchPoints = typeof nav.maxTouchPoints === 'number' ? nav.maxTouchPoints : 0
+
+  if (/iPad|iPhone|iPod/i.test(userAgent)) {
+    return true
+  }
+
+  return platform === 'MacIntel' && maxTouchPoints > 1
 }

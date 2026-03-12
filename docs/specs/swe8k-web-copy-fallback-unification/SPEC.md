@@ -209,6 +209,7 @@
 - 2026-03-12: 初始化规格，冻结复制兼容统一 helper、手动复制气泡与一次性 secret 恢复口径。
 - 2026-03-12: 落地 `copyText()` / `selectAllReadonlyText()` / `ManualCopyBubble`，统一接入 PublicHome、UserConsole、AdminDashboard、TokenDetail，并补齐 Bun 测试、build 与浏览器冒烟。
 - 2026-03-12: 修复 `ManualCopyBubble` 首次打开时因定位前短路渲染而不显示的问题，改为先挂载再定位，未完成定位前仅隐藏且禁用指针事件。
+- 2026-03-12: 为 `execCommand` fallback 补充 iOS / iPadOS 选区兼容分支，并在 PublicHome 复制失败时自动 reveal 当前 token，确保“原文可见入口”仍可手动复制。
 
 ## 参考（References）
 

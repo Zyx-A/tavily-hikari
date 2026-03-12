@@ -291,6 +291,9 @@ function PublicHome(): JSX.Element {
       window.setTimeout(() => setCopyState('idle'), 2500)
       return
     }
+    if (value.trim().length > 0) {
+      setTokenVisible(true)
+    }
     setCopyState('error')
     window.setTimeout(() => setCopyState('idle'), 2500)
   }, [])
