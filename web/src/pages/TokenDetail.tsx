@@ -3,6 +3,8 @@ import { Icon } from '@iconify/react'
 import { Chart as ChartJS, BarElement, CategoryScale, Legend, LinearScale, Tooltip, type ChartOptions } from 'chart.js'
 import { Bar } from 'react-chartjs-2'
 import { fetchTokenUsageSeries, rotateTokenSecret, type TokenOwnerSummary, type TokenUsageBucket } from '../api'
+import { type QueryLoadState, getBlockingLoadState, getRefreshingLoadState, isBlockingLoadState, isRefreshingLoadState } from '../admin/queryLoadState'
+import AdminLoadingRegion from '../components/AdminLoadingRegion'
 import AdminReturnToConsoleLink from '../components/AdminReturnToConsoleLink'
 import AdminTablePagination from '../components/AdminTablePagination'
 import AdminTableShell from '../components/AdminTableShell'
@@ -380,6 +382,7 @@ export default function TokenDetail({
 }): JSX.Element {
   const translations = useTranslate()
   const tokenStrings = translations.admin.tokens
+  const loadingStateStrings = translations.admin.loadingStates
   const pageRef = useRef<HTMLDivElement>(null)
   const { viewportMode, contentMode, isCompactLayout } = useResponsiveModes(pageRef)
   const [info, setInfo] = useState<TokenDetailInfo | null>(null)
@@ -399,14 +402,14 @@ export default function TokenDetail({
   const [requestKindOptions, setRequestKindOptions] = useState<TokenLogRequestKindOption[]>([])
   const [requestKindLabelsByKey, setRequestKindLabelsByKey] = useState<Record<string, string>>({})
   const [selectedRequestKinds, setSelectedRequestKinds] = useState<string[]>([])
-  const [loading, setLoading] = useState(true)
+  const [summaryLoadState, setSummaryLoadState] = useState<QueryLoadState>('initial_loading')
+  const [logsLoadState, setLogsLoadState] = useState<QueryLoadState>('initial_loading')
   const [quickUsage, setQuickUsage] = useState<UsageBar[]>([])
   const [quickUsageLoading, setQuickUsageLoading] = useState(true)
   const [snapshotUsage, setSnapshotUsage] = useState<UsageBar[]>([])
   const [snapshotUsageLoading, setSnapshotUsageLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [warning, setWarning] = useState<string | null>(null)
-  const [loadingMore, setLoadingMore] = useState(false)
   const sseRef = useRef<EventSource | null>(null)
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(() => new Set())
   const warningTimerRef = useRef<number | null>(null)
@@ -416,8 +419,13 @@ export default function TokenDetail({
   const [rotating, setRotating] = useState(false)
   const [rotatedToken, setRotatedToken] = useState<string | null>(null)
   const [sseConnected, setSseConnected] = useState(false)
+  const perPageRef = useRef(20)
   const quickUsageAbortRef = useRef<AbortController | null>(null)
   const snapshotUsageAbortRef = useRef<AbortController | null>(null)
+  const detailAbortRef = useRef<AbortController | null>(null)
+  const logsAbortRef = useRef<AbortController | null>(null)
+  const summaryQueryKeyRef = useRef<string | null>(null)
+  const logsQueryKeyRef = useRef<string | null>(null)
 
   useEffect(() => {
     setInfo(null)
@@ -434,13 +442,29 @@ export default function TokenDetail({
     setQuickUsageLoading(true)
     setSnapshotUsage([])
     setSnapshotUsageLoading(true)
+    setSummaryLoadState('initial_loading')
+    setLogsLoadState('initial_loading')
+    summaryQueryKeyRef.current = null
+    logsQueryKeyRef.current = null
   }, [id])
+
+  useEffect(() => {
+    perPageRef.current = perPage
+  }, [perPage])
 
   const { sinceIso, untilIso } = useMemo(() => {
     const start = computeStartDate(period, debouncedSinceInput)
     const end = computeEndDate(period, start)
     return { sinceIso: toIso(start), untilIso: toIso(end) }
   }, [period, debouncedSinceInput])
+  const summaryBlocking = isBlockingLoadState(summaryLoadState)
+  const summaryRefreshing = isRefreshingLoadState(summaryLoadState)
+  const logsBlocking = isBlockingLoadState(logsLoadState)
+  const logsRefreshing = isRefreshingLoadState(logsLoadState)
+  const filterControlsDisabled = summaryBlocking || logsBlocking
+  const infoRegionLoadState: QueryLoadState = info
+    ? (summaryRefreshing ? 'refreshing' : 'ready')
+    : summaryLoadState
 
   const periodSelectId = `token-period-select-${id}`
   const sinceInputId = `token-since-input-${id}`
@@ -518,8 +542,8 @@ export default function TokenDetail({
     }
   }, [warning])
 
-  async function getJson<T = any>(url: string): Promise<T> {
-    const res = await fetch(url)
+  async function getJson<T = any>(url: string, signal?: AbortSignal): Promise<T> {
+    const res = await fetch(url, { signal })
     const contentType = res.headers.get('content-type') ?? ''
     const body = await res.text()
     if (!res.ok) {
@@ -536,7 +560,7 @@ export default function TokenDetail({
   }
 
   const buildLogsPageUrl = useCallback(
-    (nextPage: number, nextPerPage = perPage) =>
+    (nextPage: number, nextPerPage = perPageRef.current) =>
       buildTokenLogsPagePath({
         tokenId: id,
         page: nextPage,
@@ -545,7 +569,7 @@ export default function TokenDetail({
         untilIso,
         requestKinds: selectedRequestKindsNormalized,
       }),
-    [id, perPage, selectedRequestKindsNormalized, sinceIso, untilIso],
+    [id, selectedRequestKindsNormalized, sinceIso, untilIso],
   )
 
   const syncRequestKindState = useCallback(
@@ -647,40 +671,66 @@ export default function TokenDetail({
     return () => { snapshotUsageAbortRef.current?.abort() }
   }, [refreshSnapshotUsage])
 
+  useEffect(() => () => {
+    detailAbortRef.current?.abort()
+    logsAbortRef.current?.abort()
+  }, [])
+
   // initial load (details + metrics + first page logs)
   useEffect(() => {
-    let cancelled = false
+    detailAbortRef.current?.abort()
+    logsAbortRef.current?.abort()
+    const detailController = new AbortController()
+    const logsController = new AbortController()
+    detailAbortRef.current = detailController
+    logsAbortRef.current = logsController
+    const nextQueryKey = `${id}:${period}:${sinceIso}:${untilIso}`
+    setSummaryLoadState(getBlockingLoadState(summaryQueryKeyRef.current != null))
+    setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
+    setSummary(null)
+    setLogs([])
+    setPage(1)
+    setTotal(0)
+    setExpandedLogs(new Set())
+    setError(null)
     const run = async () => {
-      setLoading(true)
       try {
-        const [detailRes, summaryRes, logsRes] = await Promise.all([
-          getJson(`/api/tokens/${encodeURIComponent(id)}`),
-          getJson(`/api/tokens/${encodeURIComponent(id)}/metrics?period=${period}&since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}`),
-          getJson<TokenLogsPageResponse>(buildLogsPageUrl(1)),
+        const [[detailRes, summaryRes], logsRes] = await Promise.all([
+          Promise.all([
+            getJson(`/api/tokens/${encodeURIComponent(id)}`, detailController.signal),
+            getJson(`/api/tokens/${encodeURIComponent(id)}/metrics?period=${period}&since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}`, detailController.signal),
+          ]),
+          getJson<TokenLogsPageResponse>(buildLogsPageUrl(1), logsController.signal),
         ])
-        if (cancelled) return
+        if (detailController.signal.aborted || logsController.signal.aborted) return
+        const resolvedPerPage = logsRes.per_page ?? logsRes.perPage ?? perPageRef.current
         setInfo(detailRes)
         setSummary(summaryRes)
         setLogs(logsRes.items)
         setPage(1)
-        setPerPage(logsRes.per_page ?? logsRes.perPage ?? perPage)
+        setPerPage(resolvedPerPage)
         setTotal(logsRes.total)
         syncRequestKindState(logsRes.request_kind_options ?? [], logsRes.items)
         setExpandedLogs(new Set())
         setError(null)
+        setSummaryLoadState('ready')
+        setLogsLoadState('ready')
+        summaryQueryKeyRef.current = nextQueryKey
+        logsQueryKeyRef.current = `${nextQueryKey}:page=1:perPage=${resolvedPerPage}`
         void loadQuickStats()
-        refreshQuickUsage()
-        refreshSnapshotUsage()
       } catch (e) {
-        if (cancelled) return
+        if ((e as Error).name === 'AbortError') return
         setError(e instanceof Error ? e.message : 'Failed to load token details')
-      } finally {
-        if (!cancelled) setLoading(false)
+        setSummaryLoadState('error')
+        setLogsLoadState('error')
       }
     }
     void run()
-    return () => { cancelled = true }
-  }, [buildLogsPageUrl, id, perPage, period, refreshQuickUsage, refreshSnapshotUsage, sinceIso, syncRequestKindState, untilIso])
+    return () => {
+      detailController.abort()
+      logsController.abort()
+    }
+  }, [buildLogsPageUrl, id, period, refreshQuickUsage, refreshSnapshotUsage, sinceIso, syncRequestKindState, untilIso])
 
   // SSE for live updates (refresh first page upon snapshot)
   useEffect(() => {
@@ -693,15 +743,27 @@ export default function TokenDetail({
       }
     }
     const refreshLogs = async () => {
+      if (page !== 1) return
+      logsAbortRef.current?.abort()
+      const controller = new AbortController()
+      logsAbortRef.current = controller
+      setLogsLoadState(getRefreshingLoadState(logsQueryKeyRef.current != null))
       try {
-        const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1))
+        const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1), controller.signal)
+        if (controller.signal.aborted) return
+        const resolvedPerPage = data.per_page ?? data.perPage ?? perPageRef.current
         setLogs(data.items)
         setTotal(data.total)
-        setPerPage(data.per_page ?? data.perPage ?? perPage)
+        setPerPage(resolvedPerPage)
         syncRequestKindState(data.request_kind_options ?? [], data.items)
         setPage(1)
         setExpandedLogs(new Set())
+        setLogsLoadState('ready')
+        logsQueryKeyRef.current = `${id}:${period}:${sinceIso}:${untilIso}:page=1:perPage=${resolvedPerPage}`
       } catch {
+        if (!controller.signal.aborted) {
+          setLogsLoadState('error')
+        }
         // ignore
       }
     }
@@ -709,7 +771,7 @@ export default function TokenDetail({
       try {
         const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1))
         setTotal(data.total)
-        setPerPage(data.per_page ?? data.perPage ?? perPage)
+        setPerPage(data.per_page ?? data.perPage ?? perPageRef.current)
         syncRequestKindState(data.request_kind_options ?? [], data.items)
       } catch {
         // ignore
@@ -724,7 +786,9 @@ export default function TokenDetail({
         const defaultMonthInput = defaultInputValue('month')
         const isMonthView = period === 'month' && (debouncedSinceInput === '' || debouncedSinceInput === defaultMonthInput)
         if (isMonthView) {
+          setSummaryLoadState(getRefreshingLoadState(summaryQueryKeyRef.current != null))
           setSummary(data.summary)
+          setSummaryLoadState('ready')
         }
         void refreshDetail()
         if (page === 1) {
@@ -743,7 +807,7 @@ export default function TokenDetail({
     es.onopen = () => setSseConnected(true)
     es.onerror = () => { setSseConnected(false) }
     return () => { try { es.close() } catch {} setSseConnected(false) }
-  }, [buildLogsPageUrl, id, page, perPage, period, sinceIso, syncRequestKindState, untilIso, debouncedSinceInput, refreshQuickUsage, refreshSnapshotUsage])
+  }, [buildLogsPageUrl, id, page, period, sinceIso, syncRequestKindState, untilIso, debouncedSinceInput, refreshQuickUsage, refreshSnapshotUsage])
 
   useEffect(() => {
     ;(window as typeof window & { __TOKEN_PERIOD__?: Period }).__TOKEN_PERIOD__ = period
@@ -752,19 +816,59 @@ export default function TokenDetail({
   const goToPage = async (next: number, nextPerPage = perPage) => {
     const pageCount = Math.max(1, Math.ceil(total / nextPerPage) || 1)
     const p = Math.max(1, Math.min(next, pageCount))
-    setLoadingMore(true)
+    logsAbortRef.current?.abort()
+    const controller = new AbortController()
+    logsAbortRef.current = controller
+    setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
+    setLogs([])
+    setPage(p)
+    setExpandedLogs(new Set())
+    setError(null)
     try {
-      const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(p, nextPerPage))
+      const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(p, nextPerPage), controller.signal)
+      if (controller.signal.aborted) return
+      const resolvedPerPage = data.per_page ?? data.perPage ?? nextPerPage
       setLogs(data.items)
       setPage(data.page)
-      setPerPage(data.per_page ?? data.perPage ?? nextPerPage)
+      setPerPage(resolvedPerPage)
       setTotal(data.total)
       syncRequestKindState(data.request_kind_options ?? [], data.items)
       setExpandedLogs(new Set())
+      setLogsLoadState('ready')
+      logsQueryKeyRef.current = `${id}:${period}:${sinceIso}:${untilIso}:page=${data.page}:perPage=${resolvedPerPage}`
     } catch (e) {
+      if ((e as Error).name === 'AbortError') return
       setError(e instanceof Error ? e.message : 'Failed to load page')
-    } finally {
-      setLoadingMore(false)
+      setLogsLoadState('error')
+    }
+  }
+
+  const changePerPage = async (nextPerPage: number) => {
+    logsAbortRef.current?.abort()
+    const controller = new AbortController()
+    logsAbortRef.current = controller
+    setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
+    setLogs([])
+    setPerPage(nextPerPage)
+    setPage(1)
+    setExpandedLogs(new Set())
+    setError(null)
+    try {
+      const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1, nextPerPage), controller.signal)
+      if (controller.signal.aborted) return
+      const resolvedPerPage = data.per_page ?? data.perPage ?? nextPerPage
+      setLogs(data.items)
+      setPage(1)
+      setPerPage(resolvedPerPage)
+      setTotal(data.total)
+      syncRequestKindState(data.request_kind_options ?? [], data.items)
+      setExpandedLogs(new Set())
+      setLogsLoadState('ready')
+      logsQueryKeyRef.current = `${id}:${period}:${sinceIso}:${untilIso}:page=1:perPage=${resolvedPerPage}`
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return
+      setError(e instanceof Error ? e.message : 'Failed to load page size')
+      setLogsLoadState('error')
     }
   }
 
@@ -859,31 +963,41 @@ export default function TokenDetail({
       {error && <div className="surface error-banner" role="alert">{error}</div>}
 
       <section className="surface panel token-info-section">
-        <div className="token-info-grid" aria-label="Token metadata">
-          <InfoCard
-            label="Token ID"
-            value={<code className="code-chip" title={info?.id ?? id}>{info?.id ?? id}</code>}
-          />
-          <InfoCard
-            label="Status"
-            value={
-              <StatusBadge tone={info?.enabled ? 'success' : 'error'}>
-                {info?.enabled ? 'Enabled' : 'Disabled'}
-              </StatusBadge>
-            }
-          />
-          <InfoCard label="Total Requests" value={formatNumber(info?.total_requests ?? 0)} />
-          <InfoCard label="Created" value={formatTime(info?.created_at ?? null)} />
-          <InfoCard label="Last Used" value={formatTime(info?.last_used_at ?? null)} />
-          <InfoCard
-            label={tokenStrings.owner.label}
-            value={<TokenOwnerValue owner={info?.owner ?? null} emptyLabel={tokenStrings.owner.unbound} onOpenUser={onOpenUser} />}
-          />
-          <InfoCard
-            label="Note"
-            value={info?.note ? <span className="token-info-note" title={info.note}>{info.note}</span> : '—'}
-          />
-        </div>
+        <AdminLoadingRegion
+          loadState={infoRegionLoadState}
+          loadingLabel={summaryRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching}
+          minHeight={184}
+        >
+          {info ? (
+            <div className="token-info-grid" aria-label="Token metadata">
+              <InfoCard
+                label="Token ID"
+                value={<code className="code-chip" title={info.id}>{info.id}</code>}
+              />
+              <InfoCard
+                label="Status"
+                value={
+                  <StatusBadge tone={info.enabled ? 'success' : 'error'}>
+                    {info.enabled ? 'Enabled' : 'Disabled'}
+                  </StatusBadge>
+                }
+              />
+              <InfoCard label="Total Requests" value={formatNumber(info.total_requests)} />
+              <InfoCard label="Created" value={formatTime(info.created_at)} />
+              <InfoCard label="Last Used" value={formatTime(info.last_used_at)} />
+              <InfoCard
+                label={tokenStrings.owner.label}
+                value={<TokenOwnerValue owner={info.owner ?? null} emptyLabel={tokenStrings.owner.unbound} onOpenUser={onOpenUser} />}
+              />
+              <InfoCard
+                label="Note"
+                value={info.note ? <span className="token-info-note" title={info.note}>{info.note}</span> : '—'}
+              />
+            </div>
+          ) : (
+            <div className="empty-state alert">Token details are unavailable right now.</div>
+          )}
+        </AdminLoadingRegion>
       </section>
 
       <section className="surface panel">
@@ -893,35 +1007,43 @@ export default function TokenDetail({
             <p className="panel-description">Rolling usage windows (1 hour / 24 hours / calendar month).</p>
           </div>
         </div>
-        <section className="quick-stats-grid">
-          {info ? (
-            <>
-              <QuotaStatCard
-                label="1 Hour"
-                used={info.quota_hourly_used}
-                limit={info.quota_hourly_limit}
-                resetAt={info.quota_hourly_reset_at}
-                description="Rolling 1-hour window"
-              />
-              <QuotaStatCard
-                label="24 Hours"
-                used={info.quota_daily_used}
-                limit={info.quota_daily_limit}
-                resetAt={info.quota_daily_reset_at}
-                description="Rolling 24-hour window"
-              />
-              <QuotaStatCard
-                label="This Month"
-                used={info.quota_monthly_used}
-                limit={info.quota_monthly_limit}
-                resetAt={info.quota_monthly_reset_at}
-                description="Calendar month"
-              />
-            </>
-          ) : (
-            <div className="empty-state alert" style={{ gridColumn: '1 / -1' }}>Loading…</div>
-          )}
-        </section>
+        <AdminLoadingRegion
+          loadState={infoRegionLoadState}
+          loadingLabel={summaryRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching}
+          minHeight={176}
+        >
+          <section className="quick-stats-grid">
+            {info ? (
+              <>
+                <QuotaStatCard
+                  label="1 Hour"
+                  used={info.quota_hourly_used}
+                  limit={info.quota_hourly_limit}
+                  resetAt={info.quota_hourly_reset_at}
+                  description="Rolling 1-hour window"
+                />
+                <QuotaStatCard
+                  label="24 Hours"
+                  used={info.quota_daily_used}
+                  limit={info.quota_daily_limit}
+                  resetAt={info.quota_daily_reset_at}
+                  description="Rolling 24-hour window"
+                />
+                <QuotaStatCard
+                  label="This Month"
+                  used={info.quota_monthly_used}
+                  limit={info.quota_monthly_limit}
+                  resetAt={info.quota_monthly_reset_at}
+                  description="Calendar month"
+                />
+              </>
+            ) : (
+              <div className="empty-state alert" style={{ gridColumn: '1 / -1' }}>
+                Token quota details are unavailable right now.
+              </div>
+            )}
+          </section>
+        </AdminLoadingRegion>
         <div style={{ marginTop: 16 }}>
           <UsageChart data={quickUsage} loading={quickUsageLoading} labelFormatter={hourLabel} height={200} />
         </div>
@@ -936,8 +1058,8 @@ export default function TokenDetail({
           <div className="token-period-controls" role="group" aria-label="Period filter">
             <div className="token-period-control">
               <label htmlFor={periodSelectId}>Period</label>
-              <Select value={period} onValueChange={(value) => { const next = value as Period; setPeriod(next); applyStartInput('', next) }}>
-                <SelectTrigger id={periodSelectId}>
+              <Select value={period} onValueChange={(value) => { const next = value as Period; setPeriod(next); applyStartInput('', next) }} disabled={filterControlsDisabled}>
+                <SelectTrigger id={periodSelectId} disabled={filterControlsDisabled}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent align="start">
@@ -955,6 +1077,7 @@ export default function TokenDetail({
                   type="date"
                   max={defaultInputValue('day')}
                   value={sinceInput}
+                  disabled={filterControlsDisabled}
                   onChange={(e) => handleStartChange(period, e.target.value)}
                 />
               )}
@@ -964,6 +1087,7 @@ export default function TokenDetail({
                   type="week"
                   max={defaultInputValue('week')}
                   value={sinceInput}
+                  disabled={filterControlsDisabled}
                   onChange={(e) => handleStartChange(period, e.target.value)}
                 />
               )}
@@ -973,6 +1097,7 @@ export default function TokenDetail({
                   type="month"
                   max={defaultInputValue('month')}
                   value={sinceInput}
+                  disabled={filterControlsDisabled}
                   onChange={(e) => handleStartChange(period, e.target.value)}
                 />
               )}
@@ -985,12 +1110,18 @@ export default function TokenDetail({
             <span>{warning}</span>
           </div>
         )}
-        <div className="token-stats">
-          <MetricCard label="Requests" value={formatNumber(summary?.total_requests ?? 0)} />
-          <MetricCard label="Success" value={formatNumber(summary?.success_count ?? 0)} />
-          <MetricCard label="Errors" value={formatNumber(summary?.error_count ?? 0)} />
-          <MetricCard label="Quota Exhausted" value={formatNumber(summary?.quota_exhausted_count ?? 0)} />
-        </div>
+        <AdminLoadingRegion
+          loadState={summaryLoadState}
+          loadingLabel={summaryRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching}
+          minHeight={160}
+        >
+          <div className="token-stats">
+            <MetricCard label="Requests" value={formatNumber(summary?.total_requests ?? 0)} />
+            <MetricCard label="Success" value={formatNumber(summary?.success_count ?? 0)} />
+            <MetricCard label="Errors" value={formatNumber(summary?.error_count ?? 0)} />
+            <MetricCard label="Quota Exhausted" value={formatNumber(summary?.quota_exhausted_count ?? 0)} />
+          </div>
+        </AdminLoadingRegion>
         <div style={{ marginTop: 16 }}>
           <UsageChart
             data={snapshotUsage}
@@ -1054,7 +1185,13 @@ export default function TokenDetail({
             </DropdownMenu>
           </div>
         </div>
-        <AdminTableShell className="token-detail-md-up" tableClassName="token-detail-table">
+        <AdminTableShell
+          className="token-detail-md-up"
+          tableClassName="token-detail-table"
+          loadState={logsLoadState}
+          loadingLabel={logsRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching}
+          minHeight={320}
+        >
           <TableHeader>
             <TableRow>
               <TableHead>Time</TableHead>
@@ -1110,15 +1247,20 @@ export default function TokenDetail({
             {logs.length === 0 && (
               <TableRow>
                 <TableCell colSpan={7} style={{ padding: 12 }}>
-                  <div className="empty-state alert" style={{ padding: 12 }}>{loading ? 'Loading…' : 'No logs yet.'}</div>
+                  <div className="empty-state alert" style={{ padding: 12 }}>No logs yet.</div>
                 </TableCell>
               </TableRow>
             )}
           </TableBody>
         </AdminTableShell>
-        <div className="token-detail-mobile-list token-detail-md-down">
+        <AdminLoadingRegion
+          className="token-detail-mobile-list token-detail-md-down"
+          loadState={logsLoadState}
+          loadingLabel={logsRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching}
+          minHeight={240}
+        >
           {logs.length === 0 ? (
-            <div className="empty-state alert" style={{ padding: 12 }}>{loading ? 'Loading…' : 'No logs yet.'}</div>
+            <div className="empty-state alert" style={{ padding: 12 }}>No logs yet.</div>
           ) : (
             logs.map((log) => (
               <article key={log.id} className="user-console-mobile-card">
@@ -1159,18 +1301,17 @@ export default function TokenDetail({
               </article>
             ))
           )}
-        </div>
+        </AdminLoadingRegion>
         <AdminTablePagination
           page={page}
           totalPages={totalPages}
           perPage={perPage}
           onPerPageChange={(value) => {
-            setPerPage(value)
-            setPage(1)
-            void goToPage(1, value)
+            void changePerPage(value)
           }}
-          previousDisabled={page <= 1 || loadingMore}
-          nextDisabled={page >= totalPages || loadingMore}
+          disabled={logsBlocking}
+          previousDisabled={page <= 1}
+          nextDisabled={page >= totalPages}
           onPrevious={() => void goToPage(page - 1)}
           onNext={() => void goToPage(page + 1)}
         />

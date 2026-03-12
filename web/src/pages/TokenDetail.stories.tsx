@@ -6,6 +6,7 @@ import { SELECT_STORY } from "storybook/internal/core-events";
 import TokenDetail from "./TokenDetail";
 
 const tokenId = "a1b2";
+type StoryMode = "default" | "initial_loading" | "switch_loading" | "refreshing";
 
 interface StoryTokenDetail {
   id: string;
@@ -62,9 +63,17 @@ const metricsMock = {
   last_activity: 1_762_390_010,
 };
 
-const logsMock = [
+const requestKindOptionsMock = [
+  { key: "api:search", label: "API | search" },
+  { key: "api:research-result", label: "API | research result" },
+  { key: "mcp:search", label: "MCP | search" },
+  { key: "mcp:batch", label: "MCP | batch" },
+  { key: "mcp:tool:acme-lookup", label: "MCP | acme-lookup" },
+  { key: "mcp:raw:/mcp", label: "MCP | /mcp" },
+];
+
+const logTemplates = [
   {
-    id: 3000,
     method: "POST",
     path: "/api/tavily/search",
     query: null,
@@ -76,10 +85,8 @@ const logsMock = [
     request_kind_detail: null,
     result_status: "success",
     error_message: null,
-    created_at: 1_762_390_010,
   },
   {
-    id: 2999,
     method: "POST",
     path: "/mcp",
     query: null,
@@ -91,10 +98,8 @@ const logsMock = [
     request_kind_detail: null,
     result_status: "success",
     error_message: null,
-    created_at: 1_762_389_590,
   },
   {
-    id: 2998,
     method: "POST",
     path: "/mcp",
     query: null,
@@ -106,10 +111,8 @@ const logsMock = [
     request_kind_detail: "search, extract",
     result_status: "success",
     error_message: null,
-    created_at: 1_762_389_170,
   },
   {
-    id: 2997,
     method: "POST",
     path: "/mcp",
     query: null,
@@ -121,10 +124,8 @@ const logsMock = [
     request_kind_detail: null,
     result_status: "success",
     error_message: null,
-    created_at: 1_762_388_750,
   },
   {
-    id: 2996,
     method: "GET",
     path: "/api/tavily/research/req_42",
     query: null,
@@ -136,10 +137,8 @@ const logsMock = [
     request_kind_detail: null,
     result_status: "error",
     error_message: "research request not found",
-    created_at: 1_762_388_330,
   },
   {
-    id: 2995,
     method: "POST",
     path: "/mcp",
     query: null,
@@ -151,18 +150,25 @@ const logsMock = [
     request_kind_detail: null,
     result_status: "quota_exhausted",
     error_message: "quota exhausted",
-    created_at: 1_762_387_910,
   },
-];
+] as const;
 
-const requestKindOptionsMock = [
-  { key: "api:search", label: "API | search" },
-  { key: "api:research-result", label: "API | research result" },
-  { key: "mcp:search", label: "MCP | search" },
-  { key: "mcp:batch", label: "MCP | batch" },
-  { key: "mcp:tool:acme-lookup", label: "MCP | acme-lookup" },
-  { key: "mcp:raw:/mcp", label: "MCP | /mcp" },
-];
+const logsMock = Array.from({ length: 24 }, (_, idx) => {
+  const template = logTemplates[idx % logTemplates.length];
+  return {
+    id: 3000 + idx,
+    ...template,
+    business_credits:
+      template.business_credits == null ? null : template.business_credits + Math.floor(idx / logTemplates.length),
+    created_at: 1_762_390_010 - idx * 420,
+  };
+});
+
+const logsPageTwoMock = logsMock.map((item, idx) => ({
+  ...item,
+  id: 4000 + idx,
+  created_at: item.created_at - 10_000,
+}));
 
 const usageSeriesMock = Array.from({ length: 16 }, (_, idx) => ({
   bucket_start: 1_762_360_000 + idx * 3600,
@@ -178,9 +184,44 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-function installFetchMock(detailOverride = tokenDetailMock): () => void {
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+type MockEventSourceShape = EventSource & {
+  dispatchEvent(event: Event): boolean;
+};
+
+const activeEventSources = new Set<MockEventSourceShape>();
+
+function buildLogPage(
+  source: typeof logsMock,
+  page: number,
+  perPage: number,
+): {
+  items: typeof logsMock;
+  page: number;
+  per_page: number;
+  total: number;
+  request_kind_options: typeof requestKindOptionsMock;
+} {
+  const start = (page - 1) * perPage;
+  return {
+    items: source.slice(start, start + perPage),
+    page,
+    per_page: perPage,
+    total: source.length,
+    request_kind_options: requestKindOptionsMock,
+  };
+}
+
+function installFetchMock(
+  detailOverride = tokenDetailMock,
+  mode: StoryMode = "default",
+): () => void {
   const originalFetch = window.fetch.bind(window);
   const activeTokenId = detailOverride.id;
+  let initialLogsResolved = false;
 
   window.fetch = async (
     input: RequestInfo | URL,
@@ -190,10 +231,16 @@ function installFetchMock(detailOverride = tokenDetailMock): () => void {
     const url = new URL(request.url, window.location.origin);
 
     if (url.pathname === `/api/tokens/${activeTokenId}`) {
+      if (mode === "initial_loading") {
+        await wait(4_000);
+      }
       return jsonResponse(detailOverride);
     }
 
     if (url.pathname === `/api/tokens/${activeTokenId}/metrics`) {
+      if (mode === "initial_loading") {
+        await wait(4_000);
+      }
       return jsonResponse(metricsMock);
     }
 
@@ -201,19 +248,20 @@ function installFetchMock(detailOverride = tokenDetailMock): () => void {
       const perPage = Number(url.searchParams.get("per_page") ?? "20");
       const page = Number(url.searchParams.get("page") ?? "1");
       const selectedRequestKinds = url.searchParams.getAll("request_kind");
-      const filteredLogs = selectedRequestKinds.length === 0
-        ? logsMock
-        : logsMock.filter((log) =>
-            selectedRequestKinds.includes(log.request_kind_key),
-          );
-      const start = Math.max(0, (page - 1) * perPage);
-      return jsonResponse({
-        items: filteredLogs.slice(start, start + perPage),
-        page,
-        per_page: perPage,
-        total: filteredLogs.length,
-        request_kind_options: requestKindOptionsMock,
-      });
+      const source = page === 2 ? logsPageTwoMock : logsMock;
+      const filteredSource =
+        selectedRequestKinds.length === 0
+          ? source
+          : source.filter((log) => selectedRequestKinds.includes(log.request_kind_key));
+      if (mode === "initial_loading") {
+        await wait(4_000);
+      } else if (mode === "switch_loading" && page === 2) {
+        await wait(4_000);
+      } else if (mode === "refreshing" && page === 1 && initialLogsResolved) {
+        await wait(4_000);
+      }
+      initialLogsResolved = true;
+      return jsonResponse(buildLogPage(filteredSource, page, perPage));
     }
 
     if (url.pathname === `/api/tokens/${activeTokenId}/metrics/usage-series`) {
@@ -256,6 +304,7 @@ function installEventSourceMock(): () => void {
 
     constructor(url: string) {
       this.url = url;
+      activeEventSources.add(this as unknown as MockEventSourceShape);
       window.setTimeout(() => {
         this.onopen?.call(this as unknown as EventSource, new Event("open"));
       }, 0);
@@ -293,6 +342,7 @@ function installEventSourceMock(): () => void {
 
     close(): void {
       this.readyState = MockEventSource.CLOSED;
+      activeEventSources.delete(this as unknown as MockEventSourceShape);
     }
   }
 
@@ -304,19 +354,30 @@ function installEventSourceMock(): () => void {
   };
 }
 
+function emitSnapshotRefresh(): void {
+  const event = new MessageEvent("snapshot", {
+    data: JSON.stringify({ summary: metricsMock, logs: logsMock.slice(0, 20) }),
+  });
+  activeEventSources.forEach((source) => {
+    source.dispatchEvent(event);
+  });
+}
+
 function openStoryInManager(storyId: string): void {
   addons.getChannel().emit(SELECT_STORY, { storyId });
 }
 
 function TokenDetailStoryCanvas({
   detail = tokenDetailMock,
+  mode = "default",
 }: {
   detail?: StoryTokenDetail;
+  mode?: StoryMode;
 }): JSX.Element {
   const [ready, setReady] = useState(false);
 
   useLayoutEffect(() => {
-    const cleanupFetch = installFetchMock(detail);
+    const cleanupFetch = installFetchMock(detail, mode);
     const cleanupEventSource = installEventSourceMock();
     setReady(true);
 
@@ -325,7 +386,28 @@ function TokenDetailStoryCanvas({
       cleanupEventSource();
       setReady(false);
     };
-  }, [detail]);
+  }, [detail, mode]);
+
+  useLayoutEffect(() => {
+    if (!ready) return;
+
+    if (mode === "switch_loading") {
+      const timer = window.setTimeout(() => {
+        const nextButton = document.querySelectorAll<HTMLButtonElement>(
+          ".table-pagination-button",
+        )[1];
+        nextButton?.click();
+      }, 600);
+      return () => window.clearTimeout(timer);
+    }
+
+    if (mode === "refreshing") {
+      const timer = window.setTimeout(() => {
+        emitSnapshotRefresh();
+      }, 600);
+      return () => window.clearTimeout(timer);
+    }
+  }, [mode, ready]);
 
   if (!ready) {
     return <div style={{ minHeight: "100vh" }} />;
@@ -337,7 +419,7 @@ function TokenDetailStoryCanvas({
       onBack={() => undefined}
       onOpenUser={(userId) => {
         if (!userId) return;
-        openStoryInManager('admin-pages--user-detail');
+        openStoryInManager("admin-pages--user-detail");
       }}
     />
   );
@@ -356,14 +438,35 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {
-  args: { detail: tokenDetailMock },
+  args: { detail: tokenDetailMock, mode: "default" },
   parameters: {
     viewport: { defaultViewport: "1440-device-desktop" },
   },
 };
 
 export const Unbound: Story = {
-  args: { detail: tokenDetailUnboundMock },
+  args: { detail: tokenDetailUnboundMock, mode: "default" },
+  parameters: {
+    viewport: { defaultViewport: "1440-device-desktop" },
+  },
+};
+
+export const InitialLoading: Story = {
+  args: { detail: tokenDetailMock, mode: "initial_loading" },
+  parameters: {
+    viewport: { defaultViewport: "1440-device-desktop" },
+  },
+};
+
+export const SwitchLoading: Story = {
+  args: { detail: tokenDetailMock, mode: "switch_loading" },
+  parameters: {
+    viewport: { defaultViewport: "1440-device-desktop" },
+  },
+};
+
+export const Refreshing: Story = {
+  args: { detail: tokenDetailMock, mode: "refreshing" },
   parameters: {
     viewport: { defaultViewport: "1440-device-desktop" },
   },
