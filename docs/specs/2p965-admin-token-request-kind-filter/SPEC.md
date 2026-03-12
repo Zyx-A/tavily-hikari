@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 待实现
+- Status: 进行中（快车道）
 - Created: 2026-03-12
 - Last: 2026-03-12
 
@@ -113,12 +113,14 @@
 ## Visual Evidence (PR)
 
 - 本地浏览器验收已完成：在 `http://127.0.0.1:58097/admin/tokens/497Q` 验证了 `Request Type` 列、多选 OR 语义筛选，以及 `MCP | batch` 展开后的 detail。
-- PR 截图与远端 checks / review-loop 结果待补。
+- PR `#119` 已创建，`type:minor` / `channel:stable` 标签已补齐，CI checks 已转绿。
+- review-loop 首轮指出了 raw MCP 子路径折叠、legacy backfill 方式，以及多选筛选在跨时间窗 / 非第一页 SSE 下的状态问题；对应修复已在当前分支落地并重新回归。
 
 ## 变更记录（Change log）
 
 - 2026-03-12: 初始化 spec，冻结 `Request Type` 列、多选精确筛选、legacy raw fallback 与 mixed MCP batch 展示规则。
 - 2026-03-12: 实现后端 request kind 持久化与多选过滤、TokenDetail 多选下拉筛选、Storybook mock 与本地回归验证。
+- 2026-03-12: 根据 review-loop 修复 `/mcp/*path` raw fallback 折叠与旧错误落库值回补，legacy request kind backfill 收敛为单次集合式更新，并补齐多选筛选在时间窗切换 / 非第一页 SSE 下的 request type 可见性。
 
 ## 参考（References）
 

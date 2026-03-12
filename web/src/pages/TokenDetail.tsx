@@ -32,7 +32,9 @@ import { useTranslate } from '../i18n'
 import { ADMIN_USER_CONSOLE_HREF } from '../lib/adminUserConsoleEntry'
 import { useResponsiveModes } from '../lib/responsive'
 import {
+  buildVisibleRequestKindOptions,
   buildTokenLogsPagePath,
+  mergeRequestKindLabels,
   summarizeSelectedRequestKinds,
   toggleRequestKindSelection,
   type TokenLogRequestKindOption,
@@ -395,6 +397,7 @@ export default function TokenDetail({
   const [perPage, setPerPage] = useState(20)
   const [total, setTotal] = useState(0)
   const [requestKindOptions, setRequestKindOptions] = useState<TokenLogRequestKindOption[]>([])
+  const [requestKindLabelsByKey, setRequestKindLabelsByKey] = useState<Record<string, string>>({})
   const [selectedRequestKinds, setSelectedRequestKinds] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [quickUsage, setQuickUsage] = useState<UsageBar[]>([])
@@ -424,6 +427,7 @@ export default function TokenDetail({
     setPage(1)
     setTotal(0)
     setRequestKindOptions([])
+    setRequestKindLabelsByKey({})
     setSelectedRequestKinds([])
     setWarning(null)
     setQuickUsage([])
@@ -444,9 +448,18 @@ export default function TokenDetail({
     () => uniqueSelectedRequestKinds(selectedRequestKinds),
     [selectedRequestKinds],
   )
+  const visibleRequestKindOptions = useMemo(
+    () =>
+      buildVisibleRequestKindOptions(
+        selectedRequestKindsNormalized,
+        requestKindOptions,
+        requestKindLabelsByKey,
+      ),
+    [requestKindLabelsByKey, requestKindOptions, selectedRequestKindsNormalized],
+  )
   const requestKindSummary = useMemo(
-    () => summarizeSelectedRequestKinds(selectedRequestKindsNormalized, requestKindOptions),
-    [requestKindOptions, selectedRequestKindsNormalized],
+    () => summarizeSelectedRequestKinds(selectedRequestKindsNormalized, visibleRequestKindOptions),
+    [selectedRequestKindsNormalized, visibleRequestKindOptions],
   )
 
   const applyStartInput = (raw: string, nextPeriod: Period = period, opts?: { suppressWarning?: boolean }) => {
@@ -533,6 +546,14 @@ export default function TokenDetail({
         requestKinds: selectedRequestKindsNormalized,
       }),
     [id, perPage, selectedRequestKindsNormalized, sinceIso, untilIso],
+  )
+
+  const syncRequestKindState = useCallback(
+    (nextOptions: TokenLogRequestKindOption[], nextLogs: TokenLog[] = []) => {
+      setRequestKindOptions(nextOptions)
+      setRequestKindLabelsByKey((prev) => mergeRequestKindLabels(prev, nextOptions, nextLogs))
+    },
+    [],
   )
 
   async function loadQuickStats() {
@@ -644,7 +665,7 @@ export default function TokenDetail({
         setPage(1)
         setPerPage(logsRes.per_page ?? logsRes.perPage ?? perPage)
         setTotal(logsRes.total)
-        setRequestKindOptions(logsRes.request_kind_options ?? [])
+        syncRequestKindState(logsRes.request_kind_options ?? [], logsRes.items)
         setExpandedLogs(new Set())
         setError(null)
         void loadQuickStats()
@@ -659,7 +680,7 @@ export default function TokenDetail({
     }
     void run()
     return () => { cancelled = true }
-  }, [buildLogsPageUrl, id, perPage, period, refreshQuickUsage, refreshSnapshotUsage, sinceIso, untilIso])
+  }, [buildLogsPageUrl, id, perPage, period, refreshQuickUsage, refreshSnapshotUsage, sinceIso, syncRequestKindState, untilIso])
 
   // SSE for live updates (refresh first page upon snapshot)
   useEffect(() => {
@@ -672,15 +693,24 @@ export default function TokenDetail({
       }
     }
     const refreshLogs = async () => {
-      if (page !== 1) return
       try {
         const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1))
         setLogs(data.items)
         setTotal(data.total)
         setPerPage(data.per_page ?? data.perPage ?? perPage)
-        setRequestKindOptions(data.request_kind_options ?? [])
+        syncRequestKindState(data.request_kind_options ?? [], data.items)
         setPage(1)
         setExpandedLogs(new Set())
+      } catch {
+        // ignore
+      }
+    }
+    const refreshRequestKindOptions = async () => {
+      try {
+        const data = await getJson<TokenLogsPageResponse>(buildLogsPageUrl(1))
+        setTotal(data.total)
+        setPerPage(data.per_page ?? data.perPage ?? perPage)
+        syncRequestKindState(data.request_kind_options ?? [], data.items)
       } catch {
         // ignore
       }
@@ -697,7 +727,11 @@ export default function TokenDetail({
           setSummary(data.summary)
         }
         void refreshDetail()
-        void refreshLogs()
+        if (page === 1) {
+          void refreshLogs()
+        } else {
+          void refreshRequestKindOptions()
+        }
         void loadQuickStats()
         refreshQuickUsage()
         refreshSnapshotUsage()
@@ -709,7 +743,7 @@ export default function TokenDetail({
     es.onopen = () => setSseConnected(true)
     es.onerror = () => { setSseConnected(false) }
     return () => { try { es.close() } catch {} setSseConnected(false) }
-  }, [buildLogsPageUrl, id, page, perPage, period, sinceIso, untilIso, debouncedSinceInput, refreshQuickUsage, refreshSnapshotUsage])
+  }, [buildLogsPageUrl, id, page, perPage, period, sinceIso, syncRequestKindState, untilIso, debouncedSinceInput, refreshQuickUsage, refreshSnapshotUsage])
 
   useEffect(() => {
     ;(window as typeof window & { __TOKEN_PERIOD__?: Period }).__TOKEN_PERIOD__ = period
@@ -725,7 +759,7 @@ export default function TokenDetail({
       setPage(data.page)
       setPerPage(data.per_page ?? data.perPage ?? nextPerPage)
       setTotal(data.total)
-      setRequestKindOptions(data.request_kind_options ?? [])
+      syncRequestKindState(data.request_kind_options ?? [], data.items)
       setExpandedLogs(new Set())
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load page')
@@ -1001,10 +1035,10 @@ export default function TokenDetail({
                   Show all request types
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                {requestKindOptions.length === 0 ? (
+                {visibleRequestKindOptions.length === 0 ? (
                   <DropdownMenuItem disabled>No request types in this window</DropdownMenuItem>
                 ) : (
-                  requestKindOptions.map((option) => (
+                  visibleRequestKindOptions.map((option) => (
                     <DropdownMenuCheckboxItem
                       key={option.key}
                       className="cursor-pointer"

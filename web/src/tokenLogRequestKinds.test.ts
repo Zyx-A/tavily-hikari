@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test'
 
 import {
+  buildVisibleRequestKindOptions,
   buildTokenLogsPagePath,
+  mergeRequestKindLabels,
   summarizeSelectedRequestKinds,
   toggleRequestKindSelection,
   uniqueSelectedRequestKinds,
@@ -55,5 +57,32 @@ describe('token log request kind helpers', () => {
     expect(
       summarizeSelectedRequestKinds(['api:search', 'mcp:search', 'mcp:batch'], options),
     ).toBe('3 selected')
+  })
+
+  it('remembers request kind labels from options and rendered logs', () => {
+    expect(
+      mergeRequestKindLabels(
+        { 'mcp:raw:/mcp/sse': 'MCP | /mcp/sse' },
+        [{ key: 'api:search', label: 'API | search' }],
+        [{ request_kind_key: 'mcp:search', request_kind_label: 'MCP | search' }],
+      ),
+    ).toEqual({
+      'api:search': 'API | search',
+      'mcp:raw:/mcp/sse': 'MCP | /mcp/sse',
+      'mcp:search': 'MCP | search',
+    })
+  })
+
+  it('keeps selected request kinds visible even when they drop out of the current window options', () => {
+    expect(
+      buildVisibleRequestKindOptions(
+        ['mcp:raw:/mcp/sse', 'api:search'],
+        [{ key: 'api:search', label: 'API | search' }],
+        { 'mcp:raw:/mcp/sse': 'MCP | /mcp/sse' },
+      ),
+    ).toEqual([
+      { key: 'api:search', label: 'API | search' },
+      { key: 'mcp:raw:/mcp/sse', label: 'MCP | /mcp/sse' },
+    ])
   })
 })

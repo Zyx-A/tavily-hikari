@@ -9400,36 +9400,27 @@ impl KeyStore {
 
     // ----- Token usage logs & metrics -----
     async fn backfill_auth_token_log_request_kinds(&self) -> Result<(), ProxyError> {
-        let rows = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+        let fallback_key_sql = token_request_kind_fallback_key_sql();
+        let fallback_label_sql = token_request_kind_fallback_label_sql();
+        // Keep startup backfill bounded to a single set-based update instead of fetch-all + row-by-row writes.
+        let query = format!(
             r#"
-            SELECT id, method, path, query
-            FROM auth_token_logs
-            WHERE request_kind_key IS NULL OR request_kind_label IS NULL
+            UPDATE auth_token_logs
+            SET
+                request_kind_key = {fallback_key_sql},
+                request_kind_label = {fallback_label_sql}
+            WHERE request_kind_key IS NULL
+               OR request_kind_label IS NULL
+               OR (
+                    path LIKE '/mcp/%'
+                    AND (
+                        request_kind_key = 'mcp:raw:/mcp'
+                        OR request_kind_label = 'MCP | /mcp'
+                    )
+               )
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        for (id, method, path, query) in rows {
-            let request_kind = derive_token_request_kind_fallback(
-                method.as_str(),
-                path.as_str(),
-                query.as_deref(),
-            );
-            sqlx::query(
-                r#"
-                UPDATE auth_token_logs
-                SET request_kind_key = ?, request_kind_label = ?, request_kind_detail = COALESCE(request_kind_detail, ?)
-                WHERE id = ?
-                "#,
-            )
-            .bind(&request_kind.key)
-            .bind(&request_kind.label)
-            .bind(request_kind.detail.as_deref())
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        }
+        );
+        sqlx::query(query.as_str()).execute(&self.pool).await?;
 
         Ok(())
     }
@@ -10125,6 +10116,8 @@ impl KeyStore {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
             .collect();
+        let effective_request_kind_key_sql = token_request_kind_effective_key_sql();
+        let effective_request_kind_label_sql = token_request_kind_effective_label_sql();
 
         let mut total_query =
             QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM auth_token_logs WHERE token_id = ");
@@ -10136,7 +10129,9 @@ impl KeyStore {
             total_query.push_bind(until);
         }
         if !filtered_request_kinds.is_empty() {
-            total_query.push(" AND request_kind_key IN (");
+            total_query.push(" AND ");
+            total_query.push(effective_request_kind_key_sql.as_str());
+            total_query.push(" IN (");
             let mut separated = total_query.separated(", ");
             for kind in &filtered_request_kinds {
                 separated.push_bind(kind);
@@ -10148,16 +10143,18 @@ impl KeyStore {
             .fetch_one(&self.pool)
             .await?;
 
-        let mut rows_query = QueryBuilder::<Sqlite>::new(
+        let mut rows_query = QueryBuilder::<Sqlite>::new(format!(
             r#"
             SELECT id, method, path, query, http_status, mcp_status,
                    CASE WHEN billing_state = 'charged' THEN business_credits ELSE NULL END,
-                   request_kind_key, request_kind_label, request_kind_detail,
+                   {effective_request_kind_key_sql} AS request_kind_key,
+                   {effective_request_kind_label_sql} AS request_kind_label,
+                   request_kind_detail,
                    result_status, error_message, created_at
             FROM auth_token_logs
             WHERE token_id =
             "#,
-        );
+        ));
         rows_query.push_bind(token_id);
         rows_query.push(" AND created_at >= ");
         rows_query.push_bind(since);
@@ -10166,7 +10163,9 @@ impl KeyStore {
             rows_query.push_bind(until);
         }
         if !filtered_request_kinds.is_empty() {
-            rows_query.push(" AND request_kind_key IN (");
+            rows_query.push(" AND ");
+            rows_query.push(effective_request_kind_key_sql.as_str());
+            rows_query.push(" IN (");
             let mut separated = rows_query.separated(", ");
             for kind in &filtered_request_kinds {
                 separated.push_bind(kind);
@@ -10236,91 +10235,54 @@ impl KeyStore {
         since: i64,
         until: Option<i64>,
     ) -> Result<Vec<TokenRequestKindOption>, ProxyError> {
-        let persisted_rows = if let Some(until) = until {
-            sqlx::query_as::<_, (String, String)>(
+        let effective_request_kind_key_sql = token_request_kind_effective_key_sql();
+        let effective_request_kind_label_sql = token_request_kind_effective_label_sql();
+        let query = if until.is_some() {
+            format!(
                 r#"
-                SELECT DISTINCT request_kind_key, request_kind_label
+                SELECT DISTINCT
+                    {effective_request_kind_key_sql} AS request_kind_key,
+                    {effective_request_kind_label_sql} AS request_kind_label
                 FROM auth_token_logs
                 WHERE token_id = ?
                   AND created_at >= ?
                   AND created_at < ?
-                  AND request_kind_key IS NOT NULL
-                  AND request_kind_label IS NOT NULL
-                "#,
+                ORDER BY request_kind_label ASC, request_kind_key ASC
+                "#
             )
-            .bind(token_id)
-            .bind(since)
-            .bind(until)
-            .fetch_all(&self.pool)
-            .await?
         } else {
-            sqlx::query_as::<_, (String, String)>(
+            format!(
                 r#"
-                SELECT DISTINCT request_kind_key, request_kind_label
+                SELECT DISTINCT
+                    {effective_request_kind_key_sql} AS request_kind_key,
+                    {effective_request_kind_label_sql} AS request_kind_label
                 FROM auth_token_logs
                 WHERE token_id = ?
                   AND created_at >= ?
-                  AND request_kind_key IS NOT NULL
-                  AND request_kind_label IS NOT NULL
-                "#,
+                ORDER BY request_kind_label ASC, request_kind_key ASC
+                "#
             )
-            .bind(token_id)
-            .bind(since)
-            .fetch_all(&self.pool)
-            .await?
         };
 
-        let legacy_rows = if let Some(until) = until {
-            sqlx::query_as::<_, (String, String, Option<String>)>(
-                r#"
-                SELECT DISTINCT method, path, query
-                FROM auth_token_logs
-                WHERE token_id = ?
-                  AND created_at >= ?
-                  AND created_at < ?
-                  AND (request_kind_key IS NULL OR request_kind_label IS NULL)
-                "#,
-            )
-            .bind(token_id)
-            .bind(since)
-            .bind(until)
-            .fetch_all(&self.pool)
-            .await?
+        let options = if let Some(until) = until {
+            sqlx::query_as::<_, (String, String)>(query.as_str())
+                .bind(token_id)
+                .bind(since)
+                .bind(until)
+                .fetch_all(&self.pool)
+                .await?
         } else {
-            sqlx::query_as::<_, (String, String, Option<String>)>(
-                r#"
-                SELECT DISTINCT method, path, query
-                FROM auth_token_logs
-                WHERE token_id = ?
-                  AND created_at >= ?
-                  AND (request_kind_key IS NULL OR request_kind_label IS NULL)
-                "#,
-            )
-            .bind(token_id)
-            .bind(since)
-            .fetch_all(&self.pool)
-            .await?
+            sqlx::query_as::<_, (String, String)>(query.as_str())
+                .bind(token_id)
+                .bind(since)
+                .fetch_all(&self.pool)
+                .await?
         };
 
-        let mut options_by_key: HashMap<String, String> = HashMap::new();
-        for (key, label) in persisted_rows {
-            options_by_key.entry(key).or_insert(label);
-        }
-        for (method, path, query) in legacy_rows {
-            let fallback = derive_token_request_kind_fallback(
-                method.as_str(),
-                path.as_str(),
-                query.as_deref(),
-            );
-            options_by_key.entry(fallback.key).or_insert(fallback.label);
-        }
-
-        let mut options = options_by_key
+        Ok(options
             .into_iter()
             .map(|(key, label)| TokenRequestKindOption { key, label })
-            .collect::<Vec<_>>();
-        options.sort_by(|left, right| left.label.cmp(&right.label).then(left.key.cmp(&right.key)));
-        Ok(options)
+            .collect())
     }
 
     pub async fn fetch_token_hourly_breakdown(
@@ -12624,8 +12586,8 @@ fn build_mcp_request_kind_with_detail(
     )
 }
 
-fn raw_mcp_request_kind() -> TokenRequestKind {
-    build_mcp_request_kind_named("raw:/mcp", "/mcp")
+fn raw_mcp_request_kind(path: &str) -> TokenRequestKind {
+    build_mcp_request_kind_named(&format!("raw:{path}"), path)
 }
 
 fn normalize_tavily_tool_name(tool: &str) -> Option<String> {
@@ -12675,17 +12637,17 @@ fn classify_mcp_request_kind_from_message(value: &Value) -> Option<TokenRequestK
     Some(build_mcp_request_kind(method))
 }
 
-fn classify_mcp_request_kind(body: Option<&[u8]>) -> TokenRequestKind {
+fn classify_mcp_request_kind(path: &str, body: Option<&[u8]>) -> TokenRequestKind {
     let Some(body) = body else {
-        return raw_mcp_request_kind();
+        return raw_mcp_request_kind(path);
     };
     if body.is_empty() {
-        return raw_mcp_request_kind();
+        return raw_mcp_request_kind(path);
     }
 
     let parsed = match serde_json::from_slice::<Value>(body) {
         Ok(value) => value,
-        Err(_) => return raw_mcp_request_kind(),
+        Err(_) => return raw_mcp_request_kind(path),
     };
 
     match parsed {
@@ -12695,7 +12657,7 @@ fn classify_mcp_request_kind(body: Option<&[u8]>) -> TokenRequestKind {
                 .filter_map(classify_mcp_request_kind_from_message)
                 .collect();
             if kinds.is_empty() {
-                return raw_mcp_request_kind();
+                return raw_mcp_request_kind(path);
             }
             let first_key = kinds[0].key.clone();
             if kinds.iter().all(|kind| kind.key == first_key) {
@@ -12715,10 +12677,9 @@ fn classify_mcp_request_kind(body: Option<&[u8]>) -> TokenRequestKind {
                 (!labels.is_empty()).then(|| labels.join(", ")),
             )
         }
-        Value::Object(_) => {
-            classify_mcp_request_kind_from_message(&parsed).unwrap_or_else(raw_mcp_request_kind)
-        }
-        _ => raw_mcp_request_kind(),
+        Value::Object(_) => classify_mcp_request_kind_from_message(&parsed)
+            .unwrap_or_else(|| raw_mcp_request_kind(path)),
+        _ => raw_mcp_request_kind(path),
     }
 }
 
@@ -12733,9 +12694,87 @@ pub fn classify_token_request_kind(path: &str, body: Option<&[u8]>) -> TokenRequ
         _ if path.starts_with("/api/tavily/research/") => {
             build_api_request_kind_named("research-result", "research result")
         }
-        _ if path.starts_with("/mcp") => classify_mcp_request_kind(body),
+        _ if path.starts_with("/mcp") => classify_mcp_request_kind(path, body),
         _ => build_api_request_kind_named(&format!("raw:{path}"), path),
     }
+}
+
+fn token_request_kind_fallback_key_sql() -> &'static str {
+    r#"
+    CASE
+        WHEN path = '/api/tavily/search' THEN 'api:search'
+        WHEN path = '/api/tavily/extract' THEN 'api:extract'
+        WHEN path = '/api/tavily/crawl' THEN 'api:crawl'
+        WHEN path = '/api/tavily/map' THEN 'api:map'
+        WHEN path = '/api/tavily/research' THEN 'api:research'
+        WHEN path = '/api/tavily/usage' THEN 'api:usage'
+        WHEN path LIKE '/api/tavily/research/%' THEN 'api:research-result'
+        WHEN path LIKE '/mcp%' THEN 'mcp:raw:' || path
+        ELSE 'api:raw:' || path
+    END
+    "#
+}
+
+fn token_request_kind_fallback_label_sql() -> &'static str {
+    r#"
+    CASE
+        WHEN path = '/api/tavily/search' THEN 'API | search'
+        WHEN path = '/api/tavily/extract' THEN 'API | extract'
+        WHEN path = '/api/tavily/crawl' THEN 'API | crawl'
+        WHEN path = '/api/tavily/map' THEN 'API | map'
+        WHEN path = '/api/tavily/research' THEN 'API | research'
+        WHEN path = '/api/tavily/usage' THEN 'API | usage'
+        WHEN path LIKE '/api/tavily/research/%' THEN 'API | research result'
+        WHEN path LIKE '/mcp%' THEN 'MCP | ' || path
+        ELSE 'API | ' || path
+    END
+    "#
+}
+
+fn token_request_kind_effective_key_sql() -> String {
+    format!(
+        r#"
+        CASE
+            WHEN request_kind_key IS NOT NULL
+             AND TRIM(request_kind_key) <> ''
+             AND request_kind_label IS NOT NULL
+             AND TRIM(request_kind_label) <> ''
+             AND NOT (
+                 path LIKE '/mcp/%'
+                 AND (
+                     request_kind_key = 'mcp:raw:/mcp'
+                     OR request_kind_label = 'MCP | /mcp'
+                 )
+             )
+            THEN request_kind_key
+            ELSE {}
+        END
+        "#,
+        token_request_kind_fallback_key_sql()
+    )
+}
+
+fn token_request_kind_effective_label_sql() -> String {
+    format!(
+        r#"
+        CASE
+            WHEN request_kind_key IS NOT NULL
+             AND TRIM(request_kind_key) <> ''
+             AND request_kind_label IS NOT NULL
+             AND TRIM(request_kind_label) <> ''
+             AND NOT (
+                 path LIKE '/mcp/%'
+                 AND (
+                     request_kind_key = 'mcp:raw:/mcp'
+                     OR request_kind_label = 'MCP | /mcp'
+                 )
+             )
+            THEN request_kind_label
+            ELSE {}
+        END
+        "#,
+        token_request_kind_fallback_label_sql()
+    )
 }
 
 fn derive_token_request_kind_fallback(
@@ -12744,6 +12783,10 @@ fn derive_token_request_kind_fallback(
     _query: Option<&str>,
 ) -> TokenRequestKind {
     classify_token_request_kind(path, None)
+}
+
+fn is_stale_root_mcp_raw_request_kind(path: &str, key: &str, label: &str) -> bool {
+    path.starts_with("/mcp/") && (key.trim() == "mcp:raw:/mcp" || label.trim() == "MCP | /mcp")
 }
 
 fn finalize_token_request_kind(
@@ -12764,7 +12807,9 @@ fn finalize_token_request_kind(
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         }),
     ) {
-        (Some(key), Some(label)) => TokenRequestKind::new(key, label, detail),
+        (Some(key), Some(label)) if !is_stale_root_mcp_raw_request_kind(path, &key, &label) => {
+            TokenRequestKind::new(key, label, detail)
+        }
         _ => derive_token_request_kind_fallback(method, path, query),
     }
 }
@@ -13341,6 +13386,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         assert_eq!(
             classify_token_request_kind("/api/custom/raw", None),
             TokenRequestKind::new("api:raw:/api/custom/raw", "API | /api/custom/raw", None)
+        );
+        assert_eq!(
+            classify_token_request_kind("/mcp/sse", None),
+            TokenRequestKind::new("mcp:raw:/mcp/sse", "MCP | /mcp/sse", None)
         );
     }
 

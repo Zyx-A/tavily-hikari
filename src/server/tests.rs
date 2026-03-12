@@ -5105,7 +5105,7 @@ mod tests {
             .record_token_attempt(
                 &token.id,
                 &Method::POST,
-                "/mcp",
+                "/mcp/sse",
                 None,
                 Some(200),
                 Some(0),
@@ -5115,6 +5115,31 @@ mod tests {
             )
             .await
             .expect("record legacy log without credits");
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open db pool");
+        sqlx::query(
+            r#"
+            UPDATE auth_token_logs
+            SET request_kind_key = 'mcp:raw:/mcp',
+                request_kind_label = 'MCP | /mcp'
+            WHERE token_id = ?
+              AND path = '/mcp/sse'
+            "#,
+        )
+        .bind(&token.id)
+        .execute(&pool)
+        .await
+        .expect("downgrade legacy mcp raw row to stale root fallback");
 
         proxy
             .record_token_attempt(
@@ -5199,6 +5224,21 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("MCP | search")
         );
+        let legacy_log = logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:raw:/mcp/sse")
+            })
+            .expect("legacy mcp raw log");
+        assert_eq!(
+            legacy_log
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | /mcp/sse")
+        );
 
         let page_resp = client
             .get(format!(
@@ -5243,6 +5283,21 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("MCP | search")
         );
+        let paged_legacy_log = items
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:raw:/mcp/sse")
+            })
+            .expect("paged legacy mcp raw log");
+        assert_eq!(
+            paged_legacy_log
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | /mcp/sse")
+        );
 
         let filtered_page_resp = client
             .get(format!(
@@ -5277,6 +5332,31 @@ mod tests {
                 "api:search".to_string(),
                 "mcp:search".to_string(),
             ])
+        );
+
+        let filtered_legacy_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&request_kind=mcp%3Araw%3A%2Fmcp%2Fsse",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("filtered legacy logs page request");
+        assert_eq!(filtered_legacy_resp.status(), reqwest::StatusCode::OK);
+        let filtered_legacy_body: serde_json::Value = filtered_legacy_resp
+            .json()
+            .await
+            .expect("filtered legacy logs page json");
+        let filtered_legacy_items = filtered_legacy_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("filtered legacy logs page items");
+        assert_eq!(filtered_legacy_items.len(), 1);
+        assert_eq!(
+            filtered_legacy_items[0]
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | /mcp/sse")
         );
 
         let mut events_resp = client
