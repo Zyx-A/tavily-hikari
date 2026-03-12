@@ -3,7 +3,6 @@ import { Button } from '../components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
 import { Input } from '../components/ui/input'
 import { Textarea } from '../components/ui/textarea'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import AdminLoadingRegion from '../components/AdminLoadingRegion'
 import type {
   ForwardProxySettings,
@@ -540,118 +539,98 @@ export default function ForwardProxySettingsModule({
             {mergedNodes.length === 0 ? (
               <div className="empty-state alert">{strings.nodes.empty}</div>
             ) : (
-              <div className="table-wrapper jobs-table-wrapper forward-proxy-table-wrapper">
-                <Table className="jobs-table forward-proxy-table">
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>{strings.nodes.table.node}</TableHead>
-                      <TableHead>{strings.nodes.table.source}</TableHead>
-                      <TableHead>{strings.nodes.table.endpoint}</TableHead>
-                      <TableHead>{strings.nodes.table.state}</TableHead>
-                      <TableHead>{strings.nodes.table.assignments}</TableHead>
-                      <TableHead>{strings.nodes.table.windows}</TableHead>
-                      <TableHead>{strings.nodes.table.activity24h}</TableHead>
-                      <TableHead>{strings.nodes.table.weight24h}</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {mergedNodes.map((node) => {
-                      const activity = summarizeActivity(node)
-                      const weight = summarizeWeight(node.weight24h)
-                      const stateBadge = getNodeStateBadge(strings, node)
-                      return (
-                        <TableRow key={node.key}>
-                          <TableCell>
-                            <div className="forward-proxy-cell-stack">
-                              <strong>{node.displayName}</strong>
-                              <code className="forward-proxy-code-inline">{node.key}</code>
-                            </div>
-                          </TableCell>
-                          <TableCell>
+              <div className="forward-proxy-node-grid">
+                {mergedNodes.map((node) => {
+                  const activity = summarizeActivity(node)
+                  const weight = summarizeWeight(node.weight24h)
+                  const stateBadge = getNodeStateBadge(strings, node)
+                  return (
+                    <Card className="forward-proxy-node-card" key={node.key}>
+                      <CardHeader className="forward-proxy-node-card-header">
+                        <div className="forward-proxy-node-card-heading">
+                          <div className="forward-proxy-node-card-title-row">
+                            <CardTitle className="text-base">{node.displayName}</CardTitle>
                             <Badge variant={node.source === 'subscription' ? 'info' : node.source === 'manual' ? 'outline' : 'neutral'}>
                               {getSourceLabel(strings, node.source)}
                             </Badge>
-                          </TableCell>
-                          <TableCell>
-                            <div className="forward-proxy-cell-stack">
-                              <code className="forward-proxy-code-inline forward-proxy-endpoint">
-                                {node.endpointUrl ?? '—'}
-                              </code>
-                              <span className="panel-description">
-                                {strings.nodes.weightLabel}: {formatDecimal(node.weight)}
-                              </span>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="forward-proxy-cell-stack">
-                              <Badge variant={stateBadge.variant}>{stateBadge.label}</Badge>
-                              <span className="panel-description">
-                                {node.penalized ? strings.states.penalizedHint : strings.states.readyHint}
-                              </span>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="forward-proxy-cell-stack">
-                              <span>
-                                {strings.nodes.primary}: <strong>{formatNumber(node.primaryAssignmentCount)}</strong>
-                              </span>
-                              <span>
-                                {strings.nodes.secondary}: <strong>{formatNumber(node.secondaryAssignmentCount)}</strong>
-                              </span>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="forward-proxy-window-grid">
-                              {WINDOW_KEYS.map((windowDefinition) => {
-                                const statsForWindow = node.stats[windowDefinition.key]
-                                return (
-                                  <Card className="forward-proxy-window-card" key={`${node.key}-${windowDefinition.key}`}>
-                                    <CardContent className="forward-proxy-window-card-content">
-                                      <span className="forward-proxy-window-label">
-                                        {strings.windows[windowDefinition.translationKey]}
-                                      </span>
-                                      <strong>{formatNumber(statsForWindow.attempts)}</strong>
-                                      <span>{strings.nodes.successRateLabel}: {formatPercent(computeSuccessRate(statsForWindow))}</span>
-                                      <span>{strings.nodes.latencyLabel}: {formatLatency(statsForWindow.avgLatencyMs)}</span>
-                                    </CardContent>
-                                  </Card>
-                                )
-                              })}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="forward-proxy-cell-stack">
-                              <span>
-                                {strings.nodes.successCountLabel}: <strong>{formatNumber(activity.success)}</strong>
-                              </span>
-                              <span>
-                                {strings.nodes.failureCountLabel}: <strong>{formatNumber(activity.failure)}</strong>
-                              </span>
-                              <span className="panel-description">
-                                {node.last24h.length > 0
-                                  ? formatTimeRange(node.last24h[0]?.bucketStart, node.last24h[node.last24h.length - 1]?.bucketEnd)
-                                  : '—'}
-                              </span>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="forward-proxy-cell-stack">
-                              <span>
-                                {strings.nodes.lastWeightLabel}: <strong>{formatDecimal(weight.lastWeight)}</strong>
-                              </span>
-                              <span>
-                                {strings.nodes.avgWeightLabel}: <strong>{formatDecimal(weight.avgWeight)}</strong>
-                              </span>
-                              <span>
-                                {strings.nodes.minMaxWeightLabel}: <strong>{`${formatDecimal(weight.minWeight)} / ${formatDecimal(weight.maxWeight)}`}</strong>
-                              </span>
-                            </div>
-                          </TableCell>
-                        </TableRow>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
+                            <Badge variant={stateBadge.variant}>{stateBadge.label}</Badge>
+                          </div>
+                          <code className="forward-proxy-code-inline">{node.key}</code>
+                        </div>
+                        <CardDescription className="panel-description">
+                          {node.penalized ? strings.states.penalizedHint : strings.states.readyHint}
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent className="forward-proxy-node-card-content">
+                        <div className="forward-proxy-node-metrics">
+                          <div className="forward-proxy-node-metric-card">
+                            <span className="forward-proxy-node-metric-label">{strings.nodes.table.endpoint}</span>
+                            <code className="forward-proxy-code-inline forward-proxy-endpoint">{node.endpointUrl ?? '—'}</code>
+                            <span className="panel-description">
+                              {strings.nodes.weightLabel}: {formatDecimal(node.weight)}
+                            </span>
+                          </div>
+                          <div className="forward-proxy-node-metric-card">
+                            <span className="forward-proxy-node-metric-label">{strings.nodes.table.assignments}</span>
+                            <span>
+                              {strings.nodes.primary}: <strong>{formatNumber(node.primaryAssignmentCount)}</strong>
+                            </span>
+                            <span>
+                              {strings.nodes.secondary}: <strong>{formatNumber(node.secondaryAssignmentCount)}</strong>
+                            </span>
+                          </div>
+                          <div className="forward-proxy-node-metric-card">
+                            <span className="forward-proxy-node-metric-label">{strings.nodes.table.activity24h}</span>
+                            <span>
+                              {strings.nodes.successCountLabel}: <strong>{formatNumber(activity.success)}</strong>
+                            </span>
+                            <span>
+                              {strings.nodes.failureCountLabel}: <strong>{formatNumber(activity.failure)}</strong>
+                            </span>
+                            <span className="panel-description">
+                              {node.last24h.length > 0
+                                ? formatTimeRange(node.last24h[0]?.bucketStart, node.last24h[node.last24h.length - 1]?.bucketEnd)
+                                : '—'}
+                            </span>
+                          </div>
+                          <div className="forward-proxy-node-metric-card">
+                            <span className="forward-proxy-node-metric-label">{strings.nodes.table.weight24h}</span>
+                            <span>
+                              {strings.nodes.lastWeightLabel}: <strong>{formatDecimal(weight.lastWeight)}</strong>
+                            </span>
+                            <span>
+                              {strings.nodes.avgWeightLabel}: <strong>{formatDecimal(weight.avgWeight)}</strong>
+                            </span>
+                            <span>
+                              {strings.nodes.minMaxWeightLabel}: <strong>{`${formatDecimal(weight.minWeight)} / ${formatDecimal(weight.maxWeight)}`}</strong>
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="forward-proxy-node-window-section">
+                          <span className="forward-proxy-node-metric-label">{strings.nodes.table.windows}</span>
+                          <div className="forward-proxy-window-grid">
+                            {WINDOW_KEYS.map((windowDefinition) => {
+                              const statsForWindow = node.stats[windowDefinition.key]
+                              return (
+                                <Card className="forward-proxy-window-card" key={`${node.key}-${windowDefinition.key}`}>
+                                  <CardContent className="forward-proxy-window-card-content">
+                                    <span className="forward-proxy-window-label">
+                                      {strings.windows[windowDefinition.translationKey]}
+                                    </span>
+                                    <strong>{formatNumber(statsForWindow.attempts)}</strong>
+                                    <span>{strings.nodes.successRateLabel}: {formatPercent(computeSuccessRate(statsForWindow))}</span>
+                                    <span>{strings.nodes.latencyLabel}: {formatLatency(statsForWindow.avgLatencyMs)}</span>
+                                  </CardContent>
+                                </Card>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )
+                })}
               </div>
             )}
           </AdminLoadingRegion>
