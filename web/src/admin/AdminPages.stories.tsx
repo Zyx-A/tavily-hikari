@@ -16,6 +16,7 @@ import type {
   RequestLog,
 } from '../api'
 import AdminPanelHeader from '../components/AdminPanelHeader'
+import JobKeyLink from '../components/JobKeyLink'
 import QuotaRangeField from '../components/QuotaRangeField'
 import { StatusBadge, type StatusTone } from '../components/StatusBadge'
 import SegmentedTabs from '../components/ui/SegmentedTabs'
@@ -1551,6 +1552,7 @@ function RequestsPageCanvas(): JSX.Element {
 function JobsPageCanvas(): JSX.Element {
   const admin = useTranslate().admin
   const jobsStrings = admin.jobs
+  const keyStrings = admin.keys
   const [expandedJobs, setExpandedJobs] = useState<Set<number>>(() => new Set([608]))
 
   const toggleJob = (id: number) => {
@@ -1613,7 +1615,14 @@ function JobsPageCanvas(): JSX.Element {
                     <tr>
                       <td>{job.id}</td>
                       <td>{jobTypeText}</td>
-                      <td>{job.key_id ? <code>{job.key_id}</code> : '—'}</td>
+                      <td>
+                        <JobKeyLink
+                          keyId={job.key_id}
+                          keyGroup={job.key_group}
+                          ungroupedLabel={keyStrings.groups.ungrouped}
+                          detailLabel={keyStrings.actions.details}
+                        />
+                      </td>
                       <td>
                         <StatusBadge tone={keyStatusTone(job.status)}>{admin.statuses[job.status] ?? job.status}</StatusBadge>
                       </td>
@@ -1654,6 +1663,17 @@ function JobsPageCanvas(): JSX.Element {
                               <div>
                                 <div className="log-details-label">{jobsStrings.table.type}</div>
                                 <div className="log-details-value">{jobTypeDetail}</div>
+                              </div>
+                              <div>
+                                <div className="log-details-label">{jobsStrings.table.key}</div>
+                                <div className="log-details-value">
+                                  <JobKeyLink
+                                    keyId={job.key_id}
+                                    keyGroup={job.key_group}
+                                    ungroupedLabel={keyStrings.groups.ungrouped}
+                                    detailLabel={keyStrings.actions.details}
+                                  />
+                                </div>
                               </div>
                               <div>
                                 <div className="log-details-label">{jobsStrings.table.status}</div>
