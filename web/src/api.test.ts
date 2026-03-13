@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test'
 
-import { bindAdminUserTag, fetchAdminUsers, fetchAdminUserTags, fetchJobs, updateAdminUserQuota } from './api'
+import { bindAdminUserTag, fetchAdminUsers, fetchAdminUserTags, fetchApiKeys, fetchJobs, updateAdminUserQuota } from './api'
 
 const originalFetch = globalThis.fetch
 
@@ -81,6 +81,39 @@ describe('admin user tag api helpers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [input] = fetchMock.mock.calls[0] as [string, RequestInit]
     expect(input).toBe('/api/users?page=1&per_page=20&q=L2&tagId=linuxdo_l2')
+  })
+
+  it('sends repeated key group and status filters when listing paginated api keys', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            total: 0,
+            page: 2,
+            perPage: 50,
+            facets: {
+              groups: [{ value: 'ops', count: 3 }],
+              statuses: [{ value: 'quarantined', count: 2 }],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const result = await fetchApiKeys(2, 50, {
+      groups: ['ops', ''],
+      statuses: ['quarantined', 'disabled'],
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [input] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(input).toBe('/api/keys?page=2&per_page=50&group=ops&group=&status=quarantined&status=disabled')
+    expect(result.page).toBe(2)
+    expect(result.perPage).toBe(50)
+    expect(result.facets.groups[0]).toEqual({ value: 'ops', count: 3 })
   })
 
   it('patches base quota through the existing user quota endpoint', async () => {
