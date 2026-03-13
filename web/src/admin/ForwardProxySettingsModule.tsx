@@ -909,7 +909,6 @@ export default function ForwardProxySettingsModule({
                             </Badge>
                             <Badge variant={stateBadge.variant}>{stateBadge.label}</Badge>
                           </div>
-                          <code className="forward-proxy-code-inline">{node.key}</code>
                         </CardHeader>
                         <CardContent className="forward-proxy-node-mobile-content">
                           <div className="forward-proxy-node-mobile-grid">
@@ -993,7 +992,6 @@ export default function ForwardProxySettingsModule({
                                   </Badge>
                                   <Badge variant={stateBadge.variant}>{stateBadge.label}</Badge>
                                 </div>
-                                <code className="forward-proxy-code-inline">{node.key}</code>
                                 <div className="forward-proxy-node-cell-meta">
                                   <span>
                                     {strings.nodes.primary}: <strong>{formatNumber(node.primaryAssignmentCount)}</strong>
