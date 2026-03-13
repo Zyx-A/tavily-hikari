@@ -86,6 +86,11 @@ pub async fn serve(
         .route("/api/user/tokens/:id", get(get_user_token_detail))
         .route("/api/user/tokens/:id/secret", get(get_user_token_secret))
         .route("/api/user/tokens/:id/logs", get(get_user_token_logs))
+        .route("/api/admin/registration", get(get_admin_registration_settings))
+        .route(
+            "/api/admin/registration",
+            patch(patch_admin_registration_settings),
+        )
         .route("/api/admin/login", post(post_admin_login))
         .route("/api/admin/logout", post(post_admin_logout))
         .route("/api/tavily/search", post(tavily_http_search))
@@ -112,6 +117,7 @@ pub async fn serve(
         .route("/api/keys/validate", post(post_validate_api_keys))
         .route("/api/keys/batch", post(create_api_keys_batch))
         .route("/api/keys/:id", get(get_api_key_detail))
+        .route("/api/keys/:id/quarantine", delete(delete_api_key_quarantine))
         .route("/api/keys/:id/sync-usage", post(post_sync_key_usage))
         .route("/api/keys/:id/secret", get(get_api_key_secret))
         .route("/api/keys/:id", delete(delete_api_key))
@@ -171,6 +177,18 @@ pub async fn serve(
                 router = router.route("/login", get(serve_login));
                 router = router.route("/login/", get(serve_login));
                 router = router.route("/login.html", get(serve_login));
+                router = router.route(
+                    "/registration-paused",
+                    get(serve_registration_paused_index),
+                );
+                router = router.route(
+                    "/registration-paused/",
+                    get(serve_registration_paused_index),
+                );
+                router = router.route(
+                    "/registration-paused.html",
+                    get(serve_registration_paused_index),
+                );
                 router =
                     router.route_service("/favicon.svg", ServeFile::new(dir.join("favicon.svg")));
                 router = router.route_service(

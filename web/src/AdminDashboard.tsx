@@ -4,6 +4,8 @@ import AdminTablePagination from './components/AdminTablePagination'
 import AdminLoadingRegion from './components/AdminLoadingRegion'
 import AdminTableShell from './components/AdminTableShell'
 import { ApiKeysValidationDialog } from './components/ApiKeysValidationDialog'
+import JobKeyLink from './components/JobKeyLink'
+import ManualCopyBubble from './components/ManualCopyBubble'
 import QuotaRangeField from './components/QuotaRangeField'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -20,10 +22,20 @@ import {
   DialogTitle,
 } from './components/ui/dialog'
 import { Input } from './components/ui/input'
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from './components/ui/dropdown-menu'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './components/ui/select'
 import SegmentedTabs from './components/ui/SegmentedTabs'
 import { Card } from './components/ui/card'
 import { Badge } from './components/ui/badge'
+import { Switch } from './components/ui/switch'
 import { Table } from './components/ui/table'
 import { Textarea } from './components/ui/textarea'
 import TokenUsageHeader from './components/TokenUsageHeader'
@@ -57,6 +69,7 @@ import {
 import {
   type AdminModuleId,
   type AdminPathRoute,
+  buildAdminKeysPath,
   isSameAdminRoute,
   keyDetailPath,
   modulePath,
@@ -69,9 +82,16 @@ import {
   userTagEditPath,
   userTagsPath,
 } from './admin/routes'
-import { useTranslate, type AdminTranslations } from './i18n'
+import { useLanguage, useTranslate, type AdminTranslations } from './i18n'
 import { extractTvlyDevApiKeysFromText } from './lib/api-key-extract'
 import { ADMIN_USER_CONSOLE_HREF } from './lib/adminUserConsoleEntry'
+import {
+  copyText,
+  isCopyIntentKey,
+  selectAllReadonlyText,
+  shouldPrewarmSecretCopy,
+  type CopyTextOptions,
+} from './lib/clipboard'
 import {
   fetchApiKeys,
   fetchApiKeySecret,
@@ -81,6 +101,7 @@ import {
   type ValidateKeyResult,
   deleteApiKey,
   setKeyStatus,
+  clearApiKeyQuarantine,
   fetchProfile,
   fetchRequestLogs,
   fetchSummary,
@@ -113,7 +134,9 @@ import {
   type TokenGroup,
   fetchAdminUsers,
   fetchAdminUserDetail,
+  fetchAdminRegistrationSettings,
   updateAdminUserQuota,
+  updateAdminRegistrationSettings,
   fetchAdminUserTags,
   createAdminUserTag,
   updateAdminUserTag,
@@ -139,6 +162,7 @@ const LOGS_MAX_PAGES = 10
 const DASHBOARD_RECENT_LOGS_PER_PAGE = 64
 const DASHBOARD_RECENT_JOBS_PER_PAGE = 20
 const DASHBOARD_OVERVIEW_SSE_REFRESH_INTERVAL_MS = 30_000
+const DEFAULT_KEYS_PER_PAGE = 20
 const USERS_PER_PAGE = 20
 // Auto-collapse behavior for the API keys batch overlay (empty textarea only):
 // The user wants "delay + close animation" to total 500ms.
@@ -146,6 +170,7 @@ const KEYS_BATCH_CLOSE_ANIMATION_MS = 200
 const KEYS_BATCH_AUTO_COLLAPSE_TOTAL_MS = 500
 const KEYS_BATCH_AUTO_COLLAPSE_DELAY_MS = Math.max(0, KEYS_BATCH_AUTO_COLLAPSE_TOTAL_MS - KEYS_BATCH_CLOSE_ANIMATION_MS)
 const API_KEYS_IMPORT_CHUNK_SIZE = 1000
+const DASHBOARD_EXHAUSTED_KEYS_PAGE_SIZE = 5
 const DASHBOARD_TOKENS_PAGE_SIZE = 100
 const DASHBOARD_TOKENS_MAX_PAGES = 10
 const USER_TAG_DISPLAY_LIMIT = 3
@@ -214,6 +239,93 @@ function formatQuotaUsagePair(used: number, limit: number): string {
   return `${formatNumber(Math.max(0, used))} / ${formatQuotaLimitValue(limit)}`
 }
 
+function formatKeyGroupName(group: string | null | undefined, ungroupedLabel: string): string {
+  const normalized = group?.trim() ?? ''
+  return normalized.length > 0 ? normalized : ungroupedLabel
+}
+
+function toggleSelection(values: string[], value: string): string[] {
+  return values.includes(value) ? values.filter((item) => item !== value) : [...values, value]
+}
+
+function summarizeFilterSelection(
+  label: string,
+  selectedLabels: string[],
+  allLabel: string,
+  selectedSuffix: string,
+): string {
+  if (selectedLabels.length === 0) return `${label}: ${allLabel}`
+  if (selectedLabels.length === 1) return `${label}: ${selectedLabels[0]}`
+  return `${label}: ${selectedLabels.length} ${selectedSuffix}`
+}
+
+const adminTableStackStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+  minWidth: 0,
+} as const
+
+const adminTableFieldStyle = {
+  whiteSpace: 'nowrap',
+  lineHeight: 1.35,
+} as const
+
+const adminTableSecondaryFieldStyle = {
+  ...adminTableFieldStyle,
+  fontSize: '0.92em',
+  opacity: 0.68,
+} as const
+
+const adminTableInlineFieldStyle = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 8,
+  whiteSpace: 'nowrap',
+  lineHeight: 1.35,
+} as const
+
+const adminTableHeaderStackStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 2,
+  minHeight: 40,
+  justifyContent: 'center',
+} as const
+
+const keysUtilityRowStyle = {
+  display: 'flex',
+  alignItems: 'stretch',
+  justifyContent: 'space-between',
+  gap: 16,
+  flexWrap: 'wrap',
+  marginBottom: 16,
+} as const
+
+const keysFilterClusterStyle = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  flexWrap: 'wrap',
+  flex: '1 1 360px',
+  minWidth: 260,
+} as const
+
+const keysQuickAddCardStyle = {
+  flex: '0 1 420px',
+  minWidth: 300,
+  width: 'min(420px, 100%)',
+  padding: 0,
+} as const
+
+const keysQuickAddActionsStyle = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  flexWrap: 'nowrap',
+  width: '100%',
+} as const
+
 function formatSignedQuotaDelta(value: number): string {
   if (value > 0) {
     return `+${formatNumber(value)}`
@@ -234,6 +346,30 @@ function getAdminUsersPageFromLocation(): number {
   const rawPage = new URLSearchParams(window.location.search).get('page')?.trim() ?? ''
   const parsedPage = Number.parseInt(rawPage, 10)
   return Number.isFinite(parsedPage) && parsedPage > 1 ? parsedPage : 1
+}
+
+function getAdminKeysPageFromLocation(): number {
+  const rawPage = new URLSearchParams(window.location.search).get('page')?.trim() ?? ''
+  const parsedPage = Number.parseInt(rawPage, 10)
+  return Number.isFinite(parsedPage) && parsedPage > 1 ? parsedPage : 1
+}
+
+function getAdminKeysPerPageFromLocation(): number {
+  const rawPerPage = new URLSearchParams(window.location.search).get('perPage')?.trim() ?? ''
+  const parsedPerPage = Number.parseInt(rawPerPage, 10)
+  if (!Number.isFinite(parsedPerPage)) return DEFAULT_KEYS_PER_PAGE
+  return Math.min(100, Math.max(1, parsedPerPage))
+}
+
+function getAdminKeysValuesFromLocation(name: 'group' | 'status'): string[] {
+  const values = new URLSearchParams(window.location.search).getAll(name)
+  const normalized = new Set<string>()
+  for (const value of values) {
+    const trimmed = value.trim()
+    if (!trimmed && name !== 'group') continue
+    normalized.add(name === 'status' ? trimmed.toLowerCase() : trimmed)
+  }
+  return Array.from(normalized)
 }
 
 function getUserTagIconSrc(icon: string | null | undefined): string | null {
@@ -534,6 +670,7 @@ function TokenOwnerValue({
 function statusTone(status: string): StatusTone {
   const normalized = status.toLowerCase()
   if (normalized === 'active' || normalized === 'success' || normalized === 'completed') return 'success'
+  if (normalized === 'quarantined') return 'warning'
   if (normalized === 'exhausted' || normalized === 'quota_exhausted' || normalized === 'retry_exhausted') return 'warning'
   if (normalized === 'running' || normalized === 'in_progress' || normalized === 'queued' || normalized === 'pending') {
     return 'info'
@@ -556,6 +693,10 @@ function quotaTone(quotaState: string): StatusTone {
 function statusLabel(status: string, strings: AdminTranslations): string {
   const normalized = status.toLowerCase()
   return strings.statuses[normalized] ?? status
+}
+
+function keyBadgeStatus(item: Pick<ApiKeyStats, 'status' | 'quarantine'>): string {
+  return item.quarantine ? 'quarantined' : item.status
 }
 
 function jobTypeLabel(jobType: string, strings: AdminTranslations['jobs']): string {
@@ -649,8 +790,20 @@ function formatErrorMessage(log: RequestLog, errorsStrings: AdminTranslations['l
   return errorsStrings.none
 }
 
+interface ManualCopyBubbleState {
+  anchorEl: HTMLElement | null
+  title: string
+  description: string
+  fieldLabel: string
+  value: string
+  multiline?: boolean
+}
+
+type ManualCopyDialogState = Omit<ManualCopyBubbleState, 'anchorEl'>
+
 function AdminDashboard(): JSX.Element {
   const [route, setRoute] = useState<AdminPathRoute>(() => parseAdminPath(window.location.pathname))
+  const { language } = useLanguage()
   const translations = useTranslate()
   const adminStrings = translations.admin
   const headerStrings = adminStrings.header
@@ -673,6 +826,14 @@ function AdminDashboard(): JSX.Element {
   const errorStrings = adminStrings.errors
   const [summary, setSummary] = useState<Summary | null>(null)
   const [keys, setKeys] = useState<ApiKeyStats[]>([])
+  const [dashboardKeys, setDashboardKeys] = useState<ApiKeyStats[]>([])
+  const [keysTotal, setKeysTotal] = useState(0)
+  const [keysPage, setKeysPage] = useState(getAdminKeysPageFromLocation)
+  const [keysPerPage, setKeysPerPage] = useState(getAdminKeysPerPageFromLocation)
+  const [keysLoadState, setKeysLoadState] = useState<QueryLoadState>('initial_loading')
+  const [keysError, setKeysError] = useState<string | null>(null)
+  const [keyGroupFacets, setKeyGroupFacets] = useState<Array<{ value: string; count: number }>>([])
+  const [keyStatusFacets, setKeyStatusFacets] = useState<Array<{ value: string; count: number }>>([])
   const [tokens, setTokens] = useState<AuthToken[]>([])
   const [dashboardTokens, setDashboardTokens] = useState<AuthToken[]>([])
   const [dashboardTokenCoverage, setDashboardTokenCoverage] = useState<'ok' | 'truncated' | 'error'>('ok')
@@ -715,6 +876,11 @@ function AdminDashboard(): JSX.Element {
   const [usersTagFilterId, setUsersTagFilterId] = useState<string | null>(null)
   const [usersLoadState, setUsersLoadState] = useState<QueryLoadState>('initial_loading')
   const [usersError, setUsersError] = useState<string | null>(null)
+  const [allowRegistration, setAllowRegistration] = useState<boolean | null>(null)
+  const [registrationSettingsLoaded, setRegistrationSettingsLoaded] = useState(false)
+  const [registrationSettingsLoading, setRegistrationSettingsLoading] = useState(false)
+  const [registrationSettingsSaving, setRegistrationSettingsSaving] = useState(false)
+  const [registrationSettingsError, setRegistrationSettingsError] = useState<string | null>(null)
   const [selectedUserDetail, setSelectedUserDetail] = useState<AdminUserDetail | null>(null)
   const [userDetailLoading, setUserDetailLoading] = useState(false)
   const [userQuotaSnapshot, setUserQuotaSnapshot] = useState<UserQuotaSnapshot | null>(null)
@@ -757,11 +923,14 @@ function AdminDashboard(): JSX.Element {
   const tokenLeaderboardNonceRef = useRef(0)
   const requestsLoadedRef = useRef(false)
   const jobsLoadedRef = useRef(false)
+  const keysLoadedRef = useRef(false)
   const usersLoadedRef = useRef(false)
+  const keysQueryKeyRef = useRef<string | null>(null)
   const usersQueryKeyRef = useRef<string | null>(null)
   const baseDataAbortRef = useRef<AbortController | null>(null)
   const requestsAbortRef = useRef<AbortController | null>(null)
   const jobsAbortRef = useRef<AbortController | null>(null)
+  const keysAbortRef = useRef<AbortController | null>(null)
   const usersAbortRef = useRef<AbortController | null>(null)
   const forwardProxySettingsAbortRef = useRef<AbortController | null>(null)
   const forwardProxyStatsAbortRef = useRef<AbortController | null>(null)
@@ -771,10 +940,17 @@ function AdminDashboard(): JSX.Element {
   const [version, setVersion] = useState<{ backend: string; frontend: string } | null>(null)
   const [profile, setProfile] = useState<Profile | null>(null)
   const secretCacheRef = useRef<Map<string, string>>(new Map())
+  const secretRequestCacheRef = useRef<Map<string, Promise<string>>>(new Map())
   const tokenSecretCacheRef = useRef<Map<string, string>>(new Map())
+  const tokenSecretRequestCacheRef = useRef<Map<string, Promise<string>>>(new Map())
+  const tokenSecretVersionRef = useRef<Map<string, number>>(new Map())
+  const secretWarmTimerRef = useRef<Map<string, number>>(new Map())
+  const secretWarmAbortRef = useRef<Map<string, AbortController>>(new Map())
   const tokenGroupsListRef = useRef<HTMLDivElement | null>(null)
-  const keyGroupsListRef = useRef<HTMLDivElement | null>(null)
   const [copyState, setCopyState] = useState<Map<string, 'loading' | 'copied'>>(() => new Map())
+  const [manualCopyBubble, setManualCopyBubble] = useState<ManualCopyBubbleState | null>(null)
+  const [manualCopyDialog, setManualCopyDialog] = useState<ManualCopyDialogState | null>(null)
+  const manualCopyDialogFieldRef = useRef<HTMLInputElement | null>(null)
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(() => new Set())
   type AddKeysBatchReportState =
     | { kind: 'success'; response: AddApiKeysBatchResponse }
@@ -782,10 +958,8 @@ function AdminDashboard(): JSX.Element {
 
   const [newKeysText, setNewKeysText] = useState('')
   const [newKeysGroup, setNewKeysGroup] = useState('')
-  const [selectedKeyGroupName, setSelectedKeyGroupName] = useState<string | null>(null)
-  const [selectedKeyUngrouped, setSelectedKeyUngrouped] = useState(false)
-  const [keyGroupsExpanded, setKeyGroupsExpanded] = useState(false)
-  const [keyGroupsCollapsedOverflowing, setKeyGroupsCollapsedOverflowing] = useState(false)
+  const [selectedKeyGroups, setSelectedKeyGroups] = useState<string[]>(() => getAdminKeysValuesFromLocation('group'))
+  const [selectedKeyStatuses, setSelectedKeyStatuses] = useState<string[]>(() => getAdminKeysValuesFromLocation('status'))
   const [keysBatchExpanded, setKeysBatchExpanded] = useState(false)
   const [keysBatchClosing, setKeysBatchClosing] = useState(false)
   const keysBatchOpenReasonRef = useRef<'hover' | 'focus' | null>(null)
@@ -841,6 +1015,7 @@ function AdminDashboard(): JSX.Element {
   const [submitting, setSubmitting] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [togglingId, setTogglingId] = useState<string | null>(null)
+  const [clearingQuarantineId, setClearingQuarantineId] = useState<string | null>(null)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [pendingDisableId, setPendingDisableId] = useState<string | null>(null)
   const [pendingTokenDeleteId, setPendingTokenDeleteId] = useState<string | null>(null)
@@ -857,6 +1032,59 @@ function AdminDashboard(): JSX.Element {
   const [batchShareText, setBatchShareText] = useState<string | null>(null)
   const isAdmin = profile?.isAdmin ?? false
   const keysBatchVisible = keysBatchExpanded || keysBatchClosing
+  const manualCopyText = useMemo(
+    () => (
+      language === 'zh'
+        ? {
+            title: '请手动复制',
+            description: '当前浏览器拦截了自动复制，下面已选中原文，可直接手动复制。',
+            close: '关闭',
+            fields: {
+              apiKey: '完整 API Key',
+              token: '完整 Token',
+              shareLink: '分享链接',
+            },
+            createToken: {
+              title: '令牌已创建，请手动复制',
+              description: '自动复制失败，下面保留了完整令牌，请先手动复制后再继续操作。',
+            },
+          }
+        : {
+            title: 'Manual copy required',
+            description: 'This browser blocked automatic copy. The original value is selected below for manual copy.',
+            close: 'Close',
+            fields: {
+              apiKey: 'Full API Key',
+              token: 'Full Token',
+              shareLink: 'Share Link',
+            },
+            createToken: {
+              title: 'Token created — copy manually',
+              description: 'Automatic copy failed. The full token is selected below so you can copy it before continuing.',
+            },
+          }
+    ),
+    [language],
+  )
+
+  useEffect(() => {
+    if (!manualCopyDialog) return
+    const frame = window.requestAnimationFrame(() => {
+      selectAllReadonlyText(manualCopyDialogFieldRef.current)
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [manualCopyDialog])
+
+  useEffect(() => {
+    return () => {
+      for (const timer of secretWarmTimerRef.current.values()) {
+        window.clearTimeout(timer)
+      }
+      for (const controller of secretWarmAbortRef.current.values()) {
+        controller.abort()
+      }
+    }
+  }, [])
 
   const clearKeysBatchAutoCollapseTimer = useCallback(() => {
     if (keysBatchAutoCollapseTimerRef.current != null) {
@@ -876,6 +1104,11 @@ function AdminDashboard(): JSX.Element {
     clearKeysBatchAutoCollapseTimer()
     clearKeysBatchCloseTimer()
   }, [clearKeysBatchAutoCollapseTimer, clearKeysBatchCloseTimer])
+
+  useEffect(() => {
+    setManualCopyBubble(null)
+    setManualCopyDialog(null)
+  }, [route])
 
   useEffect(() => {
     if (!keysBatchExpanded) return
@@ -1025,32 +1258,167 @@ function AdminDashboard(): JSX.Element {
     })
   }, [])
 
-  const copyToClipboard = useCallback(async (value: string) => {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(value)
-      return
-    }
-
-    const textarea = document.createElement('textarea')
-    textarea.value = value
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    textarea.style.left = '-9999px'
-    document.body.appendChild(textarea)
-    textarea.focus()
-    textarea.select()
-    document.execCommand('copy')
-    document.body.removeChild(textarea)
+  const copyToClipboard = useCallback(async (value: string, options?: CopyTextOptions) => {
+    return await copyText(value, options)
   }, [])
 
-  const resolveTokenSecret = useCallback(async (id: string) => {
-    let secret = tokenSecretCacheRef.current.get(id)
-    if (!secret) {
-      const result = await fetchTokenSecret(id)
-      secret = result.token
-      tokenSecretCacheRef.current.set(id, secret)
+  const openManualCopyBubble = useCallback((state: ManualCopyBubbleState) => {
+    setManualCopyBubble(state)
+  }, [])
+
+  const resolveApiKeySecret = useCallback(async (id: string, signal?: AbortSignal) => {
+    const cached = secretCacheRef.current.get(id)
+    if (cached) {
+      return cached
     }
-    return secret
+
+    const pending = secretRequestCacheRef.current.get(id)
+    if (pending) {
+      return await pending
+    }
+
+    const request = fetchApiKeySecret(id, signal)
+      .then((result) => {
+        if (!signal?.aborted) {
+          secretCacheRef.current.set(id, result.api_key)
+        }
+        return result.api_key
+      })
+      .finally(() => {
+        secretRequestCacheRef.current.delete(id)
+      })
+
+    secretRequestCacheRef.current.set(id, request)
+    return await request
+  }, [])
+
+  const resolveTokenSecret = useCallback(async (id: string, signal?: AbortSignal) => {
+    const cached = tokenSecretCacheRef.current.get(id)
+    if (cached) {
+      return cached
+    }
+
+    const pending = tokenSecretRequestCacheRef.current.get(id)
+    if (pending) {
+      return await pending
+    }
+
+    const requestVersion = tokenSecretVersionRef.current.get(id) ?? 0
+    let request: Promise<string>
+    request = fetchTokenSecret(id, signal)
+      .then((result) => {
+        if (!signal?.aborted && (tokenSecretVersionRef.current.get(id) ?? 0) === requestVersion) {
+          tokenSecretCacheRef.current.set(id, result.token)
+        }
+        return result.token
+      })
+      .finally(() => {
+        if (tokenSecretRequestCacheRef.current.get(id) === request) {
+          tokenSecretRequestCacheRef.current.delete(id)
+        }
+      })
+
+    tokenSecretRequestCacheRef.current.set(id, request)
+    return await request
+  }, [])
+
+  const shouldPrewarmAdminSecretCopy = useMemo(() => shouldPrewarmSecretCopy(), [])
+
+  const clearSecretWarmTimer = useCallback((key: string) => {
+    const timer = secretWarmTimerRef.current.get(key)
+    if (timer != null) {
+      window.clearTimeout(timer)
+      secretWarmTimerRef.current.delete(key)
+    }
+  }, [])
+
+  const dropSecretWarmRequest = useCallback((key: string) => {
+    const separatorIndex = key.indexOf(':')
+    if (separatorIndex < 0) return
+    const scope = key.slice(0, separatorIndex)
+    const id = key.slice(separatorIndex + 1)
+    if (!id) return
+    if (scope === 'token') {
+      tokenSecretRequestCacheRef.current.delete(id)
+      return
+    }
+    if (scope === 'key') {
+      secretRequestCacheRef.current.delete(id)
+    }
+  }, [])
+
+  const cancelSecretWarm = useCallback((key: string) => {
+    clearSecretWarmTimer(key)
+    const controller = secretWarmAbortRef.current.get(key)
+    if (controller) {
+      controller.abort()
+      secretWarmAbortRef.current.delete(key)
+      dropSecretWarmRequest(key)
+    }
+  }, [clearSecretWarmTimer, dropSecretWarmRequest])
+
+  const commitSecretWarm = useCallback((key: string) => {
+    clearSecretWarmTimer(key)
+    secretWarmAbortRef.current.delete(key)
+  }, [clearSecretWarmTimer])
+
+  const warmTokenSecret = useCallback((id: string) => {
+    if (!shouldPrewarmAdminSecretCopy) return
+    const key = `token:${id}`
+    clearSecretWarmTimer(key)
+    if (tokenSecretCacheRef.current.has(id) || tokenSecretRequestCacheRef.current.has(id)) return
+    const controller = new AbortController()
+    const requestVersion = tokenSecretVersionRef.current.get(id) ?? 0
+    secretWarmAbortRef.current.set(key, controller)
+    void resolveTokenSecret(id, controller.signal)
+      .then((token) => {
+        if (secretWarmAbortRef.current.get(key) !== controller) return
+        if ((tokenSecretVersionRef.current.get(id) ?? 0) === requestVersion) {
+          tokenSecretCacheRef.current.set(id, token)
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (secretWarmAbortRef.current.get(key) === controller) {
+          secretWarmAbortRef.current.delete(key)
+        }
+      })
+  }, [clearSecretWarmTimer, resolveTokenSecret, shouldPrewarmAdminSecretCopy])
+
+  const warmApiKeySecret = useCallback((id: string) => {
+    if (!shouldPrewarmAdminSecretCopy) return
+    const key = `key:${id}`
+    clearSecretWarmTimer(key)
+    if (secretCacheRef.current.has(id) || secretRequestCacheRef.current.has(id)) return
+    const controller = new AbortController()
+    secretWarmAbortRef.current.set(key, controller)
+    void resolveApiKeySecret(id, controller.signal)
+      .then((secret) => {
+        if (secretWarmAbortRef.current.get(key) !== controller) return
+        secretCacheRef.current.set(id, secret)
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (secretWarmAbortRef.current.get(key) === controller) {
+          secretWarmAbortRef.current.delete(key)
+        }
+      })
+  }, [clearSecretWarmTimer, resolveApiKeySecret, shouldPrewarmAdminSecretCopy])
+
+  const scheduleSecretWarm = useCallback((key: string, warmup: () => void) => {
+    if (!shouldPrewarmAdminSecretCopy) return
+    clearSecretWarmTimer(key)
+    const timer = window.setTimeout(() => {
+      secretWarmTimerRef.current.delete(key)
+      warmup()
+    }, 120)
+    secretWarmTimerRef.current.set(key, timer)
+  }, [clearSecretWarmTimer, shouldPrewarmAdminSecretCopy])
+
+  const handleTokenSecretRotated = useCallback((id: string, token: string) => {
+    tokenSecretVersionRef.current.set(id, (tokenSecretVersionRef.current.get(id) ?? 0) + 1)
+    tokenSecretRequestCacheRef.current.delete(id)
+    tokenSecretCacheRef.current.set(id, token)
   }, [])
 
   const beginManagedRequest = useCallback(
@@ -1104,18 +1472,45 @@ function AdminDashboard(): JSX.Element {
     return { items, truncated }
   }, [])
 
+  const loadExhaustedKeysForDashboard = useCallback(
+    async (signal?: AbortSignal): Promise<ApiKeyStats[]> => {
+      const result = await fetchApiKeys(
+        1,
+        DASHBOARD_EXHAUSTED_KEYS_PAGE_SIZE,
+        { statuses: ['exhausted'] },
+        signal,
+      )
+      return result.items
+    },
+    [],
+  )
+
   const handleCopySecret = useCallback(
-    async (id: string, stateKey: string) => {
+    async (id: string, stateKey: string, anchorEl?: HTMLElement | null) => {
+      setManualCopyBubble(null)
+      commitSecretWarm(`key:${id}`)
       updateCopyState(stateKey, 'loading')
       try {
-        let secret = secretCacheRef.current.get(id)
-        if (!secret) {
-          const result = await fetchApiKeySecret(id)
-          secret = result.api_key
-          secretCacheRef.current.set(id, secret)
+        const hasCachedSecret = secretCacheRef.current.has(id)
+        const secret = await resolveApiKeySecret(id)
+        const copyResult = await copyToClipboard(
+          secret,
+          hasCachedSecret ? { preferExecCommand: true } : undefined,
+        )
+        if (!copyResult.ok) {
+          updateCopyState(stateKey, null)
+          if (anchorEl) {
+            openManualCopyBubble({
+              anchorEl,
+              title: manualCopyText.title,
+              description: manualCopyText.description,
+              fieldLabel: manualCopyText.fields.apiKey,
+              value: secret,
+            })
+          }
+          return
         }
-
-        await copyToClipboard(secret)
+        setManualCopyBubble(null)
         updateCopyState(stateKey, 'copied')
         window.setTimeout(() => updateCopyState(stateKey, null), 2000)
       } catch (err) {
@@ -1124,7 +1519,16 @@ function AdminDashboard(): JSX.Element {
         updateCopyState(stateKey, null)
       }
     },
-    [copyToClipboard, setError, updateCopyState],
+    [
+      copyToClipboard,
+      errorStrings.copyKey,
+      manualCopyText,
+      openManualCopyBubble,
+      resolveApiKeySecret,
+      setError,
+      commitSecretWarm,
+      updateCopyState,
+    ],
   )
 
   const loadData = useCallback(
@@ -1148,9 +1552,8 @@ function AdminDashboard(): JSX.Element {
         setTokensTotal(0)
       }
       try {
-        const [summaryData, keyData, ver, profileData, tokenData, tokenGroupsData] = await Promise.all([
+        const [summaryData, ver, profileData, tokenData, tokenGroupsData] = await Promise.all([
           fetchSummary(request.signal),
-          fetchApiKeys(request.signal),
           fetchVersion(request.signal).catch(() => null),
           fetchProfile(request.signal).catch(() => null),
           fetchTokens(
@@ -1176,7 +1579,6 @@ function AdminDashboard(): JSX.Element {
 
         setProfile(profileData ?? null)
         setSummary(summaryData)
-        setKeys(keyData)
         setTokens(tokenData.items)
         setTokensTotal(tokenData.total)
         setTokenGroups(tokenGroupsData)
@@ -1204,10 +1606,11 @@ function AdminDashboard(): JSX.Element {
   const loadDashboardOverview = useCallback(
     async (signal?: AbortSignal) => {
       try {
-        const [dashboardTokenSnapshot, dashboardLogsData, dashboardJobsData] = await Promise.all([
+        const [dashboardTokenSnapshot, dashboardKeysData, dashboardLogsData, dashboardJobsData] = await Promise.all([
           loadAllTokensForDashboard(signal)
             .then((value) => ({ kind: 'ok' as const, ...value }))
             .catch(() => ({ kind: 'error' as const })),
+          loadExhaustedKeysForDashboard(signal).catch(() => [] as ApiKeyStats[]),
           fetchRequestLogs(1, DASHBOARD_RECENT_LOGS_PER_PAGE, undefined, signal).catch(
             () =>
               ({
@@ -1239,6 +1642,7 @@ function AdminDashboard(): JSX.Element {
           setDashboardTokens([])
           setDashboardTokenCoverage('error')
         }
+        setDashboardKeys(dashboardKeysData)
         setDashboardLogs(dashboardLogsData.items)
         setDashboardJobs(dashboardJobsData.items)
       } catch (err) {
@@ -1247,6 +1651,7 @@ function AdminDashboard(): JSX.Element {
         }
         setDashboardTokens([])
         setDashboardTokenCoverage('error')
+        setDashboardKeys([])
         setDashboardLogs([])
         setDashboardJobs([])
       } finally {
@@ -1255,7 +1660,7 @@ function AdminDashboard(): JSX.Element {
         }
       }
     },
-    [loadAllTokensForDashboard],
+    [loadAllTokensForDashboard, loadExhaustedKeysForDashboard],
   )
 
   useEffect(() => {
@@ -1589,6 +1994,72 @@ function AdminDashboard(): JSX.Element {
   }, [beginManagedRequest, jobFilter, jobsPage])
 
   useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'keys')) return
+
+    const request = beginManagedRequest(keysAbortRef)
+    const nextQueryKey = `${keysPage}:${keysPerPage}:${selectedKeyGroups.join('\u0000')}:${selectedKeyStatuses.join('\u0000')}`
+    const sameQueryRefresh = keysLoadedRef.current && keysQueryKeyRef.current === nextQueryKey
+    setKeysLoadState(
+      sameQueryRefresh ? getRefreshingLoadState(true) : getBlockingLoadState(keysLoadedRef.current),
+    )
+    setKeysError(null)
+    if (!sameQueryRefresh) {
+      setKeys([])
+      setKeysTotal(0)
+    }
+
+    fetchApiKeys(
+      keysPage,
+      keysPerPage,
+      {
+        groups: selectedKeyGroups,
+        statuses: selectedKeyStatuses,
+      },
+      request.signal,
+    )
+      .then((result) => {
+        if (request.signal.aborted) return
+        setKeys(result.items)
+        setKeysTotal(result.total)
+        setKeysPage(result.page)
+        setKeysPerPage(result.perPage)
+        setKeyGroupFacets(result.facets.groups)
+        setKeyStatusFacets(result.facets.statuses)
+        setKeysLoadState('ready')
+        keysLoadedRef.current = true
+        keysQueryKeyRef.current = nextQueryKey
+        const normalizedLocation = buildAdminKeysPath({
+          page: result.page,
+          perPage: result.perPage,
+          groups: selectedKeyGroups,
+          statuses: selectedKeyStatuses,
+        })
+        const currentLocation = `${window.location.pathname}${window.location.search}`
+        if (currentLocation !== normalizedLocation) {
+          window.history.replaceState(null, '', normalizedLocation)
+        }
+      })
+      .catch((err) => {
+        if (request.signal.aborted) return
+        console.error(err)
+        setKeys([])
+        setKeysTotal(0)
+        setKeyGroupFacets([])
+        setKeyStatusFacets([])
+        setKeysError(err instanceof Error ? err.message : loadingStateStrings.error)
+        setKeysLoadState('error')
+      })
+      .finally(() => {
+        request.cleanup()
+      })
+
+    return () => {
+      request.abort()
+      request.cleanup()
+    }
+  }, [beginManagedRequest, keysPage, keysPerPage, loadingStateStrings.error, route, selectedKeyGroups, selectedKeyStatuses])
+
+  useEffect(() => {
     const timer = window.setTimeout(() => {
       const normalized = usersQueryInput.trim()
       setUsersQuery((previous) => {
@@ -1676,6 +2147,40 @@ function AdminDashboard(): JSX.Element {
   }, [route, adminStrings.users.catalog.loadFailed])
 
   useEffect(() => {
+    const usersRouteActive =
+      (route.name === 'module' && route.module === 'users')
+      || route.name === 'user'
+      || route.name === 'user-tags'
+      || route.name === 'user-tag-editor'
+    if (!usersRouteActive) return
+
+    const controller = new AbortController()
+    setRegistrationSettingsLoading(true)
+    setRegistrationSettingsError(null)
+    fetchAdminRegistrationSettings(controller.signal)
+      .then((settings) => {
+        if (controller.signal.aborted) return
+        setAllowRegistration(settings.allowRegistration)
+        setRegistrationSettingsLoaded(true)
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return
+        console.error(err)
+        setAllowRegistration(null)
+        setRegistrationSettingsError(
+          err instanceof Error ? err.message : adminStrings.users.registration.loadFailed,
+        )
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setRegistrationSettingsLoading(false)
+        }
+      })
+
+    return () => controller.abort()
+  }, [route, adminStrings.users.registration.loadFailed])
+
+  useEffect(() => {
     if (!(route.name === 'module' && route.module === 'users')) return
     const locationQuery = getAdminUsersQueryFromLocation()
     const locationTagFilterId = getAdminUsersTagFilterFromLocation()
@@ -1684,6 +2189,26 @@ function AdminDashboard(): JSX.Element {
     setUsersQueryInput((previous) => (previous === locationQuery ? previous : locationQuery))
     setUsersQuery((previous) => (previous === locationQuery ? previous : locationQuery))
     setUsersTagFilterId((previous) => (previous === locationTagFilterId ? previous : locationTagFilterId))
+  }, [route])
+
+  useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'keys')) return
+    const locationPage = getAdminKeysPageFromLocation()
+    const locationPerPage = getAdminKeysPerPageFromLocation()
+    const locationGroups = getAdminKeysValuesFromLocation('group')
+    const locationStatuses = getAdminKeysValuesFromLocation('status')
+    setKeysPage((previous) => (previous === locationPage ? previous : locationPage))
+    setKeysPerPage((previous) => (previous === locationPerPage ? previous : locationPerPage))
+    setSelectedKeyGroups((previous) =>
+      previous.length === locationGroups.length && previous.every((value, index) => value === locationGroups[index])
+        ? previous
+        : locationGroups,
+    )
+    setSelectedKeyStatuses((previous) =>
+      previous.length === locationStatuses.length && previous.every((value, index) => value === locationStatuses[index])
+        ? previous
+        : locationStatuses,
+    )
   }, [route])
 
   useEffect(() => {
@@ -1809,7 +2334,7 @@ function AdminDashboard(): JSX.Element {
         try {
           const data = JSON.parse(ev.data) as { summary: Summary; keys: ApiKeyStats[]; logs: RequestLog[] }
           setSummary(data.summary)
-          setKeys(data.keys)
+          setDashboardKeys(data.keys)
           setDashboardLogs(data.logs)
           setLastUpdated(new Date())
           setError(null)
@@ -1876,10 +2401,21 @@ function AdminDashboard(): JSX.Element {
   )
 
   const navigateKey = useCallback(
-    (id: string) => {
+    (id: string, options?: { preserveKeysContext?: boolean }) => {
+      if (options?.preserveKeysContext) {
+        navigateToPath(
+          keyDetailPath(id, {
+            page: keysPage,
+            perPage: keysPerPage,
+            groups: selectedKeyGroups,
+            statuses: selectedKeyStatuses,
+          }),
+        )
+        return
+      }
       navigateToPath(keyDetailPath(id))
     },
-    [navigateToPath],
+    [keysPage, keysPerPage, navigateToPath, selectedKeyGroups, selectedKeyStatuses],
   )
 
   const navigateToken = useCallback(
@@ -1910,6 +2446,36 @@ function AdminDashboard(): JSX.Element {
       setUsersQuery(normalized)
       setUsersTagFilterId(normalizedTagId)
       navigateToPath(buildAdminUsersPath(normalized, normalizedTagId, normalizedPage))
+    },
+    [navigateToPath],
+  )
+
+  const navigateKeysList = useCallback(
+    (options?: {
+      page?: number | null
+      perPage?: number | null
+      groups?: string[] | null
+      statuses?: string[] | null
+    }) => {
+      const page = options?.page != null ? Math.max(1, Math.trunc(options.page)) : 1
+      const perPage = options?.perPage != null ? Math.max(1, Math.trunc(options.perPage)) : DEFAULT_KEYS_PER_PAGE
+      const groups = Array.from(new Set((options?.groups ?? []).map((value) => value.trim())))
+      const statuses = Array.from(
+        new Set((options?.statuses ?? []).map((value) => value.trim()).filter((value) => value.length > 0)),
+      )
+
+      setKeysPage(page)
+      setKeysPerPage(perPage)
+      setSelectedKeyGroups(groups)
+      setSelectedKeyStatuses(statuses)
+      navigateToPath(
+        buildAdminKeysPath({
+          page,
+          perPage,
+          groups,
+          statuses,
+        }),
+      )
     },
     [navigateToPath],
   )
@@ -2039,6 +2605,54 @@ function AdminDashboard(): JSX.Element {
         loadForwardProxyStatsData({ signal: controller.signal, reason: 'refresh' }),
       )
     }
+    if (route.name === 'module' && route.module === 'keys') {
+      const request = beginManagedRequest(keysAbortRef, controller.signal)
+      const nextQueryKey = `${keysPage}:${keysPerPage}:${selectedKeyGroups.join('\u0000')}:${selectedKeyStatuses.join('\u0000')}`
+      setKeysLoadState(getRefreshingLoadState(keysLoadedRef.current))
+      setKeysError(null)
+      tasks.push(
+        fetchApiKeys(
+          keysPage,
+          keysPerPage,
+          {
+            groups: selectedKeyGroups,
+            statuses: selectedKeyStatuses,
+          },
+          request.signal,
+        )
+          .then((result) => {
+            if (request.signal.aborted) return
+            setKeys(result.items)
+            setKeysTotal(result.total)
+            setKeysPage(result.page)
+            setKeysPerPage(result.perPage)
+            setKeyGroupFacets(result.facets.groups)
+            setKeyStatusFacets(result.facets.statuses)
+            setKeysLoadState('ready')
+            keysLoadedRef.current = true
+            keysQueryKeyRef.current = nextQueryKey
+            const normalizedLocation = buildAdminKeysPath({
+              page: result.page,
+              perPage: result.perPage,
+              groups: selectedKeyGroups,
+              statuses: selectedKeyStatuses,
+            })
+            const currentLocation = `${window.location.pathname}${window.location.search}`
+            if (currentLocation !== normalizedLocation) {
+              window.history.replaceState(null, '', normalizedLocation)
+            }
+          })
+          .catch((err) => {
+            if (request.signal.aborted) return
+            console.error(err)
+            setKeysError(err instanceof Error ? err.message : loadingStateStrings.error)
+            setKeysLoadState('error')
+          })
+          .finally(() => {
+            request.cleanup()
+          }),
+      )
+    }
     if (route.name === 'module' && route.module === 'dashboard') {
       tasks.push(loadDashboardOverview(controller.signal))
     }
@@ -2088,57 +2702,50 @@ function AdminDashboard(): JSX.Element {
       {
         id: 'keys',
         label: metricsStrings.labels.keys,
-        value: `${formatNumber(summary.active_keys)} / ${formatNumber(summary.active_keys + summary.exhausted_keys)}`,
+        value: formatNumber(summary.active_keys),
+        subtitle: metricsStrings.subtitles.keysAvailability
+          .replace('{active}', formatNumber(summary.active_keys))
+          .replace('{quarantined}', formatNumber(summary.quarantined_keys))
+          .replace('{exhausted}', formatNumber(summary.exhausted_keys)),
+      },
+      {
+        id: 'quarantined',
+        label: metricsStrings.labels.quarantined,
+        value: formatNumber(summary.quarantined_keys),
         subtitle:
-          summary.exhausted_keys === 0
+          summary.quarantined_keys === 0
             ? metricsStrings.subtitles.keysAll
-            : metricsStrings.subtitles.keysExhausted.replace('{count}', formatNumber(summary.exhausted_keys)),
+            : keyStrings.quarantine.badge,
       },
     ]
-  }, [summary, metricsStrings])
+  }, [keyStrings.quarantine.badge, metricsStrings, summary])
 
-  const dedupedKeys = useMemo(() => {
-    const map = new Map<string, ApiKeyStats>()
-    for (const item of keys) {
-      if (item.deleted_at) continue // hide soft-deleted keys
-      map.set(item.id, item)
-    }
-    return Array.from(map.values())
-  }, [keys])
+  const namedKeyGroups = keyGroupFacets
+    .filter((group) => group.value.trim().length > 0)
+    .map((group) => ({ name: group.value, keyCount: group.count }))
+  const hasKeyGroups = keyGroupFacets.length > 0
 
-  const sortedKeys = useMemo(() => {
-    return [...dedupedKeys].sort((a, b) => {
-      if (a.status !== b.status) {
-        return a.status === 'active' ? -1 : 1
-      }
-      const left = a.last_used_at ?? 0
-      const right = b.last_used_at ?? 0
-      return right - left
-    })
-  }, [dedupedKeys])
+  const keyGroupFilterOptions = useMemo(
+    () =>
+      keyGroupFacets.map((group) => ({
+        value: group.value,
+        label: group.value.trim().length > 0 ? group.value : keyStrings.groups.ungrouped,
+        count: group.count,
+      })),
+    [keyGroupFacets, keyStrings.groups.ungrouped],
+  )
 
-  type KeyGroup = { name: string; keyCount: number; latestUsedAt: number }
-
-  const keyGroupList = useMemo(() => {
-    const map = new Map<string, KeyGroup>()
-    for (const item of dedupedKeys) {
-      const name = (item.group ?? '').trim()
-      const existing = map.get(name) ?? { name, keyCount: 0, latestUsedAt: 0 }
-      existing.keyCount += 1
-      existing.latestUsedAt = Math.max(existing.latestUsedAt, item.last_used_at ?? 0)
-      map.set(name, existing)
-    }
-    const out = Array.from(map.values())
-    out.sort((a, b) => {
-      if (a.latestUsedAt !== b.latestUsedAt) return b.latestUsedAt - a.latestUsedAt
-      return a.name.localeCompare(b.name)
-    })
-    return out
-  }, [dedupedKeys])
-
-  const ungroupedKeyGroup = keyGroupList.find((group) => group.name.trim().length === 0)
-  const namedKeyGroups = keyGroupList.filter((group) => group.name.trim().length > 0)
-  const hasKeyGroups = keyGroupList.length > 0
+  const keyStatusFilterOptions = useMemo(
+    () =>
+      keyStatusFacets
+        .map((status) => ({
+          value: status.value,
+          label: statusLabel(status.value, adminStrings),
+          count: status.count,
+        }))
+        .sort((left, right) => left.label.localeCompare(right.label)),
+    [adminStrings, keyStatusFacets],
+  )
 
   const ungroupedTokenGroup = tokenGroups.find((group) => group.name.trim().length === 0)
   const namedTokenGroups = tokenGroups.filter((group) => group.name.trim().length > 0)
@@ -2154,35 +2761,45 @@ function AdminDashboard(): JSX.Element {
     return tokens
   }, [selectedTokenGroupName, selectedTokenUngrouped, tokens])
 
-  const visibleKeys = useMemo(() => {
-    if (selectedKeyUngrouped) {
-      return sortedKeys.filter((item) => (item.group ?? '').trim().length === 0)
-    }
-    if (selectedKeyGroupName != null) {
-      return sortedKeys.filter((item) => (item.group ?? '').trim() === selectedKeyGroupName)
-    }
-    return sortedKeys
-  }, [selectedKeyGroupName, selectedKeyUngrouped, sortedKeys])
+  const visibleKeys = keys
 
-  // Detect whether the collapsed key groups row overflows horizontally.
-  // If everything fits in a single line, we hide the "more" toggle button.
-  useEffect(() => {
-    if (!Array.isArray(keyGroupList) || keyGroupList.length === 0 || keyGroupsExpanded) {
-      setKeyGroupsCollapsedOverflowing(false)
-      return
-    }
-    const el = keyGroupsListRef.current
-    if (!el) return
+  const selectedKeyGroupLabels = useMemo(
+    () =>
+      keyGroupFilterOptions
+        .filter((option) => selectedKeyGroups.includes(option.value))
+        .map((option) => option.label),
+    [keyGroupFilterOptions, selectedKeyGroups],
+  )
 
-    const measure = () => {
-      const overflowing = el.scrollWidth > el.clientWidth
-      setKeyGroupsCollapsedOverflowing(overflowing)
-    }
+  const selectedKeyStatusLabels = useMemo(
+    () =>
+      keyStatusFilterOptions
+        .filter((option) => selectedKeyStatuses.includes(option.value))
+        .map((option) => option.label),
+    [keyStatusFilterOptions, selectedKeyStatuses],
+  )
 
-    measure()
-    window.addEventListener('resize', measure)
-    return () => window.removeEventListener('resize', measure)
-  }, [keyGroupList, keyGroupsExpanded, selectedKeyGroupName, selectedKeyUngrouped])
+  const keyGroupFilterSummary = useMemo(
+    () =>
+      summarizeFilterSelection(
+        keyStrings.groups.label,
+        selectedKeyGroupLabels,
+        keyStrings.groups.all,
+        keyStrings.filters.selectedSuffix,
+      ),
+    [keyStrings.filters.selectedSuffix, keyStrings.groups.all, keyStrings.groups.label, selectedKeyGroupLabels],
+  )
+
+  const keyStatusFilterSummary = useMemo(
+    () =>
+      summarizeFilterSelection(
+        keyStrings.filters.status,
+        selectedKeyStatusLabels,
+        keyStrings.groups.all,
+        keyStrings.filters.selectedSuffix,
+      ),
+    [keyStrings.filters.selectedSuffix, keyStrings.filters.status, keyStrings.groups.all, selectedKeyStatusLabels],
+  )
 
   const keysBatchParsed = useMemo(() => {
     return extractTvlyDevApiKeysFromText(newKeysText)
@@ -2710,10 +3327,7 @@ function AdminDashboard(): JSX.Element {
       if (shouldAutoClose && importRunId === keysValidateRunIdRef.current) {
         window.requestAnimationFrame(() => closeKeysValidationDialog())
       }
-      const controller = new AbortController()
-      setLoading(true)
-      await loadData({ signal: controller.signal, reason: 'refresh', showGlobalLoading: true })
-      controller.abort()
+      await Promise.all([refreshBaseData(), refreshKeysList()])
     } catch (err) {
       console.error(err)
       const message = err instanceof Error ? err.message : errorStrings.addKeysBatch
@@ -2725,13 +3339,24 @@ function AdminDashboard(): JSX.Element {
     }
   }
 
-  const handleAddToken = async () => {
+  const handleAddToken = async (anchorEl?: HTMLElement | null) => {
     const note = newTokenNote.trim()
+    void anchorEl
+    setManualCopyBubble(null)
+    setManualCopyDialog(null)
     setSubmitting(true)
     try {
       const { token } = await createToken(note || undefined)
       setNewTokenNote('')
-      try { await navigator.clipboard?.writeText(token) } catch {}
+      const copyResult = await copyToClipboard(token)
+      if (!copyResult.ok) {
+        setManualCopyDialog({
+          title: manualCopyText.createToken.title,
+          description: manualCopyText.createToken.description,
+          fieldLabel: manualCopyText.fields.token,
+          value: token,
+        })
+      }
       const controller = new AbortController()
       setLoading(true)
       await loadData({ signal: controller.signal, reason: 'refresh', showGlobalLoading: true })
@@ -2745,6 +3370,10 @@ function AdminDashboard(): JSX.Element {
   }
 
   const totalPages = useMemo(() => Math.max(1, Math.ceil(tokensTotal / tokensPerPage)), [tokensTotal])
+  const keysTotalPages = useMemo(() => Math.max(1, Math.ceil(keysTotal / keysPerPage)), [keysPerPage, keysTotal])
+  const keysHasFilters = selectedKeyGroups.length > 0 || selectedKeyStatuses.length > 0
+  const keysBlocking = isBlockingLoadState(keysLoadState)
+  const keysRefreshing = isRefreshingLoadState(keysLoadState)
 
   const goPrevPage = () => {
     setTokensPage((p) => Math.max(1, p - 1))
@@ -2780,6 +3409,83 @@ function AdminDashboard(): JSX.Element {
     navigateUsersSearch('', { tagId: null, page: 1 })
   }
 
+  const goPrevKeysPage = () => {
+    navigateKeysList({
+      page: keysPage - 1,
+      perPage: keysPerPage,
+      groups: selectedKeyGroups,
+      statuses: selectedKeyStatuses,
+    })
+  }
+
+  const goNextKeysPage = () => {
+    navigateKeysList({
+      page: keysPage + 1,
+      perPage: keysPerPage,
+      groups: selectedKeyGroups,
+      statuses: selectedKeyStatuses,
+    })
+  }
+
+  const changeKeysPerPage = (nextPerPage: number) => {
+    navigateKeysList({
+      page: 1,
+      perPage: nextPerPage,
+      groups: selectedKeyGroups,
+      statuses: selectedKeyStatuses,
+    })
+  }
+
+  const refreshBaseData = async (options?: { includeKeys?: boolean }) => {
+    const controller = new AbortController()
+    setLoading(true)
+    try {
+      await loadData({ signal: controller.signal, reason: 'refresh', showGlobalLoading: true })
+      if (options?.includeKeys && route.name === 'module' && route.module === 'keys') {
+        await refreshKeysList()
+      }
+    } finally {
+      controller.abort()
+    }
+  }
+
+  const refreshKeysList = async () => {
+    const pagedKeys = await fetchApiKeys(
+      keysPage,
+      keysPerPage,
+      {
+        groups: selectedKeyGroups,
+        statuses: selectedKeyStatuses,
+      },
+    )
+    setKeys(pagedKeys.items)
+    setKeysTotal(pagedKeys.total)
+    setKeysPage(pagedKeys.page)
+    setKeysPerPage(pagedKeys.perPage)
+    setKeyGroupFacets(pagedKeys.facets.groups)
+    setKeyStatusFacets(pagedKeys.facets.statuses)
+    return pagedKeys
+  }
+  const toggleAllowRegistration = async () => {
+    if (registrationSettingsSaving || registrationSettingsLoading || allowRegistration === null) return
+    const previous = allowRegistration
+    const next = !previous
+    setAllowRegistration(next)
+    setRegistrationSettingsSaving(true)
+    setRegistrationSettingsError(null)
+    try {
+      const result = await updateAdminRegistrationSettings(next)
+      setAllowRegistration(result.allowRegistration)
+    } catch (err) {
+      console.error(err)
+      setAllowRegistration(previous)
+      setRegistrationSettingsError(
+        err instanceof Error ? err.message : adminStrings.users.registration.saveFailed,
+      )
+    } finally {
+      setRegistrationSettingsSaving(false)
+    }
+  }
   const refreshUsersList = async () => {
     const pagedUsers = await fetchAdminUsers(usersPage, USERS_PER_PAGE, usersQuery, usersTagFilterId)
     setUsers(pagedUsers.items)
@@ -3019,23 +3725,40 @@ function AdminDashboard(): JSX.Element {
     setTokenGroupsExpanded((previous) => !previous)
   }
 
-  const handleSelectKeyGroupAll = () => {
-    setSelectedKeyGroupName(null)
-    setSelectedKeyUngrouped(false)
+  const handleToggleKeyGroupFilter = (group: string) => {
+    navigateKeysList({
+      page: 1,
+      perPage: keysPerPage,
+      groups: toggleSelection(selectedKeyGroups, group),
+      statuses: selectedKeyStatuses,
+    })
   }
 
-  const handleSelectKeyGroupUngrouped = () => {
-    setSelectedKeyGroupName(null)
-    setSelectedKeyUngrouped(true)
+  const handleToggleKeyStatusFilter = (status: string) => {
+    navigateKeysList({
+      page: 1,
+      perPage: keysPerPage,
+      groups: selectedKeyGroups,
+      statuses: toggleSelection(selectedKeyStatuses, status),
+    })
   }
 
-  const handleSelectKeyGroupNamed = (group: string) => {
-    setSelectedKeyGroupName(group)
-    setSelectedKeyUngrouped(false)
+  const handleClearKeyGroupFilters = () => {
+    navigateKeysList({
+      page: 1,
+      perPage: keysPerPage,
+      groups: [],
+      statuses: selectedKeyStatuses,
+    })
   }
 
-  const toggleKeyGroupsExpanded = () => {
-    setKeyGroupsExpanded((previous) => !previous)
+  const handleClearKeyStatusFilters = () => {
+    navigateKeysList({
+      page: 1,
+      perPage: keysPerPage,
+      groups: selectedKeyGroups,
+      statuses: [],
+    })
   }
 
   const openBatchDialog = () => {
@@ -3073,11 +3796,31 @@ function AdminDashboard(): JSX.Element {
     setKeysBatchReport(null)
   }
 
-  const handleCopyToken = async (id: string, stateKey: string) => {
+  const handleCopyToken = async (id: string, stateKey: string, anchorEl?: HTMLElement | null) => {
+    setManualCopyBubble(null)
+    commitSecretWarm(`token:${id}`)
     updateCopyState(stateKey, 'loading')
     try {
+      const hasCachedToken = tokenSecretCacheRef.current.has(id)
       const token = await resolveTokenSecret(id)
-      await copyToClipboard(token)
+      const copyResult = await copyToClipboard(
+        token,
+        hasCachedToken ? { preferExecCommand: true } : undefined,
+      )
+      if (!copyResult.ok) {
+        updateCopyState(stateKey, null)
+        if (anchorEl) {
+          openManualCopyBubble({
+            anchorEl,
+            title: manualCopyText.title,
+            description: manualCopyText.description,
+            fieldLabel: manualCopyText.fields.token,
+            value: token,
+          })
+        }
+        return
+      }
+      setManualCopyBubble(null)
       updateCopyState(stateKey, 'copied')
       window.setTimeout(() => updateCopyState(stateKey, null), 2000)
     } catch (err) {
@@ -3087,12 +3830,32 @@ function AdminDashboard(): JSX.Element {
     }
   }
 
-  const handleShareToken = async (id: string, stateKey: string) => {
+  const handleShareToken = async (id: string, stateKey: string, anchorEl?: HTMLElement | null) => {
+    setManualCopyBubble(null)
+    commitSecretWarm(`token:${id}`)
     updateCopyState(stateKey, 'loading')
     try {
+      const hasCachedToken = tokenSecretCacheRef.current.has(id)
       const token = await resolveTokenSecret(id)
       const shareUrl = `${window.location.origin}/#${encodeURIComponent(token)}`
-      await copyToClipboard(shareUrl)
+      const copyResult = await copyToClipboard(
+        shareUrl,
+        hasCachedToken ? { preferExecCommand: true } : undefined,
+      )
+      if (!copyResult.ok) {
+        updateCopyState(stateKey, null)
+        if (anchorEl) {
+          openManualCopyBubble({
+            anchorEl,
+            title: manualCopyText.title,
+            description: manualCopyText.description,
+            fieldLabel: manualCopyText.fields.shareLink,
+            value: shareUrl,
+          })
+        }
+        return
+      }
+      setManualCopyBubble(null)
       updateCopyState(stateKey, 'copied')
       window.setTimeout(() => updateCopyState(stateKey, null), 2000)
     } catch (err) {
@@ -3187,10 +3950,7 @@ function AdminDashboard(): JSX.Element {
     try {
       await deleteApiKey(id)
       setPendingDeleteId(null)
-      const controller = new AbortController()
-      setLoading(true)
-      await loadData({ signal: controller.signal, reason: 'refresh', showGlobalLoading: true })
-      controller.abort()
+      await refreshBaseData({ includeKeys: true })
     } catch (err) {
       console.error(err)
       setError(err instanceof Error ? err.message : errorStrings.deleteKey)
@@ -3208,15 +3968,26 @@ function AdminDashboard(): JSX.Element {
     setTogglingId(id)
     try {
       await setKeyStatus(id, toDisabled ? 'disabled' : 'active')
-      const controller = new AbortController()
-      setLoading(true)
-      await loadData({ signal: controller.signal, reason: 'refresh', showGlobalLoading: true })
-      controller.abort()
+      await refreshBaseData({ includeKeys: true })
     } catch (err) {
       console.error(err)
       setError(err instanceof Error ? err.message : errorStrings.toggleKey)
     } finally {
       setTogglingId(null)
+    }
+  }
+
+  const handleClearQuarantine = async (id: string) => {
+    if (!id) return
+    setClearingQuarantineId(id)
+    try {
+      await clearApiKeyQuarantine(id)
+      await refreshBaseData({ includeKeys: true })
+    } catch (err) {
+      console.error(err)
+      setError(err instanceof Error ? err.message : errorStrings.clearQuarantine)
+    } finally {
+      setClearingQuarantineId(null)
     }
   }
 
@@ -3260,6 +4031,17 @@ function AdminDashboard(): JSX.Element {
           ? 'users'
           : 'tokens'
   const usersStrings = adminStrings.users
+  const registrationStatusText = registrationSettingsLoading && !registrationSettingsLoaded
+    ? usersStrings.registration.description
+    : registrationSettingsSaving
+      ? usersStrings.registration.saving
+      : allowRegistration === null
+        ? usersStrings.registration.unavailable
+      : allowRegistration
+        ? usersStrings.registration.enabled
+        : usersStrings.registration.disabled
+
+  const registrationInlineStatus = registrationSettingsError ?? (registrationSettingsSaving ? registrationStatusText : null)
   const sortedTagCatalog = useMemo(
     () => [...tagCatalog].sort((left, right) => right.userCount - left.userCount || left.displayName.localeCompare(right.displayName)),
     [tagCatalog],
@@ -3670,7 +4452,20 @@ function AdminDashboard(): JSX.Element {
         skipToContentLabel={adminStrings.accessibility.skipToContent}
         onSelectModule={navigateModule}
       >
-        <KeyDetails key={route.id} id={route.id} onBack={() => navigateModule('keys')} />
+        <KeyDetails
+          key={route.id}
+          id={route.id}
+          onBack={() =>
+            navigateToPath(
+              buildAdminKeysPath({
+                page: getAdminKeysPageFromLocation(),
+                perPage: getAdminKeysPerPageFromLocation(),
+                groups: getAdminKeysValuesFromLocation('group'),
+                statuses: getAdminKeysValuesFromLocation('status'),
+              }),
+            )
+          }
+        />
       </AdminShell>
     )
   }
@@ -3682,7 +4477,13 @@ function AdminDashboard(): JSX.Element {
         skipToContentLabel={adminStrings.accessibility.skipToContent}
         onSelectModule={navigateModule}
       >
-        <TokenDetail key={route.id} id={route.id} onBack={() => navigateModule('tokens')} onOpenUser={navigateUser} />
+        <TokenDetail
+          key={route.id}
+          id={route.id}
+          onBack={() => navigateModule('tokens')}
+          onOpenUser={navigateUser}
+          onSecretRotated={handleTokenSecretRotated}
+        />
       </AdminShell>
     )
   }
@@ -4578,7 +5379,7 @@ function AdminDashboard(): JSX.Element {
           trend={trendBuckets}
           tokenCoverage={dashboardTokenCoverage}
           tokens={dashboardTokens}
-          keys={dedupedKeys}
+          keys={dashboardKeys}
           logs={dashboardLogs}
           jobs={dashboardJobs}
           onOpenModule={navigateModule}
@@ -4633,7 +5434,7 @@ function AdminDashboard(): JSX.Element {
 />
 <Button
   type="button"
-  onClick={() => void handleAddToken()}
+  onClick={(event) => void handleAddToken(event.currentTarget)}
   disabled={submitting}
 >
   {submitting ? tokenStrings.creating : tokenStrings.newToken}
@@ -4807,7 +5608,12 @@ function AdminDashboard(): JSX.Element {
   className="token-action-button shadow-none"
   title={tokenStrings.actions.copy}
   aria-label={tokenStrings.actions.copy}
-  onClick={() => void handleCopyToken(t.id, stateKey)}
+  onPointerEnter={() => scheduleSecretWarm(`token:${t.id}`, () => warmTokenSecret(t.id))}
+  onPointerLeave={() => cancelSecretWarm(`token:${t.id}`)}
+  onBlur={() => cancelSecretWarm(`token:${t.id}`)}
+  onPointerDown={() => warmTokenSecret(t.id)}
+  onKeyDown={(event) => { if (!isCopyIntentKey(event.key)) return; warmTokenSecret(t.id) }}
+  onClick={(event) => void handleCopyToken(t.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={16} height={16} />
@@ -4819,7 +5625,12 @@ function AdminDashboard(): JSX.Element {
   className="token-action-button shadow-none"
   title={tokenStrings.actions.share}
   aria-label={tokenStrings.actions.share}
-  onClick={() => void handleShareToken(t.id, shareStateKey)}
+  onPointerEnter={() => scheduleSecretWarm(`token:${t.id}`, () => warmTokenSecret(t.id))}
+  onPointerLeave={() => cancelSecretWarm(`token:${t.id}`)}
+  onBlur={() => cancelSecretWarm(`token:${t.id}`)}
+  onPointerDown={() => warmTokenSecret(t.id)}
+  onKeyDown={(event) => { if (!isCopyIntentKey(event.key)) return; warmTokenSecret(t.id) }}
+  onClick={(event) => void handleShareToken(t.id, shareStateKey, event.currentTarget)}
   disabled={shareState === 'loading'}
 >
   <Icon icon={shareState === 'copied' ? 'mdi:check' : 'mdi:share-variant'} width={16} height={16} />
@@ -4937,7 +5748,12 @@ function AdminDashboard(): JSX.Element {
   type="button"
   variant={state === 'copied' ? 'success' : 'outline'}
   size="sm"
-  onClick={() => void handleCopyToken(t.id, stateKey)}
+  onPointerEnter={() => scheduleSecretWarm(`token:${t.id}`, () => warmTokenSecret(t.id))}
+  onPointerLeave={() => cancelSecretWarm(`token:${t.id}`)}
+  onBlur={() => cancelSecretWarm(`token:${t.id}`)}
+  onPointerDown={() => warmTokenSecret(t.id)}
+  onKeyDown={(event) => { if (!isCopyIntentKey(event.key)) return; warmTokenSecret(t.id) }}
+  onClick={(event) => void handleCopyToken(t.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   {tokenStrings.actions.copy}
@@ -4946,7 +5762,12 @@ function AdminDashboard(): JSX.Element {
   type="button"
   variant={shareState === 'copied' ? 'success' : 'outline'}
   size="sm"
-  onClick={() => void handleShareToken(t.id, shareStateKey)}
+  onPointerEnter={() => scheduleSecretWarm(`token:${t.id}`, () => warmTokenSecret(t.id))}
+  onPointerLeave={() => cancelSecretWarm(`token:${t.id}`)}
+  onBlur={() => cancelSecretWarm(`token:${t.id}`)}
+  onPointerDown={() => warmTokenSecret(t.id)}
+  onKeyDown={(event) => { if (!isCopyIntentKey(event.key)) return; warmTokenSecret(t.id) }}
+  onClick={(event) => void handleShareToken(t.id, shareStateKey, event.currentTarget)}
   disabled={shareState === 'loading'}
 >
   {tokenStrings.actions.share}
@@ -5013,7 +5834,90 @@ function AdminDashboard(): JSX.Element {
 	            <h2>{keyStrings.title}</h2>
 	            <p className="panel-description">{keyStrings.description}</p>
 	          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flex: '0 1 auto', justifyContent: 'flex-end', marginLeft: 'auto' }}>
+	        </div>
+          <div style={keysUtilityRowStyle}>
+            <div style={keysFilterClusterStyle}>
+              {hasKeyGroups && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button type="button" variant="outline" size="sm" aria-label={keyGroupFilterSummary}>
+                      <Icon icon="mdi:filter-variant" width={16} height={16} aria-hidden="true" />
+                      <span style={{ whiteSpace: 'nowrap' }}>{keyGroupFilterSummary}</span>
+                      {selectedKeyGroups.length > 0 ? (
+                        <Badge variant="neutral" className="ml-1 px-1.5 py-0 text-[10px]">
+                          {selectedKeyGroups.length}
+                        </Badge>
+                      ) : null}
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-64">
+                    <DropdownMenuLabel>{keyStrings.groups.label}</DropdownMenuLabel>
+                    <DropdownMenuItem
+                      className="cursor-pointer"
+                      disabled={selectedKeyGroups.length === 0}
+                      onSelect={(event) => {
+                        event.preventDefault()
+                        handleClearKeyGroupFilters()
+                      }}
+                    >
+                      {keyStrings.filters.clearGroups}
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    {keyGroupFilterOptions.map((option) => (
+                      <DropdownMenuCheckboxItem
+                        key={option.value || '__ungrouped__'}
+                        className="cursor-pointer"
+                        checked={selectedKeyGroups.includes(option.value)}
+                        onSelect={(event) => event.preventDefault()}
+                        onCheckedChange={() => handleToggleKeyGroupFilter(option.value)}
+                      >
+                        <span>{option.label}</span>
+                        <span className="ml-auto text-xs opacity-60">{formatNumber(option.count)}</span>
+                      </DropdownMenuCheckboxItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button type="button" variant="outline" size="sm" aria-label={keyStatusFilterSummary}>
+                    <Icon icon="mdi:filter-outline" width={16} height={16} aria-hidden="true" />
+                    <span style={{ whiteSpace: 'nowrap' }}>{keyStatusFilterSummary}</span>
+                    {selectedKeyStatuses.length > 0 ? (
+                      <Badge variant="neutral" className="ml-1 px-1.5 py-0 text-[10px]">
+                        {selectedKeyStatuses.length}
+                      </Badge>
+                    ) : null}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-64">
+                  <DropdownMenuLabel>{keyStrings.filters.status}</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    className="cursor-pointer"
+                    disabled={selectedKeyStatuses.length === 0}
+                    onSelect={(event) => {
+                      event.preventDefault()
+                      handleClearKeyStatusFilters()
+                    }}
+                  >
+                    {keyStrings.filters.clearStatuses}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  {keyStatusFilterOptions.map((option) => (
+                    <DropdownMenuCheckboxItem
+                      key={option.value}
+                      className="cursor-pointer"
+                      checked={selectedKeyStatuses.includes(option.value)}
+                      onSelect={(event) => event.preventDefault()}
+                      onCheckedChange={() => handleToggleKeyStatusFilter(option.value)}
+                    >
+                      <span>{option.label}</span>
+                      <span className="ml-auto text-xs opacity-60">{formatNumber(option.count)}</span>
+                    </DropdownMenuCheckboxItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
             {isAdmin && (
               <div
                 ref={keysBatchAnchorRef}
@@ -5039,152 +5943,124 @@ function AdminDashboard(): JSX.Element {
                   keysBatchOpenReasonRef.current = 'focus'
                   setKeysBatchExpanded(true)
                 }}
-                style={{ position: 'relative' }}
+                style={{ ...keysQuickAddCardStyle, position: 'relative' }}
               >
                 <div
                   className={`keys-batch-collapsed${keysBatchVisible ? ' is-hidden' : ''}`}
                   aria-hidden={keysBatchVisible}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    flexWrap: 'wrap',
-                    justifyContent: 'flex-end',
-                    maxWidth: 'min(520px, 100%)',
-                  }}
+                  style={keysQuickAddActionsStyle}
                 >
-<Input
-  ref={keysBatchCollapsedInputRef}
-  type="text"
-  name="collapsed-key-input"
-  placeholder={keyStrings.placeholder}
-  aria-label={keyStrings.placeholder}
-  value={keysBatchFirstLine}
-  onChange={(e) => setNewKeysText(e.target.value)}
-  disabled={keysBatchVisible}
-  style={{ flex: '1 1 160px', minWidth: 160, maxWidth: '100%' }}
-/>
-<Button
-  type="button"
-  onClick={() => void handleAddKey()}
-  disabled={keysBatchVisible || submitting || keysBatchParsed.length === 0}
-  style={{ flexShrink: 0 }}
->
-  {submitting ? keyStrings.adding : keyStrings.addButton}
-</Button>
-	                </div>
-	                <datalist id="api-key-group-datalist">
-	                  {namedKeyGroups.map((group) => (
-	                    <option key={group.name} value={group.name} />
-	                  ))}
-	                </datalist>
-	              </div>
-	            )}
-	          </div>
-	        </div>
-	        {hasKeyGroups && (
-	          <div className="token-groups-container">
-	            <div className="token-groups-label">
-	              <span>{keyStrings.groups.label}</span>
-	            </div>
-	            <div className="token-groups-row">
-	              <div
-	                ref={keyGroupsListRef}
-	                className={`token-groups-list${keyGroupsExpanded ? ' token-groups-list-expanded' : ''}`}
-	              >
-	                <button
-	                  type="button"
-	                  className={`token-group-chip${
-	                    !selectedKeyUngrouped && selectedKeyGroupName == null ? ' token-group-chip-active' : ''
-	                  }`}
-	                  onClick={handleSelectKeyGroupAll}
-	                >
-	                  <span className="token-group-name">{keyStrings.groups.all}</span>
-	                </button>
-	                {ungroupedKeyGroup && (
-	                  <button
-	                    type="button"
-	                    className={`token-group-chip${selectedKeyUngrouped ? ' token-group-chip-active' : ''}`}
-	                    onClick={handleSelectKeyGroupUngrouped}
-	                  >
-	                    <span className="token-group-name">{keyStrings.groups.ungrouped}</span>
-	                    {keyGroupsExpanded && (
-	                      <span className="token-group-count">
-	                        {formatNumber(ungroupedKeyGroup.keyCount)}
-	                      </span>
-	                    )}
-	                  </button>
-	                )}
-	                {namedKeyGroups.map((group) => (
-	                  <button
-	                    key={group.name}
-	                    type="button"
-	                    className={`token-group-chip${
-	                      !selectedKeyUngrouped && selectedKeyGroupName === group.name ? ' token-group-chip-active' : ''
-	                    }`}
-	                    onClick={() => handleSelectKeyGroupNamed(group.name)}
-	                  >
-	                    <span className="token-group-name">{group.name}</span>
-	                    {keyGroupsExpanded && (
-	                      <span className="token-group-count">
-	                        {formatNumber(group.keyCount)}
-	                      </span>
-	                    )}
-	                  </button>
-	                ))}
-	              </div>
-	              {(keyGroupsCollapsedOverflowing || keyGroupsExpanded) && (
-	                <button
-	                  type="button"
-	                  className={`token-group-chip token-group-toggle${keyGroupsExpanded ? ' token-group-toggle-active' : ''}`}
-	                  onClick={toggleKeyGroupsExpanded}
-	                  aria-label={keyGroupsExpanded ? keyStrings.groups.moreHide : keyStrings.groups.moreShow}
-	                >
-	                  <Icon icon={keyGroupsExpanded ? 'mdi:chevron-up' : 'mdi:chevron-down'} width={18} height={18} />
-	                </button>
-	              )}
-	            </div>
-	          </div>
-	        )}
-	        <div className="table-wrapper jobs-table-wrapper admin-responsive-up">
-	          {visibleKeys.length === 0 ? (
-	            <div className="empty-state alert">
-	              {loading ? keyStrings.empty.loading : sortedKeys.length === 0 ? keyStrings.empty.none : keyStrings.empty.filtered}
-	            </div>
-	          ) : (
-	            <Table>
-	              <thead>
+                  <Input
+                    ref={keysBatchCollapsedInputRef}
+                    type="text"
+                    name="collapsed-key-input"
+                    placeholder={keyStrings.placeholder}
+                    aria-label={keyStrings.placeholder}
+                    value={keysBatchFirstLine}
+                    onChange={(e) => setNewKeysText(e.target.value)}
+                    disabled={keysBatchVisible}
+                    style={{ flex: '1 1 260px', minWidth: 260, maxWidth: '100%' }}
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => void handleAddKey()}
+                    disabled={keysBatchVisible || submitting || keysBatchParsed.length === 0}
+                    style={{ flexShrink: 0, whiteSpace: 'nowrap' }}
+                  >
+                    {submitting ? keyStrings.adding : keyStrings.addButton}
+                  </Button>
+                </div>
+                <datalist id="api-key-group-datalist">
+                  {namedKeyGroups.map((group) => (
+                    <option key={group.name} value={group.name} />
+                  ))}
+                </datalist>
+              </div>
+            )}
+          </div>
+        <AdminTableShell
+          className="jobs-table-wrapper admin-responsive-up"
+          loadState={keysLoadState}
+          loadingLabel={keysRefreshing ? loadingStateStrings.refreshing : keyStrings.empty.loading}
+          errorLabel={keysError ?? loadingStateStrings.error}
+          minHeight={320}
+        >
+          {visibleKeys.length === 0 ? (
+            <tbody>
+              <tr>
+                <td colSpan={isAdmin ? 6 : 5}>
+                  <div className="empty-state alert">
+                    {keysHasFilters ? keyStrings.empty.filtered : keyStrings.empty.none}
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          ) : (
+            <>
+              <thead>
                 <tr>
-                  <th>{keyStrings.table.keyId}</th>
-                  <th>{keyStrings.table.status}</th>
-                  <th>{keyStrings.table.total}</th>
-                  <th>{keyStrings.table.success}</th>
-                  <th>{keyStrings.table.errors}</th>
-                  <th>{keyStrings.table.quotaLeft}</th>
-                  <th>{keyStrings.table.lastUsed}</th>
-                  <th>{keyStrings.table.statusChanged}</th>
-                  {isAdmin && <th>{keyStrings.table.actions}</th>}
+                  <th>
+                    <div style={adminTableHeaderStackStyle}>
+                      <span style={adminTableFieldStyle}>{keyStrings.table.keyId}</span>
+                      <span style={adminTableSecondaryFieldStyle}>{keyStrings.groups.label}</span>
+                    </div>
+                  </th>
+                  <th>
+                    <div style={adminTableHeaderStackStyle}>
+                      <span style={adminTableFieldStyle}>{keyStrings.table.status}</span>
+                      <span style={adminTableSecondaryFieldStyle} aria-hidden="true">&nbsp;</span>
+                    </div>
+                  </th>
+                  <th>
+                    <div style={adminTableHeaderStackStyle}>
+                      <span style={adminTableFieldStyle}>{keyStrings.table.success}</span>
+                      <span style={adminTableSecondaryFieldStyle}>{keyStrings.table.errors}</span>
+                    </div>
+                  </th>
+                  <th>
+                    <div style={adminTableHeaderStackStyle}>
+                      <span style={adminTableFieldStyle}>{keyStrings.table.quotaLeft}</span>
+                      <span style={adminTableSecondaryFieldStyle} aria-hidden="true">&nbsp;</span>
+                    </div>
+                  </th>
+                  <th>
+                    <div style={adminTableHeaderStackStyle}>
+                      <span style={adminTableFieldStyle}>{keyStrings.table.lastUsed}</span>
+                      <span style={adminTableSecondaryFieldStyle}>{keyStrings.table.statusChanged}</span>
+                    </div>
+                  </th>
+                  {isAdmin && (
+                    <th>
+                      <div style={adminTableHeaderStackStyle}>
+                        <span style={adminTableFieldStyle}>{keyStrings.table.actions}</span>
+                        <span style={adminTableSecondaryFieldStyle} aria-hidden="true">&nbsp;</span>
+                      </div>
+                    </th>
+                  )}
                 </tr>
-	              </thead>
-	              <tbody>
-	                {visibleKeys.map((item) => {
-	                  const total = item.total_requests || 0
-	                  const stateKey = copyStateKey('keys', item.id)
-	                  const state = copyState.get(stateKey)
-	                  return (
+              </thead>
+              <tbody>
+                {visibleKeys.map((item) => {
+                  const stateKey = copyStateKey('keys', item.id)
+                  const state = copyState.get(stateKey)
+                  const keyGroupName = formatKeyGroupName(item.group, keyStrings.groups.ungrouped)
+                  return (
                     <tr key={item.id}>
                       <td>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <button
-                            type="button"
-                            className="link-button"
-                            onClick={() => navigateKey(item.id)}
-                            title={keyStrings.actions.details}
-                            aria-label={keyStrings.actions.details}
-                          >
-                            <code>{item.id}</code>
-                          </button>
-                          {isAdmin && (
+                        <div style={adminTableStackStyle}>
+                          <div style={adminTableInlineFieldStyle}>
+                            <button
+                              type="button"
+                              className="link-button"
+                              onClick={() => navigateKey(item.id, { preserveKeysContext: true })}
+                              title={keyStrings.actions.details}
+                              aria-label={keyStrings.actions.details}
+                              style={{ whiteSpace: 'nowrap' }}
+                            >
+                              <code>{item.id}</code>
+                            </button>
+                            {isAdmin && (
 <Button
   type="button"
   variant={state === 'copied' ? 'success' : 'ghost'}
@@ -5192,33 +6068,70 @@ function AdminDashboard(): JSX.Element {
   className="h-8 w-8 rounded-full p-0 shadow-none"
   title={keyStrings.actions.copy}
   aria-label={keyStrings.actions.copy}
-  onClick={() => void handleCopySecret(item.id, stateKey)}
+  onPointerEnter={() => scheduleSecretWarm(`key:${item.id}`, () => warmApiKeySecret(item.id))}
+  onPointerLeave={() => cancelSecretWarm(`key:${item.id}`)}
+  onBlur={() => cancelSecretWarm(`key:${item.id}`)}
+  onPointerDown={() => warmApiKeySecret(item.id)}
+  onKeyDown={(event) => { if (!isCopyIntentKey(event.key)) return; warmApiKeySecret(item.id) }}
+  onClick={(event) => void handleCopySecret(item.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   <Icon icon={state === 'copied' ? 'mdi:check' : 'mdi:content-copy'} width={18} height={18} />
 </Button>
-                          )}
+                            )}
+                          </div>
+                          <span style={adminTableSecondaryFieldStyle}>{keyGroupName}</span>
                         </div>
                       </td>
                       <td>
-                        <StatusBadge tone={statusTone(item.status)}>
-                          {statusLabel(item.status, adminStrings)}
-                        </StatusBadge>
+                        <div style={adminTableStackStyle}>
+                          <span style={adminTableFieldStyle}>
+                            <StatusBadge tone={statusTone(keyBadgeStatus(item))}>
+                              {statusLabel(keyBadgeStatus(item), adminStrings)}
+                            </StatusBadge>
+                          </span>
+                        </div>
                       </td>
-                      <td>{formatNumber(total)}</td>
-                      <td>{formatNumber(item.success_count)}</td>
-                      <td>{formatNumber(item.error_count)}</td>
                       <td>
-                        {item.quota_remaining != null && item.quota_limit != null
-                          ? `${formatNumber(item.quota_remaining)} / ${formatNumber(item.quota_limit)}`
-                          : '—'}
+                        <div style={adminTableStackStyle}>
+                          <span style={adminTableFieldStyle}>{formatNumber(item.success_count)}</span>
+                          <span style={adminTableSecondaryFieldStyle}>{formatNumber(item.error_count)}</span>
+                        </div>
                       </td>
-                      <td>{formatTimestampNoYear(item.last_used_at)}</td>
-                      <td>{formatTimestamp(item.status_changed_at)}</td>
+                      <td>
+                        <span style={adminTableFieldStyle}>
+                          {item.quota_remaining != null && item.quota_limit != null
+                            ? `${formatNumber(item.quota_remaining)} / ${formatNumber(item.quota_limit)}`
+                            : '—'}
+                        </span>
+                      </td>
+                      <td>
+                        <div style={adminTableStackStyle}>
+                          <span style={adminTableFieldStyle}>{formatTimestampNoYear(item.last_used_at)}</span>
+                          <span style={adminTableSecondaryFieldStyle}>{formatTimestamp(item.status_changed_at)}</span>
+                        </div>
+                      </td>
                       {isAdmin && (
                         <td>
-                          <div className="table-actions">
-                            {item.status === 'disabled' ? (
+                          <div className="table-actions" style={{ flexWrap: 'nowrap' }}>
+                            {item.quarantine ? (
+  <Button
+    type="button"
+    variant="ghost"
+    size="icon"
+    className="h-8 w-8 rounded-full p-0 shadow-none"
+    title={keyStrings.actions.clearQuarantine}
+    aria-label={keyStrings.actions.clearQuarantine}
+    onClick={() => void handleClearQuarantine(item.id)}
+    disabled={clearingQuarantineId === item.id}
+  >
+    <Icon
+      icon={clearingQuarantineId === item.id ? 'mdi:progress-helper' : 'mdi:shield-check-outline'}
+      width={18}
+      height={18}
+    />
+  </Button>
+) : item.status === 'disabled' ? (
   <Button
     type="button"
     variant="ghost"
@@ -5253,7 +6166,7 @@ function AdminDashboard(): JSX.Element {
   title={keyStrings.actions.delete}
   aria-label={keyStrings.actions.delete}
   onClick={() => openDeleteConfirm(item.id)}
-  disabled={deletingId === item.id}
+  disabled={deletingId === item.id || clearingQuarantineId === item.id}
 >
   <Icon
     icon={deletingId === item.id ? 'mdi:progress-helper' : 'mdi:trash-outline'}
@@ -5269,9 +6182,9 @@ function AdminDashboard(): JSX.Element {
   className="h-8 w-8 rounded-full p-0 shadow-none"
   title={keyStrings.actions.details}
   aria-label={keyStrings.actions.details}
-  onClick={() => navigateKey(item.id)}
->
-  <Icon icon="mdi:eye-outline" width={18} height={18} />
+  onClick={() => navigateKey(item.id, { preserveKeysContext: true })}
+  >
+    <Icon icon="mdi:eye-outline" width={18} height={18} />
 </Button>
                           </div>
                         </td>
@@ -5280,13 +6193,19 @@ function AdminDashboard(): JSX.Element {
                   )
                 })}
               </tbody>
-	            </Table>
-	          )}
-	        </div>
-        <div className="admin-mobile-list admin-responsive-down">
+            </>
+          )}
+        </AdminTableShell>
+        <AdminLoadingRegion
+          className="admin-mobile-list admin-responsive-down"
+          loadState={keysLoadState}
+          loadingLabel={keysRefreshing ? loadingStateStrings.refreshing : keyStrings.empty.loading}
+          errorLabel={keysError ?? loadingStateStrings.error}
+          minHeight={240}
+        >
           {visibleKeys.length === 0 ? (
             <div className="empty-state alert">
-              {loading ? keyStrings.empty.loading : sortedKeys.length === 0 ? keyStrings.empty.none : keyStrings.empty.filtered}
+              {keysHasFilters ? keyStrings.empty.filtered : keyStrings.empty.none}
             </div>
           ) : (
             visibleKeys.map((item) => {
@@ -5303,9 +6222,16 @@ function AdminDashboard(): JSX.Element {
                   </div>
                   <div className="admin-mobile-kv">
                     <span>{keyStrings.table.status}</span>
-                    <StatusBadge tone={statusTone(item.status)}>
-                      {statusLabel(item.status, adminStrings)}
-                    </StatusBadge>
+                    <div>
+                      <StatusBadge tone={statusTone(keyBadgeStatus(item))}>
+                        {statusLabel(keyBadgeStatus(item), adminStrings)}
+                      </StatusBadge>
+                      {item.quarantine && (
+                        <div className="panel-description" style={{ marginTop: 4 }}>
+                          {keyStrings.quarantine.badge}: {item.quarantine.reasonSummary || keyStrings.quarantine.noReason}
+                        </div>
+                      )}
+                    </div>
                   </div>
                   <div className="admin-mobile-kv">
                     <span>{keyStrings.table.total}</span>
@@ -5341,18 +6267,33 @@ function AdminDashboard(): JSX.Element {
   type="button"
   variant={state === 'copied' ? 'success' : 'outline'}
   size="sm"
-  onClick={() => void handleCopySecret(item.id, stateKey)}
+  onPointerEnter={() => scheduleSecretWarm(`key:${item.id}`, () => warmApiKeySecret(item.id))}
+  onPointerLeave={() => cancelSecretWarm(`key:${item.id}`)}
+  onBlur={() => cancelSecretWarm(`key:${item.id}`)}
+  onPointerDown={() => warmApiKeySecret(item.id)}
+  onKeyDown={(event) => { if (!isCopyIntentKey(event.key)) return; warmApiKeySecret(item.id) }}
+  onClick={(event) => void handleCopySecret(item.id, stateKey, event.currentTarget)}
   disabled={state === 'loading'}
 >
   {keyStrings.actions.copy}
 </Button>
-{item.status === 'disabled' ? (
+{item.quarantine ? (
+  <Button
+    type="button"
+    variant="outline"
+    size="sm"
+    onClick={() => void handleClearQuarantine(item.id)}
+    disabled={clearingQuarantineId === item.id}
+  >
+    {keyStrings.actions.clearQuarantine}
+  </Button>
+) : item.status === 'disabled' ? (
   <Button
     type="button"
     variant="outline"
     size="sm"
     onClick={() => void handleToggleDisable(item.id, false)}
-    disabled={togglingId === item.id}
+    disabled={togglingId === item.id || clearingQuarantineId === item.id}
   >
     {keyStrings.actions.enable}
   </Button>
@@ -5362,7 +6303,7 @@ function AdminDashboard(): JSX.Element {
     variant="outline"
     size="sm"
     onClick={() => openDisableConfirm(item.id)}
-    disabled={togglingId === item.id}
+    disabled={togglingId === item.id || clearingQuarantineId === item.id}
   >
     {keyStrings.actions.disable}
   </Button>
@@ -5376,7 +6317,7 @@ function AdminDashboard(): JSX.Element {
 >
   {keyStrings.actions.delete}
 </Button>
-<Button type="button" variant="outline" size="sm" onClick={() => navigateKey(item.id)}>
+<Button type="button" variant="outline" size="sm" onClick={() => navigateKey(item.id, { preserveKeysContext: true })}>
   {keyStrings.actions.details}
 </Button>
                     </div>
@@ -5385,7 +6326,31 @@ function AdminDashboard(): JSX.Element {
               )
             })
           )}
-        </div>
+        </AdminLoadingRegion>
+        {keysTotal > keysPerPage && (
+          <AdminTablePagination
+            page={keysPage}
+            totalPages={keysTotalPages}
+            pageSummary={
+              <span className="panel-description">
+                {keyStrings.pagination.page
+                  .replace('{page}', String(keysPage))
+                  .replace('{total}', String(keysTotalPages))}
+              </span>
+            }
+            perPage={keysPerPage}
+            perPageLabel={keyStrings.pagination.perPage}
+            perPageAriaLabel={keyStrings.pagination.perPage}
+            previousLabel={tokenStrings.pagination.prev}
+            nextLabel={tokenStrings.pagination.next}
+            previousDisabled={keysPage <= 1}
+            nextDisabled={keysPage >= keysTotalPages}
+            disabled={keysBlocking}
+            onPrevious={goPrevKeysPage}
+            onNext={goNextKeysPage}
+            onPerPageChange={changeKeysPerPage}
+          />
+        )}
       </section>
       )}
 
@@ -5579,13 +6544,13 @@ function AdminDashboard(): JSX.Element {
               </thead>
               <tbody>
                 {jobs.map((j) => {
-                  const job: any = j as any
-                  const jt = job.job_type ?? job.jobType ?? ''
+                  const jt = j.job_type
                   const jobTypeLabelText = jobTypeLabel(jt, jobsStrings)
                   const jobStatusText = jobStatusLabel(String(j.status ?? ''))
-                  const keyId = job.key_id ?? job.keyId ?? '—'
-                  const started: number | null = job.started_at ?? job.startedAt ?? null
-                  const finished: number | null = job.finished_at ?? job.finishedAt ?? null
+                  const keyId = j.key_id
+                  const keyGroup = j.key_group
+                  const started: number | null = j.started_at ?? null
+                  const finished: number | null = j.finished_at ?? null
                   const startedTimeLabel = formatTimestamp(started)
                   const startedDetail =
                     started != null
@@ -5613,41 +6578,49 @@ function AdminDashboard(): JSX.Element {
 
                   rows.push(
                     <tr key={j.id}>
-                        <td>{j.id}</td>
-                        <td>{jobTypeLabelText}</td>
-                        <td>{keyId ?? '—'}</td>
-                        <td>
-                          <StatusBadge tone={statusTone(j.status)} title={String(j.status ?? '')}>
-                            {jobStatusText}
-                          </StatusBadge>
-                        </td>
-                        <td>{j.attempt}</td>
-                        <td>{started ? startedTimeLabel : '—'}</td>
-                        <td>
-                          {jobMessage ? (
-                            <button
-                              type="button"
-                              className={`jobs-message-button${isExpanded ? ' jobs-message-button-active' : ''}`}
-                              onClick={() => toggleJobExpansion(j.id)}
-                              aria-expanded={isExpanded}
-                              aria-controls={`job-details-${j.id}`}
-                              aria-label={messageLabel}
-                              title={jobMessage}
-                            >
-                              <span className="jobs-message-text">{jobMessage}</span>
-                              <Icon
-                                icon={isExpanded ? 'mdi:chevron-up' : 'mdi:chevron-down'}
-                                width={16}
-                                height={16}
-                                className="jobs-message-icon"
-                                aria-hidden="true"
-                              />
-                            </button>
-                          ) : (
-                            '—'
-                          )}
-                        </td>
-                      </tr>,
+                      <td>{j.id}</td>
+                      <td>{jobTypeLabelText}</td>
+                      <td>
+                        <JobKeyLink
+                          keyId={keyId}
+                          keyGroup={keyGroup}
+                          ungroupedLabel={keyStrings.groups.ungrouped}
+                          detailLabel={keyStrings.actions.details}
+                          onOpenKey={navigateKey}
+                        />
+                      </td>
+                      <td>
+                        <StatusBadge tone={statusTone(j.status)} title={String(j.status ?? '')}>
+                          {jobStatusText}
+                        </StatusBadge>
+                      </td>
+                      <td>{j.attempt}</td>
+                      <td>{started ? startedTimeLabel : '—'}</td>
+                      <td className="jobs-message-cell">
+                        {jobMessage ? (
+                          <button
+                            type="button"
+                            className={`jobs-message-button${isExpanded ? ' jobs-message-button-active' : ''}`}
+                            onClick={() => toggleJobExpansion(j.id)}
+                            aria-expanded={isExpanded}
+                            aria-controls={`job-details-${j.id}`}
+                            aria-label={messageLabel}
+                            title={jobMessage}
+                          >
+                            <span className="jobs-message-text">{jobMessage}</span>
+                            <Icon
+                              icon={isExpanded ? 'mdi:chevron-up' : 'mdi:chevron-down'}
+                              width={16}
+                              height={16}
+                              className="jobs-message-icon"
+                              aria-hidden="true"
+                            />
+                          </button>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                    </tr>,
                   )
 
                   if (isExpanded) {
@@ -5681,7 +6654,15 @@ function AdminDashboard(): JSX.Element {
                               </div>
                               <div>
                                 <div className="log-details-label">{jobsStrings.table.key}</div>
-                                <div className="log-details-value">{keyId ?? '—'}</div>
+                                <div className="log-details-value">
+                                  <JobKeyLink
+                                    keyId={keyId}
+                                    keyGroup={keyGroup}
+                                    ungroupedLabel={keyStrings.groups.ungrouped}
+                                    detailLabel={keyStrings.actions.details}
+                                    onOpenKey={navigateKey}
+                                  />
+                                </div>
                               </div>
                               <div>
                                 <div className="log-details-label">{jobsStrings.table.status}</div>
@@ -5743,10 +6724,8 @@ function AdminDashboard(): JSX.Element {
             <div className="empty-state alert">{jobsStrings.empty.none}</div>
           ) : (
             jobs.map((j) => {
-              const job: any = j as any
-              const jt = job.job_type ?? job.jobType ?? ''
-              const keyId = job.key_id ?? job.keyId ?? '—'
-              const started: number | null = job.started_at ?? job.startedAt ?? null
+              const jt = j.job_type
+              const started: number | null = j.started_at ?? null
               return (
                 <article key={j.id} className="admin-mobile-card">
                   <div className="admin-mobile-kv">
@@ -5759,7 +6738,16 @@ function AdminDashboard(): JSX.Element {
                   </div>
                   <div className="admin-mobile-kv">
                     <span>{jobsStrings.table.key}</span>
-                    <strong>{keyId}</strong>
+                    <strong>
+                      <JobKeyLink
+                        keyId={j.key_id}
+                        keyGroup={j.key_group}
+                        ungroupedLabel={keyStrings.groups.ungrouped}
+                        detailLabel={keyStrings.actions.details}
+                        onOpenKey={navigateKey}
+                        showBubble={false}
+                      />
+                    </strong>
                   </div>
                   <div className="admin-mobile-kv">
                     <span>{jobsStrings.table.status}</span>
@@ -5811,36 +6799,102 @@ function AdminDashboard(): JSX.Element {
 
           <section className="surface panel">
             <div className="panel-header" style={{ gap: 12, flexWrap: 'wrap' }}>
-              <div>
+              <div style={{ flex: '1 1 340px', minWidth: 260 }}>
                 <h2>{usersStrings.title}</h2>
                 <p className="panel-description">{usersStrings.description}</p>
               </div>
-              <div className="users-search-controls">
-                <Input
-                  type="text"
-                  name="users-search"
-                  className="users-search-input"
-                  placeholder={usersStrings.searchPlaceholder}
-                  value={usersQueryInput}
-                  disabled={usersBlocking}
-                  onChange={(event) => setUsersQueryInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault()
-                      applyUserSearch()
-                    }
+              <div style={{ display: 'flex', flex: '1 1 520px', flexWrap: 'wrap', gap: 12, justifyContent: 'flex-end' }}>
+                <div
+                  className="rounded-xl border border-border/60 bg-background/55 px-4 py-3 shadow-sm backdrop-blur"
+                  style={{
+                    display: 'flex',
+                    minWidth: 260,
+                    maxWidth: 380,
+                    flex: '1 1 300px',
+                    alignItems: 'flex-start',
+                    justifyContent: 'space-between',
+                    gap: 12,
                   }}
-                />
-                <Button type="button" variant="outline" onClick={applyUserSearch} disabled={usersBlocking}>
-                  {usersStrings.search}
-                </Button>
-                {(usersQueryInput.length > 0 || usersQuery.length > 0 || usersTagFilterId != null) && (
-                  <Button type="button" variant="ghost" onClick={resetUserSearch} disabled={usersBlocking}>
-                    {usersStrings.clear}
+                >
+                  <div style={{ minWidth: 0, flex: '1 1 auto' }}>
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div className="text-sm font-semibold">{usersStrings.registration.title}</div>
+                      <Badge
+                        variant={
+                          registrationSettingsError
+                            ? 'destructive'
+                            : allowRegistration === null
+                              ? 'secondary'
+                              : allowRegistration
+                                ? 'success'
+                                : 'warning'
+                        }
+                      >
+                        {allowRegistration === null
+                          ? usersStrings.status.unknown
+                          : allowRegistration
+                            ? usersStrings.status.enabled
+                            : usersStrings.status.disabled}
+                      </Badge>
+                    </div>
+                    {registrationInlineStatus && (
+                      <p
+                        className="text-xs font-medium"
+                        role="status"
+                        aria-live="polite"
+                        style={{ margin: '6px 0 0', color: registrationSettingsError ? 'hsl(var(--destructive))' : undefined }}
+                      >
+                        {registrationInlineStatus}
+                      </p>
+                    )}
+                  </div>
+                  <Switch
+                    disabled={registrationSettingsLoading || registrationSettingsSaving || allowRegistration === null}
+                    checked={allowRegistration ?? false}
+                    aria-label={usersStrings.registration.title}
+                    onCheckedChange={() => void toggleAllowRegistration()}
+                    style={{ flex: '0 0 auto' }}
+                  />
+                </div>
+                <div className="users-search-controls">
+                  <Input
+                    type="text"
+                    name="users-search"
+                    className="users-search-input"
+                    placeholder={usersStrings.searchPlaceholder}
+                    value={usersQueryInput}
+                    disabled={usersBlocking}
+                    onChange={(event) => setUsersQueryInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        applyUserSearch()
+                      }
+                    }}
+                  />
+                  <Button type="button" variant="outline" onClick={applyUserSearch} disabled={usersBlocking}>
+                    {usersStrings.search}
                   </Button>
-                )}
+                  {(usersQueryInput.length > 0 || usersQuery.length > 0 || usersTagFilterId != null) && (
+                    <Button type="button" variant="ghost" onClick={resetUserSearch} disabled={usersBlocking}>
+                      {usersStrings.clear}
+                    </Button>
+                  )}
+                </div>
               </div>
             </div>
+            {registrationSettingsError && (
+              <div className="surface error-banner" style={{ marginBottom: 12 }}>
+                {registrationSettingsError}
+              </div>
+            )}
 
             <AdminTableShell
               className="jobs-table-wrapper"
@@ -6165,15 +7219,20 @@ function AdminDashboard(): JSX.Element {
                   overflowY: 'auto',
                 }}
                 value={batchShareText ?? ''}
+                onClick={(event) => selectAllReadonlyText(event.currentTarget)}
+                onFocus={(event) => selectAllReadonlyText(event.currentTarget)}
               />
             </div>
             <DialogFooter className="modal-action">
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => {
+                onClick={async () => {
                   if (!batchShareText) return
-                  void copyToClipboard(batchShareText)
+                  const copyResult = await copyToClipboard(batchShareText, { preferExecCommand: true })
+                  if (!copyResult.ok) {
+                    setError(errorStrings.copyToken)
+                  }
                 }}
               >
                 {tokenStrings.batchDialog.copyAll}
@@ -6384,6 +7443,48 @@ function AdminDashboard(): JSX.Element {
     </DialogFooter>
   </DialogContent>
 </Dialog>
+<Dialog open={manualCopyDialog != null} onOpenChange={(open) => { if (!open) setManualCopyDialog(null) }}>
+  <DialogContent
+    className="max-w-lg"
+    onEscapeKeyDown={(event) => event.preventDefault()}
+    onInteractOutside={(event) => event.preventDefault()}
+  >
+    <DialogHeader>
+      <DialogTitle>{manualCopyDialog?.title ?? manualCopyText.createToken.title}</DialogTitle>
+      <DialogDescription>{manualCopyDialog?.description ?? manualCopyText.createToken.description}</DialogDescription>
+    </DialogHeader>
+    <div className="grid gap-2">
+      <label className="manual-copy-bubble-label" htmlFor="admin-manual-copy-dialog-field">
+        {manualCopyDialog?.fieldLabel ?? manualCopyText.fields.token}
+      </label>
+      <Input
+        id="admin-manual-copy-dialog-field"
+        ref={manualCopyDialogFieldRef}
+        className="manual-copy-bubble-field"
+        readOnly
+        value={manualCopyDialog?.value ?? ''}
+        onFocus={(event) => selectAllReadonlyText(event.currentTarget)}
+        onClick={(event) => selectAllReadonlyText(event.currentTarget)}
+      />
+    </div>
+    <DialogFooter className="modal-action">
+      <Button type="button" onClick={() => setManualCopyDialog(null)}>
+        {manualCopyText.close}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+      <ManualCopyBubble
+        open={manualCopyBubble != null}
+        anchorEl={manualCopyBubble?.anchorEl ?? null}
+        title={manualCopyBubble?.title ?? manualCopyText.title}
+        description={manualCopyBubble?.description ?? manualCopyText.description}
+        fieldLabel={manualCopyBubble?.fieldLabel ?? manualCopyText.fields.token}
+        value={manualCopyBubble?.value ?? ''}
+        multiline={manualCopyBubble?.multiline ?? false}
+        closeLabel={manualCopyText.close}
+        onClose={() => setManualCopyBubble(null)}
+      />
     </>
   )
 }
@@ -6560,6 +7661,7 @@ function LogDetails({ log, strings }: { log: RequestLog; strings: AdminTranslati
 function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Element {
   const translations = useTranslate()
   const adminStrings = translations.admin
+  const keyStrings = adminStrings.keys
   const keyDetailsStrings = adminStrings.keyDetails
   const logsTableStrings = adminStrings.logs.table
   const loadingStateStrings = adminStrings.loadingStates
@@ -6571,11 +7673,14 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
   const [detailLoadState, setDetailLoadState] = useState<QueryLoadState>('initial_loading')
   const [error, setError] = useState<string | null>(null)
   const [syncState, setSyncState] = useState<'idle' | 'syncing' | 'success'>('idle')
+  const [quarantineState, setQuarantineState] = useState<'idle' | 'clearing'>('idle')
+  const [quarantineDetailExpanded, setQuarantineDetailExpanded] = useState(false)
   const syncInFlightRef = useRef(false)
   const syncFeedbackTimerRef = useRef<number | null>(null)
   const loadAbortRef = useRef<AbortController | null>(null)
   const queryKeyRef = useRef<string | null>(null)
   const queryKey = `${id}:${period}:${startDate}`
+  const quarantineDetailId = `key-quarantine-detail-${id}`
 
   const computeSince = useCallback((): number => {
     const base = new Date(startDate + 'T00:00:00Z')
@@ -6643,6 +7748,10 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
     }
   }, [])
 
+  useEffect(() => {
+    setQuarantineDetailExpanded(false)
+  }, [id])
+
   const syncUsage = useCallback(async () => {
     if (syncInFlightRef.current) return
     syncInFlightRef.current = true
@@ -6668,6 +7777,21 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
     }
   }, [adminStrings.errors.syncUsage, id, load])
 
+  const clearQuarantine = useCallback(async () => {
+    if (quarantineState === 'clearing') return
+    try {
+      setQuarantineState('clearing')
+      setError(null)
+      await clearApiKeyQuarantine(id)
+      await load('refresh')
+    } catch (err) {
+      console.error(err)
+      setError(err instanceof Error ? err.message : adminStrings.errors.clearQuarantine)
+    } finally {
+      setQuarantineState('idle')
+    }
+  }, [adminStrings.errors.clearQuarantine, id, load, quarantineState])
+
   const metricCards = useMemo(() => {
     if (!summary) return []
     const total = summary.total_requests
@@ -6684,6 +7808,8 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
   const detailBlocking = isBlockingLoadState(detailLoadState)
   const detailRefreshing = isRefreshingLoadState(detailLoadState)
   const detailLoadingLabel = detailRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching
+  const quarantineRawDetail = detail?.quarantine?.reasonDetail?.trim() ?? ''
+  const hasQuarantineRawDetail = quarantineRawDetail.length > 0
 
   return (
     <div className="admin-detail-stack">
@@ -6729,6 +7855,80 @@ function KeyDetails({ id, onBack }: { id: string; onBack: () => void }): JSX.Ele
       </section>
 
       {error && <div className="surface error-banner" style={{ marginTop: 8, marginBottom: 0 }}>{error}</div>}
+
+      {detail?.quarantine && (
+        <section className="surface panel">
+          <div className="panel-header">
+            <div>
+              <h2>{keyDetailsStrings.quarantine.title}</h2>
+              <p className="panel-description">{keyDetailsStrings.quarantine.description}</p>
+            </div>
+            <Button
+              type="button"
+              variant="warning"
+              onClick={() => void clearQuarantine()}
+              disabled={quarantineState === 'clearing'}
+              aria-busy={quarantineState === 'clearing'}
+            >
+              <Icon
+                icon={quarantineState === 'clearing' ? 'mdi:loading' : 'mdi:shield-check-outline'}
+                width={18}
+                height={18}
+                className={quarantineState === 'clearing' ? 'icon-spin' : undefined}
+              />
+              {quarantineState === 'clearing'
+                ? keyDetailsStrings.quarantine.clearing
+                : keyDetailsStrings.quarantine.clearAction}
+            </Button>
+          </div>
+          <div className="admin-mobile-kv">
+            <span>{keyDetailsStrings.quarantine.source}</span>
+            <strong>{detail.quarantine.source}</strong>
+          </div>
+          <div className="admin-mobile-kv">
+            <span>{keyDetailsStrings.quarantine.reason}</span>
+            <strong>{detail.quarantine.reasonSummary || keyStrings.quarantine.noReason}</strong>
+          </div>
+          <div className="admin-mobile-kv">
+            <span>{keyDetailsStrings.quarantine.createdAt}</span>
+            <strong>{formatTimestamp(detail.quarantine.createdAt)}</strong>
+          </div>
+          {hasQuarantineRawDetail && (
+            <div className="quarantine-detail-block">
+              <div className="quarantine-detail-header">
+                <div className="panel-description">{keyDetailsStrings.quarantine.detail}</div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="quarantine-detail-toggle"
+                  aria-expanded={quarantineDetailExpanded}
+                  aria-controls={quarantineDetailId}
+                  onClick={() => setQuarantineDetailExpanded((current) => !current)}
+                >
+                  <Icon
+                    icon={quarantineDetailExpanded ? 'mdi:chevron-up' : 'mdi:chevron-down'}
+                    width={18}
+                    height={18}
+                    aria-hidden="true"
+                  />
+                  {quarantineDetailExpanded
+                    ? keyDetailsStrings.quarantine.hideDetail
+                    : keyDetailsStrings.quarantine.showDetail}
+                </Button>
+              </div>
+              <pre
+                id={quarantineDetailId}
+                className="log-details-pre"
+                hidden={!quarantineDetailExpanded}
+                aria-hidden={!quarantineDetailExpanded}
+              >
+                {quarantineRawDetail}
+              </pre>
+            </div>
+          )}
+        </section>
+      )}
 
       <section className="surface panel">
         <div className="panel-header">

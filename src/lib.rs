@@ -37,6 +37,7 @@ pub const DEFAULT_UPSTREAM: &str = "https://mcp.tavily.com/mcp";
 const STATUS_ACTIVE: &str = "active";
 const STATUS_EXHAUSTED: &str = "exhausted";
 const STATUS_DISABLED: &str = "disabled";
+const QUARANTINE_REASON_DETAIL_MAX_LEN: usize = 1024;
 
 const OUTCOME_SUCCESS: &str = "success";
 const OUTCOME_ERROR: &str = "error";
@@ -163,7 +164,9 @@ const META_KEY_API_KEY_USAGE_BUCKETS_V1_DONE: &str = "api_key_usage_buckets_v1_d
 const META_KEY_ACCOUNT_QUOTA_BACKFILL_V1: &str = "account_quota_backfill_v1";
 const META_KEY_ACCOUNT_QUOTA_INHERITS_DEFAULTS_BACKFILL_V1: &str =
     "account_quota_inherits_defaults_backfill_v1";
+const META_KEY_ACCOUNT_QUOTA_ZERO_BASE_CUTOVER_V1: &str = "account_quota_zero_base_cutover_v1";
 const META_KEY_FORCE_USER_RELOGIN_V1: &str = "force_user_relogin_v1";
+const META_KEY_ALLOW_REGISTRATION_V1: &str = "allow_registration_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_V1: &str = "linuxdo_system_tag_defaults_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_TUPLE_V1: &str = "linuxdo_system_tag_defaults_tuple_v1";
 const META_KEY_AUTH_TOKEN_LOG_REQUEST_KIND_BACKFILL_V1: &str =
@@ -477,7 +480,17 @@ struct AccountQuotaLimits {
 }
 
 impl AccountQuotaLimits {
-    fn defaults() -> Self {
+    fn zero_base() -> Self {
+        Self {
+            hourly_any_limit: 0,
+            hourly_limit: 0,
+            daily_limit: 0,
+            monthly_limit: 0,
+            inherits_defaults: false,
+        }
+    }
+
+    fn legacy_defaults() -> Self {
         Self {
             hourly_any_limit: effective_token_hourly_request_limit(),
             hourly_limit: effective_token_hourly_limit(),
@@ -502,6 +515,33 @@ impl AccountQuotaLimits {
             && self.hourly_limit == other.hourly_limit
             && self.daily_limit == other.daily_limit
             && self.monthly_limit == other.monthly_limit
+    }
+}
+
+fn account_quota_limits_from_row(
+    hourly_any_limit: i64,
+    hourly_limit: i64,
+    daily_limit: i64,
+    monthly_limit: i64,
+    inherits_defaults: i64,
+) -> AccountQuotaLimits {
+    AccountQuotaLimits {
+        hourly_any_limit,
+        hourly_limit,
+        daily_limit,
+        monthly_limit,
+        inherits_defaults: inherits_defaults == 1,
+    }
+}
+
+fn default_account_quota_limits_for_created_at(
+    user_created_at: i64,
+    zero_base_cutover_at: i64,
+) -> AccountQuotaLimits {
+    if user_created_at >= zero_base_cutover_at {
+        AccountQuotaLimits::zero_base()
+    } else {
+        AccountQuotaLimits::legacy_defaults()
     }
 }
 
@@ -2207,8 +2247,7 @@ impl TavilyProxy {
                     }
                     return Ok(lease);
                 }
-                let mut state = self.research_request_affinity.lock().await;
-                state.drop_mapping(request_id);
+                return Err(ProxyError::NoAvailableKeys);
             }
         }
 
@@ -2286,6 +2325,57 @@ impl TavilyProxy {
         }
     }
 
+    async fn reconcile_key_health(
+        &self,
+        lease: &ApiKeyLease,
+        source: &str,
+        analysis: &AttemptAnalysis,
+    ) -> Result<(), ProxyError> {
+        match &analysis.key_health_action {
+            KeyHealthAction::None => self.key_store.restore_active_status(&lease.secret).await,
+            KeyHealthAction::MarkExhausted => {
+                let _changed = self.key_store.mark_quota_exhausted(&lease.secret).await?;
+                Ok(())
+            }
+            KeyHealthAction::Quarantine(decision) => {
+                self.key_store
+                    .quarantine_key_by_id(
+                        &lease.id,
+                        source,
+                        &decision.reason_code,
+                        &decision.reason_summary,
+                        &decision.reason_detail,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn maybe_quarantine_usage_error(
+        &self,
+        key_id: &str,
+        source: &str,
+        err: &ProxyError,
+    ) -> Result<(), ProxyError> {
+        let ProxyError::UsageHttp { status, body } = err else {
+            return Ok(());
+        };
+        let Some(decision) =
+            classify_quarantine_reason(Some(status.as_u16() as i64), body.as_bytes())
+        else {
+            return Ok(());
+        };
+        self.key_store
+            .quarantine_key_by_id(
+                key_id,
+                source,
+                &decision.reason_code,
+                &decision.reason_summary,
+                &decision.reason_detail,
+            )
+            .await
+    }
+
     /// 将请求透传到 Tavily upstream 并记录日志。
     pub async fn proxy_request(&self, request: ProxyRequest) -> Result<ProxyResponse, ProxyError> {
         let lease = self
@@ -2360,11 +2450,8 @@ impl TavilyProxy {
                     })
                     .await?;
 
-                if status.as_u16() == 432 || outcome.mark_exhausted {
-                    let _changed = self.key_store.mark_quota_exhausted(&lease.secret).await?;
-                } else {
-                    self.key_store.restore_active_status(&lease.secret).await?;
-                }
+                self.reconcile_key_health(&lease, request.path.as_str(), &outcome)
+                    .await?;
 
                 Ok(ProxyResponse {
                     status,
@@ -2518,11 +2605,8 @@ impl TavilyProxy {
                     })
                     .await?;
 
-                if status.as_u16() == 432 || analysis.mark_exhausted {
-                    let _changed = self.key_store.mark_quota_exhausted(&lease.secret).await?;
-                } else {
-                    self.key_store.restore_active_status(&lease.secret).await?;
-                }
+                self.reconcile_key_health(&lease, display_path, &analysis)
+                    .await?;
 
                 Ok((
                     ProxyResponse {
@@ -2580,14 +2664,22 @@ impl TavilyProxy {
         // research calls sharing the same upstream key, otherwise deltas can be misattributed.
         let _key_guard = self.lock_research_key_usage(&lease.id).await?;
 
-        let before_usage = self
+        let before_usage = match self
             .fetch_research_usage_for_secret_with_retries(
                 &lease.secret,
                 usage_base,
                 Some(&lease.id),
                 "research_usage_before",
             )
-            .await?;
+            .await
+        {
+            Ok(usage) => usage,
+            Err(err) => {
+                self.maybe_quarantine_usage_error(&lease.id, "/api/tavily/research#usage", &err)
+                    .await?;
+                return Err(err);
+            }
+        };
 
         let base = Url::parse(usage_base).map_err(|source| ProxyError::InvalidEndpoint {
             endpoint: usage_base.to_owned(),
@@ -2677,13 +2769,10 @@ impl TavilyProxy {
                     })
                     .await?;
 
-                if status.as_u16() == 432 || analysis.mark_exhausted {
-                    let _changed = self.key_store.mark_quota_exhausted(&lease.secret).await?;
-                } else {
-                    self.key_store.restore_active_status(&lease.secret).await?;
-                }
+                self.reconcile_key_health(&lease, display_path, &analysis)
+                    .await?;
 
-                let after_usage = self
+                let after_usage = match self
                     .fetch_research_usage_for_secret_with_retries(
                         &lease.secret,
                         usage_base,
@@ -2691,7 +2780,18 @@ impl TavilyProxy {
                         "research_usage_after",
                     )
                     .await
-                    .ok();
+                {
+                    Ok(usage) => Some(usage),
+                    Err(err) => {
+                        self.maybe_quarantine_usage_error(
+                            &lease.id,
+                            "/api/tavily/research#usage_after",
+                            &err,
+                        )
+                        .await?;
+                        None
+                    }
+                };
                 let delta = match after_usage {
                     Some(after) if after >= before_usage => Some(after - before_usage),
                     _ => None,
@@ -2816,11 +2916,8 @@ impl TavilyProxy {
                     })
                     .await?;
 
-                if status.as_u16() == 432 || analysis.mark_exhausted {
-                    let _changed = self.key_store.mark_quota_exhausted(&lease.secret).await?;
-                } else {
-                    self.key_store.restore_active_status(&lease.secret).await?;
-                }
+                self.reconcile_key_health(&lease, display_path, &analysis)
+                    .await?;
 
                 Ok((
                     ProxyResponse {
@@ -2882,7 +2979,28 @@ impl TavilyProxy {
 
     /// 获取全部 API key 的统计信息，按状态与最近使用时间排序。
     pub async fn list_api_key_metrics(&self) -> Result<Vec<ApiKeyMetrics>, ProxyError> {
-        self.key_store.fetch_api_key_metrics().await
+        self.key_store.fetch_api_key_metrics(false).await
+    }
+
+    /// Admin: list API key metrics with pagination and optional filters.
+    pub async fn list_api_key_metrics_paged(
+        &self,
+        page: i64,
+        per_page: i64,
+        groups: &[String],
+        statuses: &[String],
+    ) -> Result<PaginatedApiKeyMetrics, ProxyError> {
+        self.key_store
+            .fetch_api_key_metrics_page(page, per_page, groups, statuses)
+            .await
+    }
+
+    /// 获取单个 API key 的完整统计信息，包含隔离详情。
+    pub async fn get_api_key_metric(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<ApiKeyMetrics>, ProxyError> {
+        self.key_store.fetch_api_key_metric_by_id(key_id).await
     }
 
     /// 获取最近的请求日志，按时间倒序排列。
@@ -3174,6 +3292,27 @@ impl TavilyProxy {
         self.key_store.upsert_oauth_account(profile).await
     }
 
+    /// Check whether a third-party account already exists locally.
+    pub async fn oauth_account_exists(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .oauth_account_exists(provider, provider_user_id)
+            .await
+    }
+
+    /// Read whether first-time third-party registration is enabled.
+    pub async fn allow_registration(&self) -> Result<bool, ProxyError> {
+        self.key_store.allow_registration().await
+    }
+
+    /// Persist whether first-time third-party registration is enabled.
+    pub async fn set_allow_registration(&self, allow: bool) -> Result<bool, ProxyError> {
+        self.key_store.set_allow_registration(allow).await
+    }
+
     /// Ensure one-to-one user token binding exists, creating a token only when missing.
     pub async fn ensure_user_token_binding(
         &self,
@@ -3240,13 +3379,13 @@ impl TavilyProxy {
             .await?
             .unwrap_or(AccountQuotaSnapshot {
                 hourly_any_used: 0,
-                hourly_any_limit: effective_token_hourly_request_limit(),
+                hourly_any_limit: 0,
                 hourly_used: 0,
-                hourly_limit: effective_token_hourly_limit(),
+                hourly_limit: 0,
                 daily_used: 0,
-                daily_limit: effective_token_daily_limit(),
+                daily_limit: 0,
                 monthly_used: 0,
-                monthly_limit: effective_token_monthly_limit(),
+                monthly_limit: 0,
             });
         let (monthly_success, daily_success, daily_failure) =
             self.key_store.fetch_user_success_failure(user_id).await?;
@@ -3926,6 +4065,11 @@ impl TavilyProxy {
         self.key_store.enable_key_by_id(key_id).await
     }
 
+    /// Admin: clear the active quarantine record for a key.
+    pub async fn clear_key_quarantine_by_id(&self, key_id: &str) -> Result<(), ProxyError> {
+        self.key_store.clear_key_quarantine_by_id(key_id).await
+    }
+
     /// 获取整体运行情况汇总。
     pub async fn summary(&self) -> Result<ProxySummary, ProxyError> {
         self.key_store.fetch_summary().await
@@ -4353,7 +4497,7 @@ impl TokenQuota {
                 .store
                 .fetch_account_monthly_counts(&account_user_ids, month_start)
                 .await?;
-            let default_limits = AccountQuotaLimits::defaults();
+            let default_limits = AccountQuotaLimits::zero_base();
 
             for (token_id, user_id) in account_subjects {
                 let limits = account_limits
@@ -4533,7 +4677,7 @@ impl TokenRequestLimit {
                     hour_window_start,
                 )
                 .await?;
-            let default_hourly_any_limit = AccountQuotaLimits::defaults().hourly_any_limit;
+            let default_hourly_any_limit = AccountQuotaLimits::zero_base().hourly_any_limit;
             for (token_id, user_id) in account_subjects {
                 let used = account_totals.get(&user_id).copied().unwrap_or(0);
                 let limit = account_limits
@@ -4591,9 +4735,17 @@ impl TavilyProxy {
         let Some(secret) = self.key_store.fetch_api_key_secret(key_id).await? else {
             return Err(ProxyError::Database(sqlx::Error::RowNotFound));
         };
-        let (limit, remaining) = self
+        let (limit, remaining) = match self
             .fetch_usage_quota_for_secret(&secret, usage_base, None, Some(key_id), "quota_sync")
-            .await?;
+            .await
+        {
+            Ok(quota) => quota,
+            Err(err) => {
+                self.maybe_quarantine_usage_error(key_id, "/api/tavily/usage", &err)
+                    .await?;
+                return Err(err);
+            }
+        };
         let now = Utc::now().timestamp();
         self.key_store
             .update_quota_for_key(key_id, limit, remaining, now)
@@ -4940,6 +5092,8 @@ impl KeyStore {
         .await?;
 
         self.upgrade_api_keys_schema().await?;
+        self.ensure_api_key_quarantines_schema().await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS request_logs (
@@ -5635,6 +5789,17 @@ impl KeyStore {
             self.backfill_account_quota_inherits_defaults_v1().await?;
             self.set_meta_i64(
                 META_KEY_ACCOUNT_QUOTA_INHERITS_DEFAULTS_BACKFILL_V1,
+                Utc::now().timestamp(),
+            )
+            .await?;
+        }
+        if self
+            .get_meta_i64(META_KEY_ACCOUNT_QUOTA_ZERO_BASE_CUTOVER_V1)
+            .await?
+            .is_none()
+        {
+            self.set_meta_i64(
+                META_KEY_ACCOUNT_QUOTA_ZERO_BASE_CUTOVER_V1,
                 Utc::now().timestamp(),
             )
             .await?;
@@ -7057,6 +7222,40 @@ impl KeyStore {
         Ok(())
     }
 
+    async fn ensure_api_key_quarantines_schema(&self) -> Result<(), ProxyError> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS api_key_quarantines (
+                id TEXT PRIMARY KEY,
+                key_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                reason_summary TEXT NOT NULL,
+                reason_detail TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                cleared_at INTEGER,
+                FOREIGN KEY (key_id) REFERENCES api_keys(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_api_key_quarantines_active ON api_key_quarantines(key_id) WHERE cleared_at IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_api_key_quarantines_key_created ON api_key_quarantines(key_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     async fn ensure_api_key_ids(&self) -> Result<(), ProxyError> {
         if !self.api_keys_column_exists("id").await? {
             sqlx::query("ALTER TABLE api_keys ADD COLUMN id TEXT")
@@ -7401,9 +7600,26 @@ impl KeyStore {
             .and_then(normalize_timestamp)
             .filter(|ts| *ts >= since_bucket_start);
 
-        let (active_keys, exhausted_keys) = match status.as_deref() {
-            Some(STATUS_EXHAUSTED) => (0, 1),
-            _ => (1, 0),
+        let quarantined = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT 1
+            FROM api_key_quarantines
+            WHERE key_id = ? AND cleared_at IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+
+        let (active_keys, exhausted_keys, quarantined_keys) = if quarantined {
+            (0, 0, 1)
+        } else {
+            match status.as_deref() {
+                Some(STATUS_EXHAUSTED) => (0, 1, 0),
+                _ => (1, 0, 0),
+            }
         };
 
         Ok(ProxySummary {
@@ -7413,6 +7629,7 @@ impl KeyStore {
             quota_exhausted_count: totals_row.try_get("quota_exhausted_count")?,
             active_keys,
             exhausted_keys,
+            quarantined_keys,
             last_activity,
             total_quota_limit: 0,
             total_quota_remaining: 0,
@@ -7611,6 +7828,11 @@ impl KeyStore {
             SELECT id, api_key
             FROM api_keys
             WHERE status = ? AND deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM api_key_quarantines q
+                  WHERE q.key_id = api_keys.id AND q.cleared_at IS NULL
+              )
             ORDER BY last_used_at ASC, id ASC
             LIMIT 1
             "#,
@@ -7631,6 +7853,11 @@ impl KeyStore {
             SELECT id, api_key
             FROM api_keys
             WHERE status = ? AND deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM api_key_quarantines q
+                  WHERE q.key_id = api_keys.id AND q.cleared_at IS NULL
+              )
             ORDER BY
                 CASE WHEN status_changed_at IS NULL THEN 1 ELSE 0 END ASC,
                 status_changed_at ASC,
@@ -7665,6 +7892,11 @@ impl KeyStore {
             SELECT id, api_key
             FROM api_keys
             WHERE id = ? AND status = ? AND deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM api_key_quarantines q
+                  WHERE q.key_id = api_keys.id AND q.cleared_at IS NULL
+              )
             LIMIT 1
             "#,
         )
@@ -8707,7 +8939,8 @@ impl KeyStore {
             return Ok(false);
         }
 
-        let defaults = AccountQuotaLimits::defaults();
+        let defaults = AccountQuotaLimits::legacy_defaults();
+        let current = self.ensure_account_quota_limits(user_id).await?;
         let requested = AccountQuotaLimits {
             hourly_any_limit,
             hourly_limit,
@@ -8715,7 +8948,8 @@ impl KeyStore {
             monthly_limit,
             inherits_defaults: false,
         };
-        let inherits_defaults = if requested.same_limits_as(&defaults) {
+        let inherits_defaults = if current.inherits_defaults && requested.same_limits_as(&defaults)
+        {
             1
         } else {
             0
@@ -8757,7 +8991,7 @@ impl KeyStore {
     }
 
     async fn backfill_account_quota_inherits_defaults_v1(&self) -> Result<(), ProxyError> {
-        let defaults = AccountQuotaLimits::defaults();
+        let defaults = AccountQuotaLimits::legacy_defaults();
         // Legacy rows do not record whether they were following defaults or manually customized.
         // Only rows that already match the current env tuple are safe to keep on the default-track;
         // every other tuple is conservatively treated as a custom baseline so upgrades never clobber
@@ -8784,7 +9018,7 @@ impl KeyStore {
 
     async fn sync_account_quota_limits_with_defaults(&self) -> Result<(), ProxyError> {
         let now = Utc::now().timestamp();
-        let defaults = AccountQuotaLimits::defaults();
+        let defaults = AccountQuotaLimits::legacy_defaults();
         sqlx::query(
             r#"UPDATE account_quota_limits
                SET hourly_any_limit = ?,
@@ -8805,12 +9039,73 @@ impl KeyStore {
         Ok(())
     }
 
+    async fn account_quota_zero_base_cutover_at(&self) -> Result<i64, ProxyError> {
+        Ok(self
+            .get_meta_i64(META_KEY_ACCOUNT_QUOTA_ZERO_BASE_CUTOVER_V1)
+            .await?
+            .unwrap_or(i64::MAX))
+    }
+
+    async fn default_account_quota_limits_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<AccountQuotaLimits, ProxyError> {
+        let user_created_at =
+            sqlx::query_scalar::<_, i64>("SELECT created_at FROM users WHERE id = ? LIMIT 1")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let cutover_at = self.account_quota_zero_base_cutover_at().await?;
+        Ok(default_account_quota_limits_for_created_at(
+            user_created_at,
+            cutover_at,
+        ))
+    }
+
+    async fn default_account_quota_limits_for_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, AccountQuotaLimits>, ProxyError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let cutover_at = self.account_quota_zero_base_cutover_at().await?;
+        let mut builder = QueryBuilder::new("SELECT id, created_at FROM users WHERE id IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for user_id in user_ids {
+                separated.push_bind(user_id);
+            }
+        }
+        builder.push(")");
+
+        let rows = builder
+            .build_query_as::<(String, i64)>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, created_at)| {
+                (
+                    user_id,
+                    default_account_quota_limits_for_created_at(created_at, cutover_at),
+                )
+            })
+            .collect())
+    }
+
     async fn ensure_account_quota_limits(
         &self,
         user_id: &str,
     ) -> Result<AccountQuotaLimits, ProxyError> {
+        if let Some(existing) = self.fetch_account_quota_limits(user_id).await? {
+            return Ok(existing);
+        }
+
         let now = Utc::now().timestamp();
-        let defaults = AccountQuotaLimits::defaults();
+        let defaults = self.default_account_quota_limits_for_user(user_id).await?;
         sqlx::query(
             r#"INSERT INTO account_quota_limits (
                     user_id,
@@ -8830,30 +9125,19 @@ impl KeyStore {
         .bind(defaults.hourly_limit)
         .bind(defaults.daily_limit)
         .bind(defaults.monthly_limit)
-        .bind(1)
+        .bind(if defaults.inherits_defaults { 1 } else { 0 })
         .bind(now)
         .bind(now)
         .execute(&self.pool)
         .await?;
 
-        let (hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults) =
-            sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
-                r#"SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit,
-                          COALESCE(inherits_defaults, 1)
-                   FROM account_quota_limits
-                   WHERE user_id = ?
-                   LIMIT 1"#,
-            )
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(AccountQuotaLimits {
-            hourly_any_limit,
-            hourly_limit,
-            daily_limit,
-            monthly_limit,
-            inherits_defaults: inherits_defaults == 1,
-        })
+        self.fetch_account_quota_limits(user_id)
+            .await?
+            .ok_or_else(|| {
+                ProxyError::Other(format!(
+                    "account quota limits missing after ensure for user {user_id}"
+                ))
+            })
     }
 
     async fn ensure_account_quota_limits_for_users(
@@ -8864,25 +9148,68 @@ impl KeyStore {
             return Ok(());
         }
 
+        let existing = self.fetch_account_quota_limits_bulk(user_ids).await?;
+        let missing_user_ids: Vec<String> = user_ids
+            .iter()
+            .filter(|user_id| !existing.contains_key(*user_id))
+            .cloned()
+            .collect();
+        if missing_user_ids.is_empty() {
+            return Ok(());
+        }
+
         let now = Utc::now().timestamp();
-        let defaults = AccountQuotaLimits::defaults();
+        let defaults_by_user = self
+            .default_account_quota_limits_for_users(&missing_user_ids)
+            .await?;
 
         let mut builder = QueryBuilder::new(
             "INSERT INTO account_quota_limits (user_id, hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults, created_at, updated_at) ",
         );
-        builder.push_values(user_ids, |mut b, user_id| {
+        builder.push_values(&missing_user_ids, |mut b, user_id| {
+            let defaults = defaults_by_user
+                .get(user_id)
+                .cloned()
+                .unwrap_or_else(AccountQuotaLimits::zero_base);
             b.push_bind(user_id)
                 .push_bind(defaults.hourly_any_limit)
                 .push_bind(defaults.hourly_limit)
                 .push_bind(defaults.daily_limit)
                 .push_bind(defaults.monthly_limit)
-                .push_bind(1)
+                .push_bind(if defaults.inherits_defaults { 1 } else { 0 })
                 .push_bind(now)
                 .push_bind(now);
         });
         builder.push(" ON CONFLICT(user_id) DO NOTHING");
         builder.build().execute(&self.pool).await?;
         Ok(())
+    }
+
+    async fn fetch_account_quota_limits(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<AccountQuotaLimits>, ProxyError> {
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+            r#"SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit,
+                      COALESCE(inherits_defaults, 1)
+               FROM account_quota_limits
+               WHERE user_id = ?
+               LIMIT 1"#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults)| {
+                account_quota_limits_from_row(
+                    hourly_any_limit,
+                    hourly_limit,
+                    daily_limit,
+                    monthly_limit,
+                    inherits_defaults,
+                )
+            },
+        ))
     }
 
     async fn fetch_account_quota_limits_bulk(
@@ -8919,13 +9246,13 @@ impl KeyStore {
         {
             map.insert(
                 user_id,
-                AccountQuotaLimits {
+                account_quota_limits_from_row(
                     hourly_any_limit,
                     hourly_limit,
                     daily_limit,
                     monthly_limit,
-                    inherits_defaults: inherits_defaults == 1,
-                },
+                    inherits_defaults,
+                ),
             );
         }
         Ok(map)
@@ -9030,6 +9357,20 @@ impl KeyStore {
         .await
     }
 
+    async fn allow_registration(&self) -> Result<bool, ProxyError> {
+        Ok(self
+            .get_meta_i64(META_KEY_ALLOW_REGISTRATION_V1)
+            .await?
+            .unwrap_or(1)
+            != 0)
+    }
+
+    async fn set_allow_registration(&self, allow: bool) -> Result<bool, ProxyError> {
+        self.set_meta_i64(META_KEY_ALLOW_REGISTRATION_V1, if allow { 1 } else { 0 })
+            .await?;
+        Ok(allow)
+    }
+
     async fn sync_linuxdo_system_tag_default_deltas_with_env(&self) -> Result<(), ProxyError> {
         let current = linuxdo_system_tag_default_deltas();
         let previous = match self.get_linuxdo_system_tag_default_deltas_meta().await? {
@@ -9117,6 +9458,20 @@ impl KeyStore {
         user_id: &str,
         trust_level: Option<i64>,
     ) -> Result<(), ProxyError> {
+        let mut tx = self.pool.begin().await?;
+        self.sync_linuxdo_system_tag_binding_in_tx(&mut tx, user_id, trust_level)
+            .await?;
+        tx.commit().await?;
+        self.invalidate_account_quota_resolution(user_id).await;
+        Ok(())
+    }
+
+    async fn sync_linuxdo_system_tag_binding_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        user_id: &str,
+        trust_level: Option<i64>,
+    ) -> Result<(), ProxyError> {
         let Some(level) = normalize_linuxdo_trust_level(trust_level) else {
             return Ok(());
         };
@@ -9124,16 +9479,17 @@ impl KeyStore {
         let Some((tag_id,)) =
             sqlx::query_as::<_, (String,)>("SELECT id FROM user_tags WHERE system_key = ? LIMIT 1")
                 .bind(&desired_key)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut **tx)
                 .await?
         else {
-            return Err(ProxyError::Other(format!(
-                "missing system tag for LinuxDo trust level {level}"
-            )));
+            eprintln!(
+                "linuxdo system tag sync skipped for user {} trust_level {:?}: missing system tag for LinuxDo trust level {}",
+                user_id, trust_level, level
+            );
+            return Ok(());
         };
 
         let now = Utc::now().timestamp();
-        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"DELETE FROM user_tag_bindings
                WHERE user_id = ?
@@ -9144,7 +9500,7 @@ impl KeyStore {
         )
         .bind(user_id)
         .bind(&tag_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         sqlx::query(
             r#"INSERT INTO user_tag_bindings (user_id, tag_id, source, created_at, updated_at)
@@ -9158,10 +9514,8 @@ impl KeyStore {
         .bind(USER_TAG_SOURCE_SYSTEM_LINUXDO)
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        tx.commit().await?;
-        self.invalidate_account_quota_resolution(user_id).await;
         Ok(())
     }
 
@@ -9692,7 +10046,7 @@ impl KeyStore {
         self.ensure_account_quota_limits_for_users(user_ids).await?;
         let base_limits = self.fetch_account_quota_limits_bulk(user_ids).await?;
         let tag_bindings = self.list_user_tag_bindings_for_users(user_ids).await?;
-        let defaults = AccountQuotaLimits::defaults();
+        let defaults = AccountQuotaLimits::zero_base();
         let mut map = HashMap::new();
         for user_id in user_ids {
             let base = base_limits
@@ -9994,6 +10348,31 @@ impl KeyStore {
                     ));
                 };
 
+                let zero_base = AccountQuotaLimits::zero_base();
+                sqlx::query(
+                    r#"INSERT INTO account_quota_limits (
+                           user_id,
+                           hourly_any_limit,
+                           hourly_limit,
+                           daily_limit,
+                           monthly_limit,
+                           inherits_defaults,
+                           created_at,
+                           updated_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+                )
+                .bind(&user_id)
+                .bind(zero_base.hourly_any_limit)
+                .bind(zero_base.hourly_limit)
+                .bind(zero_base.daily_limit)
+                .bind(zero_base.monthly_limit)
+                .bind(0)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+
                 let inserted_account = sqlx::query(
                     r#"INSERT INTO oauth_accounts
                        (provider, provider_user_id, user_id, username, name, avatar_template, active, trust_level, raw_payload, created_at, updated_at)
@@ -10076,6 +10455,24 @@ impl KeyStore {
         Err(ProxyError::Other(
             "failed to upsert oauth account after retries".to_string(),
         ))
+    }
+
+    async fn oauth_account_exists(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+    ) -> Result<bool, ProxyError> {
+        let row = sqlx::query_scalar::<_, i64>(
+            r#"SELECT 1
+               FROM oauth_accounts
+               WHERE provider = ? AND provider_user_id = ?
+               LIMIT 1"#,
+        )
+        .bind(provider)
+        .bind(provider_user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
     }
 
     async fn ensure_user_token_binding(
@@ -11656,6 +12053,71 @@ impl KeyStore {
         Ok(())
     }
 
+    async fn quarantine_key_by_id(
+        &self,
+        key_id: &str,
+        source: &str,
+        reason_code: &str,
+        reason_summary: &str,
+        reason_detail: &str,
+    ) -> Result<(), ProxyError> {
+        let now = Utc::now().timestamp();
+        let quarantine_id = nanoid!(12);
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO api_key_quarantines (
+                id, key_id, source, reason_code, reason_summary, reason_detail, created_at, cleared_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(key_id) WHERE cleared_at IS NULL DO NOTHING
+            "#,
+        )
+        .bind(quarantine_id)
+        .bind(key_id)
+        .bind(source)
+        .bind(reason_code)
+        .bind(reason_summary)
+        .bind(reason_detail)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        if insert_result.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                UPDATE api_key_quarantines
+                SET source = ?, reason_code = ?, reason_summary = ?, reason_detail = ?
+                WHERE key_id = ? AND cleared_at IS NULL
+                "#,
+            )
+            .bind(source)
+            .bind(reason_code)
+            .bind(reason_summary)
+            .bind(reason_detail)
+            .bind(key_id)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn clear_key_quarantine_by_id(&self, key_id: &str) -> Result<(), ProxyError> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            UPDATE api_key_quarantines
+            SET cleared_at = ?
+            WHERE key_id = ? AND cleared_at IS NULL
+            "#,
+        )
+        .bind(now)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // Admin ops: add/undelete key by secret
     async fn add_or_undelete_key(&self, api_key: &str) -> Result<String, ProxyError> {
         self.add_or_undelete_key_in_group(api_key, None).await
@@ -11961,8 +12423,34 @@ impl KeyStore {
         Ok(())
     }
 
-    async fn fetch_api_key_metrics(&self) -> Result<Vec<ApiKeyMetrics>, ProxyError> {
-        let rows = sqlx::query(
+    fn api_key_metrics_from_clause() -> &'static str {
+        r#"
+            FROM api_keys ak
+            LEFT JOIN (
+                SELECT
+                    api_key_id,
+                    COALESCE(SUM(total_requests), 0) AS total_requests,
+                    COALESCE(SUM(success_count), 0) AS success_count,
+                    COALESCE(SUM(error_count), 0) AS error_count,
+                    COALESCE(SUM(quota_exhausted_count), 0) AS quota_exhausted_count
+                FROM api_key_usage_buckets
+                WHERE bucket_secs = 86400
+                GROUP BY api_key_id
+            ) AS stats
+            ON stats.api_key_id = ak.id
+            LEFT JOIN api_key_quarantines aq
+            ON aq.key_id = ak.id AND aq.cleared_at IS NULL
+            WHERE ak.deleted_at IS NULL
+        "#
+    }
+
+    fn api_key_metrics_query(include_quarantine_detail: bool) -> String {
+        let quarantine_detail_sql = if include_quarantine_detail {
+            "aq.reason_detail AS quarantine_reason_detail,"
+        } else {
+            "NULL AS quarantine_reason_detail,"
+        };
+        format!(
             r#"
             SELECT
                 ak.id,
@@ -11974,6 +12462,284 @@ impl KeyStore {
                 ak.quota_limit,
                 ak.quota_remaining,
                 ak.quota_synced_at,
+                aq.source AS quarantine_source,
+                aq.reason_code AS quarantine_reason_code,
+                aq.reason_summary AS quarantine_reason_summary,
+                {quarantine_detail_sql}
+                aq.created_at AS quarantine_created_at,
+                COALESCE(stats.total_requests, 0) AS total_requests,
+                COALESCE(stats.success_count, 0) AS success_count,
+                COALESCE(stats.error_count, 0) AS error_count,
+                COALESCE(stats.quota_exhausted_count, 0) AS quota_exhausted_count
+            {}
+            "#,
+            Self::api_key_metrics_from_clause(),
+        )
+    }
+
+    fn map_api_key_metrics_row(row: sqlx::sqlite::SqliteRow) -> Result<ApiKeyMetrics, sqlx::Error> {
+        let id: String = row.try_get("id")?;
+        let status: String = row.try_get("status")?;
+        let group_name: Option<String> = row.try_get("group_name")?;
+        let status_changed_at: Option<i64> = row.try_get("status_changed_at")?;
+        let last_used_at: i64 = row.try_get("last_used_at")?;
+        let deleted_at: Option<i64> = row.try_get("deleted_at")?;
+        let quota_limit: Option<i64> = row.try_get("quota_limit")?;
+        let quota_remaining: Option<i64> = row.try_get("quota_remaining")?;
+        let quota_synced_at: Option<i64> = row.try_get("quota_synced_at")?;
+        let total_requests: i64 = row.try_get("total_requests")?;
+        let success_count: i64 = row.try_get("success_count")?;
+        let error_count: i64 = row.try_get("error_count")?;
+        let quota_exhausted_count: i64 = row.try_get("quota_exhausted_count")?;
+        let quarantine_source: Option<String> = row.try_get("quarantine_source")?;
+        let quarantine_reason_code: Option<String> = row.try_get("quarantine_reason_code")?;
+        let quarantine_reason_summary: Option<String> = row.try_get("quarantine_reason_summary")?;
+        let quarantine_reason_detail: Option<String> = row.try_get("quarantine_reason_detail")?;
+        let quarantine_created_at: Option<i64> = row.try_get("quarantine_created_at")?;
+
+        Ok(ApiKeyMetrics {
+            id,
+            status,
+            group_name: group_name.and_then(|name| {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            }),
+            status_changed_at: status_changed_at.and_then(normalize_timestamp),
+            last_used_at: normalize_timestamp(last_used_at),
+            deleted_at: deleted_at.and_then(normalize_timestamp),
+            quota_limit,
+            quota_remaining,
+            quota_synced_at: quota_synced_at.and_then(normalize_timestamp),
+            total_requests,
+            success_count,
+            error_count,
+            quota_exhausted_count,
+            quarantine: quarantine_source.map(|source| ApiKeyQuarantine {
+                source,
+                reason_code: quarantine_reason_code.unwrap_or_default(),
+                reason_summary: quarantine_reason_summary.unwrap_or_default(),
+                reason_detail: quarantine_reason_detail.unwrap_or_default(),
+                created_at: quarantine_created_at.unwrap_or_default(),
+            }),
+        })
+    }
+
+    fn normalize_api_key_groups(groups: &[String]) -> Vec<String> {
+        let mut normalized = Vec::new();
+        for group in groups {
+            let value = group.trim().to_string();
+            if !normalized.iter().any(|existing| existing == &value) {
+                normalized.push(value);
+            }
+        }
+        normalized
+    }
+
+    fn normalize_api_key_statuses(statuses: &[String]) -> Vec<String> {
+        let mut normalized = Vec::new();
+        for status in statuses {
+            let value = status.trim().to_ascii_lowercase();
+            if value.is_empty() {
+                continue;
+            }
+            if !normalized.iter().any(|existing| existing == &value) {
+                normalized.push(value);
+            }
+        }
+        normalized
+    }
+
+    fn push_api_key_group_filters<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        groups: &'a [String],
+    ) {
+        if groups.is_empty() {
+            return;
+        }
+
+        builder.push(" AND (");
+        for (index, group) in groups.iter().enumerate() {
+            if index > 0 {
+                builder.push(" OR ");
+            }
+            if group.is_empty() {
+                builder.push("(TRIM(COALESCE(ak.group_name, '')) = '')");
+            } else {
+                builder
+                    .push("(TRIM(COALESCE(ak.group_name, '')) = ")
+                    .push_bind(group)
+                    .push(")");
+            }
+        }
+        builder.push(")");
+    }
+
+    fn push_api_key_status_filters<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        statuses: &'a [String],
+    ) {
+        if statuses.is_empty() {
+            return;
+        }
+
+        builder.push(" AND (");
+        for (index, status) in statuses.iter().enumerate() {
+            if index > 0 {
+                builder.push(" OR ");
+            }
+            if status == "quarantined" {
+                builder.push("(aq.key_id IS NOT NULL)");
+            } else {
+                builder
+                    .push("(aq.key_id IS NULL AND ak.status = ")
+                    .push_bind(status)
+                    .push(")");
+            }
+        }
+        builder.push(")");
+    }
+
+    async fn fetch_api_key_group_facets(
+        &self,
+        statuses: &[String],
+    ) -> Result<Vec<ApiKeyFacetCount>, ProxyError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT TRIM(COALESCE(ak.group_name, '')) AS value, COUNT(*) AS count",
+        );
+        builder.push(Self::api_key_metrics_from_clause());
+        Self::push_api_key_status_filters(&mut builder, statuses);
+        builder.push(" GROUP BY value ORDER BY value ASC");
+
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ApiKeyFacetCount {
+                    value: row.try_get("value")?,
+                    count: row.try_get("count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(ProxyError::from)
+    }
+
+    async fn fetch_api_key_status_facets(
+        &self,
+        groups: &[String],
+    ) -> Result<Vec<ApiKeyFacetCount>, ProxyError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT CASE WHEN aq.key_id IS NOT NULL THEN 'quarantined' ELSE ak.status END AS value, COUNT(*) AS count",
+        );
+        builder.push(Self::api_key_metrics_from_clause());
+        Self::push_api_key_group_filters(&mut builder, groups);
+        builder.push(" GROUP BY value ORDER BY value ASC");
+
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ApiKeyFacetCount {
+                    value: row.try_get("value")?,
+                    count: row.try_get("count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(ProxyError::from)
+    }
+
+    async fn fetch_api_key_metrics(
+        &self,
+        include_quarantine_detail: bool,
+    ) -> Result<Vec<ApiKeyMetrics>, ProxyError> {
+        let query = format!(
+            "{} ORDER BY CASE WHEN ak.status = 'active' THEN 0 ELSE 1 END ASC, COALESCE(ak.last_used_at, 0) DESC, ak.id ASC",
+            Self::api_key_metrics_query(include_quarantine_detail),
+        );
+        let rows = sqlx::query(&query).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(Self::map_api_key_metrics_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProxyError::from)
+    }
+
+    async fn fetch_api_key_metrics_page(
+        &self,
+        page: i64,
+        per_page: i64,
+        groups: &[String],
+        statuses: &[String],
+    ) -> Result<PaginatedApiKeyMetrics, ProxyError> {
+        let requested_page = page.max(1);
+        let per_page = per_page.clamp(1, 100);
+        let groups = Self::normalize_api_key_groups(groups);
+        let statuses = Self::normalize_api_key_statuses(statuses);
+
+        let mut count_builder = QueryBuilder::<Sqlite>::new("SELECT COUNT(*)");
+        count_builder.push(Self::api_key_metrics_from_clause());
+        Self::push_api_key_group_filters(&mut count_builder, &groups);
+        Self::push_api_key_status_filters(&mut count_builder, &statuses);
+        let total = count_builder
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await?;
+        let total_pages = ((total + per_page - 1) / per_page).max(1);
+        let page = requested_page.min(total_pages);
+        let offset = (page - 1) * per_page;
+
+        let mut items_builder = QueryBuilder::<Sqlite>::new(Self::api_key_metrics_query(false));
+        Self::push_api_key_group_filters(&mut items_builder, &groups);
+        Self::push_api_key_status_filters(&mut items_builder, &statuses);
+        items_builder.push(
+            " ORDER BY CASE WHEN ak.status = 'active' THEN 0 ELSE 1 END ASC, COALESCE(ak.last_used_at, 0) DESC, ak.id ASC",
+        );
+        items_builder.push(" LIMIT ").push_bind(per_page);
+        items_builder.push(" OFFSET ").push_bind(offset);
+        let items = items_builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(Self::map_api_key_metrics_row)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let group_counts = self.fetch_api_key_group_facets(&statuses).await?;
+        let status_counts = self.fetch_api_key_status_facets(&groups).await?;
+
+        Ok(PaginatedApiKeyMetrics {
+            items,
+            total,
+            page,
+            per_page,
+            facets: ApiKeyListFacets {
+                groups: group_counts,
+                statuses: status_counts,
+            },
+        })
+    }
+
+    async fn fetch_api_key_metric_by_id(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<ApiKeyMetrics>, ProxyError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                ak.id,
+                ak.status,
+                ak.group_name,
+                ak.status_changed_at,
+                ak.last_used_at,
+                ak.deleted_at,
+                ak.quota_limit,
+                ak.quota_remaining,
+                ak.quota_synced_at,
+                aq.source AS quarantine_source,
+                aq.reason_code AS quarantine_reason_code,
+                aq.reason_summary AS quarantine_reason_summary,
+                aq.reason_detail AS quarantine_reason_detail,
+                aq.created_at AS quarantine_created_at,
                 COALESCE(stats.total_requests, 0) AS total_requests,
                 COALESCE(stats.success_count, 0) AS success_count,
                 COALESCE(stats.error_count, 0) AS error_count,
@@ -11991,56 +12757,70 @@ impl KeyStore {
                 GROUP BY api_key_id
             ) AS stats
             ON stats.api_key_id = ak.id
-            WHERE ak.deleted_at IS NULL
-            ORDER BY ak.status ASC, ak.last_used_at ASC, ak.id ASC
+            LEFT JOIN api_key_quarantines aq
+            ON aq.key_id = ak.id AND aq.cleared_at IS NULL
+            WHERE ak.deleted_at IS NULL AND ak.id = ?
+            LIMIT 1
             "#,
         )
-        .fetch_all(&self.pool)
+        .bind(key_id)
+        .fetch_optional(&self.pool)
         .await?;
 
-        let metrics = rows
-            .into_iter()
-            .map(|row| -> Result<ApiKeyMetrics, sqlx::Error> {
-                let id: String = row.try_get("id")?;
-                let status: String = row.try_get("status")?;
-                let group_name: Option<String> = row.try_get("group_name")?;
-                let status_changed_at: Option<i64> = row.try_get("status_changed_at")?;
-                let last_used_at: i64 = row.try_get("last_used_at")?;
-                let deleted_at: Option<i64> = row.try_get("deleted_at")?;
-                let quota_limit: Option<i64> = row.try_get("quota_limit")?;
-                let quota_remaining: Option<i64> = row.try_get("quota_remaining")?;
-                let quota_synced_at: Option<i64> = row.try_get("quota_synced_at")?;
-                let total_requests: i64 = row.try_get("total_requests")?;
-                let success_count: i64 = row.try_get("success_count")?;
-                let error_count: i64 = row.try_get("error_count")?;
-                let quota_exhausted_count: i64 = row.try_get("quota_exhausted_count")?;
+        row.map(|row| -> Result<ApiKeyMetrics, sqlx::Error> {
+            let id: String = row.try_get("id")?;
+            let status: String = row.try_get("status")?;
+            let group_name: Option<String> = row.try_get("group_name")?;
+            let status_changed_at: Option<i64> = row.try_get("status_changed_at")?;
+            let last_used_at: i64 = row.try_get("last_used_at")?;
+            let deleted_at: Option<i64> = row.try_get("deleted_at")?;
+            let quota_limit: Option<i64> = row.try_get("quota_limit")?;
+            let quota_remaining: Option<i64> = row.try_get("quota_remaining")?;
+            let quota_synced_at: Option<i64> = row.try_get("quota_synced_at")?;
+            let total_requests: i64 = row.try_get("total_requests")?;
+            let success_count: i64 = row.try_get("success_count")?;
+            let error_count: i64 = row.try_get("error_count")?;
+            let quota_exhausted_count: i64 = row.try_get("quota_exhausted_count")?;
+            let quarantine_source: Option<String> = row.try_get("quarantine_source")?;
+            let quarantine_reason_code: Option<String> = row.try_get("quarantine_reason_code")?;
+            let quarantine_reason_summary: Option<String> =
+                row.try_get("quarantine_reason_summary")?;
+            let quarantine_reason_detail: Option<String> =
+                row.try_get("quarantine_reason_detail")?;
+            let quarantine_created_at: Option<i64> = row.try_get("quarantine_created_at")?;
 
-                Ok(ApiKeyMetrics {
-                    id,
-                    status,
-                    group_name: group_name.and_then(|name| {
-                        let trimmed = name.trim();
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed.to_owned())
-                        }
-                    }),
-                    status_changed_at: status_changed_at.and_then(normalize_timestamp),
-                    last_used_at: normalize_timestamp(last_used_at),
-                    deleted_at: deleted_at.and_then(normalize_timestamp),
-                    quota_limit,
-                    quota_remaining,
-                    quota_synced_at: quota_synced_at.and_then(normalize_timestamp),
-                    total_requests,
-                    success_count,
-                    error_count,
-                    quota_exhausted_count,
-                })
+            Ok(ApiKeyMetrics {
+                id,
+                status,
+                group_name: group_name.and_then(|name| {
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_owned())
+                    }
+                }),
+                status_changed_at: status_changed_at.and_then(normalize_timestamp),
+                last_used_at: normalize_timestamp(last_used_at),
+                deleted_at: deleted_at.and_then(normalize_timestamp),
+                quota_limit,
+                quota_remaining,
+                quota_synced_at: quota_synced_at.and_then(normalize_timestamp),
+                total_requests,
+                success_count,
+                error_count,
+                quota_exhausted_count,
+                quarantine: quarantine_source.map(|source| ApiKeyQuarantine {
+                    source,
+                    reason_code: quarantine_reason_code.unwrap_or_default(),
+                    reason_summary: quarantine_reason_summary.unwrap_or_default(),
+                    reason_detail: quarantine_reason_detail.unwrap_or_default(),
+                    created_at: quarantine_created_at.unwrap_or_default(),
+                }),
             })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(metrics)
+        })
+        .transpose()
+        .map_err(ProxyError::from)
     }
 
     async fn fetch_recent_logs(&self, limit: usize) -> Result<Vec<RequestLogRecord>, ProxyError> {
@@ -12272,7 +13052,13 @@ impl KeyStore {
             r#"
             SELECT id
             FROM api_keys
-            WHERE deleted_at IS NULL AND (
+            WHERE deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM api_key_quarantines aq
+                  WHERE aq.key_id = api_keys.id AND aq.cleared_at IS NULL
+              )
+              AND (
                 quota_synced_at IS NULL OR quota_synced_at = 0 OR quota_synced_at < ?
             )
             ORDER BY CASE WHEN quota_synced_at IS NULL OR quota_synced_at = 0 THEN 0 ELSE 1 END, quota_synced_at ASC
@@ -12326,9 +13112,19 @@ impl KeyStore {
     async fn list_recent_jobs(&self, limit: usize) -> Result<Vec<JobLog>, ProxyError> {
         let limit = limit.clamp(1, 500) as i64;
         let rows = sqlx::query(
-            r#"SELECT id, job_type, key_id, status, attempt, message, started_at, finished_at
-                FROM scheduled_jobs
-                ORDER BY started_at DESC, id DESC
+            r#"SELECT
+                    j.id,
+                    j.job_type,
+                    j.key_id,
+                    k.group_name AS key_group,
+                    j.status,
+                    j.attempt,
+                    j.message,
+                    j.started_at,
+                    j.finished_at
+                FROM scheduled_jobs j
+                LEFT JOIN api_keys k ON k.id = j.key_id
+                ORDER BY j.started_at DESC, j.id DESC
                 LIMIT ?"#,
         )
         .bind(limit)
@@ -12341,6 +13137,7 @@ impl KeyStore {
                     id: row.try_get("id")?,
                     job_type: row.try_get("job_type")?,
                     key_id: row.try_get::<Option<String>, _>("key_id")?,
+                    key_group: row.try_get::<Option<String>, _>("key_group")?,
                     status: row.try_get("status")?,
                     attempt: row.try_get("attempt")?,
                     message: row.try_get::<Option<String>, _>("message")?,
@@ -12363,23 +13160,40 @@ impl KeyStore {
         let offset = ((page - 1) as i64).saturating_mul(per_page);
 
         let where_clause = match group {
+            "quota" => "WHERE j.job_type = 'quota_sync' OR j.job_type = 'quota_sync/manual'",
+            "usage" => "WHERE j.job_type = 'token_usage_rollup'",
+            "logs" => "WHERE j.job_type = 'auth_token_logs_gc' OR j.job_type = 'request_logs_gc'",
+            _ => "",
+        };
+
+        let count_where_clause = match group {
             "quota" => "WHERE job_type = 'quota_sync' OR job_type = 'quota_sync/manual'",
             "usage" => "WHERE job_type = 'token_usage_rollup'",
             "logs" => "WHERE job_type = 'auth_token_logs_gc' OR job_type = 'request_logs_gc'",
             _ => "",
         };
 
-        let count_query = format!("SELECT COUNT(*) FROM scheduled_jobs {}", where_clause);
+        let count_query = format!("SELECT COUNT(*) FROM scheduled_jobs {}", count_where_clause);
         let total: i64 = sqlx::query_scalar(&count_query)
             .fetch_one(&self.pool)
             .await?;
 
         let select_query = format!(
             r#"
-            SELECT id, job_type, key_id, status, attempt, message, started_at, finished_at
-            FROM scheduled_jobs
+            SELECT
+                j.id,
+                j.job_type,
+                j.key_id,
+                k.group_name AS key_group,
+                j.status,
+                j.attempt,
+                j.message,
+                j.started_at,
+                j.finished_at
+            FROM scheduled_jobs j
+            LEFT JOIN api_keys k ON k.id = j.key_id
             {}
-            ORDER BY started_at DESC, id DESC
+            ORDER BY j.started_at DESC, j.id DESC
             LIMIT ? OFFSET ?
             "#,
             where_clause
@@ -12398,6 +13212,7 @@ impl KeyStore {
                     id: row.try_get("id")?,
                     job_type: row.try_get("job_type")?,
                     key_id: row.try_get::<Option<String>, _>("key_id")?,
+                    key_group: row.try_get::<Option<String>, _>("key_group")?,
                     status: row.try_get("status")?,
                     attempt: row.try_get("attempt")?,
                     message: row.try_get::<Option<String>, _>("message")?,
@@ -12469,10 +13284,13 @@ impl KeyStore {
         let key_counts_row = sqlx::query(
             r#"
             SELECT
-                COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS active_keys,
-                COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS exhausted_keys
-            FROM api_keys
-            WHERE deleted_at IS NULL
+                COALESCE(SUM(CASE WHEN ak.status = ? AND aq.key_id IS NULL THEN 1 ELSE 0 END), 0) AS active_keys,
+                COALESCE(SUM(CASE WHEN ak.status = ? AND aq.key_id IS NULL THEN 1 ELSE 0 END), 0) AS exhausted_keys,
+                COALESCE(SUM(CASE WHEN aq.key_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS quarantined_keys
+            FROM api_keys ak
+            LEFT JOIN api_key_quarantines aq
+              ON aq.key_id = ak.id AND aq.cleared_at IS NULL
+            WHERE ak.deleted_at IS NULL
             "#,
         )
         .bind(STATUS_ACTIVE)
@@ -12492,8 +13310,11 @@ impl KeyStore {
             r#"
             SELECT COALESCE(SUM(quota_limit), 0) AS total_quota_limit,
                    COALESCE(SUM(quota_remaining), 0) AS total_quota_remaining
-            FROM api_keys
-            WHERE deleted_at IS NULL
+            FROM api_keys ak
+            LEFT JOIN api_key_quarantines aq
+              ON aq.key_id = ak.id AND aq.cleared_at IS NULL
+            WHERE ak.deleted_at IS NULL
+              AND aq.key_id IS NULL
             "#,
         )
         .fetch_one(&self.pool)
@@ -12506,6 +13327,7 @@ impl KeyStore {
             quota_exhausted_count: totals_row.try_get("quota_exhausted_count")?,
             active_keys: key_counts_row.try_get("active_keys")?,
             exhausted_keys: key_counts_row.try_get("exhausted_keys")?,
+            quarantined_keys: key_counts_row.try_get("quarantined_keys")?,
             last_activity,
             total_quota_limit: quotas_row.try_get("total_quota_limit")?,
             total_quota_remaining: quotas_row.try_get("total_quota_remaining")?,
@@ -12776,6 +13598,37 @@ pub struct ApiKeyMetrics {
     pub success_count: i64,
     pub error_count: i64,
     pub quota_exhausted_count: i64,
+    pub quarantine: Option<ApiKeyQuarantine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyFacetCount {
+    pub value: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyListFacets {
+    pub groups: Vec<ApiKeyFacetCount>,
+    pub statuses: Vec<ApiKeyFacetCount>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaginatedApiKeyMetrics {
+    pub items: Vec<ApiKeyMetrics>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+    pub facets: ApiKeyListFacets,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyQuarantine {
+    pub source: String,
+    pub reason_code: String,
+    pub reason_summary: String,
+    pub reason_detail: String,
+    pub created_at: i64,
 }
 
 /// 单条请求日志记录的关键信息。
@@ -12807,6 +13660,7 @@ pub struct ProxySummary {
     pub quota_exhausted_count: i64,
     pub active_keys: i64,
     pub exhausted_keys: i64,
+    pub quarantined_keys: i64,
     pub last_activity: Option<i64>,
     pub total_quota_limit: i64,
     pub total_quota_remaining: i64,
@@ -12825,6 +13679,7 @@ pub struct JobLog {
     pub id: i64,
     pub job_type: String,
     pub key_id: Option<String>,
+    pub key_group: Option<String>,
     pub status: String,
     pub attempt: i64,
     pub message: Option<String>,
@@ -13259,11 +14114,25 @@ fn log_proxy_error(key: &str, method: &Method, path: &str, query: Option<&str>, 
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineDecision {
+    pub reason_code: String,
+    pub reason_summary: String,
+    pub reason_detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyHealthAction {
+    None,
+    MarkExhausted,
+    Quarantine(QuarantineDecision),
+}
+
+#[derive(Debug, Clone)]
 pub struct AttemptAnalysis {
     pub status: &'static str,
-    pub mark_exhausted: bool,
     pub tavily_status_code: Option<i64>,
+    pub key_health_action: KeyHealthAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13277,8 +14146,10 @@ fn analyze_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis {
     if !status.is_success() {
         return AttemptAnalysis {
             status: OUTCOME_ERROR,
-            mark_exhausted: false,
             tavily_status_code: Some(status.as_u16() as i64),
+            key_health_action: classify_quarantine_reason(Some(status.as_u16() as i64), body)
+                .map(KeyHealthAction::Quarantine)
+                .unwrap_or(KeyHealthAction::None),
         };
     }
 
@@ -13287,8 +14158,8 @@ fn analyze_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis {
         Err(_) => {
             return AttemptAnalysis {
                 status: OUTCOME_UNKNOWN,
-                mark_exhausted: false,
                 tavily_status_code: None,
+                key_health_action: KeyHealthAction::None,
             };
         }
     };
@@ -13317,8 +14188,8 @@ fn analyze_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis {
                 MessageOutcome::QuotaExhausted => {
                     return AttemptAnalysis {
                         status: OUTCOME_QUOTA_EXHAUSTED,
-                        mark_exhausted: true,
                         tavily_status_code: code.or(detected_code),
+                        key_health_action: KeyHealthAction::MarkExhausted,
                     };
                 }
                 MessageOutcome::Error => {
@@ -13332,23 +14203,25 @@ fn analyze_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis {
     if any_error {
         return AttemptAnalysis {
             status: OUTCOME_ERROR,
-            mark_exhausted: false,
             tavily_status_code: detected_code,
+            key_health_action: classify_quarantine_reason(detected_code, body)
+                .map(KeyHealthAction::Quarantine)
+                .unwrap_or(KeyHealthAction::None),
         };
     }
 
     if any_success {
         return AttemptAnalysis {
             status: OUTCOME_SUCCESS,
-            mark_exhausted: false,
             tavily_status_code: detected_code,
+            key_health_action: KeyHealthAction::None,
         };
     }
 
     AttemptAnalysis {
         status: OUTCOME_UNKNOWN,
-        mark_exhausted: false,
         tavily_status_code: detected_code,
+        key_health_action: KeyHealthAction::None,
     }
 }
 
@@ -13385,16 +14258,21 @@ pub fn analyze_http_attempt(status: StatusCode, body: &[u8]) -> AttemptAnalysis 
         };
     }
 
-    let (status_str, mark_exhausted) = match outcome {
-        MessageOutcome::Success => (OUTCOME_SUCCESS, false),
-        MessageOutcome::Error => (OUTCOME_ERROR, false),
-        MessageOutcome::QuotaExhausted => (OUTCOME_QUOTA_EXHAUSTED, true),
+    let (status_str, key_health_action) = match outcome {
+        MessageOutcome::Success => (OUTCOME_SUCCESS, KeyHealthAction::None),
+        MessageOutcome::Error => (
+            OUTCOME_ERROR,
+            classify_quarantine_reason(Some(effective), body)
+                .map(KeyHealthAction::Quarantine)
+                .unwrap_or(KeyHealthAction::None),
+        ),
+        MessageOutcome::QuotaExhausted => (OUTCOME_QUOTA_EXHAUSTED, KeyHealthAction::MarkExhausted),
     };
 
     AttemptAnalysis {
         status: status_str,
-        mark_exhausted,
         tavily_status_code: Some(effective),
+        key_health_action,
     }
 }
 
@@ -13684,6 +14562,62 @@ fn extract_status_code(value: &Value) -> Option<i64> {
     }
 
     None
+}
+
+fn classify_quarantine_reason(status_code: Option<i64>, body: &[u8]) -> Option<QuarantineDecision> {
+    if let Some(code) = status_code
+        && code != 401
+        && code != 403
+    {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(body);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let status_label = status_code
+        .map(|code| format!("HTTP {code}"))
+        .unwrap_or_else(|| "MCP error".to_string());
+    let (reason_code, reason_summary) = if normalized.contains("deactivated") {
+        (
+            "account_deactivated",
+            format!("Tavily account deactivated ({status_label})"),
+        )
+    } else if normalized.contains("revoked") {
+        (
+            "key_revoked",
+            format!("Tavily key revoked ({status_label})"),
+        )
+    } else if normalized.contains("invalid api key")
+        || normalized.contains("invalid_token")
+        || normalized.contains("api key is invalid")
+    {
+        (
+            "invalid_api_key",
+            format!("Tavily rejected the API key as invalid ({status_label})"),
+        )
+    } else {
+        return None;
+    };
+
+    Some(QuarantineDecision {
+        reason_code: reason_code.to_string(),
+        reason_summary,
+        reason_detail: truncate_text(trimmed, QUARANTINE_REASON_DETAIL_MAX_LEN),
+    })
+}
+
+fn truncate_text(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut truncated = input.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn extract_status_text(value: &Value) -> Option<&str> {
@@ -14421,7 +15355,10 @@ fn redact_api_key_bytes(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, routing::post};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
     use tokio::net::TcpListener;
@@ -14574,7 +15511,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
 
         let analysis = analyze_mcp_attempt(StatusCode::OK, body);
         assert_eq!(analysis.status, OUTCOME_ERROR);
-        assert!(!analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::None);
         assert_eq!(analysis.tavily_status_code, Some(200));
     }
 
@@ -14953,7 +15890,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         let body = br#"{"query":"test","results":[]}"#;
         let analysis = analyze_http_attempt(StatusCode::OK, body);
         assert_eq!(analysis.status, OUTCOME_SUCCESS);
-        assert!(!analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::None);
         assert_eq!(analysis.tavily_status_code, Some(200));
     }
 
@@ -14962,7 +15899,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         let body = br#"{"status":432,"error":"quota_exhausted"}"#;
         let analysis = analyze_http_attempt(StatusCode::OK, body);
         assert_eq!(analysis.status, OUTCOME_QUOTA_EXHAUSTED);
-        assert!(analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::MarkExhausted);
         assert_eq!(analysis.tavily_status_code, Some(432));
     }
 
@@ -14971,7 +15908,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         let body = br#"{"error":"upstream failed"}"#;
         let analysis = analyze_http_attempt(StatusCode::INTERNAL_SERVER_ERROR, body);
         assert_eq!(analysis.status, OUTCOME_ERROR);
-        assert!(!analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::None);
         assert_eq!(analysis.tavily_status_code, Some(500));
     }
 
@@ -14980,7 +15917,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         let body = br#"{"status":"failed"}"#;
         let analysis = analyze_http_attempt(StatusCode::OK, body);
         assert_eq!(analysis.status, OUTCOME_ERROR);
-        assert!(!analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::None);
         assert_eq!(analysis.tavily_status_code, Some(200));
     }
 
@@ -14989,7 +15926,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         let body = br#"{"status":"pending"}"#;
         let analysis = analyze_http_attempt(StatusCode::OK, body);
         assert_eq!(analysis.status, OUTCOME_SUCCESS);
-        assert!(!analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::None);
         assert_eq!(analysis.tavily_status_code, Some(200));
     }
 
@@ -14998,8 +15935,23 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         let body = br#"{"status":432,"detail":{"status":"failed"}}"#;
         let analysis = analyze_http_attempt(StatusCode::OK, body);
         assert_eq!(analysis.status, OUTCOME_QUOTA_EXHAUSTED);
-        assert!(analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::MarkExhausted);
         assert_eq!(analysis.tavily_status_code, Some(432));
+    }
+
+    #[test]
+    fn analyze_http_attempt_marks_401_deactivated_as_quarantine() {
+        let body = br#"{"detail":{"error":"The account associated with this API key has been deactivated."}}"#;
+        let analysis = analyze_http_attempt(StatusCode::UNAUTHORIZED, body);
+        assert_eq!(analysis.status, OUTCOME_ERROR);
+        match analysis.key_health_action {
+            KeyHealthAction::Quarantine(decision) => {
+                assert_eq!(decision.reason_code, "account_deactivated");
+                assert!(decision.reason_summary.contains("HTTP 401"));
+            }
+            other => panic!("expected quarantine action, got {other:?}"),
+        }
+        assert_eq!(analysis.tavily_status_code, Some(401));
     }
 
     #[test]
@@ -15093,7 +16045,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             .expect("proxy search succeeded");
 
         assert_eq!(analysis.status, OUTCOME_QUOTA_EXHAUSTED);
-        assert!(analysis.mark_exhausted);
+        assert_eq!(analysis.key_health_action, KeyHealthAction::MarkExhausted);
         assert_eq!(analysis.tavily_status_code, Some(432));
 
         // Verify that the key is marked exhausted in the database.
@@ -15182,6 +16134,746 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             )
             .await
             .expect("proxy request succeeds");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn proxy_http_json_endpoint_quarantines_key_on_401_deactivated() {
+        let db_path = temp_db_path("http-json-quarantine-401");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let expected_api_key = "tvly-http-quarantine-key";
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let app = Router::new().route(
+            "/search",
+            post(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "detail": {
+                            "error": "The account associated with this API key has been deactivated."
+                        }
+                    })),
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let usage_base = format!("http://{}", addr);
+        let headers = HeaderMap::new();
+        let options = serde_json::json!({ "query": "test" });
+
+        let (_resp, analysis) = proxy
+            .proxy_http_search(
+                &usage_base,
+                Some("tok1"),
+                &Method::POST,
+                "/api/tavily/search",
+                options,
+                &headers,
+            )
+            .await
+            .expect("proxy search succeeded");
+
+        assert_eq!(analysis.status, OUTCOME_ERROR);
+        match analysis.key_health_action {
+            KeyHealthAction::Quarantine(ref decision) => {
+                assert_eq!(decision.reason_code, "account_deactivated");
+            }
+            ref other => panic!("expected quarantine action, got {other:?}"),
+        }
+
+        let store = proxy.key_store.clone();
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM api_keys WHERE api_key = ?")
+            .bind(expected_api_key)
+            .fetch_one(&store.pool)
+            .await
+            .expect("key row exists");
+        assert_eq!(status, STATUS_ACTIVE);
+
+        let quarantine_row = sqlx::query(
+            r#"SELECT source, reason_code, cleared_at FROM api_key_quarantines
+               WHERE key_id = (SELECT id FROM api_keys WHERE api_key = ?) AND cleared_at IS NULL"#,
+        )
+        .bind(expected_api_key)
+        .fetch_one(&store.pool)
+        .await
+        .expect("quarantine row exists");
+        let source: String = quarantine_row.try_get("source").expect("source");
+        let reason_code: String = quarantine_row.try_get("reason_code").expect("reason_code");
+        let cleared_at: Option<i64> = quarantine_row.try_get("cleared_at").expect("cleared_at");
+        assert_eq!(source, "/api/tavily/search");
+        assert_eq!(reason_code, "account_deactivated");
+        assert!(cleared_at.is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn proxy_request_quarantines_key_on_mcp_unauthorized() {
+        let db_path = temp_db_path("mcp-quarantine-401");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "message": "Unauthorized: invalid api key"
+                        },
+                        "id": 1
+                    })),
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let expected_api_key = "tvly-mcp-quarantine-key";
+        let upstream = format!("http://{addr}/mcp");
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+
+        let request = ProxyRequest {
+            method: Method::POST,
+            path: "/mcp".to_string(),
+            query: None,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#),
+            auth_token_id: Some("tok1".to_string()),
+        };
+
+        let response = proxy.proxy_request(request).await.expect("proxy response");
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+
+        let store = proxy.key_store.clone();
+        let quarantine_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM api_key_quarantines
+               WHERE key_id = (SELECT id FROM api_keys WHERE api_key = ?) AND cleared_at IS NULL"#,
+        )
+        .bind(expected_api_key)
+        .fetch_one(&store.pool)
+        .await
+        .expect("count quarantine rows");
+        assert_eq!(quarantine_count, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn proxy_request_quarantines_key_on_mcp_error_body_without_http_status() {
+        let db_path = temp_db_path("mcp-quarantine-jsonrpc-error");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "message": "Unauthorized: invalid api key"
+                    },
+                    "id": 1
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let expected_api_key = "tvly-mcp-jsonrpc-error-key";
+        let upstream = format!("http://{addr}/mcp");
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+
+        let request = ProxyRequest {
+            method: Method::POST,
+            path: "/mcp".to_string(),
+            query: None,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#),
+            auth_token_id: Some("tok1".to_string()),
+        };
+
+        let response = proxy.proxy_request(request).await.expect("proxy response");
+        assert_eq!(response.status, StatusCode::OK);
+
+        let quarantine_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM api_key_quarantines
+               WHERE key_id = (SELECT id FROM api_keys WHERE api_key = ?) AND cleared_at IS NULL"#,
+        )
+        .bind(expected_api_key)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("count quarantine rows");
+        assert_eq!(quarantine_count, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn research_result_keeps_affinity_when_original_key_is_quarantined() {
+        let db_path = temp_db_path("research-affinity-quarantine");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![
+                "tvly-research-affinity-a".to_string(),
+                "tvly-research-affinity-b".to_string(),
+            ],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, api_key FROM api_keys ORDER BY api_key ASC",
+        )
+        .fetch_all(&proxy.key_store.pool)
+        .await
+        .expect("fetch keys");
+        let (affinity_key_id, _other_key_id) =
+            rows.into_iter()
+                .fold((None, None), |mut acc, (id, secret)| {
+                    if secret == "tvly-research-affinity-a" {
+                        acc.0 = Some(id);
+                    } else if secret == "tvly-research-affinity-b" {
+                        acc.1 = Some(id);
+                    }
+                    acc
+                });
+        let affinity_key_id = affinity_key_id.expect("affinity key exists");
+        let request_id = "req-affinity-quarantine";
+
+        proxy
+            .record_research_request_affinity(request_id, &affinity_key_id, "tok1")
+            .await
+            .expect("record research affinity");
+        proxy
+            .key_store
+            .quarantine_key_by_id(
+                &affinity_key_id,
+                "/api/tavily/search",
+                "account_deactivated",
+                "Tavily account deactivated (HTTP 401)",
+                "deactivated",
+            )
+            .await
+            .expect("quarantine affinity key");
+
+        let err = proxy
+            .acquire_key_for_research_request(Some("tok1"), Some(request_id))
+            .await
+            .expect_err("result retrieval should not fall back to a different key");
+        assert!(matches!(err, ProxyError::NoAvailableKeys));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn classify_quarantine_reason_ignores_generic_unauthorized_errors() {
+        let unauthorized = classify_quarantine_reason(Some(401), br#"{"error":"unauthorized"}"#);
+        assert!(unauthorized.is_none());
+
+        let forbidden = classify_quarantine_reason(Some(403), br#"{"error":"forbidden"}"#);
+        assert!(forbidden.is_none());
+
+        let invalid_payload_key =
+            classify_quarantine_reason(None, br#"{"error":"invalid key \"depth\""}"#);
+        assert!(invalid_payload_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn quarantined_keys_are_excluded_until_admin_clears_them() {
+        let db_path = temp_db_path("quarantine-acquire");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![
+                "tvly-quarantine-a".to_string(),
+                "tvly-quarantine-b".to_string(),
+            ],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, api_key FROM api_keys ORDER BY api_key ASC",
+        )
+        .fetch_all(&proxy.key_store.pool)
+        .await
+        .expect("fetch keys");
+        let (first_id, _first_secret) = rows
+            .into_iter()
+            .find(|(_, secret)| secret == "tvly-quarantine-a")
+            .expect("first key exists");
+
+        assert!(
+            proxy
+                .key_store
+                .try_acquire_specific_key(&first_id)
+                .await
+                .expect("acquire specific before quarantine")
+                .is_some()
+        );
+
+        proxy
+            .key_store
+            .quarantine_key_by_id(
+                &first_id,
+                "/api/tavily/search",
+                "account_deactivated",
+                "Tavily account deactivated (HTTP 401)",
+                "deactivated",
+            )
+            .await
+            .expect("quarantine key");
+
+        assert!(
+            proxy
+                .key_store
+                .try_acquire_specific_key(&first_id)
+                .await
+                .expect("acquire specific after quarantine")
+                .is_none()
+        );
+
+        let summary = proxy.summary().await.expect("summary");
+        assert_eq!(summary.active_keys, 1);
+        assert_eq!(summary.quarantined_keys, 1);
+
+        proxy
+            .clear_key_quarantine_by_id(&first_id)
+            .await
+            .expect("clear quarantine");
+
+        assert!(
+            proxy
+                .key_store
+                .try_acquire_specific_key(&first_id)
+                .await
+                .expect("acquire specific after clear")
+                .is_some()
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn quarantine_key_by_id_is_safe_under_concurrent_calls() {
+        let db_path = temp_db_path("quarantine-concurrent");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-quarantine-race".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+            .fetch_one(&proxy.key_store.pool)
+            .await
+            .expect("seeded key id");
+        let store = proxy.key_store.clone();
+
+        let first = {
+            let store = store.clone();
+            let key_id = key_id.clone();
+            async move {
+                store
+                    .quarantine_key_by_id(
+                        &key_id,
+                        "/api/tavily/search",
+                        "account_deactivated",
+                        "Tavily account deactivated (HTTP 401)",
+                        "first detail",
+                    )
+                    .await
+            }
+        };
+        let second = {
+            let store = store.clone();
+            let key_id = key_id.clone();
+            async move {
+                store
+                    .quarantine_key_by_id(
+                        &key_id,
+                        "/api/tavily/search",
+                        "account_deactivated",
+                        "Tavily account deactivated (HTTP 401)",
+                        "second detail",
+                    )
+                    .await
+            }
+        };
+
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.expect("first quarantine succeeds");
+        second_result.expect("second quarantine succeeds");
+
+        let quarantine_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
+        )
+        .bind(&key_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("count quarantine rows");
+        assert_eq!(quarantine_count, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn quarantine_key_by_id_preserves_original_created_at() {
+        let db_path = temp_db_path("quarantine-created-at");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-quarantine-created-at".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+            .fetch_one(&proxy.key_store.pool)
+            .await
+            .expect("seeded key id");
+
+        proxy
+            .key_store
+            .quarantine_key_by_id(
+                &key_id,
+                "/api/tavily/search",
+                "account_deactivated",
+                "Tavily account deactivated (HTTP 401)",
+                "first detail",
+            )
+            .await
+            .expect("first quarantine");
+
+        let first_created_at: i64 = sqlx::query_scalar(
+            "SELECT created_at FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
+        )
+        .bind(&key_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("first created_at");
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        proxy
+            .key_store
+            .quarantine_key_by_id(
+                &key_id,
+                "/api/tavily/search",
+                "account_deactivated",
+                "Tavily account deactivated (HTTP 401)",
+                "second detail",
+            )
+            .await
+            .expect("second quarantine");
+
+        let second_created_at: i64 = sqlx::query_scalar(
+            "SELECT created_at FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
+        )
+        .bind(&key_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("second created_at");
+        assert_eq!(second_created_at, first_created_at);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn list_keys_pending_quota_sync_skips_quarantined_keys() {
+        let db_path = temp_db_path("quota-sync-skip-quarantine");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![
+                "tvly-quota-sync-a".to_string(),
+                "tvly-quota-sync-b".to_string(),
+            ],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, api_key FROM api_keys ORDER BY api_key ASC",
+        )
+        .fetch_all(&proxy.key_store.pool)
+        .await
+        .expect("fetch keys");
+        let (quarantined_id, active_id) =
+            rows.into_iter()
+                .fold((None, None), |mut acc, (id, secret)| {
+                    if secret == "tvly-quota-sync-a" {
+                        acc.0 = Some(id);
+                    } else if secret == "tvly-quota-sync-b" {
+                        acc.1 = Some(id);
+                    }
+                    acc
+                });
+        let quarantined_id = quarantined_id.expect("quarantined key exists");
+        let active_id = active_id.expect("active key exists");
+
+        proxy
+            .key_store
+            .quarantine_key_by_id(
+                &quarantined_id,
+                "/api/tavily/usage",
+                "account_deactivated",
+                "Tavily account deactivated (HTTP 401)",
+                "deactivated",
+            )
+            .await
+            .expect("quarantine key");
+
+        let pending = proxy
+            .list_keys_pending_quota_sync(24 * 60 * 60)
+            .await
+            .expect("list pending keys");
+        assert_eq!(pending, vec![active_id]);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn summary_quota_totals_exclude_quarantined_keys() {
+        let db_path = temp_db_path("summary-quota-excludes-quarantine");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec![
+                "tvly-summary-quota-a".to_string(),
+                "tvly-summary-quota-b".to_string(),
+            ],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, api_key FROM api_keys ORDER BY api_key ASC",
+        )
+        .fetch_all(&proxy.key_store.pool)
+        .await
+        .expect("fetch keys");
+        let (quarantined_id, active_id) =
+            rows.into_iter()
+                .fold((None, None), |mut acc, (id, secret)| {
+                    if secret == "tvly-summary-quota-a" {
+                        acc.0 = Some(id);
+                    } else if secret == "tvly-summary-quota-b" {
+                        acc.1 = Some(id);
+                    }
+                    acc
+                });
+        let quarantined_id = quarantined_id.expect("quarantined key exists");
+        let active_id = active_id.expect("active key exists");
+
+        proxy
+            .key_store
+            .update_quota_for_key(&quarantined_id, 100, 80, Utc::now().timestamp())
+            .await
+            .expect("update quarantined key quota");
+        proxy
+            .key_store
+            .update_quota_for_key(&active_id, 50, 40, Utc::now().timestamp())
+            .await
+            .expect("update active key quota");
+        proxy
+            .key_store
+            .quarantine_key_by_id(
+                &quarantined_id,
+                "/api/tavily/search",
+                "account_deactivated",
+                "Tavily account deactivated (HTTP 401)",
+                "deactivated",
+            )
+            .await
+            .expect("quarantine key");
+
+        let summary = proxy.summary().await.expect("summary");
+        assert_eq!(summary.total_quota_limit, 50);
+        assert_eq!(summary.total_quota_remaining, 40);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn research_usage_probe_401_quarantines_key() {
+        let db_path = temp_db_path("research-usage-quarantine");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let expected_api_key = "tvly-research-quarantine-key";
+        let proxy = TavilyProxy::with_endpoint(
+            vec![expected_api_key.to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let app = Router::new().route(
+            "/usage",
+            get(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "invalid api key",
+                    })),
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let usage_base = format!("http://{}", addr);
+        let headers = HeaderMap::new();
+        let options = serde_json::json!({ "query": "test research" });
+
+        let err = proxy
+            .proxy_http_research_with_usage_diff(
+                &usage_base,
+                Some("tok1"),
+                &Method::POST,
+                "/api/tavily/research",
+                options,
+                &headers,
+                false,
+            )
+            .await
+            .expect_err("research should fail when usage probe is unauthorized");
+
+        match err {
+            ProxyError::UsageHttp { status, .. } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+            }
+            other => panic!("expected usage http error, got {other:?}"),
+        }
+
+        let quarantine_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM api_key_quarantines
+               WHERE key_id = (SELECT id FROM api_keys WHERE api_key = ?) AND cleared_at IS NULL"#,
+        )
+        .bind(expected_api_key)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("count quarantine rows");
+        assert_eq!(quarantine_count, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn sync_key_quota_quarantines_usage_auth_failures() {
+        let db_path = temp_db_path("sync-usage-quarantine");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-sync-quarantine".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+            .fetch_one(&proxy.key_store.pool)
+            .await
+            .expect("seeded key id");
+
+        let app = Router::new().route(
+            "/usage",
+            get(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "detail": {
+                            "error": "The account associated with this API key has been deactivated."
+                        }
+                    })),
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let usage_base = format!("http://{addr}");
+        let err = proxy
+            .sync_key_quota(&key_id, &usage_base)
+            .await
+            .expect_err("sync should fail");
+        match err {
+            ProxyError::UsageHttp { status, .. } => assert_eq!(status, StatusCode::UNAUTHORIZED),
+            other => panic!("expected usage http error, got {other:?}"),
+        }
+
+        let quarantine_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
+        )
+        .bind(&key_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("count quarantine rows");
+        assert_eq!(quarantine_count, 1);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -18019,14 +19711,28 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             .await
             .expect("seed account quota row");
 
-        let first_limits: (i64, i64, i64, i64) = sqlx::query_as(
+        let seeded_limits: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit FROM account_quota_limits WHERE user_id = ?",
         )
         .bind(&user.user_id)
         .fetch_one(&proxy.key_store.pool)
         .await
-        .expect("read first limits");
-        assert_eq!(first_limits, (11, 12, 13, 14));
+        .expect("read seeded limits");
+        assert_eq!(seeded_limits, (0, 0, 0, 0));
+
+        sqlx::query(
+            r#"UPDATE account_quota_limits
+               SET hourly_any_limit = 11,
+                   hourly_limit = 12,
+                   daily_limit = 13,
+                   monthly_limit = 14,
+                   inherits_defaults = 1
+               WHERE user_id = ?"#,
+        )
+        .bind(&user.user_id)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed legacy default-following row");
 
         drop(proxy);
 
@@ -18105,6 +19811,19 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             .user_dashboard_summary(&user.user_id)
             .await
             .expect("seed account quota row");
+        sqlx::query(
+            r#"UPDATE account_quota_limits
+               SET hourly_any_limit = 11,
+                   hourly_limit = 12,
+                   daily_limit = 13,
+                   monthly_limit = 14,
+                   inherits_defaults = 1
+               WHERE user_id = ?"#,
+        )
+        .bind(&user.user_id)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed legacy current default row");
         sqlx::query("DELETE FROM meta WHERE key = ?")
             .bind(META_KEY_ACCOUNT_QUOTA_INHERITS_DEFAULTS_BACKFILL_V1)
             .execute(&proxy.key_store.pool)
@@ -18235,7 +19954,12 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         }
         sqlx::query(
             r#"UPDATE account_quota_limits
-               SET updated_at = created_at + 5
+               SET hourly_any_limit = 11,
+                   hourly_limit = 12,
+                   daily_limit = 13,
+                   monthly_limit = 14,
+                   inherits_defaults = 1,
+                   updated_at = created_at + 5
                WHERE user_id IN (?, ?)"#,
         )
         .bind(&alpha.user_id)
@@ -18355,6 +20079,332 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
     }
 
     #[tokio::test]
+    async fn new_account_without_tags_defaults_to_zero_base_and_effective_quota() {
+        let db_path = temp_db_path("new-account-zero-base");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "github".to_string(),
+                provider_user_id: "new-zero-base-user".to_string(),
+                username: Some("new_zero_base_user".to_string()),
+                name: Some("New Zero Base User".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: None,
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+
+        let resolution = proxy
+            .key_store
+            .resolve_account_quota_resolution(&user.user_id)
+            .await
+            .expect("resolve account quota");
+
+        assert_eq!(resolution.base.hourly_any_limit, 0);
+        assert_eq!(resolution.base.hourly_limit, 0);
+        assert_eq!(resolution.base.daily_limit, 0);
+        assert_eq!(resolution.base.monthly_limit, 0);
+        assert!(!resolution.base.inherits_defaults);
+        assert_eq!(resolution.effective.hourly_any_limit, 0);
+        assert_eq!(resolution.effective.hourly_limit, 0);
+        assert_eq!(resolution.effective.daily_limit, 0);
+        assert_eq!(resolution.effective.monthly_limit, 0);
+
+        let persisted: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults FROM account_quota_limits WHERE user_id = ?",
+        )
+        .bind(&user.user_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("read persisted zero base");
+        assert_eq!(persisted, (0, 0, 0, 0, 0));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn new_linuxdo_account_effective_quota_comes_only_from_tags() {
+        let _guard = env_lock().lock_owned().await;
+        let db_path = temp_db_path("new-linuxdo-tag-only-quota");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "new-linuxdo-tag-only-user".to_string(),
+                username: Some("new_linuxdo_tag_only_user".to_string()),
+                name: Some("New LinuxDo Tag Only User".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+
+        let resolution = proxy
+            .key_store
+            .resolve_account_quota_resolution(&user.user_id)
+            .await
+            .expect("resolve account quota");
+        let tag_only_limits = AccountQuotaLimits::legacy_defaults();
+
+        assert_eq!(resolution.base.hourly_any_limit, 0);
+        assert_eq!(resolution.base.hourly_limit, 0);
+        assert_eq!(resolution.base.daily_limit, 0);
+        assert_eq!(resolution.base.monthly_limit, 0);
+        assert_eq!(
+            resolution.effective.hourly_any_limit,
+            tag_only_limits.hourly_any_limit
+        );
+        assert_eq!(
+            resolution.effective.hourly_limit,
+            tag_only_limits.hourly_limit
+        );
+        assert_eq!(
+            resolution.effective.daily_limit,
+            tag_only_limits.daily_limit
+        );
+        assert_eq!(
+            resolution.effective.monthly_limit,
+            tag_only_limits.monthly_limit
+        );
+        assert!(
+            resolution
+                .tags
+                .iter()
+                .any(|binding| { binding.tag.system_key.as_deref() == Some("linuxdo_l2") })
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn historical_account_without_quota_row_keeps_legacy_defaults_on_first_resolution() {
+        let _guard = env_lock().lock_owned().await;
+        let db_path = temp_db_path("historical-account-missing-quota-row");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        unsafe {
+            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "11");
+            std::env::set_var("TOKEN_HOURLY_LIMIT", "12");
+            std::env::set_var("TOKEN_DAILY_LIMIT", "13");
+            std::env::set_var("TOKEN_MONTHLY_LIMIT", "14");
+        }
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "github".to_string(),
+                provider_user_id: "historical-missing-quota-row".to_string(),
+                username: Some("historical_missing_quota_row".to_string()),
+                name: Some("Historical Missing Quota Row".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: None,
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+
+        sqlx::query("DELETE FROM account_quota_limits WHERE user_id = ?")
+            .bind(&user.user_id)
+            .execute(&proxy.key_store.pool)
+            .await
+            .expect("delete quota row");
+        sqlx::query("UPDATE users SET created_at = ?, updated_at = ? WHERE id = ?")
+            .bind(100_i64)
+            .bind(100_i64)
+            .bind(&user.user_id)
+            .execute(&proxy.key_store.pool)
+            .await
+            .expect("mark user historical");
+        proxy
+            .key_store
+            .set_meta_i64(META_KEY_ACCOUNT_QUOTA_ZERO_BASE_CUTOVER_V1, 200)
+            .await
+            .expect("set zero-base cutover after user creation");
+
+        let resolution = proxy
+            .key_store
+            .resolve_account_quota_resolution(&user.user_id)
+            .await
+            .expect("resolve historical account quota");
+        let expected = AccountQuotaLimits::legacy_defaults();
+
+        assert_eq!(resolution.base.hourly_any_limit, expected.hourly_any_limit);
+        assert_eq!(resolution.base.hourly_limit, expected.hourly_limit);
+        assert_eq!(resolution.base.daily_limit, expected.daily_limit);
+        assert_eq!(resolution.base.monthly_limit, expected.monthly_limit);
+        assert!(resolution.base.inherits_defaults);
+
+        unsafe {
+            std::env::remove_var("TOKEN_HOURLY_REQUEST_LIMIT");
+            std::env::remove_var("TOKEN_HOURLY_LIMIT");
+            std::env::remove_var("TOKEN_DAILY_LIMIT");
+            std::env::remove_var("TOKEN_MONTHLY_LIMIT");
+        }
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn manual_account_quota_matching_legacy_defaults_stays_custom_on_restart() {
+        let _guard = env_lock().lock_owned().await;
+        let db_path = temp_db_path("manual-account-quota-matching-legacy-defaults");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        unsafe {
+            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "11");
+            std::env::set_var("TOKEN_HOURLY_LIMIT", "12");
+            std::env::set_var("TOKEN_DAILY_LIMIT", "13");
+            std::env::set_var("TOKEN_MONTHLY_LIMIT", "14");
+        }
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "github".to_string(),
+                provider_user_id: "manual-legacy-default-tuple".to_string(),
+                username: Some("manual_legacy_default_tuple".to_string()),
+                name: Some("Manual Legacy Default Tuple".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: None,
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+
+        let updated = proxy
+            .key_store
+            .update_account_quota_limits(&user.user_id, 11, 12, 13, 14)
+            .await
+            .expect("update account quota");
+        assert!(updated);
+
+        let first_row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults FROM account_quota_limits WHERE user_id = ?",
+        )
+        .bind(&user.user_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("read first row");
+        assert_eq!(first_row, (11, 12, 13, 14, 0));
+
+        drop(proxy);
+
+        unsafe {
+            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "21");
+            std::env::set_var("TOKEN_HOURLY_LIMIT", "22");
+            std::env::set_var("TOKEN_DAILY_LIMIT", "23");
+            std::env::set_var("TOKEN_MONTHLY_LIMIT", "24");
+        }
+
+        let proxy_after =
+            TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+                .await
+                .expect("proxy reopened");
+        let second_row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults FROM account_quota_limits WHERE user_id = ?",
+        )
+        .bind(&user.user_id)
+        .fetch_one(&proxy_after.key_store.pool)
+        .await
+        .expect("read second row");
+        assert_eq!(second_row, (11, 12, 13, 14, 0));
+
+        unsafe {
+            std::env::remove_var("TOKEN_HOURLY_REQUEST_LIMIT");
+            std::env::remove_var("TOKEN_HOURLY_LIMIT");
+            std::env::remove_var("TOKEN_DAILY_LIMIT");
+            std::env::remove_var("TOKEN_MONTHLY_LIMIT");
+        }
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_default_following_account_keeps_inherits_defaults_on_noop_save() {
+        let _guard = env_lock().lock_owned().await;
+        let db_path = temp_db_path("legacy-default-following-noop-save");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        unsafe {
+            std::env::set_var("TOKEN_HOURLY_REQUEST_LIMIT", "11");
+            std::env::set_var("TOKEN_HOURLY_LIMIT", "12");
+            std::env::set_var("TOKEN_DAILY_LIMIT", "13");
+            std::env::set_var("TOKEN_MONTHLY_LIMIT", "14");
+        }
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "github".to_string(),
+                provider_user_id: "legacy-default-following-noop-save".to_string(),
+                username: Some("legacy_default_following_noop_save".to_string()),
+                name: Some("Legacy Default Following Noop Save".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: None,
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+
+        sqlx::query(
+            r#"UPDATE account_quota_limits
+               SET hourly_any_limit = 11,
+                   hourly_limit = 12,
+                   daily_limit = 13,
+                   monthly_limit = 14,
+                   inherits_defaults = 1
+               WHERE user_id = ?"#,
+        )
+        .bind(&user.user_id)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed legacy default-following row");
+
+        let updated = proxy
+            .key_store
+            .update_account_quota_limits(&user.user_id, 11, 12, 13, 14)
+            .await
+            .expect("update account quota");
+        assert!(updated);
+
+        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT hourly_any_limit, hourly_limit, daily_limit, monthly_limit, inherits_defaults FROM account_quota_limits WHERE user_id = ?",
+        )
+        .bind(&user.user_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("read row after noop save");
+        assert_eq!(row, (11, 12, 13, 14, 1));
+
+        unsafe {
+            std::env::remove_var("TOKEN_HOURLY_REQUEST_LIMIT");
+            std::env::remove_var("TOKEN_HOURLY_LIMIT");
+            std::env::remove_var("TOKEN_DAILY_LIMIT");
+            std::env::remove_var("TOKEN_MONTHLY_LIMIT");
+        }
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn account_quota_resolution_cache_invalidates_on_binding_and_tag_updates() {
         let db_path = temp_db_path("account-quota-resolution-cache");
         let db_str = db_path.to_string_lossy().to_string();
@@ -18375,7 +20425,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             })
             .await
             .expect("upsert user");
-        let defaults = AccountQuotaLimits::defaults();
+        let defaults = AccountQuotaLimits::zero_base();
 
         let initial = proxy
             .key_store
@@ -18863,7 +20913,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
     }
 
     #[tokio::test]
-    async fn linuxdo_oauth_upsert_survives_tag_sync_failures_and_backfill_repairs_binding() {
+    async fn linuxdo_oauth_upsert_skips_missing_tags_for_new_accounts_and_recovers_after_reseed() {
         let _guard = env_lock().lock_owned().await;
         let db_path = temp_db_path("linuxdo-sync-best-effort");
         let db_str = db_path.to_string_lossy().to_string();
@@ -18889,7 +20939,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
                 raw_payload_json: None,
             })
             .await
-            .expect("oauth upsert should succeed even when tag sync fails");
+            .expect("new linuxdo account should still succeed without system tags");
 
         let oauth_row_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_accounts WHERE provider = 'linuxdo' AND provider_user_id = ?",
@@ -18899,6 +20949,13 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         .await
         .expect("count oauth rows");
         assert_eq!(oauth_row_count, 1);
+        let user_row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = ?")
+                .bind("linuxdo_best_effort_user")
+                .fetch_one(&proxy.key_store.pool)
+                .await
+                .expect("count user rows");
+        assert_eq!(user_row_count, 1);
 
         let binding_count: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*)
@@ -18909,7 +20966,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
         .bind(&user.user_id)
         .fetch_one(&proxy.key_store.pool)
         .await
-        .expect("count linuxdo bindings after failed sync");
+        .expect("count linuxdo bindings after skipped sync");
         assert_eq!(binding_count, 0);
 
         proxy
@@ -18917,11 +20974,19 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             .seed_linuxdo_system_tags()
             .await
             .expect("reseed linuxdo system tags");
-        proxy
-            .key_store
-            .backfill_linuxdo_user_tag_bindings()
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "linuxdo-best-effort-user".to_string(),
+                username: Some("linuxdo_best_effort_user".to_string()),
+                name: Some("LinuxDo Best Effort User".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
             .await
-            .expect("repair linuxdo bindings");
+            .expect("oauth upsert should attach system tag after reseeding tags");
 
         let restored_key: String = sqlx::query_scalar(
             r#"SELECT t.system_key
@@ -19263,6 +21328,78 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             .await
             .expect("business quota verdict after unbind");
         assert!(quota_after_unbind.allowed);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn list_recent_jobs_paginated_includes_key_group() {
+        let db_path = temp_db_path("jobs-list-key-group");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let grouped_key_id = proxy
+            .add_or_undelete_key_in_group("tvly-jobs-grouped", Some("ops"))
+            .await
+            .expect("create grouped key");
+        let ungrouped_key_id = proxy
+            .add_or_undelete_key_in_group("tvly-jobs-ungrouped", None)
+            .await
+            .expect("create ungrouped key");
+
+        let grouped_job_id = proxy
+            .scheduled_job_start("quota_sync", Some(&grouped_key_id), 1)
+            .await
+            .expect("start grouped job");
+        proxy
+            .scheduled_job_finish(grouped_job_id, "error", Some("usage_http 401"))
+            .await
+            .expect("finish grouped job");
+
+        let ungrouped_job_id = proxy
+            .scheduled_job_start("quota_sync", Some(&ungrouped_key_id), 1)
+            .await
+            .expect("start ungrouped job");
+        proxy
+            .scheduled_job_finish(ungrouped_job_id, "success", Some("limit=100 remaining=99"))
+            .await
+            .expect("finish ungrouped job");
+
+        let cleanup_job_id = proxy
+            .scheduled_job_start("auth_token_logs_gc", None, 1)
+            .await
+            .expect("start cleanup job");
+        proxy
+            .scheduled_job_finish(cleanup_job_id, "success", Some("pruned=10"))
+            .await
+            .expect("finish cleanup job");
+
+        let (items, total) = proxy
+            .list_recent_jobs_paginated("all", 1, 10)
+            .await
+            .expect("list jobs");
+
+        assert_eq!(total, 3);
+
+        let grouped_job = items
+            .iter()
+            .find(|item| item.key_id.as_deref() == Some(grouped_key_id.as_str()))
+            .expect("grouped job present");
+        assert_eq!(grouped_job.key_group.as_deref(), Some("ops"));
+
+        let ungrouped_job = items
+            .iter()
+            .find(|item| item.key_id.as_deref() == Some(ungrouped_key_id.as_str()))
+            .expect("ungrouped job present");
+        assert_eq!(ungrouped_job.key_group, None);
+
+        let cleanup_job = items
+            .iter()
+            .find(|item| item.key_id.is_none())
+            .expect("cleanup job present");
+        assert_eq!(cleanup_job.key_group, None);
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -7,6 +7,7 @@ export interface Summary {
   quota_exhausted_count: number
   active_keys: number
   exhausted_keys: number
+  quarantined_keys: number
   last_activity: number | null
   total_quota_limit: number
   total_quota_remaining: number
@@ -69,6 +70,14 @@ interface ServerPublicTokenLog {
   createdAt: number
 }
 
+export interface ApiKeyQuarantine {
+  source: string
+  reasonCode: string
+  reasonSummary: string
+  reasonDetail?: string | null
+  createdAt: number
+}
+
 export interface ApiKeyStats {
   id: string
   status: string
@@ -83,6 +92,7 @@ export interface ApiKeyStats {
   success_count: number
   error_count: number
   quota_exhausted_count: number
+  quarantine: ApiKeyQuarantine | null
 }
 
 export interface RequestLog {
@@ -105,6 +115,16 @@ export interface RequestLog {
 
 export interface ApiKeySecret {
   api_key: string
+}
+
+export interface ApiKeyFacetOption {
+  value: string
+  count: number
+}
+
+export interface ApiKeyListFacets {
+  groups: ApiKeyFacetOption[]
+  statuses: ApiKeyFacetOption[]
 }
 
 // ---- Access Tokens (for /mcp auth) ----
@@ -223,12 +243,30 @@ export async function fetchPublicLogs(token: string, limit = 20, signal?: AbortS
   }))
 }
 
-export async function fetchApiKeys(signal?: AbortSignal): Promise<ApiKeyStats[]> {
-  const response = await requestJson<ApiKeyStats[] | { items?: ApiKeyStats[] }>('/api/keys', { signal })
-  if (Array.isArray(response)) {
-    return response
+export interface PaginatedApiKeys extends Paginated<ApiKeyStats> {
+  facets: ApiKeyListFacets
+}
+
+export function fetchApiKeys(
+  page = 1,
+  perPage = 20,
+  options?: { groups?: string[]; statuses?: string[] },
+  signal?: AbortSignal,
+): Promise<PaginatedApiKeys> {
+  const params = new URLSearchParams({
+    page: String(page),
+    per_page: String(perPage),
+  })
+  for (const group of options?.groups ?? []) {
+    const normalized = group.trim()
+    params.append('group', normalized)
   }
-  return Array.isArray(response.items) ? response.items : []
+  for (const status of options?.statuses ?? []) {
+    const normalized = status.trim().toLowerCase()
+    if (!normalized) continue
+    params.append('status', normalized)
+  }
+  return requestJson(`/api/keys?${params.toString()}`, { signal })
 }
 
 export function fetchApiKeyDetail(id: string, signal?: AbortSignal): Promise<ApiKeyStats> {
@@ -261,11 +299,24 @@ export interface JobLogView {
   id: number
   job_type: string
   key_id: string | null
+  key_group: string | null
   status: string
   attempt: number
   message: string | null
   started_at: number
   finished_at: number | null
+}
+
+interface ServerJobLogView {
+  id: number
+  jobType: string
+  keyId: string | null
+  keyGroup: string | null
+  status: string
+  attempt: number
+  message: string | null
+  startedAt: number
+  finishedAt: number | null
 }
 
 export type JobGroup = 'all' | 'quota' | 'usage' | 'logs'
@@ -275,6 +326,7 @@ export interface Profile {
   isAdmin: boolean
   forwardAuthEnabled: boolean
   builtinAuthEnabled: boolean
+  allowRegistration: boolean
   userLoggedIn?: boolean
   userProvider?: 'linuxdo' | null
   userDisplayName?: string | null
@@ -282,6 +334,26 @@ export interface Profile {
 
 export function fetchProfile(signal?: AbortSignal): Promise<Profile> {
   return requestJson('/api/profile', { signal })
+}
+
+export interface AdminRegistrationSettings {
+  allowRegistration: boolean
+}
+
+export function fetchAdminRegistrationSettings(
+  signal?: AbortSignal,
+): Promise<AdminRegistrationSettings> {
+  return requestJson('/api/admin/registration', { signal })
+}
+
+export function updateAdminRegistrationSettings(
+  allowRegistration: boolean,
+): Promise<AdminRegistrationSettings> {
+  return requestJson('/api/admin/registration', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allowRegistration }),
+  })
 }
 
 export interface AdminQuotaLimitSet {
@@ -644,6 +716,16 @@ export async function setKeyStatus(id: string, status: KeyAdminStatus): Promise<
   }
 }
 
+export async function clearApiKeyQuarantine(id: string): Promise<void> {
+  const encoded = encodeURIComponent(id)
+  const res = await fetch(`/api/keys/${encoded}/quarantine`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) {
+    throw new Error(`Failed to clear key quarantine: ${res.status}`)
+  }
+}
+
 // ---- Key details ----
 export interface KeySummary {
   total_requests: number
@@ -743,7 +825,22 @@ export function fetchJobs(
   if (group !== 'all') {
     params.set('group', group)
   }
-  return requestJson(`/api/jobs?${params.toString()}`, { signal })
+  return requestJson<Paginated<ServerJobLogView>>(`/api/jobs?${params.toString()}`, { signal }).then((data) => ({
+    total: data.total,
+    page: data.page,
+    perPage: data.perPage,
+    items: data.items.map((item) => ({
+      id: item.id,
+      job_type: item.jobType,
+      key_id: item.keyId,
+      key_group: item.keyGroup,
+      status: item.status,
+      attempt: item.attempt,
+      message: item.message,
+      started_at: item.startedAt,
+      finished_at: item.finishedAt,
+    })),
+  }))
 }
 
 export function fetchAdminUsers(
