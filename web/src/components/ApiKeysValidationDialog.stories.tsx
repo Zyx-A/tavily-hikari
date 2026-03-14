@@ -240,3 +240,40 @@ export const PostImportWithRemainingRows: Story = {
     viewport: { defaultViewport: "1440-device-desktop" },
   },
 };
+
+export const RegistrationIpBadge: Story = {
+  render: () => (
+    <div className="storybook-key-validation-registration-ip">
+      <style>{`
+        .storybook-key-validation-registration-ip .key-validation-detail .key-validation-bubble {
+          opacity: 1;
+          transform: scale(1);
+        }
+      `}</style>
+      <ModalHarness
+        initial={{
+          group: "default",
+          input_lines: 1,
+          valid_lines: 1,
+          unique_in_input: 1,
+          duplicate_in_input: 0,
+          checking: false,
+          importing: false,
+          rows: [
+            {
+              api_key: "tvly-OK-NEW",
+              status: "ok",
+              registration_ip: "8.8.8.8",
+              quota_limit: 1000,
+              quota_remaining: 123,
+              attempts: 1,
+            },
+          ],
+        }}
+      />
+    </div>
+  ),
+  parameters: {
+    viewport: { defaultViewport: "1440-device-desktop" },
+  },
+};
