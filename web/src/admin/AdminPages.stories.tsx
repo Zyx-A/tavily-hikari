@@ -267,7 +267,7 @@ const MOCK_KEYS: ApiKeyStats[] = [
     status: 'active',
     group: 'production',
     registration_ip: '8.8.8.8',
-    registration_region: 'United States California',
+    registration_region: 'US',
     status_changed_at: now - 2_100,
     last_used_at: now - 61,
     deleted_at: null,
@@ -284,8 +284,8 @@ const MOCK_KEYS: ApiKeyStats[] = [
     id: 'asR8',
     status: 'exhausted',
     group: 'production',
-    registration_ip: '1.1.1.1',
-    registration_region: 'Australia Sydney (NSW)',
+    registration_ip: '8.8.4.4',
+    registration_region: 'US Westfield (MA)',
     status_changed_at: now - 6_480,
     last_used_at: now - 2_300,
     deleted_at: null,
@@ -303,7 +303,7 @@ const MOCK_KEYS: ApiKeyStats[] = [
     status: 'active',
     group: 'batch',
     registration_ip: '2606:4700:4700::1111',
-    registration_region: 'United States California',
+    registration_region: null,
     status_changed_at: now - 4_200,
     last_used_at: now - 410,
     deleted_at: null,
@@ -339,7 +339,7 @@ const MOCK_KEYS: ApiKeyStats[] = [
     status: 'active',
     group: 'ops',
     registration_ip: '9.9.9.9',
-    registration_region: 'United States',
+    registration_region: null,
     status_changed_at: now - 1_800,
     last_used_at: now - 180,
     deleted_at: null,
@@ -3006,7 +3006,7 @@ export const KeysRegistrationFilters: Story = {
   render: () => (
     <KeysPageCanvas
       initialRegistrationIp="8.8.8.8"
-      initialRegions={['United States Mountain View (CA)']}
+      initialRegions={['US']}
     />
   ),
   parameters: {
