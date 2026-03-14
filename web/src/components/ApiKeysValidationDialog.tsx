@@ -5,6 +5,7 @@ import { useTranslate } from "../i18n";
 import { useViewportMode } from "../lib/responsive";
 import { StatusBadge, type StatusTone } from "./StatusBadge";
 import { Button } from "./ui/button";
+import { Badge } from "./ui/badge";
 import {
   Dialog,
   DialogContent,
@@ -33,6 +34,7 @@ export type KeyValidationStatus =
 export type KeyValidationRow = {
   api_key: string;
   status: KeyValidationStatus;
+  registration_ip?: string | null;
   quota_limit?: number;
   quota_remaining?: number;
   detail?: string;
@@ -166,6 +168,25 @@ function filterKeyForStatus(status: KeyValidationStatus): ValidationFilterKey {
   }
 }
 
+function RegistrationIpIndicator(props: { label: string; tooltip: string }): JSX.Element {
+  return (
+    <span className="group/registration-ip relative inline-flex align-middle">
+      <Badge
+        variant="success"
+        className="cursor-help gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em]"
+        title={props.tooltip}
+        tabIndex={0}
+      >
+        <Icon icon="mdi:check-bold" width={12} height={12} aria-hidden="true" />
+        <span>{props.label}</span>
+      </Badge>
+      <span className="pointer-events-none absolute left-1/2 top-full z-20 mt-2 hidden w-max max-w-[16rem] -translate-x-1/2 rounded-lg border border-base-300 bg-base-100 px-2.5 py-1.5 text-[11px] font-medium text-base-content shadow-lg group-hover/registration-ip:block group-focus-within/registration-ip:block">
+        {props.tooltip}
+      </span>
+    </span>
+  );
+}
+
 export interface ApiKeysValidationDialogProps {
   open: boolean;
   state: KeysValidationState | null;
@@ -189,6 +210,7 @@ export function ApiKeysValidationDialog(props: ApiKeysValidationDialogProps): JS
   const summaryStrings = validationStrings.summary;
   const tableStrings = validationStrings.table;
   const importStrings = validationStrings.import;
+  const ipBadgeLabel = validationStrings.registrationIpBadge ?? "IP";
   const [activeFilter, setActiveFilter] = React.useState<ValidationFilterKey | null>(null);
 
   const groupLabel = props.state?.group?.trim() || "default";
@@ -439,12 +461,29 @@ export function ApiKeysValidationDialog(props: ApiKeysValidationDialogProps): JS
                         ? `${formatNumber(row.quota_remaining)}/${formatNumber(row.quota_limit)}`
                         : "—";
                     const label = statuses[row.status] ?? row.status;
+                    const registrationIp = row.registration_ip?.trim();
+                    const registrationTooltip = registrationIp
+                      ? (validationStrings.registrationIpTooltip ?? "Registration IP: {ip}").replace(
+                          "{ip}",
+                          registrationIp,
+                        )
+                      : null;
                     return (
                       <div key={`${row.api_key}-${index}`} className="p-3">
                         <div className="flex items-start justify-between gap-3">
-                          <code className="block font-mono text-xs break-all whitespace-normal bg-base-200/50 px-2 py-1 rounded-lg max-w-full">
-                            {row.api_key}
-                          </code>
+                          <div className="min-w-0">
+                            <code className="block font-mono text-xs break-all whitespace-normal bg-base-200/50 px-2 py-1 rounded-lg max-w-full">
+                              {row.api_key}
+                            </code>
+                            {registrationIp && registrationTooltip ? (
+                              <div className="mt-2">
+                                <RegistrationIpIndicator
+                                  label={ipBadgeLabel}
+                                  tooltip={registrationTooltip}
+                                />
+                              </div>
+                            ) : null}
+                          </div>
                           <Button
                             type="button"
                             variant="ghost"
@@ -520,12 +559,29 @@ export function ApiKeysValidationDialog(props: ApiKeysValidationDialogProps): JS
                             ? `${formatNumber(row.quota_remaining)}/${formatNumber(row.quota_limit)}`
                             : "—";
                         const label = statuses[row.status] ?? row.status;
+                        const registrationIp = row.registration_ip?.trim();
+                        const registrationTooltip = registrationIp
+                          ? (validationStrings.registrationIpTooltip ?? "Registration IP: {ip}").replace(
+                              "{ip}",
+                              registrationIp,
+                            )
+                          : null;
                         return (
                           <TableRow key={`${row.api_key}-${index}`}>
                             <TableCell className="max-w-0">
-                              <code className="block font-mono text-xs break-all whitespace-normal bg-base-200/50 px-2 py-1 rounded-lg max-w-full">
-                                {row.api_key}
-                              </code>
+                              <div className="min-w-0">
+                                <code className="block font-mono text-xs break-all whitespace-normal bg-base-200/50 px-2 py-1 rounded-lg max-w-full">
+                                  {row.api_key}
+                                </code>
+                                {registrationIp && registrationTooltip ? (
+                                  <div className="mt-2">
+                                    <RegistrationIpIndicator
+                                      label={ipBadgeLabel}
+                                      tooltip={registrationTooltip}
+                                    />
+                                  </div>
+                                ) : null}
+                              </div>
                             </TableCell>
                             <TableCell className="max-w-0">
                               {row.detail ? (

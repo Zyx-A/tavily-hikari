@@ -761,6 +761,8 @@ interface AdminTranslationsShape {
     validation: {
       title: string
       hint: string
+      registrationIpBadge: string
+      registrationIpTooltip: string
       actions: {
         close: string
         retry: string
@@ -1846,6 +1848,8 @@ export const translations: Record<Language, TranslationShape> = {
         validation: {
           title: 'Verify API Keys',
           hint: 'Support text paste: extract the first tvly-dev-* key and first public IP from each line; geo lookup uses the configured country.is-compatible service.',
+          registrationIpBadge: 'IP',
+          registrationIpTooltip: 'Registration IP: {ip}',
           actions: {
             close: 'Close',
             retry: 'Retry',
@@ -2914,6 +2918,8 @@ export const translations: Record<Language, TranslationShape> = {
         validation: {
           title: '检测 API Keys',
           hint: '支持粘贴文本：每行先提取首个 tvly-dev-* key 和首个公网 IP，再检测并入库；地区解析会访问已配置的兼容 country.is 服务。',
+          registrationIpBadge: 'IP',
+          registrationIpTooltip: '注册 IP：{ip}',
           actions: {
             close: '关闭',
             retry: '重试',

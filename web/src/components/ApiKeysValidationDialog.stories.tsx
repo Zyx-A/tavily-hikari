@@ -101,8 +101,22 @@ export const MixedResults: Story = {
       checking: false,
       importing: false,
       rows: [
-        { api_key: "tvly-OK-NEW", status: "ok", quota_limit: 1000, quota_remaining: 123, attempts: 1 },
-        { api_key: "tvly-OK-EXHAUSTED", status: "ok_exhausted", quota_limit: 1000, quota_remaining: 0, attempts: 1 },
+        {
+          api_key: "tvly-OK-NEW",
+          status: "ok",
+          registration_ip: "8.8.8.8",
+          quota_limit: 1000,
+          quota_remaining: 123,
+          attempts: 1,
+        },
+        {
+          api_key: "tvly-OK-EXHAUSTED",
+          status: "ok_exhausted",
+          registration_ip: "2606:4700:4700::1111",
+          quota_limit: 1000,
+          quota_remaining: 0,
+          attempts: 1,
+        },
         {
           api_key: "tvly-UNAUTHORIZED",
           status: "unauthorized",
@@ -116,7 +130,7 @@ export const MixedResults: Story = {
             "Upstream returned 502 Bad Gateway. Click/hover the badge to see this message. On mobile, focus the badge to reveal it.",
           attempts: 1,
         },
-        { api_key: "tvly-OK-NEW", status: "duplicate_in_input", attempts: 0 },
+        { api_key: "tvly-OK-NEW", status: "duplicate_in_input", registration_ip: "8.8.8.8", attempts: 0 },
       ],
     },
   },
