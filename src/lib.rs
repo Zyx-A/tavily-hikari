@@ -3170,7 +3170,10 @@ impl TavilyProxy {
                 {
                     return (endpoint, vec![ip], ForwardProxyGeoSource::Trace);
                 }
-                (endpoint, cached_ips, cached_source)
+                if cached_source == ForwardProxyGeoSource::Trace {
+                    return (endpoint, cached_ips, cached_source);
+                }
+                (endpoint, Vec::new(), ForwardProxyGeoSource::Unknown)
             },
         ))
         .buffer_unordered(3)
@@ -16383,7 +16386,7 @@ fn parse_forward_proxy_trace_response(body: &str) -> Option<(String, String)> {
         }
     }
 
-    let ip = ip?;
+    let ip = normalize_ip_string(&ip?)?;
     let location = match (country, colo) {
         (Some(country), Some(colo)) => format!("{country} / {colo}"),
         (Some(country), None) => country,
@@ -17876,6 +17879,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_forward_proxy_trace_response_normalizes_ipv6_addresses() {
+        let parsed = parse_forward_proxy_trace_response(
+            "ip=2602:FEDA:F30F:DD6A:782D:DE80:6148:5EE2\nloc=US\ncolo=SJC\n",
+        )
+        .expect("trace response should parse");
+        assert_eq!(
+            parsed,
+            (
+                "2602:feda:f30f:dd6a:782d:de80:6148:5ee2".to_string(),
+                "US / SJC".to_string(),
+            )
+        );
+    }
+
+    #[test]
     fn extract_usage_credits_from_json_bytes_finds_nested_usage_and_rounds_up() {
         let body = br#"{"result":{"structuredContent":{"usage":{"credits":1.2}}}}"#;
         assert_eq!(extract_usage_credits_from_json_bytes(body), Some(2));
@@ -18990,6 +19008,102 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
             serde_json::from_str(&row.2).expect("decode refreshed legacy resolved regions");
         assert_eq!(resolved_ips, vec!["1.0.0.1".to_string()]);
         assert_eq!(resolved_regions, vec!["HK".to_string()]);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn select_proxy_affinity_does_not_match_legacy_host_based_runtime_geo_when_trace_fails() {
+        let db_path = temp_db_path("proxy-runtime-geo-ignore-legacy-host");
+        let db_str = db_path.to_string_lossy().to_string();
+        let geo_addr = spawn_api_key_geo_mock_server().await;
+        let geo_origin = format!("http://{geo_addr}/geo");
+        let proxy_url = "http://127.0.0.1:1".to_string();
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let settings = ForwardProxySettings {
+            proxy_urls: vec![proxy_url.clone()],
+            subscription_urls: Vec::new(),
+            subscription_update_interval_secs: 3600,
+            insert_direct: false,
+        }
+        .normalized();
+        let endpoint_key = {
+            let mut manager = proxy.forward_proxy.lock().await;
+            manager.apply_settings(settings.clone());
+            manager
+                .endpoints
+                .iter()
+                .find(|endpoint| {
+                    endpoint.endpoint_url.as_ref().map(Url::to_string) == Some(proxy_url.clone())
+                        || endpoint.key == proxy_url
+                })
+                .map(|endpoint| endpoint.key.clone())
+                .unwrap_or_else(|| proxy_url.clone())
+        };
+        let persisted_runtime = {
+            let manager = proxy.forward_proxy.lock().await;
+            manager
+                .runtime
+                .get(&endpoint_key)
+                .cloned()
+                .expect("persisted runtime state")
+        };
+        forward_proxy::persist_forward_proxy_runtime_state(
+            &proxy.key_store.pool,
+            &persisted_runtime,
+        )
+        .await
+        .expect("persist initial runtime state");
+
+        sqlx::query(
+            "UPDATE forward_proxy_runtime SET resolved_ips_json = '[\"1.1.1.1\"]', resolved_regions_json = '[\"HK\"]', resolved_ip_source = '' WHERE proxy_key = ?",
+        )
+        .bind(&endpoint_key)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed legacy host-based runtime geo metadata");
+
+        let reloaded = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy reloaded");
+        {
+            let mut manager = reloaded.forward_proxy.lock().await;
+            manager.apply_settings(settings);
+        }
+
+        let (record, preview) = reloaded
+            .select_proxy_affinity_preview_for_registration_with_hint(
+                "subject:ignore-runtime-geo-legacy",
+                &geo_origin,
+                Some("1.1.1.1"),
+                Some("HK"),
+                None,
+            )
+            .await
+            .expect("selection should ignore legacy host-based runtime geo metadata");
+        assert_eq!(
+            record.primary_proxy_key.as_deref(),
+            Some(endpoint_key.as_str())
+        );
+        assert_eq!(
+            preview.as_ref().map(|item| item.match_kind),
+            Some(AssignedProxyMatchKind::Other)
+        );
+
+        let row: String = sqlx::query_scalar(
+            "SELECT resolved_ip_source FROM forward_proxy_runtime WHERE proxy_key = ?",
+        )
+        .bind(&endpoint_key)
+        .fetch_one(&reloaded.key_store.pool)
+        .await
+        .expect("load stale runtime source");
+        assert!(
+            row.is_empty(),
+            "trace failures should not relabel legacy host-derived metadata as trace"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
