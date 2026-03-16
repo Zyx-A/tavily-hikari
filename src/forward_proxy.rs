@@ -374,10 +374,25 @@ impl ForwardProxyEndpoint {
 }
 
 pub fn endpoint_host(endpoint: &ForwardProxyEndpoint) -> Option<String> {
+    if endpoint.requires_xray() {
+        return endpoint
+            .raw_url
+            .as_deref()
+            .and_then(raw_endpoint_host)
+            .or_else(|| {
+                endpoint
+                    .endpoint_url
+                    .as_ref()
+                    .and_then(|url| url.host_str().map(ToOwned::to_owned))
+            });
+    }
     if let Some(url) = endpoint.endpoint_url.as_ref() {
         return url.host_str().map(ToOwned::to_owned);
     }
-    let raw = endpoint.raw_url.as_deref()?;
+    endpoint.raw_url.as_deref().and_then(raw_endpoint_host)
+}
+
+fn raw_endpoint_host(raw: &str) -> Option<String> {
     if !raw.contains("://") {
         return Url::parse(&format!("http://{raw}"))
             .ok()
@@ -405,6 +420,9 @@ pub struct ForwardProxyRuntimeState {
     pub source: String,
     pub kind: String,
     pub endpoint_url: Option<String>,
+    pub resolved_ip_source: String,
+    pub resolved_ips: Vec<String>,
+    pub resolved_regions: Vec<String>,
     pub available: bool,
     pub last_error: Option<String>,
     pub weight: f64,
@@ -425,6 +443,9 @@ impl ForwardProxyRuntimeState {
                 .as_ref()
                 .map(Url::to_string)
                 .or_else(|| endpoint.raw_url.clone()),
+            resolved_ip_source: String::new(),
+            resolved_ips: Vec::new(),
+            resolved_regions: Vec::new(),
             available: endpoint.is_selectable(),
             last_error: if endpoint.is_selectable() {
                 None
@@ -483,6 +504,9 @@ struct ForwardProxyRuntimeRow {
     display_name: String,
     source: String,
     endpoint_url: Option<String>,
+    resolved_ip_source: Option<String>,
+    resolved_ips_json: Option<String>,
+    resolved_regions_json: Option<String>,
     weight: f64,
     success_ema: f64,
     latency_ema_ms: Option<f64>,
@@ -497,6 +521,13 @@ impl From<ForwardProxyRuntimeRow> for ForwardProxyRuntimeState {
             source: value.source,
             kind: "unknown".to_string(),
             endpoint_url: value.endpoint_url,
+            resolved_ip_source: value
+                .resolved_ip_source
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            resolved_ips: decode_string_vec_json(value.resolved_ips_json.as_deref()),
+            resolved_regions: decode_string_vec_json(value.resolved_regions_json.as_deref()),
             available: true,
             last_error: None,
             weight: value
@@ -1138,6 +1169,8 @@ pub struct ForwardProxyNodeResponse {
     pub source: String,
     pub display_name: String,
     pub endpoint_url: Option<String>,
+    pub resolved_ips: Vec<String>,
+    pub resolved_regions: Vec<String>,
     pub weight: f64,
     pub available: bool,
     pub last_error: Option<String>,
@@ -1200,6 +1233,8 @@ pub struct ForwardProxyLiveNodeResponse {
     pub source: String,
     pub display_name: String,
     pub endpoint_url: Option<String>,
+    pub resolved_ips: Vec<String>,
+    pub resolved_regions: Vec<String>,
     pub weight: f64,
     pub available: bool,
     pub last_error: Option<String>,
@@ -1411,6 +1446,9 @@ pub async fn ensure_forward_proxy_schema(pool: &SqlitePool) -> Result<(), ProxyE
             display_name TEXT NOT NULL,
             source TEXT NOT NULL,
             endpoint_url TEXT,
+            resolved_ip_source TEXT NOT NULL DEFAULT '',
+            resolved_ips_json TEXT NOT NULL DEFAULT '[]',
+            resolved_regions_json TEXT NOT NULL DEFAULT '[]',
             weight REAL NOT NULL,
             success_ema REAL NOT NULL,
             latency_ema_ms REAL,
@@ -1422,6 +1460,17 @@ pub async fn ensure_forward_proxy_schema(pool: &SqlitePool) -> Result<(), ProxyE
     )
     .execute(pool)
     .await?;
+
+    ensure_forward_proxy_runtime_column(pool, "resolved_ips_json", "TEXT NOT NULL DEFAULT '[]'")
+        .await?;
+    ensure_forward_proxy_runtime_column(
+        pool,
+        "resolved_regions_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    ensure_forward_proxy_runtime_column(pool, "resolved_ip_source", "TEXT NOT NULL DEFAULT ''")
+        .await?;
 
     sqlx::query(
         r#"
@@ -1570,7 +1619,18 @@ pub async fn load_forward_proxy_runtime_states(
 ) -> Result<Vec<ForwardProxyRuntimeState>, ProxyError> {
     let rows = sqlx::query_as::<_, ForwardProxyRuntimeRow>(
         r#"
-        SELECT proxy_key, display_name, source, endpoint_url, weight, success_ema, latency_ema_ms, consecutive_failures
+        SELECT
+            proxy_key,
+            display_name,
+            source,
+            endpoint_url,
+            resolved_ip_source,
+            resolved_ips_json,
+            resolved_regions_json,
+            weight,
+            success_ema,
+            latency_ema_ms,
+            consecutive_failures
         FROM forward_proxy_runtime
         "#,
     )
@@ -1598,6 +1658,12 @@ pub async fn persist_forward_proxy_runtime_state(
     pool: &SqlitePool,
     state: &ForwardProxyRuntimeState,
 ) -> Result<(), ProxyError> {
+    let resolved_ips_json = serde_json::to_string(&state.resolved_ips).map_err(|err| {
+        ProxyError::Other(format!("failed to serialize forward proxy ips: {err}"))
+    })?;
+    let resolved_regions_json = serde_json::to_string(&state.resolved_regions).map_err(|err| {
+        ProxyError::Other(format!("failed to serialize forward proxy regions: {err}"))
+    })?;
     sqlx::query(
         r#"
         INSERT INTO forward_proxy_runtime (
@@ -1605,17 +1671,23 @@ pub async fn persist_forward_proxy_runtime_state(
             display_name,
             source,
             endpoint_url,
+            resolved_ip_source,
+            resolved_ips_json,
+            resolved_regions_json,
             weight,
             success_ema,
             latency_ema_ms,
             consecutive_failures,
             is_penalized,
             updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s', 'now'))
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%s', 'now'))
         ON CONFLICT(proxy_key) DO UPDATE SET
             display_name = excluded.display_name,
             source = excluded.source,
             endpoint_url = excluded.endpoint_url,
+            resolved_ip_source = excluded.resolved_ip_source,
+            resolved_ips_json = excluded.resolved_ips_json,
+            resolved_regions_json = excluded.resolved_regions_json,
             weight = excluded.weight,
             success_ema = excluded.success_ema,
             latency_ema_ms = excluded.latency_ema_ms,
@@ -1628,6 +1700,9 @@ pub async fn persist_forward_proxy_runtime_state(
     .bind(&state.display_name)
     .bind(&state.source)
     .bind(&state.endpoint_url)
+    .bind(&state.resolved_ip_source)
+    .bind(resolved_ips_json)
+    .bind(resolved_regions_json)
     .bind(state.weight)
     .bind(state.success_ema)
     .bind(state.latency_ema_ms)
@@ -1635,6 +1710,27 @@ pub async fn persist_forward_proxy_runtime_state(
     .bind(state.is_penalized() as i64)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+async fn ensure_forward_proxy_runtime_column(
+    pool: &SqlitePool,
+    column_name: &str,
+    column_def: &str,
+) -> Result<(), ProxyError> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('forward_proxy_runtime') WHERE name = ?1",
+    )
+    .bind(column_name)
+    .fetch_one(pool)
+    .await?;
+    if exists == 0 {
+        sqlx::query(&format!(
+            "ALTER TABLE forward_proxy_runtime ADD COLUMN {column_name} {column_def}"
+        ))
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -1737,8 +1833,14 @@ async fn load_forward_proxy_affinity(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|row| ForwardProxyKeyAffinity {
-        primary_proxy_key: row.try_get("primary_proxy_key").ok(),
-        secondary_proxy_key: row.try_get("secondary_proxy_key").ok(),
+        primary_proxy_key: row
+            .try_get("primary_proxy_key")
+            .ok()
+            .filter(|value: &String| !value.trim().is_empty()),
+        secondary_proxy_key: row
+            .try_get("secondary_proxy_key")
+            .ok()
+            .filter(|value: &String| !value.trim().is_empty()),
     }))
 }
 
@@ -2048,6 +2150,8 @@ pub async fn build_forward_proxy_settings_response(
                     source: runtime.source.clone(),
                     display_name: runtime.display_name.clone(),
                     endpoint_url: runtime.endpoint_url.clone(),
+                    resolved_ips: runtime.resolved_ips.clone(),
+                    resolved_regions: runtime.resolved_regions.clone(),
                     weight: runtime.weight,
                     available: runtime.available,
                     last_error: runtime.last_error.clone(),
@@ -2184,6 +2288,8 @@ pub async fn build_forward_proxy_live_stats_response(
             source: runtime.source,
             display_name: runtime.display_name,
             endpoint_url: runtime.endpoint_url,
+            resolved_ips: runtime.resolved_ips,
+            resolved_regions: runtime.resolved_regions,
             weight: runtime.weight,
             available: runtime.available,
             last_error: runtime.last_error,
@@ -3530,5 +3636,38 @@ rule-providers:
         .expect("parse vless");
 
         assert_eq!(parsed.display_name, "broken%ZZname");
+    }
+
+    #[test]
+    fn endpoint_host_prefers_share_link_host_for_xray_routes() {
+        let endpoint = ForwardProxyEndpoint {
+            key: "vless://example".to_string(),
+            source: FORWARD_PROXY_SOURCE_MANUAL.to_string(),
+            display_name: "example".to_string(),
+            protocol: ForwardProxyProtocol::Vless,
+            endpoint_url: Some(
+                Url::parse("socks5h://127.0.0.1:41000").expect("parse local xray route"),
+            ),
+            raw_url: Some(
+                "vless://0688fa59-e971-4278-8c03-4b35821a71dc@1.1.1.1:443?encryption=none#hk"
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(endpoint_host(&endpoint).as_deref(), Some("1.1.1.1"));
+    }
+
+    #[test]
+    fn endpoint_host_keeps_local_listener_for_non_xray_routes() {
+        let endpoint = ForwardProxyEndpoint {
+            key: "http://127.0.0.1:8080".to_string(),
+            source: FORWARD_PROXY_SOURCE_MANUAL.to_string(),
+            display_name: "local".to_string(),
+            protocol: ForwardProxyProtocol::Http,
+            endpoint_url: Some(Url::parse("http://127.0.0.1:8080").expect("parse http url")),
+            raw_url: Some("http://example.com:8080".to_string()),
+        };
+
+        assert_eq!(endpoint_host(&endpoint).as_deref(), Some("127.0.0.1"));
     }
 }
