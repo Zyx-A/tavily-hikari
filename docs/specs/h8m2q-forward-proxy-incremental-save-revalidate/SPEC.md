@@ -50,7 +50,7 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Admin/ForwardProxySettingsModule/Revalidate Progress Bubble`
   state: `running`
   evidence_note: 验证页面级全量验证气泡、按钮禁用态，以及 `refresh_subscription -> probe_nodes -> refresh_ui` 的阶段可见性。
