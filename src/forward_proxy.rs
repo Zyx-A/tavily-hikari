@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     io,
@@ -279,6 +279,8 @@ pub struct ForwardProxyEndpoint {
     pub protocol: ForwardProxyProtocol,
     pub endpoint_url: Option<Url>,
     pub raw_url: Option<String>,
+    pub manual_present: bool,
+    pub subscription_sources: BTreeSet<String>,
 }
 
 impl ForwardProxyEndpoint {
@@ -290,7 +292,66 @@ impl ForwardProxyEndpoint {
             protocol: ForwardProxyProtocol::Direct,
             endpoint_url: None,
             raw_url: None,
+            manual_present: false,
+            subscription_sources: BTreeSet::new(),
         }
+    }
+
+    pub fn new_manual(
+        key: String,
+        display_name: String,
+        protocol: ForwardProxyProtocol,
+        endpoint_url: Option<Url>,
+        raw_url: Option<String>,
+    ) -> Self {
+        Self {
+            key,
+            source: FORWARD_PROXY_SOURCE_MANUAL.to_string(),
+            display_name,
+            protocol,
+            endpoint_url,
+            raw_url,
+            manual_present: true,
+            subscription_sources: BTreeSet::new(),
+        }
+    }
+
+    pub fn new_subscription(
+        key: String,
+        display_name: String,
+        protocol: ForwardProxyProtocol,
+        endpoint_url: Option<Url>,
+        raw_url: Option<String>,
+        subscription_source: String,
+    ) -> Self {
+        let mut endpoint = Self {
+            key,
+            source: FORWARD_PROXY_SOURCE_SUBSCRIPTION.to_string(),
+            display_name,
+            protocol,
+            endpoint_url,
+            raw_url,
+            manual_present: false,
+            subscription_sources: BTreeSet::from([subscription_source]),
+        };
+        endpoint.refresh_source();
+        endpoint
+    }
+
+    pub fn refresh_source(&mut self) {
+        self.source = if self.is_direct() {
+            FORWARD_PROXY_SOURCE_DIRECT.to_string()
+        } else if self.manual_present {
+            FORWARD_PROXY_SOURCE_MANUAL.to_string()
+        } else if !self.subscription_sources.is_empty() {
+            FORWARD_PROXY_SOURCE_SUBSCRIPTION.to_string()
+        } else {
+            FORWARD_PROXY_SOURCE_MANUAL.to_string()
+        };
+    }
+
+    pub fn is_subscription_backed(&self) -> bool {
+        !self.subscription_sources.is_empty()
     }
 
     pub fn is_selectable(&self) -> bool {
@@ -490,21 +551,27 @@ impl ForwardProxyManager {
         self.rebuild_endpoints(Vec::new());
     }
 
-    pub fn apply_subscription_urls(&mut self, proxy_urls: Vec<String>) {
-        let normalized_urls = normalize_proxy_url_entries(proxy_urls);
-        let subscription_endpoints = normalize_proxy_endpoints_from_urls(
-            &normalized_urls,
-            FORWARD_PROXY_SOURCE_SUBSCRIPTION,
-        );
+    pub fn update_settings_only(&mut self, settings: ForwardProxySettings) {
+        self.settings = settings;
+    }
+
+    pub fn apply_subscription_refresh(
+        &mut self,
+        subscription_proxy_urls: &HashMap<String, Vec<String>>,
+    ) {
+        let mut subscription_endpoints = Vec::new();
+        for (subscription_source, proxy_urls) in subscription_proxy_urls {
+            subscription_endpoints.extend(normalize_subscription_endpoints_from_urls(
+                proxy_urls,
+                subscription_source,
+            ));
+        }
         self.rebuild_endpoints(subscription_endpoints);
         self.last_subscription_refresh_at = Some(Utc::now().timestamp());
     }
 
     pub fn rebuild_endpoints(&mut self, subscription_endpoints: Vec<ForwardProxyEndpoint>) {
-        let manual = normalize_proxy_endpoints_from_urls(
-            &self.settings.proxy_urls,
-            FORWARD_PROXY_SOURCE_MANUAL,
-        );
+        let manual = normalize_proxy_endpoints_from_urls(&self.settings.proxy_urls);
         let mut merged = Vec::new();
         let mut seen = HashSet::new();
         for endpoint in manual.into_iter().chain(subscription_endpoints.into_iter()) {
@@ -548,6 +615,125 @@ impl ForwardProxyManager {
             }
         }
         self.ensure_non_zero_weight();
+    }
+
+    pub fn apply_incremental_settings(
+        &mut self,
+        settings: ForwardProxySettings,
+        fetched_subscriptions: &HashMap<String, Vec<String>>,
+    ) -> Vec<ForwardProxyEndpoint> {
+        let previous_keys = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.key.clone())
+            .collect::<HashSet<_>>();
+        self.settings = settings.clone();
+
+        let manual_by_key = normalize_proxy_endpoints_from_urls(&settings.proxy_urls)
+            .into_iter()
+            .map(|endpoint| (endpoint.key.clone(), endpoint))
+            .collect::<HashMap<_, _>>();
+        let desired_subscription_sources = settings
+            .subscription_urls
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        let mut merged = Vec::new();
+        let mut seen = HashSet::new();
+
+        for mut endpoint in self.endpoints.clone() {
+            if endpoint.is_direct() {
+                continue;
+            }
+            endpoint.manual_present = manual_by_key.contains_key(&endpoint.key);
+            endpoint
+                .subscription_sources
+                .retain(|source| desired_subscription_sources.contains(source));
+            if endpoint.manual_present || endpoint.is_subscription_backed() {
+                endpoint.refresh_source();
+                if seen.insert(endpoint.key.clone()) {
+                    merged.push(endpoint);
+                }
+            }
+        }
+
+        for (key, manual_endpoint) in &manual_by_key {
+            if let Some(existing) = merged.iter_mut().find(|endpoint| endpoint.key == *key) {
+                existing.manual_present = true;
+                existing.display_name = manual_endpoint.display_name.clone();
+                existing.protocol = manual_endpoint.protocol;
+                existing.raw_url = manual_endpoint.raw_url.clone();
+                existing.refresh_source();
+                continue;
+            }
+            if seen.insert(key.clone()) {
+                merged.push(manual_endpoint.clone());
+            }
+        }
+
+        for (subscription_source, proxy_urls) in fetched_subscriptions {
+            for mut endpoint in
+                normalize_subscription_endpoints_from_urls(proxy_urls, subscription_source)
+            {
+                if let Some(existing) = merged
+                    .iter_mut()
+                    .find(|candidate| candidate.key == endpoint.key)
+                {
+                    existing
+                        .subscription_sources
+                        .append(&mut endpoint.subscription_sources);
+                    existing.refresh_source();
+                    continue;
+                }
+                if seen.insert(endpoint.key.clone()) {
+                    merged.push(endpoint);
+                }
+            }
+        }
+
+        if settings.insert_direct {
+            merged.push(ForwardProxyEndpoint::direct());
+        }
+        if merged.is_empty()
+            && settings.proxy_urls.is_empty()
+            && settings.subscription_urls.is_empty()
+        {
+            merged.push(ForwardProxyEndpoint::direct());
+        }
+
+        self.endpoints = merged;
+        for endpoint in &self.endpoints {
+            match self.runtime.entry(endpoint.key.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    let runtime = occupied.get_mut();
+                    runtime.display_name = endpoint.display_name.clone();
+                    runtime.source = endpoint.source.clone();
+                    runtime.kind = endpoint.protocol.as_str().to_string();
+                    runtime.endpoint_url = endpoint
+                        .endpoint_url
+                        .as_ref()
+                        .map(Url::to_string)
+                        .or_else(|| endpoint.raw_url.clone());
+                    runtime.available = endpoint.is_selectable();
+                    runtime.last_error = if endpoint.is_selectable() {
+                        None
+                    } else {
+                        Some("xray_missing".to_string())
+                    };
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(ForwardProxyRuntimeState::default_for_endpoint(endpoint));
+                }
+            }
+        }
+        self.ensure_non_zero_weight();
+
+        self.endpoints
+            .iter()
+            .filter(|endpoint| !previous_keys.contains(&endpoint.key))
+            .cloned()
+            .collect()
     }
 
     pub fn ensure_non_zero_weight(&mut self) {
@@ -2075,9 +2261,30 @@ fn split_proxy_entry_tokens(raw: &str) -> Vec<&str> {
         .collect()
 }
 
-pub fn normalize_proxy_endpoints_from_urls(
+pub fn normalize_proxy_endpoints_from_urls(urls: &[String]) -> Vec<ForwardProxyEndpoint> {
+    let mut seen = HashSet::new();
+    let mut endpoints = Vec::new();
+    for raw in urls {
+        if let Some(parsed) = parse_forward_proxy_entry(raw) {
+            let key = parsed.normalized.clone();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            endpoints.push(ForwardProxyEndpoint::new_manual(
+                key,
+                parsed.display_name,
+                parsed.protocol,
+                parsed.endpoint_url,
+                Some(parsed.normalized),
+            ));
+        }
+    }
+    endpoints
+}
+
+pub fn normalize_subscription_endpoints_from_urls(
     urls: &[String],
-    source: &str,
+    subscription_source: &str,
 ) -> Vec<ForwardProxyEndpoint> {
     let mut seen = HashSet::new();
     let mut endpoints = Vec::new();
@@ -2087,14 +2294,14 @@ pub fn normalize_proxy_endpoints_from_urls(
             if !seen.insert(key.clone()) {
                 continue;
             }
-            endpoints.push(ForwardProxyEndpoint {
+            endpoints.push(ForwardProxyEndpoint::new_subscription(
                 key,
-                source: source.to_string(),
-                display_name: parsed.display_name,
-                protocol: parsed.protocol,
-                endpoint_url: parsed.endpoint_url,
-                raw_url: Some(parsed.normalized),
-            });
+                parsed.display_name,
+                parsed.protocol,
+                parsed.endpoint_url,
+                Some(parsed.normalized),
+                subscription_source.to_string(),
+            ));
         }
     }
     endpoints
