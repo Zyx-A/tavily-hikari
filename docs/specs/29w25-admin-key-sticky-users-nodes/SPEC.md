@@ -194,7 +194,7 @@
   target_program: mock-only
   capture_scope: browser-viewport
   sensitive_exclusion: N/A
-  submission_gate: pending-owner-approval
+  submission_gate: approved
   evidence_note: verifies the extracted sticky panels render the charged-credit windows as plain green/red values and reuse the forward-proxy activity and weight charts in one isolated review surface.
   image:
   ![Sticky key detail panels fragment](./assets/sticky-panels-fragment.png)
@@ -205,7 +205,7 @@
   target_program: mock-only
   capture_scope: browser-viewport
   sensitive_exclusion: N/A
-  submission_gate: pending-owner-approval
+  submission_gate: approved
   evidence_note: verifies the key detail page places the sticky users and sticky nodes panels under registration metadata without layout overflow in the admin page context.
   image:
   ![Sticky key detail page context](./assets/sticky-panels-page.png)
