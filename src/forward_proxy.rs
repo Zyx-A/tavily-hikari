@@ -437,12 +437,30 @@ pub struct ForwardProxyRuntimeState {
     pub resolved_ip_source: String,
     pub resolved_ips: Vec<String>,
     pub resolved_regions: Vec<String>,
+    pub geo_refreshed_at: i64,
     pub available: bool,
     pub last_error: Option<String>,
     pub weight: f64,
     pub success_ema: f64,
     pub latency_ema_ms: Option<f64>,
     pub consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForwardProxyRuntimeGeoMetadataUpdate {
+    pub proxy_key: String,
+    pub display_name: String,
+    pub source: String,
+    pub endpoint_url: Option<String>,
+    pub resolved_ip_source: String,
+    pub resolved_ips: Vec<String>,
+    pub resolved_regions: Vec<String>,
+    pub geo_refreshed_at: i64,
+    pub weight: f64,
+    pub success_ema: f64,
+    pub latency_ema_ms: Option<f64>,
+    pub consecutive_failures: u32,
+    pub is_penalized: bool,
 }
 
 impl ForwardProxyRuntimeState {
@@ -460,6 +478,7 @@ impl ForwardProxyRuntimeState {
             resolved_ip_source: String::new(),
             resolved_ips: Vec::new(),
             resolved_regions: Vec::new(),
+            geo_refreshed_at: 0,
             available: endpoint.is_selectable(),
             last_error: if endpoint.is_selectable() {
                 None
@@ -521,6 +540,7 @@ struct ForwardProxyRuntimeRow {
     resolved_ip_source: Option<String>,
     resolved_ips_json: Option<String>,
     resolved_regions_json: Option<String>,
+    geo_refreshed_at: Option<i64>,
     weight: f64,
     success_ema: f64,
     latency_ema_ms: Option<f64>,
@@ -542,6 +562,7 @@ impl From<ForwardProxyRuntimeRow> for ForwardProxyRuntimeState {
                 .to_string(),
             resolved_ips: decode_string_vec_json(value.resolved_ips_json.as_deref()),
             resolved_regions: decode_string_vec_json(value.resolved_regions_json.as_deref()),
+            geo_refreshed_at: value.geo_refreshed_at.unwrap_or_default().max(0),
             available: true,
             last_error: None,
             weight: value
@@ -1470,6 +1491,7 @@ pub async fn ensure_forward_proxy_schema(pool: &SqlitePool) -> Result<(), ProxyE
             resolved_ip_source TEXT NOT NULL DEFAULT '',
             resolved_ips_json TEXT NOT NULL DEFAULT '[]',
             resolved_regions_json TEXT NOT NULL DEFAULT '[]',
+            geo_refreshed_at INTEGER NOT NULL DEFAULT 0,
             weight REAL NOT NULL,
             success_ema REAL NOT NULL,
             latency_ema_ms REAL,
@@ -1491,6 +1513,8 @@ pub async fn ensure_forward_proxy_schema(pool: &SqlitePool) -> Result<(), ProxyE
     )
     .await?;
     ensure_forward_proxy_runtime_column(pool, "resolved_ip_source", "TEXT NOT NULL DEFAULT ''")
+        .await?;
+    ensure_forward_proxy_runtime_column(pool, "geo_refreshed_at", "INTEGER NOT NULL DEFAULT 0")
         .await?;
 
     sqlx::query(
@@ -1648,6 +1672,7 @@ pub async fn load_forward_proxy_runtime_states(
             resolved_ip_source,
             resolved_ips_json,
             resolved_regions_json,
+            geo_refreshed_at,
             weight,
             success_ema,
             latency_ema_ms,
@@ -1675,7 +1700,37 @@ pub async fn persist_forward_proxy_runtime_snapshot(
     Ok(())
 }
 
-pub async fn persist_forward_proxy_runtime_state(
+pub async fn persist_forward_proxy_runtime_states_atomic(
+    pool: &SqlitePool,
+    states: &[ForwardProxyRuntimeState],
+) -> Result<(), ProxyError> {
+    if states.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for state in states {
+        persist_forward_proxy_runtime_state_tx(&mut tx, state).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn persist_forward_proxy_runtime_geo_metadata_atomic(
+    pool: &SqlitePool,
+    updates: &[ForwardProxyRuntimeGeoMetadataUpdate],
+) -> Result<(), ProxyError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for update in updates {
+        persist_forward_proxy_runtime_geo_metadata_tx(&mut tx, update).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn persist_forward_proxy_runtime_health_state(
     pool: &SqlitePool,
     state: &ForwardProxyRuntimeState,
 ) -> Result<(), ProxyError> {
@@ -1695,20 +1750,18 @@ pub async fn persist_forward_proxy_runtime_state(
             resolved_ip_source,
             resolved_ips_json,
             resolved_regions_json,
+            geo_refreshed_at,
             weight,
             success_ema,
             latency_ema_ms,
             consecutive_failures,
             is_penalized,
             updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%s', 'now'))
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s', 'now'))
         ON CONFLICT(proxy_key) DO UPDATE SET
             display_name = excluded.display_name,
             source = excluded.source,
             endpoint_url = excluded.endpoint_url,
-            resolved_ip_source = excluded.resolved_ip_source,
-            resolved_ips_json = excluded.resolved_ips_json,
-            resolved_regions_json = excluded.resolved_regions_json,
             weight = excluded.weight,
             success_ema = excluded.success_ema,
             latency_ema_ms = excluded.latency_ema_ms,
@@ -1724,12 +1777,139 @@ pub async fn persist_forward_proxy_runtime_state(
     .bind(&state.resolved_ip_source)
     .bind(resolved_ips_json)
     .bind(resolved_regions_json)
+    .bind(state.geo_refreshed_at)
     .bind(state.weight)
     .bind(state.success_ema)
     .bind(state.latency_ema_ms)
     .bind(i64::from(state.consecutive_failures))
     .bind(state.is_penalized() as i64)
     .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn persist_forward_proxy_runtime_state(
+    pool: &SqlitePool,
+    state: &ForwardProxyRuntimeState,
+) -> Result<(), ProxyError> {
+    let mut tx = pool.begin().await?;
+    persist_forward_proxy_runtime_state_tx(&mut tx, state).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn persist_forward_proxy_runtime_state_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    state: &ForwardProxyRuntimeState,
+) -> Result<(), ProxyError> {
+    let resolved_ips_json = serde_json::to_string(&state.resolved_ips).map_err(|err| {
+        ProxyError::Other(format!("failed to serialize forward proxy ips: {err}"))
+    })?;
+    let resolved_regions_json = serde_json::to_string(&state.resolved_regions).map_err(|err| {
+        ProxyError::Other(format!("failed to serialize forward proxy regions: {err}"))
+    })?;
+    sqlx::query(
+        r#"
+        INSERT INTO forward_proxy_runtime (
+            proxy_key,
+            display_name,
+            source,
+            endpoint_url,
+            resolved_ip_source,
+            resolved_ips_json,
+            resolved_regions_json,
+            geo_refreshed_at,
+            weight,
+            success_ema,
+            latency_ema_ms,
+            consecutive_failures,
+            is_penalized,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s', 'now'))
+        ON CONFLICT(proxy_key) DO UPDATE SET
+            display_name = excluded.display_name,
+            source = excluded.source,
+            endpoint_url = excluded.endpoint_url,
+            resolved_ip_source = excluded.resolved_ip_source,
+            resolved_ips_json = excluded.resolved_ips_json,
+            resolved_regions_json = excluded.resolved_regions_json,
+            geo_refreshed_at = excluded.geo_refreshed_at,
+            weight = excluded.weight,
+            success_ema = excluded.success_ema,
+            latency_ema_ms = excluded.latency_ema_ms,
+            consecutive_failures = excluded.consecutive_failures,
+            is_penalized = excluded.is_penalized,
+            updated_at = strftime('%s', 'now')
+        "#,
+    )
+    .bind(&state.proxy_key)
+    .bind(&state.display_name)
+    .bind(&state.source)
+    .bind(&state.endpoint_url)
+    .bind(&state.resolved_ip_source)
+    .bind(resolved_ips_json)
+    .bind(resolved_regions_json)
+    .bind(state.geo_refreshed_at)
+    .bind(state.weight)
+    .bind(state.success_ema)
+    .bind(state.latency_ema_ms)
+    .bind(i64::from(state.consecutive_failures))
+    .bind(state.is_penalized() as i64)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn persist_forward_proxy_runtime_geo_metadata_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    update: &ForwardProxyRuntimeGeoMetadataUpdate,
+) -> Result<(), ProxyError> {
+    let resolved_ips_json = serde_json::to_string(&update.resolved_ips).map_err(|err| {
+        ProxyError::Other(format!("failed to serialize forward proxy ips: {err}"))
+    })?;
+    let resolved_regions_json = serde_json::to_string(&update.resolved_regions).map_err(|err| {
+        ProxyError::Other(format!("failed to serialize forward proxy regions: {err}"))
+    })?;
+    sqlx::query(
+        r#"
+        INSERT INTO forward_proxy_runtime (
+            proxy_key,
+            display_name,
+            source,
+            endpoint_url,
+            resolved_ip_source,
+            resolved_ips_json,
+            resolved_regions_json,
+            geo_refreshed_at,
+            weight,
+            success_ema,
+            latency_ema_ms,
+            consecutive_failures,
+            is_penalized,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s', 'now'))
+        ON CONFLICT(proxy_key) DO UPDATE SET
+            resolved_ip_source = excluded.resolved_ip_source,
+            resolved_ips_json = excluded.resolved_ips_json,
+            resolved_regions_json = excluded.resolved_regions_json,
+            geo_refreshed_at = excluded.geo_refreshed_at,
+            updated_at = strftime('%s', 'now')
+        "#,
+    )
+    .bind(&update.proxy_key)
+    .bind(&update.display_name)
+    .bind(&update.source)
+    .bind(&update.endpoint_url)
+    .bind(&update.resolved_ip_source)
+    .bind(resolved_ips_json)
+    .bind(resolved_regions_json)
+    .bind(update.geo_refreshed_at)
+    .bind(update.weight)
+    .bind(update.success_ema)
+    .bind(update.latency_ema_ms)
+    .bind(i64::from(update.consecutive_failures))
+    .bind(update.is_penalized as i64)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
