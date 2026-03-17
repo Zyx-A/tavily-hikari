@@ -19586,6 +19586,42 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"oop
     }
 
     #[tokio::test]
+    async fn update_forward_proxy_settings_rejects_invalid_egress_socks5_url() {
+        let db_path = temp_db_path("invalid-egress-socks5-url");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let result = proxy
+            .update_forward_proxy_settings(
+                ForwardProxySettings {
+                    proxy_urls: Vec::new(),
+                    subscription_urls: Vec::new(),
+                    subscription_update_interval_secs: 3600,
+                    insert_direct: true,
+                    egress_socks5_enabled: true,
+                    egress_socks5_url: "socks5h://user:pass@127".to_string(),
+                },
+                true,
+            )
+            .await;
+
+        match result {
+            Err(ProxyError::Other(message)) => {
+                assert!(
+                    message.contains("valid socks5:// or socks5h:// URL"),
+                    "unexpected validation error: {message}",
+                );
+            }
+            other => panic!("expected invalid egress socks5 URL to be rejected, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn select_proxy_affinity_refreshes_incomplete_persisted_forward_proxy_runtime_geo_metadata()
      {
         let db_path = temp_db_path("proxy-runtime-geo-refresh-incomplete");

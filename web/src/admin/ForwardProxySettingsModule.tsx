@@ -37,6 +37,8 @@ import {
   type ForwardProxyDialogProgressState,
   updateDialogProgressState,
 } from './forwardProxyDialogProgress'
+import ForwardProxyEgressControl from './ForwardProxyEgressControl'
+import ForwardProxyProgressBubble from './ForwardProxyProgressBubble'
 import type { QueryLoadState } from './queryLoadState'
 
 const numberFormatter = new Intl.NumberFormat()
@@ -161,6 +163,46 @@ function formatPercent(value: number | null | undefined): string {
 function formatLatency(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value)) return '—'
   return `${decimalFormatter.format(value)} ms`
+}
+
+function normalizeEgressErrorMessage(
+  strings: AdminTranslations['proxySettings'],
+  message: string | null | undefined,
+): string {
+  if (!message) return strings.config.egressUnknownError
+
+  const normalized = message.trim()
+  const withoutPrefix = normalized.replace(/^other error:\s*/i, '')
+
+  if (
+    /global SOCKS5 relay must be a valid socks5:\/\/ or socks5h:\/\/ URL/i.test(withoutPrefix)
+  ) {
+    return strings.config.egressInvalidUrlError
+  }
+
+  return withoutPrefix || strings.config.egressUnknownError
+}
+
+function validateEgressUrl(
+  strings: AdminTranslations['proxySettings'],
+  value: string,
+): string | null {
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return null
+
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    return strings.config.egressInvalidUrlError
+  }
+
+  const scheme = parsed.protocol.replace(/:$/, '').toLowerCase()
+  if ((scheme !== 'socks5' && scheme !== 'socks5h') || !parsed.hostname || !parsed.port) {
+    return strings.config.egressInvalidUrlError
+  }
+
+  return null
 }
 
 function formatTimeRange(start: string | null | undefined, end: string | null | undefined): string {
@@ -723,95 +765,6 @@ export function formatValidationMessage(
   }
 
   return message || mapValidationErrorLabel(strings, result.errorCode, result.message)
-}
-
-function ForwardProxyProgressBubble({
-  strings,
-  progress,
-}: {
-  strings: AdminTranslations['proxySettings']
-  progress: ForwardProxyDialogProgressState
-}): JSX.Element {
-  const title =
-    progress.action === 'validate'
-      ? strings.progress.titleValidate
-      : progress.action === 'revalidate'
-        ? strings.progress.titleRevalidate
-        : strings.progress.titleSave
-
-  return (
-    <div className="rounded-2xl border border-primary/25 bg-primary/5 px-4 py-3 shadow-[0_16px_40px_-28px_hsl(var(--primary)/0.8)]">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <p className="text-sm font-semibold text-foreground">{title}</p>
-          <p className="text-xs text-muted-foreground">
-            {progress.message ?? strings.progress.running}
-          </p>
-        </div>
-        <Badge variant="outline" className="border-primary/30 bg-background/70">
-          {progress.action === 'validate'
-            ? strings.progress.badgeValidate
-            : progress.action === 'revalidate'
-              ? strings.progress.badgeRevalidate
-              : strings.progress.badgeSave}
-        </Badge>
-      </div>
-
-      <div className="space-y-2">
-        {progress.steps.map((step) => {
-          const icon =
-            step.status === 'done'
-              ? 'mdi:check-circle'
-              : step.status === 'error'
-                ? 'mdi:alert-circle'
-                : step.status === 'running'
-                  ? 'mdi:loading'
-                  : 'mdi:circle-outline'
-          const toneClass =
-            step.status === 'done'
-              ? 'text-success'
-              : step.status === 'error'
-                ? 'text-destructive'
-                : step.status === 'running'
-                  ? 'text-primary'
-                  : 'text-muted-foreground'
-
-          return (
-            <div
-              key={step.key}
-              className={`flex items-start gap-3 rounded-2xl border px-3 py-2 transition-colors ${
-                step.status === 'running'
-                  ? 'border-primary/35 bg-background/88'
-                  : step.status === 'error'
-                    ? 'border-destructive/30 bg-destructive/5'
-                    : step.status === 'done'
-                      ? 'border-success/25 bg-success/5'
-                      : 'border-border/60 bg-background/70'
-              }`}
-            >
-              <Icon
-                icon={icon}
-                className={`${toneClass} mt-0.5 text-base ${step.status === 'running' ? 'animate-spin' : ''}`}
-              />
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-foreground">{step.label}</p>
-                <p className="text-xs text-muted-foreground">
-                  {step.detail
-                    ?? (step.status === 'done'
-                      ? strings.progress.done
-                      : step.status === 'error'
-                        ? strings.progress.failed
-                        : step.status === 'running'
-                          ? strings.progress.running
-                          : strings.progress.waiting)}
-                </p>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
 }
 
 export interface ForwardProxyValidationNodeRow {
@@ -1542,6 +1495,7 @@ export default function ForwardProxySettingsModule({
   const [egressSocks5UrlDraft, setEgressSocks5UrlDraft] = useState(draft.egressSocks5Url)
   const [egressSocks5EnabledDraft, setEgressSocks5EnabledDraft] = useState(draft.egressSocks5Enabled)
   const [egressProgress, setEgressProgress] = useState<ForwardProxyDialogProgressState | null>(null)
+  const [egressFieldError, setEgressFieldError] = useState<{ message: string; presentation: 'hint' | 'alert' } | null>(null)
   const [dialogKind, setDialogKind] = useState<ForwardProxyDialogKind>(null)
   const [dialogInput, setDialogInput] = useState('')
   const [dialogError, setDialogError] = useState<string | null>(null)
@@ -1588,7 +1542,7 @@ export default function ForwardProxySettingsModule({
   const egressDraftDirty =
     egressSocks5UrlDraft.trim() !== draft.egressSocks5Url.trim()
     || egressSocks5EnabledDraft !== draft.egressSocks5Enabled
-  const egressApplyBusy = controlsDisabled && activeEgressProgress?.action === 'save'
+  const egressApplyBusy = activeEgressProgress?.action === 'save'
   const canAddSubscription = dialogSubscriptionCandidate != null
     && (!activeDialogValidating || dialogHasLiveImportableSubscription)
   const canAddManualBatch = dialogManualBatchValues.length > manualUrls.length
@@ -1606,6 +1560,7 @@ export default function ForwardProxySettingsModule({
   useEffect(() => {
     setEgressSocks5UrlDraft(draft.egressSocks5Url)
     setEgressSocks5EnabledDraft(draft.egressSocks5Enabled)
+    setEgressFieldError(null)
   }, [draft.egressSocks5Enabled, draft.egressSocks5Url])
 
   const summaryCards = [
@@ -1749,32 +1704,69 @@ export default function ForwardProxySettingsModule({
     }
   }
 
-  const handleApplyEgress = async () => {
+  const handleToggleEgress = async (nextChecked: boolean) => {
+    const localValidationError = validateEgressUrl(strings, egressSocks5UrlDraft)
+    if (nextChecked && localValidationError) {
+      setEgressFieldError({
+        message: localValidationError,
+        presentation: 'alert',
+      })
+      setEgressSocks5EnabledDraft(false)
+      return
+    }
+
+    setEgressFieldError(null)
+    setEgressSocks5EnabledDraft(nextChecked)
     try {
       setEgressProgress(
         createDialogProgressState(strings.progress, 'egress', 'save', {
-          includeEgressValidation: egressSocks5EnabledDraft,
+          includeEgressValidation: nextChecked,
         }),
       )
       await persistDraft(
         {
           ...draft,
-          egressSocks5Enabled: egressSocks5EnabledDraft,
+          egressSocks5Enabled: nextChecked,
           egressSocks5Url: egressSocks5UrlDraft.trim(),
         },
         (event) => {
+          const normalizedEvent =
+            event.type === 'error'
+              ? {
+                  ...event,
+                  message: normalizeEgressErrorMessage(
+                    strings,
+                    event.message || event.detail || strings.config.egressUnknownError,
+                  ),
+                  detail: normalizeEgressErrorMessage(
+                    strings,
+                    event.detail || event.message || strings.config.egressUnknownError,
+                  ),
+                }
+              : event
+
+          if (normalizedEvent.type === 'error') {
+            setEgressFieldError({
+              message: normalizedEvent.message,
+              presentation: 'alert',
+            })
+          }
           setEgressProgress((current) => {
             const base =
               current
               ?? createDialogProgressState(strings.progress, 'egress', 'save', {
-                includeEgressValidation: egressSocks5EnabledDraft,
+                includeEgressValidation: nextChecked,
               })
-            return updateDialogProgressState(base, strings.progress, event)
+            return updateDialogProgressState(base, strings.progress, normalizedEvent)
           })
         },
       )
     } catch {
-      // Parent state already exposes the error banner.
+      setEgressFieldError((current) => current ?? {
+        message: normalizeEgressErrorMessage(strings, saveError || strings.config.egressUnknownError),
+        presentation: 'alert',
+      })
+      setEgressSocks5EnabledDraft(draft.egressSocks5Enabled)
     }
   }
 
@@ -2160,7 +2152,7 @@ export default function ForwardProxySettingsModule({
           </div>
         </CardHeader>
         <CardContent className="forward-proxy-panel-content">
-          {saveError && (
+          {saveError && !activeEgressProgress && (
             <div className="alert alert-error" role="alert">
               {saveError}
             </div>
@@ -2178,65 +2170,39 @@ export default function ForwardProxySettingsModule({
             minHeight={220}
           >
             <div className="space-y-3">
-              <Card className="forward-proxy-field-card">
-                <CardHeader className="forward-proxy-editor-head">
-                  <div>
-                    <CardTitle className="text-base">{strings.config.egressTitle}</CardTitle>
-                    <CardDescription className="panel-description">
-                      {strings.config.egressDescription}
-                    </CardDescription>
-                  </div>
-                  <Badge variant={settings?.egressSocks5Enabled ? 'info' : 'outline'}>
-                    {settings?.egressSocks5Enabled
-                      ? strings.config.egressEnabled
-                      : strings.config.egressDisabled}
-                  </Badge>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  {activeEgressProgress && (
-                    <ForwardProxyProgressBubble strings={strings} progress={activeEgressProgress} />
-                  )}
-                  <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
-                    <label className="forward-proxy-field">
-                      <span className="forward-proxy-field-label">{strings.config.egressUrlLabel}</span>
-                      <Input
-                        value={egressSocks5UrlDraft}
-                        onChange={(event) => setEgressSocks5UrlDraft(event.target.value)}
-                        placeholder={strings.config.egressUrlPlaceholder}
-                        disabled={controlsDisabled || egressInputLocked}
-                        readOnly={egressInputLocked}
-                      />
-                      <span className="panel-description">
-                        {egressInputLocked
-                          ? strings.config.egressLockedHint
-                          : strings.config.egressUrlHint}
-                      </span>
-                    </label>
-
-                    <div className="space-y-3 rounded-xl border border-border/70 bg-card/45 p-3">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="space-y-1">
-                          <strong className="text-sm">{strings.config.egressSwitchLabel}</strong>
-                          <p className="panel-description">{strings.config.egressSwitchHint}</p>
-                        </div>
-                        <Switch
-                          checked={egressSocks5EnabledDraft}
-                          onCheckedChange={setEgressSocks5EnabledDraft}
-                          disabled={controlsDisabled}
-                        />
-                      </div>
-                      <Button
-                        type="button"
-                        className="w-full"
-                        onClick={() => void handleApplyEgress()}
-                        disabled={controlsDisabled || !egressDraftDirty}
-                      >
-                        {egressApplyBusy ? strings.config.egressApplying : strings.config.egressApply}
-                      </Button>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
+              <ForwardProxyEgressControl
+                strings={strings}
+                enabled={egressSocks5EnabledDraft}
+                url={egressSocks5UrlDraft}
+                loading={egressApplyBusy}
+                controlsDisabled={controlsDisabled}
+                inputLocked={egressInputLocked}
+                errorMessage={egressFieldError?.message ?? null}
+                errorPresentation={egressFieldError?.presentation ?? 'hint'}
+                progress={activeEgressProgress}
+                onToggle={(checked) => void handleToggleEgress(checked)}
+                onUrlChange={(value) => {
+                  setEgressFieldError(null)
+                  setEgressSocks5UrlDraft(value)
+                }}
+                onUrlBlur={() => {
+                  const validationError = validateEgressUrl(strings, egressSocks5UrlDraft)
+                  setEgressFieldError(
+                    validationError
+                      ? {
+                          message: validationError,
+                          presentation: 'alert',
+                        }
+                      : null,
+                  )
+                }}
+                onRequireUrl={() => {
+                  setEgressFieldError({
+                    message: strings.config.egressRequiredError,
+                    presentation: 'hint',
+                  })
+                }}
+              />
 
               <div className="rounded-xl border border-border/70 bg-card/45 px-3.5 py-3">
                 <div className="flex flex-wrap items-center gap-3">

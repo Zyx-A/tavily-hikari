@@ -4040,6 +4040,26 @@ rule-providers:
     }
 
     #[test]
+    fn parse_egress_socks5_url_requires_supported_scheme_and_explicit_port() {
+        assert!(
+            parse_egress_socks5_url("socks5h://user:pass@127.0.0.1:1080").is_some(),
+            "complete socks5h URLs should remain valid",
+        );
+        assert!(
+            parse_egress_socks5_url("socks5://127.0.0.1").is_none(),
+            "missing ports should be rejected for egress URLs",
+        );
+        assert!(
+            parse_egress_socks5_url("socks5h://user:pass@127").is_none(),
+            "hostname-only values without an explicit port should be rejected",
+        );
+        assert!(
+            parse_egress_socks5_url("http://127.0.0.1:1080").is_none(),
+            "non-SOCKS egress URLs should be rejected",
+        );
+    }
+
+    #[test]
     fn subscription_refresh_preserves_overlapping_manual_and_subscription_sources() {
         let subscription_url = "https://subscription.example.com/feed".to_string();
         let endpoint_url = "http://198.51.100.8:8080".to_string();
