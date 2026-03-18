@@ -276,7 +276,7 @@ function buildMcpProbeStepDefinitions(
     {
       id: 'mcp-ping',
       label: probeText.steps.mcpPing,
-      billable: true,
+      billable: false,
       run: async (token: string): Promise<McpProbeStepResult | null> => {
         const payload = await probeMcpPing(token)
         const error = envelopeError(payload)
@@ -448,6 +448,19 @@ function buildApiProbeStepDefinitions(
       },
     },
   ]
+}
+
+function nextRunningMcpProbeModel(
+  previous: ProbeButtonModel,
+  stepDefinitions: readonly McpProbeStepDefinition[],
+  completed: number,
+): ProbeButtonModel {
+  return {
+    ...previous,
+    state: 'running',
+    completed,
+    total: stepDefinitions.length,
+  }
 }
 
 function getResearchRequestId(payload: unknown): string | null {
@@ -1160,11 +1173,7 @@ export default function UserConsole(): JSX.Element {
         }
       }
 
-      setMcpProbe((prev) => ({
-        ...prev,
-        state: 'running',
-        completed: index + 1,
-      }))
+      setMcpProbe((prev) => nextRunningMcpProbeModel(prev, stepDefinitions, index + 1))
       setProbeBubble({
         visible: true,
         anchor: 'mcp',
@@ -1893,6 +1902,7 @@ export const __testables = {
   buildMcpProbeStepDefinitions,
   buildMcpToolCallProbeStepDefinitions,
   extractAdvertisedMcpTools,
+  nextRunningMcpProbeModel,
   resolveGuideToken,
   shouldRenderLandingGuide,
 }

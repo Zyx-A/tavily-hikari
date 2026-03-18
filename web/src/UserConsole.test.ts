@@ -68,6 +68,15 @@ describe('UserConsole landing guide helpers', () => {
 })
 
 describe('UserConsole probe step definitions', () => {
+  it('keeps MCP ping non-billable so exhausted tokens can still test connectivity', () => {
+    const steps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+
+    expect(steps[0]?.id).toBe('mcp-ping')
+    expect(steps[0]?.billable).toBe(false)
+    expect(steps[1]?.id).toBe('mcp-tools-list')
+    expect(steps[1]?.billable).toBeUndefined()
+  })
+
   it('executes live MCP probe calls with the expected JSON-RPC payloads', async () => {
     const calls: Array<{ url: string, init?: RequestInit }> = []
     globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -192,6 +201,30 @@ describe('UserConsole probe step definitions', () => {
         },
       },
     ])
+  })
+
+  it('updates the running MCP progress total after discovering tool call steps', () => {
+    const baseSteps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+    const toolSteps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, [
+      'tavily-search',
+      'tavily-extract',
+      'tavily-crawl',
+      'tavily-map',
+      'tavily-research',
+    ])
+
+    const stepDefinitions = [...baseSteps, ...toolSteps]
+    const nextModel = __testables.nextRunningMcpProbeModel(
+      { state: 'running', completed: 2, total: 2 },
+      stepDefinitions,
+      3,
+    )
+
+    expect(nextModel).toEqual({
+      state: 'running',
+      completed: 3,
+      total: 7,
+    })
   })
 
   it('executes every API probe call with the expected endpoint and payload', async () => {
