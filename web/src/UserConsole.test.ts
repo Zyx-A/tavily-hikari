@@ -117,7 +117,7 @@ describe('UserConsole probe step definitions', () => {
     )
 
     expect(calls.map((call) => JSON.parse(String(call.init?.body ?? 'null')).params.name)).toEqual([
-      'tavily_search',
+      'tavily-search',
     ])
   })
 
@@ -234,10 +234,10 @@ describe('UserConsole probe step definitions', () => {
     expect(calls.slice(2).map((call) => JSON.parse(String(call.init?.body ?? 'null')))).toEqual([
       {
         jsonrpc: '2.0',
-        id: 'probe-tool-call:tavily_search',
+        id: 'probe-tool-call:tavily-search',
         method: 'tools/call',
         params: {
-          name: 'tavily_search',
+          name: 'tavily-search',
           arguments: {
             query: 'health check',
             search_depth: 'basic',
@@ -246,10 +246,10 @@ describe('UserConsole probe step definitions', () => {
       },
       {
         jsonrpc: '2.0',
-        id: 'probe-tool-call:tavily_extract',
+        id: 'probe-tool-call:tavily-extract',
         method: 'tools/call',
         params: {
-          name: 'tavily_extract',
+          name: 'tavily-extract',
           arguments: {
             urls: ['https://example.com'],
           },
@@ -270,10 +270,10 @@ describe('UserConsole probe step definitions', () => {
       },
       {
         jsonrpc: '2.0',
-        id: 'probe-tool-call:tavily_map',
+        id: 'probe-tool-call:tavily-map',
         method: 'tools/call',
         params: {
-          name: 'tavily_map',
+          name: 'tavily-map',
           arguments: {
             url: 'https://example.com',
             max_depth: 1,
@@ -283,10 +283,10 @@ describe('UserConsole probe step definitions', () => {
       },
       {
         jsonrpc: '2.0',
-        id: 'probe-tool-call:tavily_research',
+        id: 'probe-tool-call:tavily-research',
         method: 'tools/call',
         params: {
-          name: 'tavily_research',
+          name: 'tavily-research',
           arguments: {
             query: 'health check',
           },

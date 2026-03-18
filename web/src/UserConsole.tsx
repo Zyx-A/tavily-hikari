@@ -351,12 +351,16 @@ function buildMcpToolCallProbeStepDefinitions(
       }]
     }
 
+    // Route known Tavily aliases through the canonical `tavily-*` name so the proxy
+    // exercises the same billable/include_usage path as real token traffic.
+    const callName = isBillableMcpProbeTool(displayName) ? displayName : requestName
+
     return [{
       id: `mcp-tool-call:${displayName}`,
       label: formatTemplate(probeText.steps.mcpToolCall, { tool: displayName }),
       billable: isBillableMcpProbeTool(displayName),
       run: async (token: string): Promise<McpProbeStepResult | null> => {
-        const payload = await probeMcpToolsCall(token, requestName, probeArguments)
+        const payload = await probeMcpToolsCall(token, callName, probeArguments)
         const error = envelopeError(payload) ?? getMcpProbeResultError(payload)
         if (error) throw new Error(error)
         return null
