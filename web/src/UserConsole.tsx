@@ -43,6 +43,7 @@ import { Button } from './components/ui/button'
 import { useLanguage, useTranslate, type Language } from './i18n'
 import { copyText, isCopyIntentKey, selectAllReadonlyText, shouldPrewarmSecretCopy } from './lib/clipboard'
 import {
+  getMcpProbeResultError,
   type McpProbeStepState,
   type ProbeQuotaWindow,
   McpProbeRequestError,
@@ -282,12 +283,6 @@ function extractAdvertisedMcpTools(payload: unknown): string[] {
   return Array.from(new Set(names))
 }
 
-function missingMcpProbeFixtures(toolNames: string[]): string[] {
-  return Array.from(new Set(
-    toolNames.filter((toolName) => mcpToolProbeArguments(toolName) == null),
-  ))
-}
-
 function buildMcpProbeStepDefinitions(
   probeText: McpProbeText,
 ): McpProbeStepDefinition[] {
@@ -314,12 +309,6 @@ function buildMcpProbeStepDefinitions(
         if (discoveredTools.length === 0) {
           throw new Error(probeText.errors.missingAdvertisedTools)
         }
-        const unsupportedTools = missingMcpProbeFixtures(discoveredTools)
-        if (unsupportedTools.length > 0) {
-          throw new Error(formatTemplate(probeText.errors.missingProbeFixture, {
-            tools: unsupportedTools.join(', '),
-          }))
-        }
         return { discoveredTools }
       },
     },
@@ -339,7 +328,16 @@ function buildMcpToolCallProbeStepDefinitions(
   return canonicalToolNames.flatMap((toolName) => {
     const probeArguments = mcpToolProbeArguments(toolName)
     if (!probeArguments) {
-      return []
+      return [{
+        id: `mcp-tool-call:${toolName}`,
+        label: formatTemplate(probeText.steps.mcpToolCall, { tool: toolName }),
+        billable: isBillableMcpProbeTool(toolName),
+        run: async (): Promise<McpProbeStepResult | null> => {
+          throw new Error(formatTemplate(probeText.errors.missingProbeFixture, {
+            tools: toolName,
+          }))
+        },
+      }]
     }
 
     return [{
@@ -348,7 +346,7 @@ function buildMcpToolCallProbeStepDefinitions(
       billable: isBillableMcpProbeTool(toolName),
       run: async (token: string): Promise<McpProbeStepResult | null> => {
         const payload = await probeMcpToolsCall(token, toolName, probeArguments)
-        const error = envelopeError(payload)
+        const error = envelopeError(payload) ?? getMcpProbeResultError(payload)
         if (error) throw new Error(error)
         return null
       },

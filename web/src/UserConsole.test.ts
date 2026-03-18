@@ -91,7 +91,7 @@ describe('UserConsole probe step definitions', () => {
     })).toEqual(['tavily-search', 'tavily-map', 'Acme_Lookup'])
   })
 
-  it('skips unsupported tools when building the MCP call sweep', async () => {
+  it('keeps unsupported advertised tools in the MCP call sweep and fails them per tool', async () => {
     const calls: Array<{ url: string, init?: RequestInit }> = []
     globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: requestUrl(input), init })
@@ -108,16 +108,20 @@ describe('UserConsole probe step definitions', () => {
 
     expect(steps.map((step) => ({ id: step.id, billable: step.billable }))).toEqual([
       { id: 'mcp-tool-call:tavily-search', billable: true },
+      { id: 'mcp-tool-call:Acme_Lookup', billable: false },
     ])
 
     await steps[0]?.run('th-zjvc-secret')
+    await expect(steps[1]?.run('th-zjvc-secret')).rejects.toThrow(
+      'MCP 检测缺少这些工具的调用夹具：Acme_Lookup',
+    )
 
     expect(calls.map((call) => JSON.parse(String(call.init?.body ?? 'null')).params.name)).toEqual([
       'tavily-search',
     ])
   })
 
-  it('fails early when tools/list advertises a tool without a probe fixture', async () => {
+  it('keeps tools/list successful even when it advertises a tool without a probe fixture', async () => {
     globalThis.fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body ?? '{}')) as { id?: string }
       return new Response(JSON.stringify({
@@ -137,9 +141,32 @@ describe('UserConsole probe step definitions', () => {
 
     const steps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
 
-    await expect(steps[1]?.run('th-zjvc-secret')).rejects.toThrow(
-      'MCP 检测缺少这些工具的调用夹具：Acme_Lookup',
-    )
+    await expect(steps[1]?.run('th-zjvc-secret')).resolves.toEqual({
+      discoveredTools: ['tavily-search', 'Acme_Lookup'],
+    })
+  })
+
+  it('treats tools/call JSON-RPC result envelopes with failing statuses as probe failures', async () => {
+    globalThis.fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { id?: string }
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0',
+        id: body.id ?? 'unknown',
+        result: {
+          isError: true,
+          structuredContent: {
+            detail: { status: 500 },
+          },
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, ['tavily-search'])
+
+    await expect(steps[0]?.run('th-zjvc-secret')).rejects.toThrow('Request failed with status 500')
   })
 
   it('executes live MCP probe calls with the expected JSON-RPC payloads', async () => {
