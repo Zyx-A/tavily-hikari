@@ -12,6 +12,7 @@ const mcpProbeText: Parameters<typeof __testables.buildMcpProbeStepDefinitions>[
   },
   errors: {
     missingAdvertisedTools: 'MCP tools/list 没有返回任何工具',
+    missingProbeFixture: 'MCP 检测缺少这些工具的调用夹具：{tools}',
   },
 }
 
@@ -114,6 +115,31 @@ describe('UserConsole probe step definitions', () => {
     expect(calls.map((call) => JSON.parse(String(call.init?.body ?? 'null')).params.name)).toEqual([
       'tavily-search',
     ])
+  })
+
+  it('fails early when tools/list advertises a tool without a probe fixture', async () => {
+    globalThis.fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { id?: string }
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0',
+        id: body.id ?? 'unknown',
+        result: {
+          tools: [
+            { name: 'tavily-search' },
+            { name: 'Acme_Lookup' },
+          ],
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const steps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+
+    await expect(steps[1]?.run('th-zjvc-secret')).rejects.toThrow(
+      'MCP 检测缺少这些工具的调用夹具：Acme_Lookup',
+    )
   })
 
   it('executes live MCP probe calls with the expected JSON-RPC payloads', async () => {

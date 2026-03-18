@@ -132,6 +132,7 @@ interface McpProbeText {
   }
   errors: {
     missingAdvertisedTools: string
+    missingProbeFixture: string
   }
 }
 
@@ -281,6 +282,12 @@ function extractAdvertisedMcpTools(payload: unknown): string[] {
   return Array.from(new Set(names))
 }
 
+function missingMcpProbeFixtures(toolNames: string[]): string[] {
+  return Array.from(new Set(
+    toolNames.filter((toolName) => mcpToolProbeArguments(toolName) == null),
+  ))
+}
+
 function buildMcpProbeStepDefinitions(
   probeText: McpProbeText,
 ): McpProbeStepDefinition[] {
@@ -306,6 +313,12 @@ function buildMcpProbeStepDefinitions(
         const discoveredTools = extractAdvertisedMcpTools(payload)
         if (discoveredTools.length === 0) {
           throw new Error(probeText.errors.missingAdvertisedTools)
+        }
+        const unsupportedTools = missingMcpProbeFixtures(discoveredTools)
+        if (unsupportedTools.length > 0) {
+          throw new Error(formatTemplate(probeText.errors.missingProbeFixture, {
+            tools: unsupportedTools.join(', '),
+          }))
         }
         return { discoveredTools }
       },
@@ -2341,6 +2354,7 @@ const EN = {
       },
       errors: {
         missingAdvertisedTools: 'MCP tools/list returned no tools',
+        missingProbeFixture: 'MCP probe has no fixture for: {tools}',
         missingRequestId: 'Research request_id is missing',
         researchFailed: 'Research task failed',
         researchUnexpectedStatus: 'Research returned unsupported status: {status}',
@@ -2493,6 +2507,7 @@ const ZH = {
       },
       errors: {
         missingAdvertisedTools: 'MCP tools/list 没有返回任何工具',
+        missingProbeFixture: 'MCP 检测缺少这些工具的调用夹具：{tools}',
         missingRequestId: 'research 响应缺少 request_id',
         researchFailed: 'research 任务失败',
         researchUnexpectedStatus: 'research 返回了不支持的状态：{status}',
