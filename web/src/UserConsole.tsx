@@ -133,6 +133,31 @@ interface ApiProbeStepDefinition {
   ) => Promise<string | null>
 }
 
+interface McpProbeText {
+  steps: {
+    mcpPing: string
+    mcpToolsList: string
+  }
+}
+
+interface ApiProbeText {
+  steps: {
+    apiSearch: string
+    apiExtract: string
+    apiCrawl: string
+    apiMap: string
+    apiResearch: string
+    apiResearchResult: string
+  }
+  errors: {
+    missingRequestId: string
+    researchFailed: string
+    researchUnexpectedStatus: string
+  }
+  researchPendingAccepted: string
+  researchStatus: string
+}
+
 const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 })
 
 function formatNumber(value: number): string {
@@ -205,6 +230,165 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function envelopeError(payload: unknown): string | null {
   return getProbeEnvelopeError(payload)
+}
+
+function buildMcpProbeStepDefinitions(
+  probeText: McpProbeText,
+): McpProbeStepDefinition[] {
+  return [
+    {
+      id: 'mcp-ping',
+      label: probeText.steps.mcpPing,
+      run: async (token: string): Promise<string | null> => {
+        const payload = await probeMcpPing(token)
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        return null
+      },
+    },
+    {
+      id: 'mcp-tools-list',
+      label: probeText.steps.mcpToolsList,
+      run: async (token: string): Promise<string | null> => {
+        const payload = await probeMcpToolsList(token)
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        return null
+      },
+    },
+  ]
+}
+
+function buildApiProbeStepDefinitions(
+  probeText: ApiProbeText,
+): ApiProbeStepDefinition[] {
+  return [
+    {
+      id: 'api-search',
+      label: probeText.steps.apiSearch,
+      run: async (token: string): Promise<string | null> => {
+        const payload = await probeApiTavilySearch(token, {
+          query: 'health check',
+          max_results: 1,
+          search_depth: 'basic',
+          include_answer: false,
+          include_raw_content: false,
+          include_images: false,
+        })
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        return null
+      },
+    },
+    {
+      id: 'api-extract',
+      label: probeText.steps.apiExtract,
+      run: async (token: string): Promise<string | null> => {
+        const payload = await probeApiTavilyExtract(token, {
+          urls: ['https://example.com'],
+          include_images: false,
+        })
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        return null
+      },
+    },
+    {
+      id: 'api-crawl',
+      label: probeText.steps.apiCrawl,
+      run: async (token: string): Promise<string | null> => {
+        const payload = await probeApiTavilyCrawl(token, {
+          url: 'https://example.com',
+          max_depth: 1,
+          limit: 1,
+        })
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        return null
+      },
+    },
+    {
+      id: 'api-map',
+      label: probeText.steps.apiMap,
+      run: async (token: string): Promise<string | null> => {
+        const payload = await probeApiTavilyMap(token, {
+          url: 'https://example.com',
+          max_depth: 1,
+          limit: 1,
+        })
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        return null
+      },
+    },
+    {
+      id: 'api-research',
+      label: probeText.steps.apiResearch,
+      run: async (token: string): Promise<string | null> => {
+        const payload = await probeApiTavilyResearch(token, {
+          input: 'health check',
+          model: 'mini',
+          citation_format: 'numbered',
+        })
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        const requestId = getResearchRequestId(payload)
+        if (!requestId) {
+          throw new Error(probeText.errors.missingRequestId)
+        }
+        return requestId
+      },
+    },
+    {
+      id: 'api-research-result',
+      label: probeText.steps.apiResearchResult,
+      run: async (token: string, context: { requestId: string | null }): Promise<string | null> => {
+        if (!context.requestId) {
+          throw new Error(probeText.errors.missingRequestId)
+        }
+        const payload = await probeApiTavilyResearchResult(token, context.requestId)
+        const error = envelopeError(payload)
+        if (error) throw new Error(error)
+        const status = payload.status
+        if (typeof status === 'string' && status.trim().length > 0) {
+          const normalized = status.trim().toLowerCase()
+          if (
+            normalized === 'failed'
+            || normalized === 'failure'
+            || normalized === 'error'
+            || normalized === 'errored'
+            || normalized === 'cancelled'
+            || normalized === 'canceled'
+          ) {
+            throw new Error(probeText.errors.researchFailed)
+          }
+          if (
+            normalized === 'pending'
+            || normalized === 'processing'
+            || normalized === 'running'
+            || normalized === 'in_progress'
+            || normalized === 'queued'
+          ) {
+            return probeText.researchPendingAccepted
+          }
+          if (
+            normalized === 'completed'
+            || normalized === 'success'
+            || normalized === 'succeeded'
+            || normalized === 'done'
+          ) {
+            return formatTemplate(probeText.researchStatus, { status: normalized })
+          }
+          throw new Error(
+            formatTemplate(probeText.errors.researchUnexpectedStatus, {
+              status: normalized,
+            }),
+          )
+        }
+        return null
+      },
+    },
+  ]
 }
 
 function getResearchRequestId(payload: unknown): string | null {
@@ -798,28 +982,7 @@ export default function UserConsole(): JSX.Element {
     const isActiveRun = () => probeRunIdRef.current === runId
     const probeText = text.detail.probe
 
-    const stepDefinitions: McpProbeStepDefinition[] = [
-      {
-        id: 'mcp-ping',
-        label: probeText.steps.mcpPing,
-        run: async (token: string): Promise<string | null> => {
-          const payload = await probeMcpPing(token)
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          return null
-        },
-      },
-      {
-        id: 'mcp-tools-list',
-        label: probeText.steps.mcpToolsList,
-        run: async (token: string): Promise<string | null> => {
-          const payload = await probeMcpToolsList(token)
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          return null
-        },
-      },
-    ]
+    const stepDefinitions = buildMcpProbeStepDefinitions(probeText)
 
     setMcpProbe({
       state: 'running',
@@ -961,133 +1124,7 @@ export default function UserConsole(): JSX.Element {
     probeRunIdRef.current = runId
     const isActiveRun = () => probeRunIdRef.current === runId
 
-    const stepDefinitions: ApiProbeStepDefinition[] = [
-      {
-        id: 'api-search',
-        label: text.detail.probe.steps.apiSearch,
-        run: async (token: string): Promise<string | null> => {
-          const payload = await probeApiTavilySearch(token, {
-            query: 'health check',
-            max_results: 1,
-            search_depth: 'basic',
-            include_answer: false,
-            include_raw_content: false,
-            include_images: false,
-          })
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          return null
-        },
-      },
-      {
-        id: 'api-extract',
-        label: text.detail.probe.steps.apiExtract,
-        run: async (token: string): Promise<string | null> => {
-          const payload = await probeApiTavilyExtract(token, {
-            urls: ['https://example.com'],
-            include_images: false,
-          })
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          return null
-        },
-      },
-      {
-        id: 'api-crawl',
-        label: text.detail.probe.steps.apiCrawl,
-        run: async (token: string): Promise<string | null> => {
-          const payload = await probeApiTavilyCrawl(token, {
-            url: 'https://example.com',
-            max_depth: 1,
-            limit: 1,
-          })
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          return null
-        },
-      },
-      {
-        id: 'api-map',
-        label: text.detail.probe.steps.apiMap,
-        run: async (token: string): Promise<string | null> => {
-          const payload = await probeApiTavilyMap(token, {
-            url: 'https://example.com',
-            max_depth: 1,
-            limit: 1,
-          })
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          return null
-        },
-      },
-      {
-        id: 'api-research',
-        label: text.detail.probe.steps.apiResearch,
-        run: async (token: string): Promise<string | null> => {
-          const payload = await probeApiTavilyResearch(token, {
-            input: 'health check',
-            model: 'mini',
-            citation_format: 'numbered',
-          })
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          const requestId = getResearchRequestId(payload)
-          if (!requestId) {
-            throw new Error(text.detail.probe.errors.missingRequestId)
-          }
-          return requestId
-        },
-      },
-      {
-        id: 'api-research-result',
-        label: text.detail.probe.steps.apiResearchResult,
-        run: async (token: string, context: { requestId: string | null }): Promise<string | null> => {
-          if (!context.requestId) {
-            throw new Error(text.detail.probe.errors.missingRequestId)
-          }
-          const payload = await probeApiTavilyResearchResult(token, context.requestId)
-          const error = envelopeError(payload)
-          if (error) throw new Error(error)
-          const status = payload.status
-          if (typeof status === 'string' && status.trim().length > 0) {
-            const normalized = status.trim().toLowerCase()
-            if (
-              normalized === 'failed'
-              || normalized === 'failure'
-              || normalized === 'error'
-              || normalized === 'errored'
-              || normalized === 'cancelled'
-              || normalized === 'canceled'
-            ) {
-              throw new Error(text.detail.probe.errors.researchFailed)
-            }
-            if (
-              normalized === 'pending'
-              || normalized === 'processing'
-              || normalized === 'running'
-              || normalized === 'in_progress'
-              || normalized === 'queued'
-            ) {
-              return text.detail.probe.researchPendingAccepted
-            }
-            if (
-              normalized === 'completed'
-              || normalized === 'success'
-              || normalized === 'succeeded'
-              || normalized === 'done'
-            ) {
-              return formatTemplate(text.detail.probe.researchStatus, { status: normalized })
-            }
-            throw new Error(
-              formatTemplate(text.detail.probe.errors.researchUnexpectedStatus, {
-                status: normalized,
-              }),
-            )
-          }
-          return null
-        },
-      },
-    ]
+    const stepDefinitions = buildApiProbeStepDefinitions(text.detail.probe)
 
     setApiProbe({
       state: 'running',
@@ -1898,6 +1935,8 @@ export default function UserConsole(): JSX.Element {
 }
 
 export const __testables = {
+  buildApiProbeStepDefinitions,
+  buildMcpProbeStepDefinitions,
   resolveGuideToken,
   shouldRenderLandingGuide,
 }

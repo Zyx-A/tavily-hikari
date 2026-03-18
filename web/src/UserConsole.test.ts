@@ -1,6 +1,43 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, mock } from 'bun:test'
 
 import { __testables } from './UserConsole'
+
+const originalFetch = globalThis.fetch
+
+const mcpProbeText: Parameters<typeof __testables.buildMcpProbeStepDefinitions>[0] = {
+  steps: {
+    mcpPing: 'MCP 服务连通',
+    mcpToolsList: 'MCP 工具发现',
+  },
+}
+
+const apiProbeText: Parameters<typeof __testables.buildApiProbeStepDefinitions>[0] = {
+  steps: {
+    apiSearch: 'Search API',
+    apiExtract: 'Extract API',
+    apiCrawl: 'Crawl API',
+    apiMap: 'Map API',
+    apiResearch: 'Research API',
+    apiResearchResult: 'Research Result API',
+  },
+  errors: {
+    missingRequestId: 'Missing research request id',
+    researchFailed: 'Research failed',
+    researchUnexpectedStatus: 'Unexpected research status: {status}',
+  },
+  researchPendingAccepted: 'Research still processing',
+  researchStatus: 'Research status: {status}',
+}
+
+afterEach(() => {
+  globalThis.fetch = originalFetch
+})
+
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.toString()
+  return input.url
+}
 
 describe('UserConsole landing guide helpers', () => {
   it('shows the landing guide only when exactly one token is visible on the merged landing page', () => {
@@ -23,5 +60,138 @@ describe('UserConsole landing guide helpers', () => {
       { name: 'landing', section: 'dashboard' },
       [{ tokenId: 'a1b2' } as any, { tokenId: 'c3d4' } as any],
     )).toBe('th-xxxx-xxxxxxxxxxxx')
+  })
+})
+
+describe('UserConsole probe step definitions', () => {
+  it('executes live MCP probe calls with the expected JSON-RPC payloads', async () => {
+    const calls: Array<{ url: string, init?: RequestInit }> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: requestUrl(input), init })
+      const body = JSON.parse(String(init?.body ?? '{}')) as { id?: string; method?: string }
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: body.id ?? 'unknown',
+          result: body.method === 'tools/list' ? { tools: [{ name: 'tavily_search' }] } : { ok: true },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      )
+    }) as typeof fetch
+
+    const steps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+    for (const step of steps) {
+      await step.run('th-zjvc-secret')
+    }
+
+    expect(calls).toHaveLength(2)
+    expect(calls[0]?.url).toBe('/mcp')
+    expect(calls[1]?.url).toBe('/mcp')
+
+    const firstHeaders = new Headers(calls[0]?.init?.headers ?? {})
+    const secondHeaders = new Headers(calls[1]?.init?.headers ?? {})
+    expect(firstHeaders.get('Authorization')).toBe('Bearer th-zjvc-secret')
+    expect(secondHeaders.get('Authorization')).toBe('Bearer th-zjvc-secret')
+
+    expect(JSON.parse(String(calls[0]?.init?.body ?? 'null'))).toEqual({
+      jsonrpc: '2.0',
+      id: 'probe-ping',
+      method: 'ping',
+      params: {},
+    })
+    expect(JSON.parse(String(calls[1]?.init?.body ?? 'null'))).toEqual({
+      jsonrpc: '2.0',
+      id: 'probe-tools-list',
+      method: 'tools/list',
+      params: {},
+    })
+  })
+
+  it('executes every API probe call with the expected endpoint and payload', async () => {
+    const calls: Array<{ url: string, init?: RequestInit }> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input)
+      calls.push({ url, init })
+
+      if (url === '/api/tavily/research') {
+        return new Response(JSON.stringify({ request_id: 'req-health-check' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      if (url === '/api/tavily/research/req-health-check') {
+        return new Response(JSON.stringify({ status: 'completed' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const steps = __testables.buildApiProbeStepDefinitions(apiProbeText)
+    let requestId: string | null = null
+    let researchResultDetail: string | null = null
+
+    for (const step of steps) {
+      const result = await step.run('th-zjvc-secret', { requestId })
+      if (step.id === 'api-research') {
+        requestId = result
+      }
+      if (step.id === 'api-research-result') {
+        researchResultDetail = result
+      }
+    }
+
+    expect(calls).toHaveLength(6)
+    expect(calls.map((call) => [call.url, call.init?.method ?? 'GET'])).toEqual([
+      ['/api/tavily/search', 'POST'],
+      ['/api/tavily/extract', 'POST'],
+      ['/api/tavily/crawl', 'POST'],
+      ['/api/tavily/map', 'POST'],
+      ['/api/tavily/research', 'POST'],
+      ['/api/tavily/research/req-health-check', 'GET'],
+    ])
+
+    for (const call of calls) {
+      const headers = new Headers(call.init?.headers ?? {})
+      expect(headers.get('Authorization')).toBe('Bearer th-zjvc-secret')
+    }
+
+    expect(JSON.parse(String(calls[0]?.init?.body ?? 'null'))).toEqual({
+      query: 'health check',
+      max_results: 1,
+      search_depth: 'basic',
+      include_answer: false,
+      include_raw_content: false,
+      include_images: false,
+    })
+    expect(JSON.parse(String(calls[1]?.init?.body ?? 'null'))).toEqual({
+      urls: ['https://example.com'],
+      include_images: false,
+    })
+    expect(JSON.parse(String(calls[2]?.init?.body ?? 'null'))).toEqual({
+      url: 'https://example.com',
+      max_depth: 1,
+      limit: 1,
+    })
+    expect(JSON.parse(String(calls[3]?.init?.body ?? 'null'))).toEqual({
+      url: 'https://example.com',
+      max_depth: 1,
+      limit: 1,
+    })
+    expect(JSON.parse(String(calls[4]?.init?.body ?? 'null'))).toEqual({
+      input: 'health check',
+      model: 'mini',
+      citation_format: 'numbered',
+    })
+    expect(researchResultDetail).toBe('Research status: completed')
   })
 })
