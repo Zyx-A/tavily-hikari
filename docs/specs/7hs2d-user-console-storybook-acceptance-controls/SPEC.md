@@ -121,6 +121,12 @@
 - 假设：probe 的多状态验收更适合 fragment gallery，而不是整页页面 Story。
 - 假设：管理员/非管理员差异本轮不纳入 UserConsole Storybook 验收。
 
+## Visual Evidence (PR)
+
+Connectivity Checks gallery Canvas，聚合展示 idle、running、success、partial、authentication failed、quota blocked，并明确呈现 MCP `tools/list` 后对全部广告工具逐个 `tools/call` 的展示效果。
+
+![Connectivity Checks gallery canvas](./assets/connectivity-checks-gallery-canvas.png)
+
 ## 变更记录（Change log）
 
 - 2026-03-07: 创建 spec，冻结 Storybook 验收参数重构范围；明确移除 `scenario` 公开暴露，并排除管理员差异项。
