@@ -9449,12 +9449,21 @@ async fn list_recent_jobs_paginated_includes_key_group() {
         .await
         .expect("finish cleanup job");
 
+    let geo_job_id = proxy
+        .scheduled_job_start("forward_proxy_geo_refresh", None, 1)
+        .await
+        .expect("start geo job");
+    proxy
+        .scheduled_job_finish(geo_job_id, "success", Some("refreshed_candidates=4"))
+        .await
+        .expect("finish geo job");
+
     let (items, total) = proxy
         .list_recent_jobs_paginated("all", 1, 10)
         .await
         .expect("list jobs");
 
-    assert_eq!(total, 3);
+    assert_eq!(total, 4);
 
     let grouped_job = items
         .iter()
@@ -9470,9 +9479,24 @@ async fn list_recent_jobs_paginated_includes_key_group() {
 
     let cleanup_job = items
         .iter()
-        .find(|item| item.key_id.is_none())
+        .find(|item| item.job_type == "auth_token_logs_gc")
         .expect("cleanup job present");
     assert_eq!(cleanup_job.key_group, None);
+
+    let geo_job = items
+        .iter()
+        .find(|item| item.job_type == "forward_proxy_geo_refresh")
+        .expect("geo job present");
+    assert_eq!(geo_job.key_id, None);
+    assert_eq!(geo_job.key_group, None);
+
+    let (geo_items, geo_total) = proxy
+        .list_recent_jobs_paginated("geo", 1, 10)
+        .await
+        .expect("list geo jobs");
+    assert_eq!(geo_total, 1);
+    assert_eq!(geo_items.len(), 1);
+    assert_eq!(geo_items[0].job_type, "forward_proxy_geo_refresh");
 
     let _ = std::fs::remove_file(db_path);
 }

@@ -9025,6 +9025,7 @@ impl KeyStore {
             "quota" => "WHERE j.job_type = 'quota_sync' OR j.job_type = 'quota_sync/manual'",
             "usage" => "WHERE j.job_type = 'token_usage_rollup'",
             "logs" => "WHERE j.job_type = 'auth_token_logs_gc' OR j.job_type = 'request_logs_gc'",
+            "geo" => "WHERE j.job_type = 'forward_proxy_geo_refresh'",
             _ => "",
         };
 
@@ -9032,6 +9033,7 @@ impl KeyStore {
             "quota" => "WHERE job_type = 'quota_sync' OR job_type = 'quota_sync/manual'",
             "usage" => "WHERE job_type = 'token_usage_rollup'",
             "logs" => "WHERE job_type = 'auth_token_logs_gc' OR job_type = 'request_logs_gc'",
+            "geo" => "WHERE job_type = 'forward_proxy_geo_refresh'",
             _ => "",
         };
 
