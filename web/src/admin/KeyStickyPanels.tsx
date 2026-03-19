@@ -254,17 +254,26 @@ function stickyNodeWindowSummary(node: StickyNode): string {
   return `${formatNumber(attempts)} · ${rateLabel} · ${latencyLabel}`
 }
 
-function stickyNodeAssignmentLabels(
+function stickyNodeAssignmentSummary(
   node: StickyNode,
   strings: {
+    assignmentSummary: string
     primaryAssignments: string
     secondaryAssignments: string
   },
-): [string, string] {
-  return [
-    strings.primaryAssignments.replace('{count}', formatNumber(node.primaryAssignmentCount)),
-    strings.secondaryAssignments.replace('{count}', formatNumber(node.secondaryAssignmentCount)),
-  ]
+): { compact: string; detail: string } {
+  const primaryCount = formatNumber(node.primaryAssignmentCount)
+  const secondaryCount = formatNumber(node.secondaryAssignmentCount)
+  const detail = [
+    strings.primaryAssignments.replace('{count}', primaryCount),
+    strings.secondaryAssignments.replace('{count}', secondaryCount),
+  ].join(' · ')
+  return {
+    compact: strings.assignmentSummary
+      .replace('{primary}', primaryCount)
+      .replace('{secondary}', secondaryCount),
+    detail,
+  }
 }
 
 function StickyWindowValue({
@@ -346,7 +355,7 @@ export default function KeyStickyPanels({
   const stickyNodesLoadingLabel = stickyNodesRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching
 
   return (
-    <>
+    <div className="key-sticky-panels-stack">
       <section className="surface panel">
         <div className="panel-header">
           <div>
@@ -546,7 +555,7 @@ export default function KeyStickyPanels({
               </thead>
               <tbody>
                 {stickyNodes.map((node) => {
-                  const assignmentLabels = stickyNodeAssignmentLabels(node, keyDetailsStrings.stickyNodes)
+                  const assignmentSummary = stickyNodeAssignmentSummary(node, keyDetailsStrings.stickyNodes)
                   return (
                     <tr key={`${node.role}:${node.key}`}>
                       <td className="key-sticky-nodes-role-cell">
@@ -555,14 +564,12 @@ export default function KeyStickyPanels({
                         </StatusBadge>
                       </td>
                       <td className="key-sticky-nodes-node-cell">
-                        <div className="sticky-node-summary" title={`${node.displayName} · ${assignmentLabels.join(' · ')}`}>
+                        <div className="sticky-node-summary" title={`${node.displayName} · ${assignmentSummary.detail}`}>
                           <strong className="sticky-node-summary-title">{node.displayName}</strong>
                           <div className="sticky-node-summary-meta">
-                            {assignmentLabels.map((label) => (
-                              <span key={`${node.role}:${label}`} className="sticky-node-summary-chip">
-                                {label}
-                              </span>
-                            ))}
+                            <span className="sticky-node-summary-chip" aria-label={assignmentSummary.detail}>
+                              {assignmentSummary.compact}
+                            </span>
                           </div>
                         </div>
                       </td>
@@ -591,7 +598,7 @@ export default function KeyStickyPanels({
             <div className="empty-state alert">{keyDetailsStrings.stickyNodes.empty}</div>
           ) : (
             stickyNodes.map((node) => {
-              const assignmentLabels = stickyNodeAssignmentLabels(node, keyDetailsStrings.stickyNodes)
+              const assignmentSummary = stickyNodeAssignmentSummary(node, keyDetailsStrings.stickyNodes)
               return (
                 <article key={`${node.role}:${node.key}`} className="admin-mobile-card">
                   <div className="admin-mobile-kv">
@@ -602,14 +609,12 @@ export default function KeyStickyPanels({
                   </div>
                   <div className="admin-mobile-kv">
                     <span>{keyDetailsStrings.stickyNodes.node}</span>
-                    <div className="sticky-node-summary">
+                    <div className="sticky-node-summary" title={`${node.displayName} · ${assignmentSummary.detail}`}>
                       <strong className="sticky-node-summary-title">{node.displayName}</strong>
                       <div className="sticky-node-summary-meta">
-                        {assignmentLabels.map((label) => (
-                          <span key={`${node.role}:mobile:${label}`} className="sticky-node-summary-chip">
-                            {label}
-                          </span>
-                        ))}
+                        <span className="sticky-node-summary-chip" aria-label={assignmentSummary.detail}>
+                          {assignmentSummary.compact}
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -631,6 +636,6 @@ export default function KeyStickyPanels({
           )}
         </AdminLoadingRegion>
       </section>
-    </>
+    </div>
   )
 }

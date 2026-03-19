@@ -2148,6 +2148,11 @@
   font-weight: 700;
 }
 
+.key-sticky-panels-stack {
+  display: grid;
+  gap: 24px;
+}
+
 .sticky-node-summary {
   display: grid;
   gap: 6px;
@@ -2163,7 +2168,7 @@
 
 .sticky-node-summary-meta {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 8px;
   min-width: 0;
 }
@@ -2180,6 +2185,7 @@
   font-size: 0.76rem;
   font-weight: 600;
   line-height: 1.75rem;
+  white-space: nowrap;
 }
 
 .key-sticky-nodes-table {
