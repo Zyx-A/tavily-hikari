@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（4/5）
+- Status: 已完成（快车道）
 - Created: 2026-03-19
 - Last: 2026-03-19
 
@@ -96,7 +96,7 @@
 - [x] M2: 下沉纯类型/纯函数与库测试到 `models` / `analysis` / `tests`
 - [x] M3: 下沉 `KeyStore`、schema/migration 与 quota/billing 相关实现到 `src/store/**`
 - [x] M4: 下沉 `TavilyProxy` 巨型实现到 `src/tavily_proxy/**`，并通过本地 fmt/clippy/test
-- [ ] M5: PR、checks、review-loop 与 spec-sync 收敛到 merge-ready
+- [x] M5: PR、checks、review-loop 与 spec-sync 收敛到 merge-ready
 
 ## 变更记录（Change log）
 
@@ -104,3 +104,4 @@
 - 2026-03-19: 将 `src/lib.rs` 拆分为薄门面，并下沉到 `src/tavily_proxy/mod.rs`、`src/store/mod.rs`、`src/models.rs`、`src/analysis.rs` 与 `src/tests/mod.rs`；同步适配 `src/forward_proxy.rs` 的 `KeyStore` 导入路径。
 - 2026-03-19: 为 `src/server/tests.rs` 中两个 research create -> result 场景补齐 `EnvVarGuard`，消除 `TOKEN_HOURLY_LIMIT` 并发污染导致的偶发 429/失败。
 - 2026-03-19: 本地验证通过：`cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`、`cargo test` 全部成功；库测试保持 `168` 项，server 集成测试 `153` 项，HTTP 契约测试 `8` 项。
+- 2026-03-19: PR #154 已创建并收敛到 merge-ready；`type:skip` + `channel:stable` 标签就位，GitHub checks 全绿，`codex review --base origin/main` 未发现需修复问题。
