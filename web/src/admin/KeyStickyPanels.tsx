@@ -254,6 +254,19 @@ function stickyNodeWindowSummary(node: StickyNode): string {
   return `${formatNumber(attempts)} · ${rateLabel} · ${latencyLabel}`
 }
 
+function stickyNodeAssignmentLabels(
+  node: StickyNode,
+  strings: {
+    primaryAssignments: string
+    secondaryAssignments: string
+  },
+): [string, string] {
+  return [
+    strings.primaryAssignments.replace('{count}', formatNumber(node.primaryAssignmentCount)),
+    strings.secondaryAssignments.replace('{count}', formatNumber(node.secondaryAssignmentCount)),
+  ]
+}
+
 function StickyWindowValue({
   successValue,
   failureValue,
@@ -521,7 +534,7 @@ export default function KeyStickyPanels({
           {stickyNodes.length === 0 ? (
             <div className="empty-state alert">{keyDetailsStrings.stickyNodes.empty}</div>
           ) : (
-            <Table>
+            <Table className="key-sticky-nodes-table">
               <thead>
                 <tr>
                   <th>{keyDetailsStrings.stickyNodes.role}</th>
@@ -532,28 +545,37 @@ export default function KeyStickyPanels({
                 </tr>
               </thead>
               <tbody>
-                {stickyNodes.map((node) => (
-                  <tr key={`${node.role}:${node.key}`}>
-                    <td>
-                      <StatusBadge tone={node.role === 'primary' ? 'success' : 'info'}>
-                        {node.role === 'primary' ? keyDetailsStrings.stickyNodes.primary : keyDetailsStrings.stickyNodes.secondary}
-                      </StatusBadge>
-                    </td>
-                    <td>
-                      <div style={{ display: 'grid', gap: 4 }}>
-                        <strong>{node.displayName}</strong>
-                        <span className="token-owner-empty">{node.key}</span>
-                      </div>
-                    </td>
-                    <td>{stickyNodeWindowSummary(node)}</td>
-                    <td style={{ minWidth: 180 }}>
-                      <ProxyActivityTrendCell buckets={node.last24h} scaleMax={stickyNodeScaleMax} />
-                    </td>
-                    <td style={{ minWidth: 180 }}>
-                      <ProxyWeightTrendCell buckets={resolveStickyNodeWeightBuckets(node)} scale={stickyNodeWeightScale} />
-                    </td>
-                  </tr>
-                ))}
+                {stickyNodes.map((node) => {
+                  const assignmentLabels = stickyNodeAssignmentLabels(node, keyDetailsStrings.stickyNodes)
+                  return (
+                    <tr key={`${node.role}:${node.key}`}>
+                      <td className="key-sticky-nodes-role-cell">
+                        <StatusBadge tone={node.role === 'primary' ? 'success' : 'info'}>
+                          {node.role === 'primary' ? keyDetailsStrings.stickyNodes.primary : keyDetailsStrings.stickyNodes.secondary}
+                        </StatusBadge>
+                      </td>
+                      <td className="key-sticky-nodes-node-cell">
+                        <div className="sticky-node-summary" title={`${node.displayName} · ${assignmentLabels.join(' · ')}`}>
+                          <strong className="sticky-node-summary-title">{node.displayName}</strong>
+                          <div className="sticky-node-summary-meta">
+                            {assignmentLabels.map((label) => (
+                              <span key={`${node.role}:${label}`} className="sticky-node-summary-chip">
+                                {label}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </td>
+                      <td>{stickyNodeWindowSummary(node)}</td>
+                      <td style={{ minWidth: 180 }}>
+                        <ProxyActivityTrendCell buckets={node.last24h} scaleMax={stickyNodeScaleMax} />
+                      </td>
+                      <td style={{ minWidth: 180 }}>
+                        <ProxyWeightTrendCell buckets={resolveStickyNodeWeightBuckets(node)} scale={stickyNodeWeightScale} />
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </Table>
           )}
@@ -568,32 +590,44 @@ export default function KeyStickyPanels({
           {stickyNodes.length === 0 ? (
             <div className="empty-state alert">{keyDetailsStrings.stickyNodes.empty}</div>
           ) : (
-            stickyNodes.map((node) => (
-              <article key={`${node.role}:${node.key}`} className="admin-mobile-card">
-                <div className="admin-mobile-kv">
-                  <span>{keyDetailsStrings.stickyNodes.role}</span>
-                  <StatusBadge tone={node.role === 'primary' ? 'success' : 'info'}>
-                    {node.role === 'primary' ? keyDetailsStrings.stickyNodes.primary : keyDetailsStrings.stickyNodes.secondary}
-                  </StatusBadge>
-                </div>
-                <div className="admin-mobile-kv">
-                  <span>{keyDetailsStrings.stickyNodes.node}</span>
-                  <strong>{node.displayName}</strong>
-                </div>
-                <div className="admin-mobile-kv">
-                  <span>{keyDetailsStrings.stickyNodes.activity}</span>
-                  <div style={{ width: '100%' }}>
-                    <ProxyActivityTrendCell buckets={node.last24h} scaleMax={stickyNodeScaleMax} />
+            stickyNodes.map((node) => {
+              const assignmentLabels = stickyNodeAssignmentLabels(node, keyDetailsStrings.stickyNodes)
+              return (
+                <article key={`${node.role}:${node.key}`} className="admin-mobile-card">
+                  <div className="admin-mobile-kv">
+                    <span>{keyDetailsStrings.stickyNodes.role}</span>
+                    <StatusBadge tone={node.role === 'primary' ? 'success' : 'info'}>
+                      {node.role === 'primary' ? keyDetailsStrings.stickyNodes.primary : keyDetailsStrings.stickyNodes.secondary}
+                    </StatusBadge>
                   </div>
-                </div>
-                <div className="admin-mobile-kv">
-                  <span>{keyDetailsStrings.stickyNodes.weight}</span>
-                  <div style={{ width: '100%' }}>
-                    <ProxyWeightTrendCell buckets={resolveStickyNodeWeightBuckets(node)} scale={stickyNodeWeightScale} />
+                  <div className="admin-mobile-kv">
+                    <span>{keyDetailsStrings.stickyNodes.node}</span>
+                    <div className="sticky-node-summary">
+                      <strong className="sticky-node-summary-title">{node.displayName}</strong>
+                      <div className="sticky-node-summary-meta">
+                        {assignmentLabels.map((label) => (
+                          <span key={`${node.role}:mobile:${label}`} className="sticky-node-summary-chip">
+                            {label}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </article>
-            ))
+                  <div className="admin-mobile-kv">
+                    <span>{keyDetailsStrings.stickyNodes.activity}</span>
+                    <div style={{ width: '100%' }}>
+                      <ProxyActivityTrendCell buckets={node.last24h} scaleMax={stickyNodeScaleMax} />
+                    </div>
+                  </div>
+                  <div className="admin-mobile-kv">
+                    <span>{keyDetailsStrings.stickyNodes.weight}</span>
+                    <div style={{ width: '100%' }}>
+                      <ProxyWeightTrendCell buckets={resolveStickyNodeWeightBuckets(node)} scale={stickyNodeWeightScale} />
+                    </div>
+                  </div>
+                </article>
+              )
+            })
           )}
         </AdminLoadingRegion>
       </section>
