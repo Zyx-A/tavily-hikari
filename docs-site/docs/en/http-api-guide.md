@@ -1,29 +1,102 @@
 # HTTP API Guide
 
-## Public probes
+## What this page is for
 
-| Method | Path           | Notes                  |
-| ------ | -------------- | ---------------------- |
-| `GET`  | `/health`      | Liveness probe         |
-| `GET`  | `/api/summary` | Public summary metrics |
+Use this page when your client speaks Tavily's HTTP API directly instead of MCP.
 
-## Admin endpoints
+Typical cases:
 
-| Method   | Path                   | Notes                          |
-| -------- | ---------------------- | ------------------------------ |
-| `GET`    | `/api/keys`            | List keys, status, counters    |
-| `GET`    | `/api/logs?page=1`     | Paginated request logs         |
-| `POST`   | `/api/keys`            | Add or restore a key           |
-| `DELETE` | `/api/keys/:id`        | Soft-delete a key              |
-| `GET`    | `/api/keys/:id/secret` | Reveal the upstream Tavily key |
+- Cherry Studio and similar clients that only need a Base URL plus API key
+- scripts, webhooks, or backend services that call Tavily over JSON
+- deployments where end users must never see the real upstream Tavily key
 
-## Hikari token endpoints
+If you are integrating an MCP client, use `/mcp` instead of `/api/tavily/*`.
 
-| Method | Path                 | Notes                                                |
-| ------ | -------------------- | ---------------------------------------------------- |
-| `POST` | `/api/tavily/search` | Tavily HTTP facade for clients such as Cherry Studio |
-| `GET`  | `/api/user/token`    | Resolve the current user's bound access token        |
-| `POST` | `/api/user/logout`   | End-user logout                                      |
+## Currently available Tavily facade endpoints
+
+| Method | Path                               | Notes                           | Auth         |
+| ------ | ---------------------------------- | ------------------------------- | ------------ |
+| `POST` | `/api/tavily/search`               | Proxy Tavily `/search`          | Hikari token |
+| `POST` | `/api/tavily/extract`              | Proxy Tavily `/extract`         | Hikari token |
+| `POST` | `/api/tavily/crawl`                | Proxy Tavily `/crawl`           | Hikari token |
+| `POST` | `/api/tavily/map`                  | Proxy Tavily `/map`             | Hikari token |
+| `POST` | `/api/tavily/research`             | Proxy Tavily `/research`        | Hikari token |
+| `GET`  | `/api/tavily/research/:request_id` | Fetch a research result         | Hikari token |
+| `GET`  | `/api/tavily/usage`                | Daily and monthly usage summary | Hikari token |
+
+## Authentication
+
+Preferred form:
+
+```http
+Authorization: Bearer th-<id>-<secret>
+```
+
+For `POST /api/tavily/*` JSON requests, Hikari also accepts the token in the request body:
+
+```json
+{
+  "api_key": "th-<id>-<secret>",
+  "query": "rust async runtime"
+}
+```
+
+Additional rules:
+
+- if both header and body contain a token, `Authorization: Bearer ...` wins
+- GET endpoints such as `/api/tavily/research/:request_id` and `/api/tavily/usage` should use the
+  `Authorization` header, not a request body
+- local `DEV_OPEN_ADMIN=true` mode allows tokenless fallback for debugging; do not rely on that in
+  production
+
+## Search example
+
+```bash
+curl -X POST http://127.0.0.1:58087/api/tavily/search \
+  -H "Authorization: Bearer th-<id>-<secret>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "rust async runtime",
+    "topic": "general",
+    "search_depth": "basic",
+    "max_results": 3
+  }'
+```
+
+If the client can only send the token in the JSON body:
+
+```bash
+curl -X POST http://127.0.0.1:58087/api/tavily/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "th-<id>-<secret>",
+    "query": "rust async runtime",
+    "topic": "general"
+  }'
+```
+
+## Other Tavily HTTP endpoints
+
+Besides `/search`, the proxy currently supports:
+
+- `/api/tavily/extract`
+- `/api/tavily/crawl`
+- `/api/tavily/map`
+- `/api/tavily/research`
+
+They follow the same contract:
+
+- client-facing JSON stays as close to Tavily HTTP conventions as practical
+- Hikari strips the client token from `api_key` before the upstream call
+- Hikari injects a pooled real Tavily key internally
+- quota checks, audit logging, and key selection all happen inside Hikari
+
+Research result retrieval example:
+
+```bash
+curl -H "Authorization: Bearer th-<id>-<secret>" \
+  http://127.0.0.1:58087/api/tavily/research/<request_id>
+```
 
 ## Cherry Studio setup
 
@@ -34,15 +107,63 @@
 
 Do **not** paste the official Tavily API key into Cherry Studio when Hikari is in front of it.
 
-## HTTP facade notes
+For local development, the API URL is usually:
 
-- The Tavily HTTP facade keeps client-facing fields aligned with Tavily conventions where practical.
-- Authentication is always Hikari-token-based, not upstream-key-based.
-- Quota and routing decisions happen inside Hikari before the request reaches the upstream Tavily
-  endpoint.
+`http://127.0.0.1:58087/api/tavily`
+
+## Common responses and errors
+
+- `401 Unauthorized`
+  - token is missing
+  - token is invalid
+  - token is disabled
+- `429 Too Many Requests`
+  - hourly request count limit is exhausted
+  - credits quota for the token is exhausted
+- `400 Bad Request`
+  - request body is not valid JSON
+  - a field such as `max_results` is obviously invalid
+- `502 Bad Gateway`
+  - Hikari cannot reach the upstream Tavily endpoint
+  - there is no available upstream key
+
+On success, Hikari tries to return the upstream Tavily body directly instead of wrapping it in an
+extra envelope.
+
+## `/mcp` versus `/api/tavily/*`
+
+- `/mcp`
+  - for Codex CLI, Cursor, Claude Desktop, and other MCP clients
+  - speaks standard MCP-over-HTTP transport
+- `/api/tavily/*`
+  - for Cherry Studio, scripts, and plain HTTP integrations
+  - speaks Tavily-style JSON endpoints
+
+Both paths still share:
+
+- Hikari access tokens
+- the Tavily key pool
+- quota enforcement
+- request auditing
+
+## Related endpoints
+
+| Method | Path                  | Notes                          |
+| ------ | --------------------- | ------------------------------ |
+| `GET`  | `/health`             | Liveness probe                 |
+| `GET`  | `/api/summary`        | Public summary metrics         |
+| `GET`  | `/api/user/token`     | Resolve the current user token |
+| `GET`  | `/api/user/dashboard` | User dashboard summary         |
+| `POST` | `/api/user/logout`    | End-user logout                |
+| `GET`  | `/api/keys`           | Admin list of upstream keys    |
+| `POST` | `/api/keys`           | Admin add or restore a key     |
+
+Those admin endpoints use admin authentication, not Hikari token auth.
 
 ## When to use Storybook instead
 
 If you are reviewing operator workflows or dashboard states rather than integrating an API client,
-open [Storybook](/storybook.html) or the [Storybook Guide](/storybook-guide.html) instead of this
-page.
+open [Storybook](/storybook.html) instead of this page.
+
+If the integration fails with `401`, `429`, `502`, or token-passing confusion, continue with
+[FAQ & Troubleshooting](/faq).

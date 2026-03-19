@@ -4,36 +4,47 @@ Tavily Hikari is a Rust + Axum proxy for Tavily traffic. It rotates multiple ups
 full SQLite-backed audit logs, supports admin and end-user access flows, and ships with a React +
 Vite operator console.
 
-This public docs site is intentionally scoped to:
+It is not just a reverse proxy. Tavily Hikari packages Tavily access into four stable surfaces:
 
-- product overview and local onboarding
-- deployment and access patterns
-- HTTP API integration guidance
-- development and Storybook review entry points
+- Protocol entrypoints: it serves both `/mcp` and `/api/tavily/*`, so it can sit in front of MCP
+  clients and plain Tavily HTTP API clients.
+- Access-token layer: end users receive Hikari-issued `th-<id>-<secret>` tokens instead of seeing
+  raw Tavily API keys.
+- Operator and auth layer: admins can manage keys through ForwardAuth or the built-in admin login,
+  while end users can sign in with Linux DO OAuth and reuse their bound token.
+- Audit and quota layer: SQLite persists key state, request logs, and quota-related records for
+  troubleshooting, accounting, and operational review.
 
-It intentionally does **not** publish internal execution specs under `docs/specs/**` or legacy work
-plans under `docs/plan/**`.
+Treat this site as the public operator guide: get the service running, choose an access model,
+integrate clients, then review UI states when needed.
+
+## What problems it solves
+
+- One service fronting both Tavily MCP and Tavily HTTP API traffic.
+- Multi-key scheduling with short-lived affinity, global least-recently-used balancing, and
+  automatic handling for `432 exhausted`.
+- Secret isolation: clients use Hikari tokens while raw Tavily keys stay admin-only.
+- Operability: user console, admin console, Storybook review surface, and full request audit data.
+- Deployability: local dev, Docker, Docker Compose, ForwardAuth gateways, and high-anonymity
+  topologies are all first-class use cases.
 
 ## Documentation map
 
-1. Start with [Quick Start](/quick-start) if you need a local dev, Docker, or Docker Compose setup.
-2. Open [Configuration & Access](/configuration-access) for CLI flags, ForwardAuth, built-in admin
-   login, and Linux DO OAuth.
-3. Use [HTTP API Guide](/http-api-guide) when integrating clients such as Cherry Studio.
-4. Read [Deployment & Anonymity](/deployment-anonymity) for production and high-anonymity notes.
-5. Visit [Storybook](/storybook.html) or the curated [Storybook Guide](/storybook-guide.html) when
-   you want to review UI states instead of prose.
+1. Start with [Quick Start](/quick-start) when you want a running instance fast.
+2. Open [Configuration & Access](/configuration-access) for environment variables, admin login, and
+   access patterns.
+3. Use [HTTP API Guide](/http-api-guide) when integrating Cherry Studio or other HTTP clients.
+4. Read [Deployment & Anonymity](/deployment-anonymity) for production, proxying, and
+   high-anonymity notes.
+5. Open [FAQ & Troubleshooting](/faq) when you need answers for 401, 429, 502, persistence, or
+   admin-access problems.
+6. Visit [Storybook](/storybook.html) for UI review instead of prose.
 
-## Product shape
+## What you will find in this project
 
-- Backend: Rust 2024, Axum, SQLx, Tokio, Clap
-- Data: SQLite (`api_keys`, `request_logs`, user/session state)
-- Frontend: React 18, TanStack Router, Tailwind CSS, shadcn/ui, Vite 5
-- Delivery surfaces: runtime web app, Storybook, and this public docs site
-
-## What to open next
-
-- Need a running instance fast: [Quick Start](/quick-start)
-- Need auth and operator model details: [Configuration & Access](/configuration-access)
-- Need endpoint and token contract details: [HTTP API Guide](/http-api-guide)
-- Need visual QA surfaces: [Storybook Guide](/storybook-guide.html)
+- MCP proxying for clients such as Codex CLI, Claude Desktop, Cursor, and VS Code.
+- HTTP API proxying for clients such as Cherry Studio that speak Tavily over REST instead of MCP.
+- User-facing flows for login, token lookup, recent request inspection, and quota visibility.
+- Admin-facing flows for key registration, recovery, disablement, secret reveal, and audit review.
+- Documentation and review surfaces where the docs site explains usage and Storybook verifies UI
+  states and component behavior.
