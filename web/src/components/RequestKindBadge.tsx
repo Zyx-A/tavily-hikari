@@ -95,10 +95,12 @@ export function resolveRequestKindBadgeTone(
     return 'mcp-system'
   }
   if (
+    key.startsWith('mcp:session-delete-unsupported') ||
     key.startsWith('mcp:unsupported-path') ||
     key.startsWith('mcp:unknown-payload') ||
     key.startsWith('mcp:unknown-method') ||
     key.startsWith('mcp:raw:') ||
+    label === 'mcp | session delete unsupported' ||
     label === 'mcp | unsupported path' ||
     label === 'mcp | unknown payload' ||
     label === 'mcp | unknown method'

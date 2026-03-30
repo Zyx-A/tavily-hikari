@@ -241,6 +241,10 @@ fn mcp_request_contains_method(body: &[u8], needle: &str) -> bool {
     }
 }
 
+fn is_mcp_session_delete_request(method: &Method, path: &str) -> bool {
+    *method == Method::DELETE && path == "/mcp"
+}
+
 fn mcp_session_response(
     status: StatusCode,
     error: &str,
@@ -472,6 +476,7 @@ async fn proxy_handler(
         pinned_api_key_id = Some(session.upstream_key_id.clone());
     }
     let request_kind = classify_token_request_kind(&path, Some(body_bytes.as_ref()));
+    let is_mcp_delete_root_request = is_mcp_session_delete_request(&method, &path);
 
     // Billing plan (1:1 upstream credits):
     // - Non-business whitelist methods are ignored by business quota.
@@ -494,8 +499,12 @@ async fn proxy_handler(
     let mut expected_search_credits_without_id_total: i64 = 0;
     let mut invalid_mcp_request_message: Option<String> = None;
     if path.starts_with("/mcp") {
-        match serde_json::from_slice::<Value>(&body_bytes) {
-            Ok(mut value) => {
+        if is_mcp_delete_root_request {
+            billable_flag = false;
+            lockable_tool = false;
+        } else {
+            match serde_json::from_slice::<Value>(&body_bytes) {
+                Ok(mut value) => {
                 // Default to billable unless we can *prove* it's a non-billable control plane call.
                 let mut any_billable = false;
                 let mut any_lockable = false;
@@ -772,11 +781,12 @@ async fn proxy_handler(
                     expected_search_credits = Some(expected_search_total);
                 }
 
-            }
-            Err(_) => {
-                // Non-JSON / unparseable: treat as billable to avoid bypass.
-                billable_flag = true;
-                lockable_tool = true;
+                }
+                Err(_) => {
+                    // Non-JSON / unparseable: treat as billable to avoid bypass.
+                    billable_flag = true;
+                    lockable_tool = true;
+                }
             }
         }
     }

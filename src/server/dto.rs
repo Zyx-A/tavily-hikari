@@ -534,6 +534,7 @@ fn normalize_result_status_filter(value: Option<&str>) -> Option<&'static str> {
     match value.map(str::trim) {
         Some(v) if v.eq_ignore_ascii_case("success") => Some("success"),
         Some(v) if v.eq_ignore_ascii_case("error") => Some("error"),
+        Some(v) if v.eq_ignore_ascii_case("neutral") => Some("neutral"),
         Some(v) if v.eq_ignore_ascii_case("quota_exhausted") || v.eq_ignore_ascii_case("quota") => {
             Some("quota_exhausted")
         }

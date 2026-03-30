@@ -129,6 +129,7 @@ function statusLabel(status: string, strings: AdminTranslations): string {
   const normalized = status.trim().toLowerCase()
   if (normalized === 'success') return strings.statuses.success
   if (normalized === 'error') return strings.statuses.error
+  if (normalized === 'neutral') return strings.statuses.neutral
   if (normalized === 'quota_exhausted') return strings.statuses.quota_exhausted
   return status || strings.logs.errors.none
 }

@@ -1498,7 +1498,7 @@ export interface Paginated<T> {
   perPage: number
 }
 
-export type LogResultFilter = 'success' | 'error' | 'quota_exhausted'
+export type LogResultFilter = 'success' | 'error' | 'neutral' | 'quota_exhausted'
 export type LogOperationalClass =
   | 'success'
   | 'neutral'
