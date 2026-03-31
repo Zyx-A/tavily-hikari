@@ -2925,7 +2925,7 @@ function AdminDashboard(): JSX.Element {
   )
   const requestLogResultFilter =
     requestLogOutcomeFilter?.kind === 'result'
-      ? (requestLogOutcomeFilter.value as 'success' | 'error' | 'quota_exhausted')
+      ? (requestLogOutcomeFilter.value as 'success' | 'error' | 'neutral' | 'quota_exhausted')
       : undefined
   const requestLogKeyEffectFilter =
     requestLogOutcomeFilter?.kind === 'keyEffect' ? requestLogOutcomeFilter.value : undefined
@@ -10631,7 +10631,7 @@ export function KeyDetails({
   )
   const keyLogResultFilter =
     keyLogOutcomeFilter?.kind === 'result'
-      ? (keyLogOutcomeFilter.value as 'success' | 'error' | 'quota_exhausted')
+      ? (keyLogOutcomeFilter.value as 'success' | 'error' | 'neutral' | 'quota_exhausted')
       : undefined
   const keyLogKeyEffectFilter =
     keyLogOutcomeFilter?.kind === 'keyEffect' ? keyLogOutcomeFilter.value : undefined

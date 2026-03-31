@@ -431,6 +431,7 @@ const QUOTA_SUBJECT_LOCK_REFRESH_RETRY_SECS: u64 = 1;
 
 const REQUEST_LOGS_MIN_RETENTION_DAYS: i64 = 7;
 
+const BILLING_STATE_NONE: &str = "none";
 const BILLING_STATE_PENDING: &str = "pending";
 const BILLING_STATE_CHARGED: &str = "charged";
 

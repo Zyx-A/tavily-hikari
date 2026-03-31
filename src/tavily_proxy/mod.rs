@@ -7330,6 +7330,35 @@ impl TavilyProxy {
         }
     }
 
+    pub async fn rebuild_token_usage_stats_for_tokens(
+        &self,
+        token_ids: &[String],
+    ) -> Result<i64, ProxyError> {
+        let mut retry_idx = 0usize;
+        loop {
+            match self
+                .key_store
+                .rebuild_token_usage_stats_for_tokens(token_ids)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err)
+                    if is_transient_sqlite_write_error(&err)
+                        && retry_idx < TOKEN_USAGE_ROLLUP_TRANSIENT_RETRY_BACKOFF_MS.len() =>
+                {
+                    let backoff_ms = TOKEN_USAGE_ROLLUP_TRANSIENT_RETRY_BACKOFF_MS[retry_idx];
+                    retry_idx += 1;
+                    eprintln!(
+                        "token usage rebuild transient sqlite error (attempt={}, backoff={}ms): {}",
+                        retry_idx, backoff_ms, err
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Time-based garbage collection for per-token access logs.
     /// This uses a fixed retention window and never looks at token status,
     /// to avoid impacting auditability.

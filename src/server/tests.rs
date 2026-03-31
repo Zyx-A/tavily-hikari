@@ -430,6 +430,166 @@ mod tests {
         (addr, hits)
     }
 
+    async fn spawn_mock_mcp_upstream_for_search_and_delete_405(
+        expected_api_key: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/mcp",
+            any({
+                let hits = hits.clone();
+                move |method: Method,
+                      Query(params): Query<HashMap<String, String>>,
+                      body: Bytes| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let received = params.get("tavilyApiKey").cloned();
+                        assert_eq!(
+                            received.as_deref(),
+                            Some(expected_api_key.as_str()),
+                            "missing or incorrect tavilyApiKey"
+                        );
+
+                        if method == Method::DELETE {
+                            return Response::builder()
+                                .status(StatusCode::METHOD_NOT_ALLOWED)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    serde_json::json!({
+                                        "error": "Method Not Allowed",
+                                        "message": "Method Not Allowed: Session termination not supported"
+                                    })
+                                    .to_string(),
+                                ))
+                                .expect("build delete 405 response");
+                        }
+
+                        let body: Value =
+                            serde_json::from_slice(&body).expect("valid MCP JSON body");
+                        assert_eq!(
+                            body.get("method").and_then(|v| v.as_str()),
+                            Some("tools/call"),
+                            "expected MCP tools/call"
+                        );
+                        assert_eq!(
+                            body.get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str()),
+                            Some("tavily-search"),
+                            "expected tavily-search tool call"
+                        );
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!(1)),
+                                "result": {
+                                    "structuredContent": {
+                                        "status": 200,
+                                        "usage": { "credits": 1 },
+                                    }
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
+    async fn spawn_mock_mcp_upstream_for_search_and_delete_500(
+        expected_api_key: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/mcp",
+            any({
+                let hits = hits.clone();
+                move |method: Method,
+                      Query(params): Query<HashMap<String, String>>,
+                      body: Bytes| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let received = params.get("tavilyApiKey").cloned();
+                        assert_eq!(
+                            received.as_deref(),
+                            Some(expected_api_key.as_str()),
+                            "missing or incorrect tavilyApiKey"
+                        );
+
+                        if method == Method::DELETE {
+                            return Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    serde_json::json!({
+                                        "error": "Internal Server Error",
+                                        "message": "delete failed upstream"
+                                    })
+                                    .to_string(),
+                                ))
+                                .expect("build delete 500 response");
+                        }
+
+                        let body: Value =
+                            serde_json::from_slice(&body).expect("valid MCP JSON body");
+                        assert_eq!(
+                            body.get("method").and_then(|v| v.as_str()),
+                            Some("tools/call"),
+                            "expected MCP tools/call"
+                        );
+                        assert_eq!(
+                            body.get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str()),
+                            Some("tavily-search"),
+                            "expected tavily-search tool call"
+                        );
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!(1)),
+                                "result": {
+                                    "structuredContent": {
+                                        "status": 200,
+                                        "usage": { "credits": 1 },
+                                    }
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
     async fn spawn_mock_mcp_upstream_for_session_headers(
         allowed_api_keys: Vec<String>,
     ) -> (
@@ -8103,6 +8263,41 @@ colo=LAX
         .execute(&pool)
         .await
         .expect("insert neutral request log");
+        sqlx::query(
+            r#"
+            INSERT INTO request_logs (
+                api_key_id,
+                auth_token_id,
+                method,
+                path,
+                query,
+                status_code,
+                tavily_status_code,
+                error_message,
+                result_status,
+                request_kind_key,
+                request_kind_label,
+                request_kind_detail,
+                business_credits,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                request_body,
+                response_body,
+                forwarded_headers,
+                dropped_headers,
+                created_at
+            ) VALUES (?, 'token-session-delete', 'DELETE', '/mcp', NULL, 405, 405, 'Method Not Allowed: Session termination not supported', 'error', 'mcp:session-delete-unsupported', 'MCP | session delete unsupported', NULL, NULL, 'mcp_method_405', 'none', NULL, X'7B7D', ?, '[]', '[]', ?)
+            "#,
+        )
+        .bind(&key_id)
+        .bind(
+            br#"{"error":"Method Not Allowed","message":"Method Not Allowed: Session termination not supported"}"#.as_slice(),
+        )
+        .bind(325_i64)
+        .execute(&pool)
+        .await
+        .expect("insert session delete neutral request log");
 
         let admin_password = "admin-logs-page-password";
         let admin_addr = spawn_builtin_keys_admin_server(proxy, admin_password).await;
@@ -8130,7 +8325,7 @@ colo=LAX
         assert_eq!(unfiltered_resp.status(), reqwest::StatusCode::OK);
         let unfiltered_body: serde_json::Value =
             unfiltered_resp.json().await.expect("unfiltered admin logs json");
-        assert_eq!(unfiltered_body.get("total").and_then(|value| value.as_i64()), Some(5));
+        assert_eq!(unfiltered_body.get("total").and_then(|value| value.as_i64()), Some(6));
         let unfiltered_items = unfiltered_body
             .get("items")
             .and_then(|value| value.as_array())
@@ -8139,7 +8334,7 @@ colo=LAX
             unfiltered_body
                 .pointer("/items/0/failure_kind")
                 .and_then(|value| value.as_str()),
-            None
+            Some("mcp_method_405")
         );
         let unfiltered_error_log = unfiltered_items
             .iter()
@@ -8247,12 +8442,18 @@ colo=LAX
         assert_eq!(neutral_resp.status(), reqwest::StatusCode::OK);
         let neutral_body: serde_json::Value =
             neutral_resp.json().await.expect("neutral admin logs json");
-        assert_eq!(neutral_body.get("total").and_then(|value| value.as_i64()), Some(1));
+        assert_eq!(neutral_body.get("total").and_then(|value| value.as_i64()), Some(2));
         assert_eq!(
             neutral_body
                 .pointer("/items/0/auth_token_id")
                 .and_then(|value| value.as_str()),
-            Some("token-neutral")
+            Some("token-session-delete")
+        );
+        assert_eq!(
+            neutral_body
+                .pointer("/items/0/request_kind_key")
+                .and_then(|value| value.as_str()),
+            Some("mcp:session-delete-unsupported")
         );
         assert!(
             neutral_body
@@ -8276,6 +8477,58 @@ colo=LAX
                 })),
             "mixed MCP batches must not leak into the neutral filter"
         );
+
+        let neutral_result_resp = client
+            .get(format!(
+                "http://{}/api/logs?page=1&per_page=20&result=neutral",
+                admin_addr
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("neutral result admin logs request");
+        assert_eq!(neutral_result_resp.status(), reqwest::StatusCode::OK);
+        let neutral_result_body: serde_json::Value = neutral_result_resp
+            .json()
+            .await
+            .expect("neutral result admin logs json");
+        assert_eq!(
+            neutral_result_body
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert!(neutral_result_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.iter().any(|item| {
+                item.get("request_kind_key")
+                    .and_then(|value| value.as_str())
+                    == Some("mcp:session-delete-unsupported")
+            })));
+
+        let error_result_resp = client
+            .get(format!(
+                "http://{}/api/logs?page=1&per_page=20&result=error",
+                admin_addr
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("error result admin logs request");
+        assert_eq!(error_result_resp.status(), reqwest::StatusCode::OK);
+        let error_result_body: serde_json::Value = error_result_resp
+            .json()
+            .await
+            .expect("error result admin logs json");
+        assert!(error_result_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.iter().all(|item| {
+                item.get("request_kind_key")
+                    .and_then(|value| value.as_str())
+                    != Some("mcp:session-delete-unsupported")
+            })));
 
         let upstream_resp = client
             .get(format!(
@@ -11350,6 +11603,34 @@ colo=LAX
         .execute(&pool)
         .await
         .expect("insert neutral token log");
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id,
+                method,
+                path,
+                query,
+                http_status,
+                mcp_status,
+                request_kind_key,
+                request_kind_label,
+                request_kind_detail,
+                result_status,
+                error_message,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                created_at,
+                counts_business_quota,
+                billing_state
+            ) VALUES (?, 'DELETE', '/mcp', NULL, 405, 405, 'mcp:session-delete-unsupported', 'MCP | session delete unsupported', NULL, 'error', 'Method Not Allowed: Session termination not supported', 'mcp_method_405', 'none', NULL, ?, 0, 'none')
+            "#,
+        )
+        .bind(&token.id)
+        .bind(Utc::now().timestamp() + 3)
+        .execute(&pool)
+        .await
+        .expect("insert session delete neutral token log");
 
         let mcp_search_kind = classify_token_request_kind(
             "/mcp",
@@ -11401,7 +11682,7 @@ colo=LAX
         assert_eq!(logs_resp.status(), reqwest::StatusCode::OK);
         let logs_body: serde_json::Value = logs_resp.json().await.expect("logs json");
         let logs = logs_body.as_array().expect("logs array");
-        assert_eq!(logs.len(), 4);
+        assert_eq!(logs.len(), 5);
         let charged_log = logs
             .iter()
             .find(|value| {
@@ -11488,8 +11769,8 @@ colo=LAX
             .get("request_kind_options")
             .and_then(|value| value.as_array())
             .expect("request kind options array");
-        assert_eq!(items.len(), 4);
-        assert_eq!(request_kind_options.len(), 4);
+        assert_eq!(items.len(), 5);
+        assert_eq!(request_kind_options.len(), 5);
         let search_option = request_kind_options
             .iter()
             .find(|value| {
@@ -11538,6 +11819,25 @@ colo=LAX
         );
         assert_eq!(
             legacy_option.get("count").and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        let session_delete_option = request_kind_options
+            .iter()
+            .find(|value| {
+                value
+                    .get("key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:session-delete-unsupported")
+            })
+            .expect("session-delete option");
+        assert_eq!(
+            session_delete_option
+                .get("billing_group")
+                .and_then(|value| value.as_str()),
+            Some("non_billable")
+        );
+        assert_eq!(
+            session_delete_option.get("count").and_then(|value| value.as_i64()),
             Some(1)
         );
         let page_search_log = items
@@ -11614,13 +11914,63 @@ colo=LAX
             .get("items")
             .and_then(|value| value.as_array())
             .expect("neutral token logs page items");
-        assert_eq!(neutral_items.len(), 2);
+        assert_eq!(neutral_items.len(), 3);
         let neutral_kinds = neutral_items
             .iter()
             .filter_map(|value| value.get("request_kind_key").and_then(|inner| inner.as_str()))
             .collect::<Vec<_>>();
         assert!(neutral_kinds.contains(&"mcp:notifications/initialized"));
+        assert!(neutral_kinds.contains(&"mcp:session-delete-unsupported"));
         assert!(neutral_kinds.contains(&"mcp:unsupported-path"));
+
+        let neutral_result_page_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&result=neutral",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("neutral result token logs page request");
+        assert_eq!(neutral_result_page_resp.status(), reqwest::StatusCode::OK);
+        let neutral_result_page_body: serde_json::Value = neutral_result_page_resp
+            .json()
+            .await
+            .expect("neutral result token logs page json");
+        let neutral_result_items = neutral_result_page_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("neutral result token logs items");
+        assert_eq!(neutral_result_items.len(), 3);
+        assert!(neutral_result_items.iter().any(|value| {
+            value
+                .get("request_kind_key")
+                .and_then(|kind| kind.as_str())
+                == Some("mcp:session-delete-unsupported")
+        }));
+
+        let error_result_page_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&result=error",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("error result token logs page request");
+        assert_eq!(error_result_page_resp.status(), reqwest::StatusCode::OK);
+        let error_result_page_body: serde_json::Value = error_result_page_resp
+            .json()
+            .await
+            .expect("error result token logs page json");
+        let error_result_items = error_result_page_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("error result token logs items");
+        assert!(error_result_items.iter().all(|value| {
+            value
+                .get("request_kind_key")
+                .and_then(|kind| kind.as_str())
+                != Some("mcp:session-delete-unsupported")
+        }));
 
         let filtered_page_resp = client
             .get(format!(
@@ -11716,7 +12066,7 @@ colo=LAX
             .get("logs")
             .and_then(|value| value.as_array())
             .expect("snapshot logs array");
-        assert_eq!(snapshot_logs.len(), 4);
+        assert_eq!(snapshot_logs.len(), 5);
         let snapshot_search_log = snapshot_logs
             .iter()
             .find(|value| {
@@ -11749,6 +12099,21 @@ colo=LAX
             .expect("snapshot neutral log");
         assert_eq!(
             snapshot_neutral_log
+                .get("operationalClass")
+                .and_then(|value| value.as_str()),
+            Some("neutral")
+        );
+        let snapshot_session_delete_log = snapshot_logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:session-delete-unsupported")
+            })
+            .expect("snapshot session delete log");
+        assert_eq!(
+            snapshot_session_delete_log
                 .get("operationalClass")
                 .and_then(|value| value.as_str()),
             Some("neutral")
@@ -15350,6 +15715,233 @@ colo=LAX
 
         let counts_business_quota: i64 = row.try_get("counts_business_quota").unwrap();
         assert_eq!(counts_business_quota, 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_session_delete_405_stays_non_billable_even_when_business_quota_is_exhausted() {
+        let db_path = temp_db_path("mcp-session-delete-neutral");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let _hourly_business_guard = EnvVarGuard::set("TOKEN_HOURLY_LIMIT", "1");
+
+        let expected_api_key = "tvly-mcp-session-delete-neutral-key";
+        let (upstream_addr, hits) =
+            spawn_mock_mcp_upstream_for_search_and_delete_405(expected_api_key.to_string()).await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("mcp-session-delete-neutral"))
+            .await
+            .expect("create access token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), upstream.clone()).await;
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let search = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "search-before-delete",
+                "method": "tools/call",
+                "params": {
+                    "name": "tavily-search",
+                    "arguments": {
+                        "query": "exhaust quota before delete",
+                        "search_depth": "basic"
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("search request");
+        assert_eq!(search.status(), StatusCode::OK);
+
+        let delete = client.delete(&url).send().await.expect("delete request");
+        assert_eq!(delete.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let delete_body: Value = delete.json().await.expect("delete body");
+        assert_eq!(
+            delete_body.get("message").and_then(|value| value.as_str()),
+            Some("Method Not Allowed: Session termination not supported")
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "delete must still hit upstream");
+
+        let latest_token_log = proxy
+            .token_recent_logs(&access_token.id, 1, None)
+            .await
+            .expect("token recent logs")
+            .into_iter()
+            .next()
+            .expect("latest token log");
+        assert_eq!(
+            latest_token_log.request_kind_key,
+            "mcp:session-delete-unsupported"
+        );
+        assert_eq!(
+            latest_token_log.request_kind_label,
+            "MCP | session delete unsupported"
+        );
+        assert_eq!(
+            latest_token_log.failure_kind.as_deref(),
+            Some("mcp_method_405")
+        );
+        assert_eq!(latest_token_log.http_status, Some(405));
+        assert_eq!(latest_token_log.mcp_status, Some(405));
+        assert_eq!(latest_token_log.result_status, "error");
+        assert!(!latest_token_log.counts_business_quota);
+        assert_eq!(latest_token_log.business_credits, None);
+
+        let verdict = proxy
+            .peek_token_quota(&access_token.id)
+            .await
+            .expect("peek token quota");
+        assert_eq!(
+            verdict.hourly_used, 1,
+            "session delete 405 must not consume an extra business quota unit"
+        );
+
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        let request_row = sqlx::query(
+            r#"
+            SELECT
+                status_code,
+                tavily_status_code,
+                request_kind_key,
+                request_kind_label,
+                business_credits,
+                failure_kind
+            FROM request_logs
+            WHERE auth_token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("request log row");
+        assert_eq!(
+            request_row
+                .try_get::<Option<i64>, _>("status_code")
+                .expect("status code"),
+            Some(405)
+        );
+        assert_eq!(
+            request_row
+                .try_get::<Option<i64>, _>("tavily_status_code")
+                .expect("tavily status code"),
+            Some(405)
+        );
+        assert_eq!(
+            request_row
+                .try_get::<String, _>("request_kind_key")
+                .expect("request kind key"),
+            "mcp:session-delete-unsupported"
+        );
+        assert_eq!(
+            request_row
+                .try_get::<String, _>("request_kind_label")
+                .expect("request kind label"),
+            "MCP | session delete unsupported"
+        );
+        assert_eq!(
+            request_row
+                .try_get::<Option<i64>, _>("business_credits")
+                .expect("business credits"),
+            None
+        );
+        assert_eq!(
+            request_row
+                .try_get::<Option<String>, _>("failure_kind")
+                .expect("failure kind")
+                .as_deref(),
+            Some("mcp_method_405")
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_session_delete_non_405_keeps_billable_error_semantics() {
+        let db_path = temp_db_path("mcp-session-delete-500");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let expected_api_key = "tvly-mcp-session-delete-500-key";
+        let (upstream_addr, hits) =
+            spawn_mock_mcp_upstream_for_search_and_delete_500(expected_api_key.to_string()).await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("mcp-session-delete-500"))
+            .await
+            .expect("create access token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), upstream.clone()).await;
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let delete = client.delete(&url).send().await.expect("delete request");
+        assert_eq!(delete.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let delete_body: Value = delete.json().await.expect("delete body");
+        assert_eq!(
+            delete_body.get("message").and_then(|value| value.as_str()),
+            Some("delete failed upstream")
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let latest_token_log = proxy
+            .token_recent_logs(&access_token.id, 1, None)
+            .await
+            .expect("token recent logs")
+            .into_iter()
+            .next()
+            .expect("latest token log");
+        assert_eq!(latest_token_log.http_status, Some(500));
+        assert_eq!(latest_token_log.request_kind_key, "mcp:unknown-payload");
+        assert!(latest_token_log.counts_business_quota);
+
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        let request_row = sqlx::query(
+            r#"
+            SELECT request_kind_key, business_credits
+            FROM request_logs
+            WHERE auth_token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("request log row");
+        assert_eq!(
+            request_row
+                .try_get::<String, _>("request_kind_key")
+                .expect("request kind key"),
+            "mcp:unknown-payload"
+        );
+        assert_eq!(
+            request_row
+                .try_get::<Option<i64>, _>("business_credits")
+                .expect("business credits"),
+            None
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
