@@ -245,6 +245,23 @@ fn is_mcp_session_delete_request(method: &Method, path: &str) -> bool {
     *method == Method::DELETE && path == "/mcp"
 }
 
+fn is_mcp_session_delete_unsupported_response(
+    method: &Method,
+    path: &str,
+    status: StatusCode,
+    tavily_status_code: Option<i64>,
+    failure_kind: Option<&str>,
+    body: &[u8],
+) -> bool {
+    is_mcp_session_delete_request(method, path)
+        && status == StatusCode::METHOD_NOT_ALLOWED
+        && tavily_status_code == Some(StatusCode::METHOD_NOT_ALLOWED.as_u16() as i64)
+        && failure_kind == Some("mcp_method_405")
+        && String::from_utf8_lossy(body)
+            .to_ascii_lowercase()
+            .contains("session termination not supported")
+}
+
 fn mcp_session_response(
     status: StatusCode,
     error: &str,
@@ -500,7 +517,6 @@ async fn proxy_handler(
     let mut invalid_mcp_request_message: Option<String> = None;
     if path.starts_with("/mcp") {
         if is_mcp_delete_root_request {
-            billable_flag = false;
             lockable_tool = false;
         } else {
             match serde_json::from_slice::<Value>(&body_bytes) {
@@ -1049,6 +1065,18 @@ async fn proxy_handler(
                 let api_key_id = resp.api_key_id.as_deref();
                 let tavily_code: Option<i64> = analysis.tavily_status_code;
                 let result_status = analysis.status;
+                let effective_billable_flag = if is_mcp_delete_root_request {
+                    !is_mcp_session_delete_unsupported_response(
+                        &method,
+                        &path,
+                        resp.status,
+                        tavily_code,
+                        analysis.failure_kind.as_deref(),
+                        &resp.body,
+                    )
+                } else {
+                    billable_flag
+                };
                 let mut attempt_logged = false;
 
                 // Charge credits after a successful billable Tavily tool call.
@@ -1059,7 +1087,7 @@ async fn proxy_handler(
                 // to avoid guessing partial failures.
                 let allow_empty_body_search_fallback =
                     resp.body.is_empty() && expected_search_credits.is_some();
-                if billable_flag && resp.status.is_success() {
+                if effective_billable_flag && resp.status.is_success() {
                     let missing_usage_fallback_total = {
                         let total = expected_search_credits
                             .unwrap_or(0)
@@ -1154,7 +1182,7 @@ async fn proxy_handler(
                                     query.as_deref(),
                                     Some(resp.status.as_u16() as i64),
                                     tavily_code,
-                                    billable_flag,
+                                    effective_billable_flag,
                                     result_status,
                                     None,
                                     credits,
@@ -1177,7 +1205,7 @@ async fn proxy_handler(
                                     query.as_deref(),
                                     Some(resp.status.as_u16() as i64),
                                     tavily_code,
-                                    billable_flag,
+                                    effective_billable_flag,
                                     result_status,
                                     None,
                                     credits,
@@ -1256,7 +1284,7 @@ async fn proxy_handler(
                             query.as_deref(),
                             Some(http_code),
                             tavily_code,
-                            billable_flag,
+                            effective_billable_flag,
                             result_status,
                             billing_error.as_deref(),
                             &request_kind,
@@ -1278,6 +1306,11 @@ async fn proxy_handler(
                 matches!(&err, ProxyError::PinnedMcpSessionUnavailable);
             if let Some(tid) = token_id.as_deref() {
                 let err_str = err.to_string();
+                let effective_billable_flag = if is_mcp_delete_root_request {
+                    true
+                } else {
+                    billable_flag
+                };
                 let _ = state
                     .proxy
                     .record_token_attempt_with_kind(
@@ -1287,7 +1320,7 @@ async fn proxy_handler(
                         query.as_deref(),
                         None,
                         None,
-                        billable_flag,
+                        effective_billable_flag,
                         "error",
                         Some(err_str.as_str()),
                         &request_kind,

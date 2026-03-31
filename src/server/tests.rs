@@ -510,6 +510,86 @@ mod tests {
         (addr, hits)
     }
 
+    async fn spawn_mock_mcp_upstream_for_search_and_delete_500(
+        expected_api_key: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/mcp",
+            any({
+                let hits = hits.clone();
+                move |method: Method,
+                      Query(params): Query<HashMap<String, String>>,
+                      body: Bytes| {
+                    let expected_api_key = expected_api_key.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let received = params.get("tavilyApiKey").cloned();
+                        assert_eq!(
+                            received.as_deref(),
+                            Some(expected_api_key.as_str()),
+                            "missing or incorrect tavilyApiKey"
+                        );
+
+                        if method == Method::DELETE {
+                            return Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    serde_json::json!({
+                                        "error": "Internal Server Error",
+                                        "message": "delete failed upstream"
+                                    })
+                                    .to_string(),
+                                ))
+                                .expect("build delete 500 response");
+                        }
+
+                        let body: Value =
+                            serde_json::from_slice(&body).expect("valid MCP JSON body");
+                        assert_eq!(
+                            body.get("method").and_then(|v| v.as_str()),
+                            Some("tools/call"),
+                            "expected MCP tools/call"
+                        );
+                        assert_eq!(
+                            body.get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str()),
+                            Some("tavily-search"),
+                            "expected tavily-search tool call"
+                        );
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!(1)),
+                                "result": {
+                                    "structuredContent": {
+                                        "status": 200,
+                                        "usage": { "credits": 1 },
+                                    }
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, hits)
+    }
+
     async fn spawn_mock_mcp_upstream_for_session_headers(
         allowed_api_keys: Vec<String>,
     ) -> (
@@ -15689,6 +15769,82 @@ colo=LAX
                 .expect("failure kind")
                 .as_deref(),
             Some("mcp_method_405")
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_session_delete_non_405_keeps_billable_error_semantics() {
+        let db_path = temp_db_path("mcp-session-delete-500");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let expected_api_key = "tvly-mcp-session-delete-500-key";
+        let (upstream_addr, hits) =
+            spawn_mock_mcp_upstream_for_search_and_delete_500(expected_api_key.to_string()).await;
+        let upstream = format!("http://{}", upstream_addr);
+
+        let proxy =
+            TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+                .await
+                .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some("mcp-session-delete-500"))
+            .await
+            .expect("create access token");
+
+        let proxy_addr = spawn_proxy_server(proxy.clone(), upstream.clone()).await;
+        let client = Client::new();
+        let url = format!(
+            "http://{}/mcp?tavilyApiKey={}",
+            proxy_addr, access_token.token
+        );
+
+        let delete = client.delete(&url).send().await.expect("delete request");
+        assert_eq!(delete.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let delete_body: Value = delete.json().await.expect("delete body");
+        assert_eq!(
+            delete_body.get("message").and_then(|value| value.as_str()),
+            Some("delete failed upstream")
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let latest_token_log = proxy
+            .token_recent_logs(&access_token.id, 1, None)
+            .await
+            .expect("token recent logs")
+            .into_iter()
+            .next()
+            .expect("latest token log");
+        assert_eq!(latest_token_log.http_status, Some(500));
+        assert_eq!(latest_token_log.request_kind_key, "mcp:unknown-payload");
+        assert!(latest_token_log.counts_business_quota);
+
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        let request_row = sqlx::query(
+            r#"
+            SELECT request_kind_key, business_credits
+            FROM request_logs
+            WHERE auth_token_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token.id)
+        .fetch_one(&pool)
+        .await
+        .expect("request log row");
+        assert_eq!(
+            request_row
+                .try_get::<String, _>("request_kind_key")
+                .expect("request kind key"),
+            "mcp:unknown-payload"
+        );
+        assert_eq!(
+            request_row
+                .try_get::<Option<i64>, _>("business_credits")
+                .expect("business credits"),
+            None
         );
 
         let _ = std::fs::remove_file(db_path);

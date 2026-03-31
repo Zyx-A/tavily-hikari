@@ -643,13 +643,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &cli.db_path)
                 .await?;
         let affected_tokens = affected_tokens(&auth_candidates);
-        let token_usage_stats_rows_rebuilt = if affected_tokens.is_empty() {
-            0
-        } else {
-            proxy
-                .rebuild_token_usage_stats_for_tokens(&affected_tokens)
-                .await?
-        };
+        let token_usage_stats_rows_rebuilt =
+            if affected_tokens.is_empty() || auth_token_rows_updated == 0 {
+                0
+            } else {
+                proxy
+                    .rebuild_token_usage_stats_for_tokens(&affected_tokens)
+                    .await?
+            };
 
         let touched_months = touched_months(&request_candidates, &auth_candidates);
         let monthly_rebase = if auth_token_rows_updated > 0 {
@@ -1293,18 +1294,16 @@ mod tests {
         let second_auth_candidates = load_auth_token_log_candidates(&pool)
             .await
             .expect("load second auth candidates");
+        let second_auth_rows_updated = apply_auth_token_log_updates(&pool, &second_auth_candidates)
+            .await
+            .expect("second auth apply");
         assert_eq!(
             apply_request_log_updates(&pool, &second_request_candidates)
                 .await
                 .expect("second request apply"),
             0
         );
-        assert_eq!(
-            apply_auth_token_log_updates(&pool, &second_auth_candidates)
-                .await
-                .expect("second auth apply"),
-            0
-        );
+        assert_eq!(second_auth_rows_updated, 0);
         assert_eq!(
             second_request_candidates
                 .iter()
@@ -1319,6 +1318,17 @@ mod tests {
                 .count(),
             0
         );
+        let second_affected_tokens = super::affected_tokens(&second_auth_candidates);
+        let second_rebuilt_rows =
+            if second_affected_tokens.is_empty() || second_auth_rows_updated == 0 {
+                0
+            } else {
+                proxy
+                    .rebuild_token_usage_stats_for_tokens(&second_affected_tokens)
+                    .await
+                    .expect("second rebuild token usage stats")
+            };
+        assert_eq!(second_rebuilt_rows, 0);
 
         let _ = std::fs::remove_file(db_str);
     }
