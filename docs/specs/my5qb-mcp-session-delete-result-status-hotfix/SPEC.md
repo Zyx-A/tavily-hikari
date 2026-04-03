@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 待实现
+- Status: 已完成
 - Created: 2026-04-03
 - Last: 2026-04-03
 
@@ -106,10 +106,10 @@
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
-- [ ] M1: 新增统一 display helper，并接入 request/token/public serializer
-- [ ] M2: 补齐 admin/key/token/snapshot/public 回归测试
-- [ ] M3: 记录 hotfix spec 与 101 drift follow-up
-- [ ] M4: 完成 fast-track PR、merge 与 cleanup
+- [x] M1: 新增统一 display helper，并接入 request/token/public serializer
+- [x] M2: 补齐 admin/key/token/snapshot/public 回归测试
+- [x] M3: 记录 hotfix spec 与 101 drift follow-up
+- [x] M4: 完成 fast-track PR、merge 与 cleanup
 
 ## 风险 / 假设（Risks, Assumptions）
 
@@ -119,3 +119,7 @@
 ## 参考（References）
 
 - `docs/specs/w6m86-mcp-session-delete-neutral-repair/SPEC.md`
+
+## 变更记录（Change log）
+
+- 2026-04-03: PR #203 修正 session-delete unsupported 的 display `resultStatus` 输出，补齐 serializer/admin/key/token/snapshot 回归，并记录 101 digest drift 证据。
