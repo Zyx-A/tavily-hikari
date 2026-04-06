@@ -70,7 +70,9 @@
 ## 接口契约（Interfaces & Contracts）
 
 ### `GET /api/logs/list`
+
 ### `GET /api/keys/:id/logs/list`
+
 ### `GET /api/tokens/:id/logs/list`
 
 - 查询参数：
@@ -101,7 +103,9 @@
 - `items[].request_body` 与 `items[].response_body` 固定返回 `null`；详情 bodies 继续走既有 details endpoint。
 
 ### `GET /api/logs/catalog`
+
 ### `GET /api/keys/:id/logs/catalog`
+
 ### `GET /api/tokens/:id/logs/catalog`
 
 - 响应：
@@ -164,4 +168,28 @@
 
 ## Visual Evidence
 
-- 待实现后补充。
+- Live `/admin/requests`：真实页面首屏仅请求 `profile`、`version`、`logs/list`、`logs/catalog`，并展示基于运行时 retention 的文案。
+
+  ![Live admin requests page](./assets/admin-requests-live.png)
+
+- Storybook `requests global`：共享 recent requests 面板改为 cursor 导航，不再展示伪精确总页数，文案改为按时间倒序浏览并显示 retention 天数。
+
+  ![Global recent requests story](./assets/requests-global-storybook.png)
+
+- Storybook `key detail recent requests`：key 详情页复用 admin 专用 list/catalog 契约，描述与全局 requests 页保持一致。
+
+  ![Key detail recent requests](./assets/key-detail-recent-requests.png)
+
+- Storybook `token detail recent requests`：token 详情页同样切到 cursor 导航与 retention 文案，验证 scoped recent requests 体验一致。
+
+  ![Token detail recent requests](./assets/token-detail-recent-requests.png)
+
+- Storybook `catalog loading`：catalog 慢时先渲染列表与安全兜底文案，filters 元数据后补齐，不再整体阻塞首屏。
+
+  ![Catalog loading fallback](./assets/catalog-loading-fallback.png)
+
+- Storybook `empty state` / `error state`：空态与错误态都保留可浏览的稳定容器与文案，不回退到旧的 200 条 / 10 页提示。
+
+  ![Empty state](./assets/empty-state.png)
+
+  ![Error state](./assets/error-state.png)

@@ -507,6 +507,32 @@ struct LogsQuery {
     include_bodies: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CursorLogsQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+    direction: Option<String>,
+    result: Option<String>,
+    key_effect: Option<String>,
+    auth_token_id: Option<String>,
+    key_id: Option<String>,
+    operational_class: Option<String>,
+    since: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenCursorLogsQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+    direction: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    result: Option<String>,
+    key_effect: Option<String>,
+    key_id: Option<String>,
+    operational_class: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LogFacetOptionView {
@@ -530,6 +556,133 @@ struct RequestLogFacetsView {
     key_effects: Vec<LogFacetOptionView>,
     tokens: Vec<LogFacetOptionView>,
     keys: Vec<LogFacetOptionView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestLogsCursorPageView {
+    items: Vec<RequestLogView>,
+    page_size: i64,
+    next_cursor: Option<String>,
+    prev_cursor: Option<String>,
+    has_older: bool,
+    has_newer: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestLogsCatalogView {
+    retention_days: i64,
+    request_kind_options: Vec<TokenRequestKindOptionView>,
+    facets: RequestLogFacetsView,
+}
+
+impl From<RequestLogsCatalog> for RequestLogsCatalogView {
+    fn from(value: RequestLogsCatalog) -> Self {
+        Self {
+            retention_days: value.retention_days,
+            request_kind_options: value
+                .request_kind_options
+                .into_iter()
+                .map(TokenRequestKindOptionView::from)
+                .collect(),
+            facets: RequestLogFacetsView {
+                results: value
+                    .facets
+                    .results
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                key_effects: value
+                    .facets
+                    .key_effects
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                tokens: value
+                    .facets
+                    .tokens
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                keys: value
+                    .facets
+                    .keys
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+            },
+        }
+    }
+}
+
+fn build_request_logs_cursor_page_view(page: RequestLogsCursorPage) -> RequestLogsCursorPageView {
+    RequestLogsCursorPageView {
+        items: page
+            .items
+            .into_iter()
+            .map(RequestLogView::from_summary_record)
+            .collect(),
+        page_size: page.page_size,
+        next_cursor: page.next_cursor.as_ref().map(encode_request_logs_cursor),
+        prev_cursor: page.prev_cursor.as_ref().map(encode_request_logs_cursor),
+        has_older: page.has_older,
+        has_newer: page.has_newer,
+    }
+}
+
+fn build_token_logs_cursor_page_view(page: TokenLogsCursorPage, token_id: &str) -> RequestLogsCursorPageView {
+    RequestLogsCursorPageView {
+        items: page
+            .items
+            .into_iter()
+            .map(|record| RequestLogView::from_token_record(record, token_id))
+            .map(|mut view| {
+                if let Some(err) = view.error_message.as_ref() {
+                    view.error_message = Some(redact_sensitive(err));
+                }
+                view
+            })
+            .collect(),
+        page_size: page.page_size,
+        next_cursor: page.next_cursor.as_ref().map(encode_request_logs_cursor),
+        prev_cursor: page.prev_cursor.as_ref().map(encode_request_logs_cursor),
+        has_older: page.has_older,
+        has_newer: page.has_newer,
+    }
+}
+
+fn encode_request_logs_cursor(cursor: &RequestLogsCursor) -> String {
+    format!("{}:{}", cursor.created_at, cursor.id)
+}
+
+fn parse_request_logs_cursor(value: Option<&str>) -> Result<Option<RequestLogsCursor>, StatusCode> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((created_at_raw, id_raw)) = raw.split_once(':') else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let created_at = created_at_raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = id_raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Some(RequestLogsCursor { created_at, id }))
+}
+
+fn normalize_request_logs_cursor_direction(
+    value: Option<&str>,
+) -> Result<RequestLogsCursorDirection, StatusCode> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(RequestLogsCursorDirection::Older),
+        Some(value) if value.eq_ignore_ascii_case("older") => Ok(RequestLogsCursorDirection::Older),
+        Some(value) if value.eq_ignore_ascii_case("newer") => Ok(RequestLogsCursorDirection::Newer),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 fn normalize_result_status_filter(value: Option<&str>) -> Option<&'static str> {
@@ -774,6 +927,100 @@ async fn get_key_logs_page(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn get_key_logs_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<CursorLogsQuery>,
+) -> Result<Json<RequestLogsCursorPageView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let page_size = q.limit.unwrap_or(20).clamp(1, 200);
+    let cursor = parse_request_logs_cursor(q.cursor.as_deref())?;
+    let direction = normalize_request_logs_cursor_direction(q.direction.as_deref())?;
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    if result_status.is_some() && key_effect_code.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let auth_token_id = normalize_optional_filter(q.auth_token_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .key_logs_list(
+            &id,
+            q.since,
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            auth_token_id,
+            operational_class,
+            cursor.as_ref(),
+            direction,
+            page_size,
+        )
+        .await
+        .map(build_request_logs_cursor_page_view)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_key_logs_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<CursorLogsQuery>,
+) -> Result<Json<RequestLogsCatalogView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    if result_status.is_some() && key_effect_code.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let auth_token_id = normalize_optional_filter(q.auth_token_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .key_logs_catalog(
+            &id,
+            q.since,
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            auth_token_id,
+            operational_class,
+        )
+        .await
+        .map(RequestLogsCatalogView::from)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 #[derive(Debug, Deserialize)]
 struct StickyUsersQuery {
     page: Option<i64>,
@@ -1013,6 +1260,14 @@ async fn get_token_logs_page(
     }
     let key_id = normalize_optional_filter(q.key_id.as_deref());
     let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     state
         .proxy
         .token_logs_page(
@@ -1078,6 +1333,128 @@ async fn get_token_logs_page(
                 },
             })
         })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_token_logs_list(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<TokenCursorLogsQuery>,
+) -> Result<Json<RequestLogsCursorPageView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let page_size = q.limit.unwrap_or(20).clamp(1, 200);
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_since(Some("month")));
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_until(Some("month"), since));
+    if until <= since {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let cursor = parse_request_logs_cursor(q.cursor.as_deref())?;
+    let direction = normalize_request_logs_cursor_direction(q.direction.as_deref())?;
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    if result_status.is_some() && key_effect_code.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let key_id = normalize_optional_filter(q.key_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .token_logs_list(
+            &id,
+            page_size,
+            since,
+            Some(until),
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            key_id,
+            operational_class,
+            cursor.as_ref(),
+            direction,
+        )
+        .await
+        .map(|page| build_token_logs_cursor_page_view(page, &id))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_token_logs_catalog(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<TokenCursorLogsQuery>,
+) -> Result<Json<RequestLogsCatalogView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_since(Some("month")));
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_until(Some("month"), since));
+    if until <= since {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    if result_status.is_some() && key_effect_code.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let key_id = normalize_optional_filter(q.key_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .token_logs_catalog(
+            &id,
+            since,
+            Some(until),
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            key_id,
+            operational_class,
+        )
+        .await
+        .map(RequestLogsCatalogView::from)
+        .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 

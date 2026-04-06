@@ -4763,6 +4763,64 @@ impl TavilyProxy {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_logs_list(
+        &self,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        auth_token_id: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+        cursor: Option<&RequestLogsCursor>,
+        direction: RequestLogsCursorDirection,
+        page_size: i64,
+    ) -> Result<RequestLogsCursorPage, ProxyError> {
+        self.key_store
+            .fetch_request_logs_cursor_page(
+                None,
+                None,
+                request_kinds,
+                result_status,
+                key_effect_code,
+                auth_token_id,
+                key_id,
+                operational_class,
+                cursor,
+                direction,
+                page_size,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_logs_catalog(
+        &self,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        auth_token_id: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+    ) -> Result<RequestLogsCatalog, ProxyError> {
+        self.key_store
+            .fetch_request_logs_catalog(
+                None,
+                None,
+                true,
+                true,
+                RequestLogsCatalogFilters {
+                    request_kinds,
+                    result_status,
+                    key_effect_code,
+                    auth_token_id,
+                    key_id,
+                    operational_class,
+                },
+            )
+            .await
+    }
+
     pub async fn request_log_bodies(
         &self,
         log_id: i64,
@@ -4820,6 +4878,66 @@ impl TavilyProxy {
                 per_page,
                 true,
                 false,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn key_logs_list(
+        &self,
+        key_id: &str,
+        since: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        auth_token_id: Option<&str>,
+        operational_class: Option<&str>,
+        cursor: Option<&RequestLogsCursor>,
+        direction: RequestLogsCursorDirection,
+        page_size: i64,
+    ) -> Result<RequestLogsCursorPage, ProxyError> {
+        self.key_store
+            .fetch_request_logs_cursor_page(
+                Some(key_id),
+                since,
+                request_kinds,
+                result_status,
+                key_effect_code,
+                auth_token_id,
+                None,
+                operational_class,
+                cursor,
+                direction,
+                page_size,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn key_logs_catalog(
+        &self,
+        key_id: &str,
+        since: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        auth_token_id: Option<&str>,
+        operational_class: Option<&str>,
+    ) -> Result<RequestLogsCatalog, ProxyError> {
+        self.key_store
+            .fetch_request_logs_catalog(
+                Some(key_id),
+                since,
+                true,
+                false,
+                RequestLogsCatalogFilters {
+                    request_kinds,
+                    result_status,
+                    key_effect_code,
+                    auth_token_id,
+                    key_id: None,
+                    operational_class,
+                },
             )
             .await
     }
@@ -6551,6 +6669,66 @@ impl TavilyProxy {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn token_logs_list(
+        &self,
+        token_id: &str,
+        page_size: i64,
+        since: i64,
+        until: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+        cursor: Option<&RequestLogsCursor>,
+        direction: RequestLogsCursorDirection,
+    ) -> Result<TokenLogsCursorPage, ProxyError> {
+        self.key_store
+            .fetch_token_logs_cursor_page(
+                token_id,
+                page_size,
+                since,
+                until,
+                request_kinds,
+                result_status,
+                key_effect_code,
+                key_id,
+                operational_class,
+                cursor,
+                direction,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn token_logs_catalog(
+        &self,
+        token_id: &str,
+        since: i64,
+        until: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+    ) -> Result<RequestLogsCatalog, ProxyError> {
+        self.key_store
+            .fetch_token_logs_catalog(
+                token_id,
+                since,
+                until,
+                TokenLogsCatalogFilters {
+                    request_kinds,
+                    result_status,
+                    key_effect_code,
+                    key_id,
+                    operational_class,
+                },
+            )
+            .await
+    }
+
     pub async fn token_request_log_bodies(
         &self,
         token_id: &str,
@@ -6568,7 +6746,18 @@ impl TavilyProxy {
         until: Option<i64>,
     ) -> Result<Vec<TokenRequestKindOption>, ProxyError> {
         self.key_store
-            .fetch_token_log_request_kind_options(token_id, since, until)
+            .fetch_token_log_request_kind_options(
+                token_id,
+                since,
+                until,
+                TokenLogsCatalogFilters {
+                    request_kinds: &[],
+                    result_status: None,
+                    key_effect_code: None,
+                    key_id: None,
+                    operational_class: None,
+                },
+            )
             .await
     }
 

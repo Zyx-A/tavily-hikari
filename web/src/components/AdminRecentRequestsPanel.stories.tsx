@@ -255,11 +255,12 @@ function LazyDetailsStateGallery(): JSX.Element {
         onKeyFilterChange={() => undefined}
         showKeyColumn
         showTokenColumn
-        page={1}
         perPage={20}
-        total={storyLogs.length}
-        onPreviousPage={() => undefined}
-        onNextPage={() => undefined}
+        hasOlder
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summaryWithRetention.replace('{days}', '32')}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
         onPerPageChange={() => undefined}
         formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
         formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
@@ -371,11 +372,160 @@ function IdentifierAlignmentShowcase(): JSX.Element {
         onKeyFilterChange={() => undefined}
         showKeyColumn
         showTokenColumn
-        page={1}
         perPage={20}
-        total={alignmentStoryLogs.length}
-        onPreviousPage={() => undefined}
-        onNextPage={() => undefined}
+        hasOlder
+        hasNewer
+        paginationSummary={admin.logs.pagination.summary}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function CatalogLoadingShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title={admin.logs.title}
+        description={admin.logs.descriptionFallback}
+        emptyLabel={admin.logs.empty.none}
+        loadState="ready"
+        loadingLabel={admin.logs.empty.loading}
+        logs={storyLogs.slice(0, 3)}
+        requestKindOptions={[]}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={null}
+        resultOptions={[]}
+        keyEffectOptions={[]}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={[]}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summary}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function EmptyStateShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title={admin.logs.title}
+        description={admin.logs.descriptionWithRetention.replace('{days}', '32')}
+        emptyLabel={admin.logs.empty.none}
+        loadState="ready"
+        loadingLabel={admin.logs.empty.loading}
+        logs={[]}
+        requestKindOptions={requestKindOptions}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={null}
+        resultOptions={[]}
+        keyEffectOptions={[]}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={[]}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder={false}
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summaryWithRetention.replace('{days}', '32')}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function ErrorStateShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title={admin.logs.title}
+        description={admin.logs.descriptionWithRetention.replace('{days}', '32')}
+        emptyLabel={admin.logs.empty.none}
+        loadState="error"
+        loadingLabel={admin.logs.empty.loading}
+        errorLabel={language === 'zh' ? '加载近期请求失败。' : 'Failed to load recent requests.'}
+        logs={[]}
+        requestKindOptions={requestKindOptions}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={null}
+        resultOptions={[]}
+        keyEffectOptions={[]}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={[]}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder={false}
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summaryWithRetention.replace('{days}', '32')}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
         onPerPageChange={() => undefined}
         formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
         formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
@@ -453,5 +603,43 @@ export const IdentifierAlignment: Story = {
         throw new Error(`Expected identifier alignment canvas to contain: ${expected}`)
       }
     }
+  },
+}
+
+export const CatalogLoading: Story = {
+  render: () => <CatalogLoadingShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: '当 list 已经返回、catalog 尚未补齐时的安全兜底态，不展示保留天数数字。',
+      },
+    },
+  },
+}
+
+export const EmptyState: Story = {
+  render: () => <EmptyStateShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+  },
+}
+
+export const ErrorState: Story = {
+  render: () => <ErrorStateShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
   },
 }

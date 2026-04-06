@@ -2177,6 +2177,14 @@ async fn list_logs(
     let auth_token_id = normalize_optional_filter(params.auth_token_id.as_deref());
     let key_id = normalize_optional_filter(params.key_id.as_deref());
     let operational_class = normalize_operational_class_filter(params.operational_class.as_deref());
+    if params
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     state
         .proxy
@@ -2237,6 +2245,104 @@ async fn list_logs(
         })
         .map_err(|err| {
             eprintln!("list logs error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn list_logs_cursor(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(params): Query<CursorLogsQuery>,
+) -> Result<Json<RequestLogsCursorPageView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let page_size = params.limit.unwrap_or(20).clamp(1, 200);
+    let cursor = parse_request_logs_cursor(params.cursor.as_deref())?;
+    let direction = normalize_request_logs_cursor_direction(params.direction.as_deref())?;
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(params.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(params.key_effect.as_deref());
+    if result_status.is_some() && key_effect_code.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let auth_token_id = normalize_optional_filter(params.auth_token_id.as_deref());
+    let key_id = normalize_optional_filter(params.key_id.as_deref());
+    let operational_class = normalize_operational_class_filter(params.operational_class.as_deref());
+    if params
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .request_logs_list(
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            auth_token_id,
+            key_id,
+            operational_class,
+            cursor.as_ref(),
+            direction,
+            page_size,
+        )
+        .await
+        .map(build_request_logs_cursor_page_view)
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("list logs cursor error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn get_logs_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<CursorLogsQuery>,
+) -> Result<Json<RequestLogsCatalogView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    if result_status.is_some() && key_effect_code.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let auth_token_id = normalize_optional_filter(q.auth_token_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .request_logs_catalog(
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            auth_token_id,
+            normalize_optional_filter(q.key_id.as_deref()),
+            operational_class,
+        )
+        .await
+        .map(RequestLogsCatalogView::from)
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("request logs catalog error: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }

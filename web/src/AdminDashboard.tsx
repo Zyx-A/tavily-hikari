@@ -116,6 +116,12 @@ import {
   userTagsPath,
   userUsagePath,
 } from './admin/routes'
+import {
+  buildRequestLogsCatalogPlan,
+  buildRequestLogsListPlan,
+  formatRequestLogsDescription,
+  formatRequestLogsPaginationSummary,
+} from './admin/requestLogsUi'
 import { useLanguage, useTranslate, type AdminTranslations } from './i18n'
 import { extractApiKeyImportEntriesFromText } from './lib/api-key-extract'
 import { ADMIN_USER_CONSOLE_HREF } from './lib/adminUserConsoleEntry'
@@ -147,8 +153,10 @@ import {
   setKeyStatus,
   clearApiKeyQuarantine,
   fetchProfile,
+  fetchRequestLogs,
+  fetchRequestLogsCatalog,
+  fetchRequestLogsList,
   fetchRequestLogDetails,
-  fetchRequestLogsPage,
   fetchDashboardOverview,
   fetchSummary,
   fetchVersion,
@@ -159,7 +167,9 @@ import {
   type DashboardTrendBuckets,
   type Profile,
   type RequestLog,
+  type RequestLogsCatalog,
   type RequestLogFacets,
+  type RequestLogsListPage,
   type Summary,
   type SummaryWindowsResponse,
   fetchTokens,
@@ -172,7 +182,8 @@ import {
   createTokensBatch,
   type Paginated,
   fetchKeyMetrics,
-  fetchKeyLogsPage,
+  fetchKeyLogsCatalog,
+  fetchKeyLogsList,
   fetchKeyLogDetails,
   fetchKeyStickyNodes,
   fetchKeyStickyUsers,
@@ -243,7 +254,8 @@ import { finalizeForwardProxyRevalidate } from './admin/forwardProxyRevalidate'
 
 const REFRESH_INTERVAL_MS = 30_000
 const LOGS_PER_PAGE = 20
-const LOGS_MAX_PAGES = 10
+const DASHBOARD_RECENT_LOGS_PER_PAGE = 64
+const DASHBOARD_RECENT_JOBS_PER_PAGE = 20
 const DEFAULT_KEYS_PER_PAGE = 20
 const USERS_PER_PAGE = 20
 // Auto-collapse behavior for the API keys batch overlay (empty textarea only):
@@ -1382,6 +1394,15 @@ const emptyRequestLogFacets: RequestLogFacets = {
   keys: [],
 }
 
+const emptyRequestLogsListPage: RequestLogsListPage = {
+  items: [],
+  pageSize: LOGS_PER_PAGE,
+  nextCursor: null,
+  prevCursor: null,
+  hasOlder: false,
+  hasNewer: false,
+}
+
 interface ManualCopyBubbleState {
   anchorEl: HTMLElement | null
   title: string
@@ -1459,14 +1480,16 @@ function AdminDashboard(): JSX.Element {
   const [unboundTokenUsageError, setUnboundTokenUsageError] = useState<string | null>(null)
   const [logs, setLogs] = useState<RequestLog[]>([])
   const [dashboardLogs, setDashboardLogs] = useState<RequestLog[]>([])
-  const [logsTotal, setLogsTotal] = useState(0)
-  const [logsPage, setLogsPage] = useState(1)
   const [logsPerPage, setLogsPerPage] = useState(LOGS_PER_PAGE)
+  const [logsCursor, setLogsCursor] = useState<string | null>(null)
+  const [logsDirection, setLogsDirection] = useState<'older' | 'newer'>('older')
+  const [logsPageInfo, setLogsPageInfo] = useState<RequestLogsListPage>(emptyRequestLogsListPage)
   const [requestLogRequestKindOptions, setRequestLogRequestKindOptions] = useState<TokenLogRequestKindOption[]>([])
   const [requestLogSelectedKinds, setRequestLogSelectedKinds] = useState<string[]>([])
   const [requestLogQuickBilling, setRequestLogQuickBilling] = useState<TokenLogRequestKindQuickBilling>('all')
   const [requestLogQuickProtocol, setRequestLogQuickProtocol] = useState<TokenLogRequestKindQuickProtocol>('all')
   const [requestLogFacets, setRequestLogFacets] = useState<RequestLogFacets>(emptyRequestLogFacets)
+  const [requestLogsCatalog, setRequestLogsCatalog] = useState<RequestLogsCatalog | null>(null)
   const [requestLogOutcomeFilter, setRequestLogOutcomeFilter] = useState<RecentRequestsOutcomeFilter | null>(null)
   const [requestLogKeyFilter, setRequestLogKeyFilter] = useState<string | null>(null)
   const [requestsLoadState, setRequestsLoadState] = useState<QueryLoadState>('initial_loading')
@@ -2250,25 +2273,29 @@ function AdminDashboard(): JSX.Element {
         setTokensTotal(0)
       }
       try {
-        const [summaryData, ver, profileData, tokenData, tokenGroupsData] = await Promise.all([
-          fetchSummary(request.signal),
+        const shouldLoadTokens = route.name === 'module' && route.module === 'tokens'
+        const [ver, profileData, tokenData, tokenGroupsData] = await Promise.all([
           fetchVersion(request.signal).catch(() => null),
           fetchProfile(request.signal).catch(() => null),
-          fetchTokens(
-            tokensPage,
-            tokensPerPage,
-            { group: selectedTokenGroupName, ungrouped: selectedTokenUngrouped },
-            request.signal,
-          ).catch(
-            () =>
-              ({
-                items: [],
-                total: 0,
-                page: tokensPage,
-                perPage: tokensPerPage,
-              }) as Paginated<AuthToken>,
-          ),
-          fetchTokenGroups(request.signal).catch(() => [] as TokenGroup[]),
+          shouldLoadTokens
+            ? fetchTokens(
+                tokensPage,
+                tokensPerPage,
+                { group: selectedTokenGroupName, ungrouped: selectedTokenUngrouped },
+                request.signal,
+              ).catch(
+                () =>
+                  ({
+                    items: [],
+                    total: 0,
+                    page: tokensPage,
+                    perPage: tokensPerPage,
+                  }) as Paginated<AuthToken>,
+              )
+            : Promise.resolve(null),
+          shouldLoadTokens
+            ? fetchTokenGroups(request.signal).catch(() => [] as TokenGroup[])
+            : Promise.resolve(null),
         ])
 
         if (request.signal.aborted) {
@@ -2276,10 +2303,13 @@ function AdminDashboard(): JSX.Element {
         }
 
         setProfile(profileData ?? null)
-        setSummary(summaryData)
-        setTokens(tokenData.items)
-        setTokensTotal(tokenData.total)
-        setTokenGroups(tokenGroupsData)
+        if (tokenData) {
+          setTokens(tokenData.items)
+          setTokensTotal(tokenData.total)
+        }
+        if (tokenGroupsData) {
+          setTokenGroups(tokenGroupsData)
+        }
         setVersion(ver ?? null)
         setLastUpdated(new Date())
         setError(null)
@@ -2298,7 +2328,7 @@ function AdminDashboard(): JSX.Element {
         request.cleanup()
       }
     },
-    [beginManagedRequest, tokensPage, selectedTokenGroupName, selectedTokenUngrouped],
+    [beginManagedRequest, route, tokensPage, selectedTokenGroupName, selectedTokenUngrouped],
   )
 
   const loadDashboardOverview = useCallback(
@@ -2985,19 +3015,24 @@ function AdminDashboard(): JSX.Element {
   const requestLogKeyEffectFilter =
     requestLogOutcomeFilter?.kind === 'keyEffect' ? requestLogOutcomeFilter.value : undefined
 
-  // Logs list: backend pagination & result filter
+  // Logs list: cursor pagination, list first and catalog after
   useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'requests')) {
+      return
+    }
     const request = beginManagedRequest(requestsAbortRef)
     setRequestsLoadState(getBlockingLoadState(requestsLoadedRef.current))
     setRequestsError(null)
     setLogs([])
-    setLogsTotal(0)
+    setLogsPageInfo((current) => ({ ...current, items: [] }))
     setExpandedLogs(new Set())
-    setRequestLogFacets(emptyRequestLogFacets)
 
     if (requestLogHasEmptyMatch) {
       setLogs([])
-      setLogsTotal(0)
+      setLogsPageInfo({
+        ...emptyRequestLogsListPage,
+        pageSize: logsPerPage,
+      })
       setRequestsLoadState('ready')
       requestsLoadedRef.current = true
       request.cleanup()
@@ -3007,10 +3042,11 @@ function AdminDashboard(): JSX.Element {
       }
     }
 
-    fetchRequestLogsPage(
+    fetchRequestLogsList(
       {
-        page: logsPage,
-        perPage: logsPerPage,
+        limit: logsPerPage,
+        cursor: logsCursor,
+        direction: logsDirection,
         requestKinds: requestLogEffectiveKinds,
         result: requestLogResultFilter,
         keyEffect: requestLogKeyEffectFilter,
@@ -3021,9 +3057,7 @@ function AdminDashboard(): JSX.Element {
       .then((result) => {
         if (request.signal.aborted) return
         setLogs(result.items)
-        setLogsTotal(result.total)
-        setRequestLogRequestKindOptions(result.requestKindOptions)
-        setRequestLogFacets(result.facets)
+        setLogsPageInfo(result)
         setRequestsLoadState('ready')
         requestsLoadedRef.current = true
       })
@@ -3031,7 +3065,10 @@ function AdminDashboard(): JSX.Element {
         if (request.signal.aborted) return
         console.error(err)
         setLogs([])
-        setLogsTotal(0)
+        setLogsPageInfo({
+          ...emptyRequestLogsListPage,
+          pageSize: logsPerPage,
+        })
         setRequestsError(err instanceof Error ? err.message : loadingStateStrings.error)
         setRequestsLoadState('error')
       })
@@ -3045,8 +3082,54 @@ function AdminDashboard(): JSX.Element {
     }
   }, [
     beginManagedRequest,
-    logsPage,
     logsPerPage,
+    logsCursor,
+    logsDirection,
+    route,
+    requestLogEffectiveKindsKey,
+    requestLogHasEmptyMatch,
+    requestLogKeyEffectFilter,
+    requestLogKeyFilter,
+    requestLogResultFilter,
+  ])
+
+  useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'requests')) {
+      return
+    }
+    const controller = new AbortController()
+    const catalogPlan = buildRequestLogsCatalogPlan({
+      hasEmptyMatch: requestLogHasEmptyMatch,
+      requestKinds: requestLogEffectiveKinds,
+      result: requestLogResultFilter,
+      keyEffect: requestLogKeyEffectFilter,
+      keyId: requestLogKeyFilter,
+    })
+
+    if (catalogPlan.kind === 'empty') {
+      setRequestLogRequestKindOptions([])
+      setRequestLogFacets(emptyRequestLogFacets)
+      return () => controller.abort()
+    }
+
+    fetchRequestLogsCatalog(catalogPlan.query, controller.signal)
+      .then((catalog) => {
+        if (controller.signal.aborted) return
+        setRequestLogsCatalog(catalog)
+        setRequestLogRequestKindOptions(catalog.requestKindOptions)
+        setRequestLogFacets(catalog.facets)
+      })
+      .catch((err) => {
+        if ((err as Error).name === 'AbortError') return
+        console.error(err)
+        setRequestLogsCatalog(null)
+        setRequestLogRequestKindOptions([])
+        setRequestLogFacets(emptyRequestLogFacets)
+      })
+
+    return () => controller.abort()
+  }, [
+    route,
     requestLogEffectiveKindsKey,
     requestLogHasEmptyMatch,
     requestLogKeyEffectFilter,
@@ -3062,7 +3145,8 @@ function AdminDashboard(): JSX.Element {
       setRequestLogSelectedKinds(
         buildRequestKindQuickFilterSelection(requestLogRequestKindOptions, nextFilters),
       )
-      setLogsPage(1)
+      setLogsCursor(null)
+      setLogsDirection('older')
     },
     [requestLogRequestKindOptions],
   )
@@ -3079,7 +3163,8 @@ function AdminDashboard(): JSX.Element {
       setRequestLogSelectedKinds(nextSelected)
       setRequestLogQuickBilling(nextQuickFilters.billing)
       setRequestLogQuickProtocol(nextQuickFilters.protocol)
-      setLogsPage(1)
+      setLogsCursor(null)
+      setLogsDirection('older')
     },
     [
       requestLogEffectiveKinds,
@@ -3093,17 +3178,20 @@ function AdminDashboard(): JSX.Element {
     setRequestLogSelectedKinds([])
     setRequestLogQuickBilling(defaultTokenLogRequestKindQuickFilters.billing)
     setRequestLogQuickProtocol(defaultTokenLogRequestKindQuickFilters.protocol)
-    setLogsPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const handleRequestLogOutcomeFilter = useCallback((value: RecentRequestsOutcomeFilter | null) => {
     setRequestLogOutcomeFilter(value)
-    setLogsPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const handleRequestLogKeyFilter = useCallback((value: string | null) => {
     setRequestLogKeyFilter(value)
-    setLogsPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const loadRequestLogBodies = useCallback(
@@ -3113,6 +3201,9 @@ function AdminDashboard(): JSX.Element {
 
   // Jobs list: refetch when filter or page changes
   useEffect(() => {
+    if (!(route.name === 'module' && route.module === 'jobs')) {
+      return
+    }
     const request = beginManagedRequest(jobsAbortRef)
     setJobsLoadState(getBlockingLoadState(jobsLoadedRef.current))
     setJobsError(null)
@@ -3143,7 +3234,7 @@ function AdminDashboard(): JSX.Element {
       request.abort()
       request.cleanup()
     }
-  }, [beginManagedRequest, jobFilter, jobsPage])
+  }, [beginManagedRequest, jobFilter, jobsPage, route])
 
   useEffect(() => {
     if (!(route.name === 'module' && route.module === 'keys')) return
@@ -4017,36 +4108,70 @@ function AdminDashboard(): JSX.Element {
       const request = beginManagedRequest(requestsAbortRef, controller.signal)
       setRequestsLoadState(getRefreshingLoadState(requestsLoadedRef.current))
       setRequestsError(null)
-      tasks.push(
-        fetchRequestLogsPage(
-          {
-            page: logsPage,
-            perPage: logsPerPage,
-            requestKinds: requestLogHasEmptyMatch ? [] : requestLogEffectiveKinds,
-            result: requestLogResultFilter,
-            keyEffect: requestLogKeyEffectFilter,
-            keyId: requestLogKeyFilter ?? undefined,
-          },
-          request.signal,
+      const listPlan = buildRequestLogsListPlan({
+        limit: logsPerPage,
+        cursor: logsCursor,
+        direction: logsDirection,
+        hasEmptyMatch: requestLogHasEmptyMatch,
+        requestKinds: requestLogEffectiveKinds,
+        result: requestLogResultFilter,
+        keyEffect: requestLogKeyEffectFilter,
+        keyId: requestLogKeyFilter,
+      })
+      if (listPlan.kind === 'empty') {
+        setLogs([])
+        setLogsPageInfo({
+          ...emptyRequestLogsListPage,
+          pageSize: logsPerPage,
+        })
+        setRequestsLoadState('ready')
+        request.cleanup()
+      } else {
+        tasks.push(
+          fetchRequestLogsList(listPlan.query, request.signal)
+            .then((result) => {
+              if (request.signal.aborted) return
+              setLogs(result.items)
+              setLogsPageInfo(result)
+              setRequestsLoadState('ready')
+            })
+            .catch((err) => {
+              if (request.signal.aborted) return
+              console.error(err)
+              setRequestsError(err instanceof Error ? err.message : loadingStateStrings.error)
+              setRequestsLoadState('error')
+            })
+            .finally(() => {
+              request.cleanup()
+            }),
         )
-          .then((result) => {
-            if (request.signal.aborted) return
-            setLogs(result.items)
-            setLogsTotal(result.total)
-            setRequestLogRequestKindOptions(result.requestKindOptions)
-            setRequestLogFacets(result.facets)
-            setRequestsLoadState('ready')
-          })
-          .catch((err) => {
-            if (request.signal.aborted) return
-            console.error(err)
-            setRequestsError(err instanceof Error ? err.message : loadingStateStrings.error)
-            setRequestsLoadState('error')
-          })
-          .finally(() => {
-            request.cleanup()
-          }),
-      )
+      }
+      const catalogPlan = buildRequestLogsCatalogPlan({
+        hasEmptyMatch: requestLogHasEmptyMatch,
+        requestKinds: requestLogEffectiveKinds,
+        result: requestLogResultFilter,
+        keyEffect: requestLogKeyEffectFilter,
+        keyId: requestLogKeyFilter,
+      })
+      if (catalogPlan.kind === 'empty') {
+        setRequestLogRequestKindOptions([])
+        setRequestLogFacets(emptyRequestLogFacets)
+      } else {
+        tasks.push(
+          fetchRequestLogsCatalog(catalogPlan.query, controller.signal)
+            .then((catalog) => {
+              if (controller.signal.aborted) return
+              setRequestLogsCatalog(catalog)
+              setRequestLogRequestKindOptions(catalog.requestKindOptions)
+              setRequestLogFacets(catalog.facets)
+            })
+            .catch((err) => {
+              if ((err as Error).name === 'AbortError' || controller.signal.aborted) return
+              console.error(err)
+              setRequestLogsCatalog(null)
+            }),
+        )
+      }
     }
     if (route.name === 'module' && route.module === 'jobs') {
       const request = beginManagedRequest(jobsAbortRef, controller.signal)
@@ -4726,14 +4851,6 @@ function AdminDashboard(): JSX.Element {
     return () => window.cancelAnimationFrame(raf)
   }, [keysBatchExpanded, updateKeysBatchOverlayLayout])
 
-  const logsTotalPagesRaw = useMemo(
-    () => Math.max(1, Math.ceil(logsTotal / logsPerPage)),
-    [logsPerPage, logsTotal],
-  )
-
-  const logsTotalPages = Math.min(logsTotalPagesRaw, LOGS_MAX_PAGES)
-
-  const safeLogsPage = Math.min(logsPage, logsTotalPages)
   const tokensBlocking = isBlockingLoadState(tokensLoadState)
   const tokensRefreshing = isRefreshingLoadState(tokensLoadState)
   const requestsBlocking = isBlockingLoadState(requestsLoadState)
@@ -4750,6 +4867,14 @@ function AdminDashboard(): JSX.Element {
     unboundTokenUsageSort ?? ADMIN_UNBOUND_TOKEN_USAGE_DEFAULT_SORT_FIELD
   const effectiveUnboundTokenUsageSortOrder =
     unboundTokenUsageSortOrder ?? ADMIN_UNBOUND_TOKEN_USAGE_DEFAULT_SORT_ORDER
+  const requestLogsDescription = useMemo(
+    () => formatRequestLogsDescription(adminStrings.logs, requestLogsCatalog?.retentionDays),
+    [adminStrings.logs, requestLogsCatalog?.retentionDays],
+  )
+  const requestLogsPaginationSummary = useMemo(
+    () => formatRequestLogsPaginationSummary(adminStrings.logs, requestLogsCatalog?.retentionDays),
+    [adminStrings.logs, requestLogsCatalog?.retentionDays],
+  )
   const systemSettingsBlocking = isBlockingLoadState(systemSettingsLoadState)
   const forwardProxySettingsBlocking = isBlockingLoadState(forwardProxySettingsLoadState)
   const forwardProxyStatsBlocking = isBlockingLoadState(forwardProxyStatsLoadState)
@@ -5201,24 +5326,28 @@ function AdminDashboard(): JSX.Element {
     setTokensPage((p) => Math.min(totalPages, p + 1))
   }
 
-  const hasLogsPagination = logsTotal > logsPerPage
   const usersTotalPages = useMemo(() => Math.max(1, Math.ceil(usersTotal / USERS_PER_PAGE)), [usersTotal])
   const unboundTokenUsageTotalPages = useMemo(
     () => Math.max(1, Math.ceil(unboundTokenUsageTotal / USERS_PER_PAGE)),
     [unboundTokenUsageTotal],
   )
 
-  const goPrevLogsPage = () => {
-    setLogsPage((p) => Math.max(1, p - 1))
+  const goNewerLogsPage = () => {
+    if (!logsPageInfo.prevCursor) return
+    setLogsCursor(logsPageInfo.prevCursor)
+    setLogsDirection('newer')
   }
 
-  const goNextLogsPage = () => {
-    setLogsPage((p) => Math.min(logsTotalPages, p + 1))
+  const goOlderLogsPage = () => {
+    if (!logsPageInfo.nextCursor) return
+    setLogsCursor(logsPageInfo.nextCursor)
+    setLogsDirection('older')
   }
 
   const changeLogsPerPage = (value: number) => {
     setLogsPerPage(value)
-    setLogsPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }
 
   const goPrevUsersPage = () => {
@@ -10190,7 +10319,7 @@ function AdminDashboard(): JSX.Element {
           language={language}
           strings={adminStrings}
           title={logStrings.title}
-          description={logStrings.description}
+          description={requestLogsDescription}
           emptyLabel={logStrings.empty.none}
           loadState={requestsLoadState}
           loadingLabel={requestsRefreshing ? loadingStateStrings.refreshing : logStrings.empty.loading}
@@ -10212,12 +10341,13 @@ function AdminDashboard(): JSX.Element {
           onKeyFilterChange={handleRequestLogKeyFilter}
           showKeyColumn
           showTokenColumn
-          page={safeLogsPage}
           perPage={logsPerPage}
-          total={logsTotal}
+          hasOlder={logsPageInfo.hasOlder}
+          hasNewer={logsPageInfo.hasNewer}
+          paginationSummary={requestLogsPaginationSummary}
           paginationDisabled={requestsBlocking}
-          onPreviousPage={goPrevLogsPage}
-          onNextPage={goNextLogsPage}
+          onNewerPage={goNewerLogsPage}
+          onOlderPage={goOlderLogsPage}
           onPerPageChange={changeLogsPerPage}
           formatTime={formatTimestampNoYear}
           formatTimeDetail={(ts) => (ts ? `${formatTimestampWithMs(ts)} · ${formatRelativeTime(ts)}` : '—')}
@@ -11105,15 +11235,17 @@ export function KeyDetails({
   const [startDate, setStartDate] = useState<string>(() => new Date().toISOString().slice(0, 10))
   const [summary, setSummary] = useState<KeySummary | null>(null)
   const [logs, setLogs] = useState<RequestLog[]>([])
-  const [logsPage, setLogsPage] = useState(1)
   const [logsPerPage, setLogsPerPage] = useState(20)
-  const [logsTotal, setLogsTotal] = useState(0)
+  const [logsCursor, setLogsCursor] = useState<string | null>(null)
+  const [logsDirection, setLogsDirection] = useState<'older' | 'newer'>('older')
+  const [logsPageInfo, setLogsPageInfo] = useState<RequestLogsListPage>({ ...emptyRequestLogsListPage, pageSize: 20 })
   const [logsNonce, setLogsNonce] = useState(0)
   const [keyLogRequestKindOptions, setKeyLogRequestKindOptions] = useState<TokenLogRequestKindOption[]>([])
   const [keyLogSelectedKinds, setKeyLogSelectedKinds] = useState<string[]>([])
   const [keyLogQuickBilling, setKeyLogQuickBilling] = useState<TokenLogRequestKindQuickBilling>('all')
   const [keyLogQuickProtocol, setKeyLogQuickProtocol] = useState<TokenLogRequestKindQuickProtocol>('all')
   const [keyLogFacets, setKeyLogFacets] = useState<RequestLogFacets>(emptyRequestLogFacets)
+  const [keyLogsCatalog, setKeyLogsCatalog] = useState<RequestLogsCatalog | null>(null)
   const [keyLogOutcomeFilter, setKeyLogOutcomeFilter] = useState<RecentRequestsOutcomeFilter | null>(null)
   const [stickyUsers, setStickyUsers] = useState<StickyUserRow[]>([])
   const [stickyUsersPage, setStickyUsersPage] = useState(1)
@@ -11141,7 +11273,8 @@ export function KeyDetails({
   const stickyNodesAbortRef = useRef<AbortController | null>(null)
   const stickyNodesQueryKeyRef = useRef<string | null>(null)
   const queryKey = `${id}:${period}:${startDate}`
-  const logsQueryKey = `${id}:${period}:${startDate}:${logsPage}:${logsPerPage}:${keyLogSelectedKinds.join(',')}:${keyLogQuickBilling}:${keyLogQuickProtocol}:${keyLogOutcomeFilter?.kind ?? ''}:${keyLogOutcomeFilter?.value ?? ''}:${logsNonce}`
+  const logsQueryKey = `${id}:${period}:${startDate}:${logsCursor ?? ''}:${logsDirection}:${logsPerPage}:${keyLogSelectedKinds.join(',')}:${keyLogQuickBilling}:${keyLogQuickProtocol}:${keyLogOutcomeFilter?.kind ?? ''}:${keyLogOutcomeFilter?.value ?? ''}:${logsNonce}`
+  const logsCatalogQueryKey = `${id}:${period}:${startDate}:${logsNonce}`
   const stickyUsersQueryKey = `${id}:${stickyUsersPage}`
   const stickyUsersPerPage = 20
   const quarantineDetailId = `key-quarantine-detail-${id}`
@@ -11245,13 +11378,12 @@ export function KeyDetails({
     setLogsLoadState(panelLoadState)
     setLogsError(null)
     setLogs([])
-    setLogsTotal(0)
-    setKeyLogFacets(emptyRequestLogFacets)
+    setLogsPageInfo({ ...emptyRequestLogsListPage, pageSize: logsPerPage })
     const since = computeSince()
 
     if (keyLogHasEmptyMatch) {
       setLogs([])
-      setLogsTotal(0)
+      setLogsPageInfo({ ...emptyRequestLogsListPage, pageSize: logsPerPage })
       setLogsLoadState('ready')
       logsQueryKeyRef.current = logsQueryKey
       return () => {
@@ -11259,11 +11391,12 @@ export function KeyDetails({
       }
     }
 
-    fetchKeyLogsPage(
+    fetchKeyLogsList(
       id,
       {
-        page: logsPage,
-        perPage: logsPerPage,
+        limit: logsPerPage,
+        cursor: logsCursor,
+        direction: logsDirection,
         since,
         requestKinds: keyLogEffectiveKinds,
         result: keyLogResultFilter,
@@ -11274,10 +11407,7 @@ export function KeyDetails({
       .then((result) => {
         if (controller.signal.aborted) return
         setLogs(result.items)
-        setLogsTotal(result.total)
-        setLogsPerPage(result.perPage)
-        setKeyLogRequestKindOptions(result.requestKindOptions)
-        setKeyLogFacets(result.facets)
+        setLogsPageInfo(result)
         setLogsLoadState('ready')
         logsQueryKeyRef.current = logsQueryKey
       })
@@ -11299,9 +11429,52 @@ export function KeyDetails({
     keyLogHasEmptyMatch,
     keyLogKeyEffectFilter,
     keyLogResultFilter,
-    logsPage,
     logsPerPage,
+    logsCursor,
+    logsDirection,
     logsQueryKey,
+  ])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const since = computeSince()
+    const catalogPlan = buildRequestLogsCatalogPlan({
+      hasEmptyMatch: keyLogHasEmptyMatch,
+      since,
+      requestKinds: keyLogEffectiveKinds,
+      result: keyLogResultFilter,
+      keyEffect: keyLogKeyEffectFilter,
+    })
+    if (catalogPlan.kind === 'empty') {
+      setKeyLogRequestKindOptions([])
+      setKeyLogFacets(emptyRequestLogFacets)
+      return () => controller.abort()
+    }
+
+    fetchKeyLogsCatalog(id, catalogPlan.query, controller.signal)
+      .then((catalog) => {
+        if (controller.signal.aborted) return
+        setKeyLogsCatalog(catalog)
+        setKeyLogRequestKindOptions(catalog.requestKindOptions)
+        setKeyLogFacets(catalog.facets)
+      })
+      .catch((err) => {
+        if ((err as Error).name === 'AbortError') return
+        console.error(err)
+        setKeyLogsCatalog(null)
+        setKeyLogRequestKindOptions([])
+        setKeyLogFacets(emptyRequestLogFacets)
+      })
+
+    return () => controller.abort()
+  }, [
+    computeSince,
+    id,
+    keyLogEffectiveKindsKey,
+    keyLogHasEmptyMatch,
+    keyLogKeyEffectFilter,
+    keyLogResultFilter,
+    logsCatalogQueryKey,
   ])
 
   const loadStickyUsers = useCallback(async (reason: 'initial' | 'switch' | 'refresh' = 'refresh') => {
@@ -11403,8 +11576,11 @@ export function KeyDetails({
   useEffect(() => {
     setQuarantineDetailExpanded(false)
     setStickyUsersPage(1)
-    setLogsPage(1)
     setLogsPerPage(20)
+    setLogsCursor(null)
+    setLogsDirection('older')
+    setLogsPageInfo({ ...emptyRequestLogsListPage, pageSize: 20 })
+    setKeyLogsCatalog(null)
     setKeyLogRequestKindOptions([])
     setKeyLogSelectedKinds([])
     setKeyLogQuickBilling('all')
@@ -11461,7 +11637,8 @@ export function KeyDetails({
       setKeyLogQuickBilling(billing)
       setKeyLogQuickProtocol(protocol)
       setKeyLogSelectedKinds(buildRequestKindQuickFilterSelection(keyLogRequestKindOptions, nextFilters))
-      setLogsPage(1)
+      setLogsCursor(null)
+      setLogsDirection('older')
     },
     [keyLogRequestKindOptions],
   )
@@ -11478,7 +11655,8 @@ export function KeyDetails({
       setKeyLogSelectedKinds(nextSelected)
       setKeyLogQuickBilling(nextQuickFilters.billing)
       setKeyLogQuickProtocol(nextQuickFilters.protocol)
-      setLogsPage(1)
+      setLogsCursor(null)
+      setLogsDirection('older')
     },
     [keyLogEffectiveKinds, keyLogQuickFilters, keyLogQuickSelection, keyLogRequestKindOptions],
   )
@@ -11487,12 +11665,14 @@ export function KeyDetails({
     setKeyLogSelectedKinds([])
     setKeyLogQuickBilling(defaultTokenLogRequestKindQuickFilters.billing)
     setKeyLogQuickProtocol(defaultTokenLogRequestKindQuickFilters.protocol)
-    setLogsPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const handleKeyLogOutcomeFilter = useCallback((value: RecentRequestsOutcomeFilter | null) => {
     setKeyLogOutcomeFilter(value)
-    setLogsPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const loadKeyLogBodies = useCallback(
@@ -11500,12 +11680,20 @@ export function KeyDetails({
     [id],
   )
 
-  const keyLogsTotalPages = Math.max(1, Math.ceil(logsTotal / logsPerPage) || 1)
-  const goPrevKeyLogsPage = () => setLogsPage((value) => Math.max(1, value - 1))
-  const goNextKeyLogsPage = () => setLogsPage((value) => Math.min(keyLogsTotalPages, value + 1))
+  const goNewerKeyLogsPage = () => {
+    if (!logsPageInfo.prevCursor) return
+    setLogsCursor(logsPageInfo.prevCursor)
+    setLogsDirection('newer')
+  }
+  const goOlderKeyLogsPage = () => {
+    if (!logsPageInfo.nextCursor) return
+    setLogsCursor(logsPageInfo.nextCursor)
+    setLogsDirection('older')
+  }
   const changeKeyLogsPerPage = (value: number) => {
     setLogsPerPage(value)
-    setLogsPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }
 
   const metricCards = useMemo(() => {
@@ -11524,6 +11712,14 @@ export function KeyDetails({
   const detailBlocking = isBlockingLoadState(detailLoadState)
   const detailRefreshing = isRefreshingLoadState(detailLoadState)
   const detailLoadingLabel = detailRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching
+  const keyLogsDescription = useMemo(
+    () => formatRequestLogsDescription(adminStrings.logs, keyLogsCatalog?.retentionDays),
+    [adminStrings.logs, keyLogsCatalog?.retentionDays],
+  )
+  const keyLogsPaginationSummary = useMemo(
+    () => formatRequestLogsPaginationSummary(adminStrings.logs, keyLogsCatalog?.retentionDays),
+    [adminStrings.logs, keyLogsCatalog?.retentionDays],
+  )
   const stickyUsersTotalPages = Math.max(1, Math.ceil(stickyUsersTotal / stickyUsersPerPage))
   const quarantineRawDetail = detail?.quarantine?.reasonDetail?.trim() ?? ''
   const hasQuarantineRawDetail = quarantineRawDetail.length > 0
@@ -11842,7 +12038,7 @@ export function KeyDetails({
           language={language}
           strings={adminStrings}
           title={keyDetailsStrings.logsTitle}
-          description={keyDetailsStrings.logsDescription}
+          description={keyLogsDescription}
           emptyLabel={keyDetailsStrings.logsEmpty}
           loadState={logsLoadState}
           loadingLabel={logsLoadState === 'refreshing' ? loadingStateStrings.refreshing : detailLoadingLabel}
@@ -11863,12 +12059,13 @@ export function KeyDetails({
           showKeyColumn={false}
           showTokenColumn
           onOpenToken={onOpenToken}
-          page={logsPage}
           perPage={logsPerPage}
-          total={logsTotal}
+          hasOlder={logsPageInfo.hasOlder}
+          hasNewer={logsPageInfo.hasNewer}
+          paginationSummary={keyLogsPaginationSummary}
           paginationDisabled={logsLoadState !== 'ready' && logsLoadState !== 'error'}
-          onPreviousPage={goPrevKeyLogsPage}
-          onNextPage={goNextKeyLogsPage}
+          onNewerPage={goNewerKeyLogsPage}
+          onOlderPage={goOlderKeyLogsPage}
           onPerPageChange={changeKeyLogsPerPage}
           formatTime={formatTimestamp}
           formatTimeDetail={(ts) => (ts ? `${formatTimestampWithMs(ts)} · ${formatRelativeTime(ts)}` : '—')}

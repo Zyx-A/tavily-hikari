@@ -237,6 +237,21 @@ export interface RequestLogsPage {
   facets: RequestLogFacets
 }
 
+export interface RequestLogsListPage {
+  items: RequestLog[]
+  pageSize: number
+  nextCursor: string | null
+  prevCursor: string | null
+  hasOlder: boolean
+  hasNewer: boolean
+}
+
+export interface RequestLogsCatalog {
+  retentionDays: number
+  requestKindOptions: TokenLogRequestKindOption[]
+  facets: RequestLogFacets
+}
+
 interface ServerLogFacetOption {
   value: string
   count: number
@@ -261,6 +276,28 @@ interface ServerRequestLogsPage {
   facets?: ServerRequestLogFacets
 }
 
+interface ServerRequestLogsListPage {
+  items?: RequestLog[]
+  pageSize?: number
+  page_size?: number
+  nextCursor?: string | null
+  next_cursor?: string | null
+  prevCursor?: string | null
+  prev_cursor?: string | null
+  hasOlder?: boolean
+  has_older?: boolean
+  hasNewer?: boolean
+  has_newer?: boolean
+}
+
+interface ServerRequestLogsCatalog {
+  retentionDays?: number
+  retention_days?: number
+  requestKindOptions?: TokenLogRequestKindOption[]
+  request_kind_options?: TokenLogRequestKindOption[]
+  facets?: ServerRequestLogFacets
+}
+
 export interface RequestLogsPageQuery {
   page?: number
   perPage?: number
@@ -275,6 +312,15 @@ export interface RequestLogsPageQuery {
   sinceIso?: string
   untilIso?: string
 }
+
+export interface RequestLogsListQuery
+  extends Omit<RequestLogsPageQuery, 'page' | 'perPage' | 'includeBodies'> {
+  limit?: number
+  cursor?: string | null
+  direction?: 'older' | 'newer'
+}
+
+export type RequestLogsCatalogQuery = Omit<RequestLogsListQuery, 'limit' | 'cursor' | 'direction'>
 
 function normalizeRequestLogFacets(value?: ServerRequestLogFacets): RequestLogFacets {
   return {
@@ -296,6 +342,25 @@ function normalizeRequestLogsPage(value: ServerRequestLogsPage): RequestLogsPage
   }
 }
 
+function normalizeRequestLogsListPage(value: ServerRequestLogsListPage): RequestLogsListPage {
+  return {
+    items: value.items ?? [],
+    pageSize: value.pageSize ?? value.page_size ?? 20,
+    nextCursor: value.nextCursor ?? value.next_cursor ?? null,
+    prevCursor: value.prevCursor ?? value.prev_cursor ?? null,
+    hasOlder: value.hasOlder ?? value.has_older ?? false,
+    hasNewer: value.hasNewer ?? value.has_newer ?? false,
+  }
+}
+
+function normalizeRequestLogsCatalog(value: ServerRequestLogsCatalog): RequestLogsCatalog {
+  return {
+    retentionDays: value.retentionDays ?? value.retention_days ?? 0,
+    requestKindOptions: value.requestKindOptions ?? value.request_kind_options ?? [],
+    facets: normalizeRequestLogFacets(value.facets),
+  }
+}
+
 function appendRequestLogsPageFilters(
   params: URLSearchParams,
   {
@@ -309,7 +374,19 @@ function appendRequestLogsPageFilters(
     since,
     sinceIso,
     untilIso,
-  }: RequestLogsPageQuery,
+  }: Pick<
+    RequestLogsPageQuery,
+    | 'requestKinds'
+    | 'result'
+    | 'keyEffect'
+    | 'operationalClass'
+    | 'includeBodies'
+    | 'tokenId'
+    | 'keyId'
+    | 'since'
+    | 'sinceIso'
+    | 'untilIso'
+  >,
 ) {
   for (const requestKind of requestKinds ?? []) {
     const trimmed = requestKind.trim()
@@ -324,6 +401,17 @@ function appendRequestLogsPageFilters(
   if (typeof since === 'number' && Number.isFinite(since)) params.set('since', String(since))
   if (sinceIso?.trim()) params.set('since', sinceIso.trim())
   if (untilIso?.trim()) params.set('until', untilIso.trim())
+}
+
+function appendRequestLogsListParams(params: URLSearchParams, query: RequestLogsListQuery) {
+  params.set('limit', String(query.limit ?? 20))
+  if (query.cursor?.trim()) params.set('cursor', query.cursor.trim())
+  if (query.direction) params.set('direction', query.direction)
+  appendRequestLogsPageFilters(params, query)
+}
+
+function appendRequestLogsCatalogParams(params: URLSearchParams, query: RequestLogsCatalogQuery) {
+  appendRequestLogsPageFilters(params, query)
 }
 
 export interface ApiKeySecret {
@@ -1747,6 +1835,33 @@ export function fetchKeyLogsPage(
   )
 }
 
+export function fetchKeyLogsList(
+  id: string,
+  query: RequestLogsListQuery = {},
+  signal?: AbortSignal,
+): Promise<RequestLogsListPage> {
+  const params = new URLSearchParams()
+  appendRequestLogsListParams(params, query)
+  const encoded = encodeURIComponent(id)
+  return requestJson<ServerRequestLogsListPage>(`/api/keys/${encoded}/logs/list?${params.toString()}`, { signal }).then(
+    normalizeRequestLogsListPage,
+  )
+}
+
+export function fetchKeyLogsCatalog(
+  id: string,
+  options: RequestLogsCatalogQuery = {},
+  signal?: AbortSignal,
+): Promise<RequestLogsCatalog> {
+  const params = new URLSearchParams()
+  appendRequestLogsCatalogParams(params, options)
+  const encoded = encodeURIComponent(id)
+  const suffix = params.toString() ? `?${params.toString()}` : ''
+  return requestJson<ServerRequestLogsCatalog>(`/api/keys/${encoded}/logs/catalog${suffix}`, { signal }).then(
+    normalizeRequestLogsCatalog,
+  )
+}
+
 export function fetchKeyLogDetails(id: string, logId: number, signal?: AbortSignal): Promise<RequestLogBodies> {
   const encoded = encodeURIComponent(id)
   return requestJson(`/api/keys/${encoded}/logs/${encodeURIComponent(String(logId))}/details`, { signal })
@@ -1799,6 +1914,29 @@ export function fetchRequestLogsPage(
   appendRequestLogsPageFilters(params, query)
   return requestJson<ServerRequestLogsPage>(`/api/logs?${params.toString()}`, { signal }).then(
     normalizeRequestLogsPage,
+  )
+}
+
+export function fetchRequestLogsList(
+  query: RequestLogsListQuery = {},
+  signal?: AbortSignal,
+): Promise<RequestLogsListPage> {
+  const params = new URLSearchParams()
+  appendRequestLogsListParams(params, query)
+  return requestJson<ServerRequestLogsListPage>(`/api/logs/list?${params.toString()}`, { signal }).then(
+    normalizeRequestLogsListPage,
+  )
+}
+
+export function fetchRequestLogsCatalog(
+  query: RequestLogsCatalogQuery = {},
+  signal?: AbortSignal,
+): Promise<RequestLogsCatalog> {
+  const params = new URLSearchParams()
+  appendRequestLogsCatalogParams(params, query)
+  const suffix = params.toString() ? `?${params.toString()}` : ''
+  return requestJson<ServerRequestLogsCatalog>(`/api/logs/catalog${suffix}`, { signal }).then(
+    normalizeRequestLogsCatalog,
   )
 }
 
@@ -2103,6 +2241,33 @@ export function fetchTokenLogsPage(
   const encoded = encodeURIComponent(id)
   return requestJson<ServerRequestLogsPage>(`/api/tokens/${encoded}/logs/page?${params.toString()}`, { signal }).then(
     normalizeRequestLogsPage,
+  )
+}
+
+export function fetchTokenLogsList(
+  id: string,
+  query: RequestLogsListQuery = {},
+  signal?: AbortSignal,
+): Promise<RequestLogsListPage> {
+  const params = new URLSearchParams()
+  appendRequestLogsListParams(params, query)
+  const encoded = encodeURIComponent(id)
+  return requestJson<ServerRequestLogsListPage>(`/api/tokens/${encoded}/logs/list?${params.toString()}`, {
+    signal,
+  }).then(normalizeRequestLogsListPage)
+}
+
+export function fetchTokenLogsCatalog(
+  id: string,
+  options: RequestLogsCatalogQuery = {},
+  signal?: AbortSignal,
+): Promise<RequestLogsCatalog> {
+  const params = new URLSearchParams()
+  appendRequestLogsCatalogParams(params, options)
+  const encoded = encodeURIComponent(id)
+  const suffix = params.toString() ? `?${params.toString()}` : ''
+  return requestJson<ServerRequestLogsCatalog>(`/api/tokens/${encoded}/logs/catalog${suffix}`, { signal }).then(
+    normalizeRequestLogsCatalog,
   )
 }
 

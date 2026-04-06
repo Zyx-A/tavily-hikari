@@ -1105,6 +1105,8 @@ interface AdminTranslationsShape {
   logs: {
     title: string
     description: string
+    descriptionFallback: string
+    descriptionWithRetention: string
     filters: {
       all: string
       success: string
@@ -1143,6 +1145,12 @@ interface AdminTranslationsShape {
     toggles: {
       show: string
       hide: string
+    }
+    pagination: {
+      summary: string
+      summaryWithRetention: string
+      newer: string
+      older: string
     }
     errors: {
       quotaExhausted: string
@@ -1257,7 +1265,7 @@ interface AdminTranslationsShape {
     logsDescription: string
     logsEmpty: string
   }
-    errors: {
+  errors: {
       copyKey: string
       addKey: string
       addKeysBatch: string
@@ -2416,7 +2424,9 @@ export const translations: Record<Language, TranslationShape> = {
       },
       logs: {
         title: 'Recent Requests',
-        description: 'Up to the latest 200 invocations handled by the proxy (20 per page, up to 10 pages).',
+        description: 'Browse recent requests in reverse chronological order.',
+        descriptionFallback: 'Browse recent requests in reverse chronological order.',
+        descriptionWithRetention: 'Browse recent requests in reverse chronological order. Logs are retained for {days} days.',
         filters: {
           all: 'All',
           success: 'Success',
@@ -2455,6 +2465,12 @@ export const translations: Record<Language, TranslationShape> = {
         toggles: {
           show: 'Show request details',
           hide: 'Hide request details',
+        },
+        pagination: {
+          summary: 'Use newer/older navigation to browse recent requests.',
+          summaryWithRetention: 'Use newer/older navigation to browse recent requests kept for {days} days.',
+          newer: 'Newer',
+          older: 'Older',
         },
         errors: {
           quotaExhausted: 'Quota exhausted',
@@ -2623,7 +2639,7 @@ export const translations: Record<Language, TranslationShape> = {
           window: 'Window',
         },
         logsTitle: 'Recent Requests',
-        logsDescription: 'Up to the latest 200 for this key.',
+        logsDescription: 'Browse recent requests for this key in reverse chronological order.',
         logsEmpty: 'No request logs for this period.',
       },
       errors: {
@@ -3743,7 +3759,9 @@ export const translations: Record<Language, TranslationShape> = {
       },
       logs: {
         title: '近期请求',
-        description: '展示代理最近处理的最多 200 条调用记录，每页 20 条，最多 10 页。',
+        description: '按时间倒序浏览近期请求。',
+        descriptionFallback: '按时间倒序浏览近期请求。',
+        descriptionWithRetention: '按时间倒序浏览近期请求。日志保留 {days} 天。',
         filters: {
           all: '全部',
           success: '成功',
@@ -3782,6 +3800,12 @@ export const translations: Record<Language, TranslationShape> = {
         toggles: {
           show: '展开请求详情',
           hide: '收起请求详情',
+        },
+        pagination: {
+          summary: '使用较新 / 较旧翻页浏览近期请求。',
+          summaryWithRetention: '使用较新 / 较旧翻页浏览近 {days} 天内保留的请求。',
+          newer: '较新',
+          older: '较旧',
         },
         errors: {
           quotaExhausted: '额度耗尽',
@@ -3950,7 +3974,7 @@ export const translations: Record<Language, TranslationShape> = {
           window: '窗口',
         },
         logsTitle: '近期请求',
-        logsDescription: '最多展示该密钥的 200 条请求。',
+        logsDescription: '按时间倒序浏览该密钥的近期请求。',
         logsEmpty: '该时间段内没有请求。',
       },
       errors: {

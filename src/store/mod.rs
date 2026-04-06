@@ -224,16 +224,35 @@ enum AuthTokenLogsRebuildMode {
     DropLegacyRequestKindColumns,
 }
 
-struct RequestLogFilterParams<'a> {
-    request_kinds: &'a [&'a str],
-    result_status: Option<&'a str>,
-    key_effect_code: Option<&'a str>,
-    auth_token_id: Option<&'a str>,
-    key_id: Option<&'a str>,
+struct RequestLogFilterParams<'a, 'b> {
+    request_kinds: &'b [String],
+    result_status: Option<&'b str>,
+    key_effect_code: Option<&'b str>,
+    auth_token_id: Option<&'b str>,
+    key_id: Option<&'b str>,
     stored_request_kind_sql: &'a str,
     legacy_request_kind_predicate_sql: &'a str,
     legacy_request_kind_sql: &'a str,
     has_where: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RequestLogsCatalogFilters<'a> {
+    pub(crate) request_kinds: &'a [String],
+    pub(crate) result_status: Option<&'a str>,
+    pub(crate) key_effect_code: Option<&'a str>,
+    pub(crate) auth_token_id: Option<&'a str>,
+    pub(crate) key_id: Option<&'a str>,
+    pub(crate) operational_class: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TokenLogsCatalogFilters<'a> {
+    pub(crate) request_kinds: &'a [String],
+    pub(crate) result_status: Option<&'a str>,
+    pub(crate) key_effect_code: Option<&'a str>,
+    pub(crate) key_id: Option<&'a str>,
+    pub(crate) operational_class: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1056,7 +1075,7 @@ pub(crate) async fn run_request_kind_canonical_backfill_with_pool(
 }
 
 #[derive(Debug, Clone)]
-struct RequestLogsCatalogCacheEntry {
+pub(crate) struct RequestLogsCatalogCacheEntry {
     value: RequestLogsCatalog,
     expires_at: Instant,
 }
@@ -11872,7 +11891,7 @@ impl KeyStore {
         stored_request_kind_sql: &str,
         legacy_request_kind_predicate_sql: &str,
         legacy_request_kind_sql: &str,
-        request_kinds: &[&'a str],
+        request_kinds: &[String],
     ) {
         builder.push("(");
         builder.push(stored_request_kind_sql.to_string());
@@ -11880,7 +11899,7 @@ impl KeyStore {
         {
             let mut separated = builder.separated(", ");
             for request_kind in request_kinds {
-                separated.push_bind(*request_kind);
+                separated.push_bind(request_kind.clone());
             }
             separated.push_unseparated(")");
         }
@@ -11892,7 +11911,7 @@ impl KeyStore {
         {
             let mut separated = builder.separated(", ");
             for request_kind in request_kinds {
-                separated.push_bind(*request_kind);
+                separated.push_bind(request_kind.clone());
             }
             separated.push_unseparated(")");
         }
@@ -12054,6 +12073,222 @@ impl KeyStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_token_logs_catalog(
+        &self,
+        token_id: &str,
+        since: i64,
+        until: Option<i64>,
+        filters: TokenLogsCatalogFilters<'_>,
+    ) -> Result<RequestLogsCatalog, ProxyError> {
+        let cache_key = Self::token_logs_catalog_filters_are_empty(filters)
+            .then(|| Self::token_logs_catalog_cache_key(token_id, since, until));
+        if let Some(cache_key) = cache_key.as_deref()
+            && let Some(cached) = self.cached_request_logs_catalog(cache_key).await
+        {
+            return Ok(cached);
+        }
+
+        let request_kind_options = self
+            .fetch_token_log_request_kind_options(token_id, since, until, filters)
+            .await?;
+        let results = self
+            .fetch_token_log_result_facet_options(token_id, since, until, filters)
+            .await?;
+        let key_effects = self
+            .fetch_token_log_facet_options(
+                token_id,
+                since,
+                until,
+                "key_effect_code",
+                false,
+                filters,
+            )
+            .await?;
+        let keys = self
+            .fetch_token_log_facet_options(token_id, since, until, "api_key_id", true, filters)
+            .await?;
+        let catalog = RequestLogsCatalog {
+            retention_days: effective_auth_token_log_retention_days(),
+            request_kind_options,
+            facets: RequestLogPageFacets {
+                results,
+                key_effects,
+                tokens: Vec::new(),
+                keys,
+            },
+        };
+        if let Some(cache_key) = cache_key {
+            self.cache_request_logs_catalog(cache_key, &catalog).await;
+        }
+        Ok(catalog)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_token_logs_cursor_page(
+        &self,
+        token_id: &str,
+        page_size: i64,
+        since: i64,
+        until: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+        cursor: Option<&RequestLogsCursor>,
+        direction: RequestLogsCursorDirection,
+    ) -> Result<TokenLogsCursorPage, ProxyError> {
+        let page_size = page_size.clamp(1, 200);
+        let query_limit = page_size + 1;
+        let normalized_request_kinds = Self::normalize_request_kind_filters(request_kinds);
+        let stored_request_kind_sql = "request_kind_key";
+        let legacy_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
+        let legacy_request_kind_sql = token_log_request_kind_key_sql("path", "request_kind_key");
+        let stored_operational_class_case_sql = token_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            "counts_business_quota",
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_operational_class_case_sql = token_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            "counts_business_quota",
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
+
+        let mut rows_query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT id, api_key_id, method, path, query, http_status, mcp_status,
+                   CASE WHEN billing_state = 'charged' THEN business_credits ELSE NULL END AS business_credits,
+                   request_kind_key,
+                   request_kind_label,
+                   request_kind_detail,
+                   counts_business_quota,
+                   result_status, error_message, failure_kind, key_effect_code,
+                   key_effect_summary, created_at
+            FROM auth_token_logs
+            WHERE token_id =
+            "#
+            .to_string(),
+        );
+        rows_query.push_bind(token_id);
+        rows_query.push(" AND created_at >= ");
+        rows_query.push_bind(since);
+        if let Some(until) = until {
+            rows_query.push(" AND created_at < ");
+            rows_query.push_bind(until);
+        }
+        if let Some(result_status) = result_status {
+            rows_query.push(" AND ");
+            Self::push_result_bucket_filter_clause(
+                &mut rows_query,
+                result_status,
+                &legacy_request_kind_predicate_sql,
+                &stored_result_bucket_sql,
+                &legacy_result_bucket_sql,
+            );
+        }
+        if let Some(key_effect_code) = key_effect_code {
+            rows_query.push(" AND key_effect_code = ");
+            rows_query.push_bind(key_effect_code);
+        }
+        if let Some(key_id) = key_id {
+            rows_query.push(" AND api_key_id = ");
+            rows_query.push_bind(key_id);
+        }
+        if !normalized_request_kinds.is_empty() {
+            rows_query.push(" AND ");
+            Self::push_request_kind_filter_clause(
+                &mut rows_query,
+                stored_request_kind_sql,
+                &legacy_request_kind_predicate_sql,
+                &legacy_request_kind_sql,
+                &normalized_request_kinds,
+            );
+        }
+        if let Some(operational_class) = operational_class {
+            rows_query.push(" AND ");
+            Self::push_operational_class_filter_clause(
+                &mut rows_query,
+                operational_class,
+                &legacy_request_kind_predicate_sql,
+                &stored_operational_class_case_sql,
+                &legacy_operational_class_case_sql,
+            );
+        }
+        Self::push_desc_cursor_clause(&mut rows_query, "created_at", "id", cursor, direction, true);
+        match direction {
+            RequestLogsCursorDirection::Older => {
+                rows_query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+            }
+            RequestLogsCursorDirection::Newer => {
+                rows_query.push(" ORDER BY created_at ASC, id ASC LIMIT ");
+            }
+        }
+        rows_query.push_bind(query_limit);
+
+        let mut rows = rows_query.build().fetch_all(&self.pool).await?;
+        let has_more = rows.len() as i64 > page_size;
+        if has_more {
+            rows.truncate(page_size as usize);
+        }
+        if matches!(direction, RequestLogsCursorDirection::Newer) {
+            rows.reverse();
+        }
+
+        let items = rows
+            .into_iter()
+            .map(Self::map_token_log_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_older = match direction {
+            RequestLogsCursorDirection::Older => has_more,
+            RequestLogsCursorDirection::Newer => cursor.is_some(),
+        };
+        let has_newer = match direction {
+            RequestLogsCursorDirection::Older => cursor.is_some(),
+            RequestLogsCursorDirection::Newer => has_more,
+        };
+        let recovery_cursor = cursor.cloned();
+
+        Ok(TokenLogsCursorPage {
+            next_cursor: has_older
+                .then(|| {
+                    items
+                        .last()
+                        .map(Self::request_logs_cursor_for_token_record)
+                        .or_else(|| {
+                            matches!(direction, RequestLogsCursorDirection::Newer)
+                                .then(|| recovery_cursor.clone())
+                                .flatten()
+                        })
+                })
+                .flatten(),
+            prev_cursor: has_newer
+                .then(|| {
+                    items
+                        .first()
+                        .map(Self::request_logs_cursor_for_token_record)
+                        .or_else(|| {
+                            matches!(direction, RequestLogsCursorDirection::Older)
+                                .then(|| recovery_cursor.clone())
+                                .flatten()
+                        })
+                })
+                .flatten(),
+            items,
+            page_size,
+            has_older,
+            has_newer,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_token_logs_page(
         &self,
         token_id: &str,
@@ -12071,10 +12306,6 @@ impl KeyStore {
         let page = page.max(1) as i64;
         let offset = (page - 1) * per_page;
         let normalized_request_kinds = Self::normalize_request_kind_filters(request_kinds);
-        let filtered_request_kinds: Vec<&str> = normalized_request_kinds
-            .iter()
-            .map(String::as_str)
-            .collect();
         let stored_request_kind_sql = "request_kind_key";
         let legacy_request_kind_predicate_sql =
             legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
@@ -12123,14 +12354,14 @@ impl KeyStore {
             total_query.push(" AND api_key_id = ");
             total_query.push_bind(key_id);
         }
-        if !filtered_request_kinds.is_empty() {
+        if !normalized_request_kinds.is_empty() {
             total_query.push(" AND ");
             Self::push_request_kind_filter_clause(
                 &mut total_query,
                 stored_request_kind_sql,
                 &legacy_request_kind_predicate_sql,
                 &legacy_request_kind_sql,
-                &filtered_request_kinds,
+                &normalized_request_kinds,
             );
         }
         if let Some(operational_class) = operational_class {
@@ -12188,14 +12419,14 @@ impl KeyStore {
             rows_query.push(" AND api_key_id = ");
             rows_query.push_bind(key_id);
         }
-        if !filtered_request_kinds.is_empty() {
+        if !normalized_request_kinds.is_empty() {
             rows_query.push(" AND ");
             Self::push_request_kind_filter_clause(
                 &mut rows_query,
                 stored_request_kind_sql,
                 &legacy_request_kind_predicate_sql,
                 &legacy_request_kind_sql,
-                &filtered_request_kinds,
+                &normalized_request_kinds,
             );
         }
         if let Some(operational_class) = operational_class {
@@ -12219,17 +12450,38 @@ impl KeyStore {
             .map(Self::map_token_log_row)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let empty_filters = TokenLogsCatalogFilters {
+            request_kinds: &[],
+            result_status: None,
+            key_effect_code: None,
+            key_id: None,
+            operational_class: None,
+        };
         let request_kind_options = self
-            .fetch_token_log_request_kind_options(token_id, since, until)
+            .fetch_token_log_request_kind_options(token_id, since, until, empty_filters)
             .await?;
         let results = self
-            .fetch_token_log_result_facet_options(token_id, since, until)
+            .fetch_token_log_result_facet_options(token_id, since, until, empty_filters)
             .await?;
         let key_effects = self
-            .fetch_token_log_facet_options(token_id, since, until, "key_effect_code", false)
+            .fetch_token_log_facet_options(
+                token_id,
+                since,
+                until,
+                "key_effect_code",
+                false,
+                empty_filters,
+            )
             .await?;
         let keys = self
-            .fetch_token_log_facet_options(token_id, since, until, "api_key_id", true)
+            .fetch_token_log_facet_options(
+                token_id,
+                since,
+                until,
+                "api_key_id",
+                true,
+                empty_filters,
+            )
             .await?;
 
         Ok(TokenLogsPage {
@@ -12252,17 +12504,45 @@ impl KeyStore {
         until: Option<i64>,
         column_expr: &str,
         require_non_empty: bool,
+        filters: TokenLogsCatalogFilters<'_>,
     ) -> Result<Vec<LogFacetOption>, ProxyError> {
+        let stored_request_kind_sql = "request_kind_key";
+        let legacy_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
+        let legacy_request_kind_sql = token_log_request_kind_key_sql("path", "request_kind_key");
+        let stored_operational_class_case_sql = token_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            "counts_business_quota",
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_operational_class_case_sql = token_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            "counts_business_quota",
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
         let mut query = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT {column_expr} AS value, COUNT(*) AS count FROM auth_token_logs WHERE token_id = "
+            "SELECT {column_expr} AS value, COUNT(*) AS count FROM auth_token_logs"
         ));
-        query.push_bind(token_id);
-        query.push(" AND created_at >= ");
-        query.push_bind(since);
-        if let Some(until) = until {
-            query.push(" AND created_at < ");
-            query.push_bind(until);
-        }
+        Self::push_token_logs_catalog_filters(
+            &mut query,
+            token_id,
+            since,
+            until,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
         if require_non_empty {
             query.push(" AND ");
             query.push(format!(
@@ -12288,6 +12568,7 @@ impl KeyStore {
         token_id: &str,
         since: i64,
         until: Option<i64>,
+        filters: TokenLogsCatalogFilters<'_>,
     ) -> Result<Vec<LogFacetOption>, ProxyError> {
         let stored_request_kind_sql = "request_kind_key";
         let legacy_request_kind_predicate_sql =
@@ -12319,16 +12600,22 @@ impl KeyStore {
                 END AS value,
                 COUNT(*) AS count
             FROM auth_token_logs
-            WHERE token_id =
             "
         ));
-        query.push_bind(token_id);
-        query.push(" AND created_at >= ");
-        query.push_bind(since);
-        if let Some(until) = until {
-            query.push(" AND created_at < ");
-            query.push_bind(until);
-        }
+        Self::push_token_logs_catalog_filters(
+            &mut query,
+            token_id,
+            since,
+            until,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
         query.push(" GROUP BY 1 ORDER BY count DESC, value ASC");
 
         let rows = query.build().fetch_all(&self.pool).await?;
@@ -12348,6 +12635,7 @@ impl KeyStore {
         token_id: &str,
         since: i64,
         until: Option<i64>,
+        filters: TokenLogsCatalogFilters<'_>,
     ) -> Result<Vec<TokenRequestKindOption>, ProxyError> {
         type RequestKindOptionRow = (String, String, i64, i64, i64);
         let stored_request_kind_sql = "request_kind_key";
@@ -12365,16 +12653,39 @@ impl KeyStore {
                 MAX(CASE WHEN counts_business_quota = 1 THEN 1 ELSE 0 END) AS has_billable,
                 MAX(CASE WHEN counts_business_quota = 0 THEN 1 ELSE 0 END) AS has_non_billable
             FROM auth_token_logs
-            WHERE token_id =
             "
         ));
-        stored_query.push_bind(token_id);
-        stored_query.push(" AND created_at >= ");
-        stored_query.push_bind(since);
-        if let Some(until) = until {
-            stored_query.push(" AND created_at < ");
-            stored_query.push_bind(until);
-        }
+        let stored_operational_class_case_sql = token_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            "counts_business_quota",
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_request_kind_sql = token_log_request_kind_key_sql("path", "request_kind_key");
+        let legacy_operational_class_case_sql = token_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            "counts_business_quota",
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
+        Self::push_token_logs_catalog_filters(
+            &mut stored_query,
+            token_id,
+            since,
+            until,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
         stored_query.push(" AND ");
         stored_query.push(canonical_request_kind_predicate_sql.clone());
         stored_query.push(" GROUP BY 1, 2");
@@ -12383,7 +12694,6 @@ impl KeyStore {
             .build_query_as::<RequestKindOptionRow>()
             .fetch_all(&self.pool)
             .await?;
-        let legacy_request_kind_sql = token_log_request_kind_key_sql("path", "request_kind_key");
         let legacy_label_sql = canonical_request_kind_label_sql(&legacy_request_kind_sql);
         let mut legacy_query = QueryBuilder::<Sqlite>::new(format!(
             "
@@ -12394,18 +12704,24 @@ impl KeyStore {
                 MAX(CASE WHEN counts_business_quota = 1 THEN 1 ELSE 0 END) AS has_billable,
                 MAX(CASE WHEN counts_business_quota = 0 THEN 1 ELSE 0 END) AS has_non_billable
             FROM auth_token_logs
-            WHERE token_id =
             "
         ));
-        legacy_query.push_bind(token_id);
-        legacy_query.push(" AND created_at >= ");
-        legacy_query.push_bind(since);
-        if let Some(until) = until {
-            legacy_query.push(" AND created_at < ");
-            legacy_query.push_bind(until);
-        }
+        Self::push_token_logs_catalog_filters(
+            &mut legacy_query,
+            token_id,
+            since,
+            until,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
         legacy_query.push(" AND ");
-        legacy_query.push(legacy_request_kind_predicate_sql);
+        legacy_query.push(legacy_request_kind_predicate_sql.as_str());
         legacy_query.push(" GROUP BY 1, 2");
 
         let legacy_options = legacy_query
@@ -14094,6 +14410,23 @@ impl KeyStore {
         )
     }
 
+    fn request_logs_catalog_filters_are_empty(filters: RequestLogsCatalogFilters<'_>) -> bool {
+        filters.request_kinds.is_empty()
+            && filters.result_status.is_none()
+            && filters.key_effect_code.is_none()
+            && filters.auth_token_id.is_none()
+            && filters.key_id.is_none()
+            && filters.operational_class.is_none()
+    }
+
+    fn token_logs_catalog_filters_are_empty(filters: TokenLogsCatalogFilters<'_>) -> bool {
+        filters.request_kinds.is_empty()
+            && filters.result_status.is_none()
+            && filters.key_effect_code.is_none()
+            && filters.key_id.is_none()
+            && filters.operational_class.is_none()
+    }
+
     fn push_request_logs_scope<'a>(
         builder: &mut QueryBuilder<'a, Sqlite>,
         scoped_key_id: Option<&'a str>,
@@ -14119,9 +14452,9 @@ impl KeyStore {
         has_where
     }
 
-    fn push_request_logs_filters<'a>(
+    fn push_request_logs_filters<'a, 'b>(
         builder: &mut QueryBuilder<'a, Sqlite>,
-        filters: RequestLogFilterParams<'a>,
+        filters: RequestLogFilterParams<'a, 'b>,
     ) {
         let RequestLogFilterParams {
             request_kinds,
@@ -14140,7 +14473,7 @@ impl KeyStore {
             } else {
                 " WHERE result_status = "
             });
-            builder.push_bind(result_status);
+            builder.push_bind(result_status.to_string());
             has_where = true;
         }
         if let Some(key_effect_code) = key_effect_code {
@@ -14149,7 +14482,7 @@ impl KeyStore {
             } else {
                 " WHERE key_effect_code = "
             });
-            builder.push_bind(key_effect_code);
+            builder.push_bind(key_effect_code.to_string());
             has_where = true;
         }
         if let Some(auth_token_id) = auth_token_id {
@@ -14158,7 +14491,7 @@ impl KeyStore {
             } else {
                 " WHERE auth_token_id = "
             });
-            builder.push_bind(auth_token_id);
+            builder.push_bind(auth_token_id.to_string());
             has_where = true;
         }
         if let Some(key_id) = key_id {
@@ -14167,7 +14500,7 @@ impl KeyStore {
             } else {
                 " WHERE api_key_id = "
             });
-            builder.push_bind(key_id);
+            builder.push_bind(key_id.to_string());
             has_where = true;
         }
         if !request_kinds.is_empty() {
@@ -14182,10 +14515,127 @@ impl KeyStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn push_request_logs_catalog_filters<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        scoped_key_id: Option<&'a str>,
+        since: Option<i64>,
+        filters: RequestLogsCatalogFilters<'a>,
+        stored_request_kind_sql: &'a str,
+        legacy_request_kind_predicate_sql: &'a str,
+        legacy_request_kind_sql: &'a str,
+        stored_operational_class_case_sql: &'a str,
+        legacy_operational_class_case_sql: &'a str,
+        stored_result_bucket_sql: &'a str,
+        legacy_result_bucket_sql: &'a str,
+    ) {
+        let normalized_request_kinds = Self::normalize_request_kind_filters(filters.request_kinds);
+        let has_where = Self::push_request_logs_scope(builder, scoped_key_id, since);
+        Self::push_request_logs_filters(
+            builder,
+            RequestLogFilterParams {
+                request_kinds: &normalized_request_kinds,
+                result_status: None,
+                key_effect_code: filters.key_effect_code,
+                auth_token_id: filters.auth_token_id,
+                key_id: filters.key_id,
+                stored_request_kind_sql,
+                legacy_request_kind_predicate_sql,
+                legacy_request_kind_sql,
+                has_where,
+            },
+        );
+        if let Some(result_status) = filters.result_status {
+            builder.push(" AND ");
+            Self::push_result_bucket_filter_clause(
+                builder,
+                result_status,
+                legacy_request_kind_predicate_sql,
+                stored_result_bucket_sql,
+                legacy_result_bucket_sql,
+            );
+        }
+        if let Some(operational_class) = filters.operational_class {
+            builder.push(" AND ");
+            Self::push_operational_class_filter_clause(
+                builder,
+                operational_class,
+                legacy_request_kind_predicate_sql,
+                stored_operational_class_case_sql,
+                legacy_operational_class_case_sql,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_token_logs_catalog_filters<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        token_id: &'a str,
+        since: i64,
+        until: Option<i64>,
+        filters: TokenLogsCatalogFilters<'a>,
+        stored_request_kind_sql: &'a str,
+        legacy_request_kind_predicate_sql: &'a str,
+        legacy_request_kind_sql: &'a str,
+        stored_operational_class_case_sql: &'a str,
+        legacy_operational_class_case_sql: &'a str,
+        stored_result_bucket_sql: &'a str,
+        legacy_result_bucket_sql: &'a str,
+    ) {
+        let normalized_request_kinds = Self::normalize_request_kind_filters(filters.request_kinds);
+        builder.push(" WHERE token_id = ");
+        builder.push_bind(token_id);
+        builder.push(" AND created_at >= ");
+        builder.push_bind(since);
+        if let Some(until) = until {
+            builder.push(" AND created_at < ");
+            builder.push_bind(until);
+        }
+        if let Some(key_effect_code) = filters.key_effect_code {
+            builder.push(" AND key_effect_code = ");
+            builder.push_bind(key_effect_code);
+        }
+        if let Some(key_id) = filters.key_id {
+            builder.push(" AND api_key_id = ");
+            builder.push_bind(key_id);
+        }
+        if !normalized_request_kinds.is_empty() {
+            builder.push(" AND ");
+            Self::push_request_kind_filter_clause(
+                builder,
+                stored_request_kind_sql,
+                legacy_request_kind_predicate_sql,
+                legacy_request_kind_sql,
+                &normalized_request_kinds,
+            );
+        }
+        if let Some(result_status) = filters.result_status {
+            builder.push(" AND ");
+            Self::push_result_bucket_filter_clause(
+                builder,
+                result_status,
+                legacy_request_kind_predicate_sql,
+                stored_result_bucket_sql,
+                legacy_result_bucket_sql,
+            );
+        }
+        if let Some(operational_class) = filters.operational_class {
+            builder.push(" AND ");
+            Self::push_operational_class_filter_clause(
+                builder,
+                operational_class,
+                legacy_request_kind_predicate_sql,
+                stored_operational_class_case_sql,
+                legacy_operational_class_case_sql,
+            );
+        }
+    }
+
     async fn fetch_request_log_request_kind_options(
         &self,
         scoped_key_id: Option<&str>,
         since: Option<i64>,
+        filters: RequestLogsCatalogFilters<'_>,
     ) -> Result<Vec<TokenRequestKindOption>, ProxyError> {
         type RequestKindOptionRow = (String, String, i64);
         let stored_request_kind_sql = "request_kind_key";
@@ -14197,8 +14647,42 @@ impl KeyStore {
         let mut stored_query = QueryBuilder::<Sqlite>::new(format!(
             "SELECT {stored_request_kind_sql} AS request_kind_key, {stored_label_sql} AS request_kind_label, COUNT(*) AS request_count FROM request_logs"
         ));
-        let has_where = Self::push_request_logs_scope(&mut stored_query, scoped_key_id, since);
-        stored_query.push(if has_where { " AND " } else { " WHERE " });
+        let stored_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(stored_request_kind_sql, "request_body");
+        let stored_operational_class_case_sql = request_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            &stored_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_request_kind_sql =
+            request_log_request_kind_key_sql("path", "request_body", "request_kind_key");
+        let legacy_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(&legacy_request_kind_sql, "request_body");
+        let legacy_operational_class_case_sql = request_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            &legacy_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
+        Self::push_request_logs_catalog_filters(
+            &mut stored_query,
+            scoped_key_id,
+            since,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
+        stored_query.push(" AND ");
         stored_query.push(canonical_request_kind_predicate_sql);
         stored_query.push(" GROUP BY 1, 2");
 
@@ -14206,15 +14690,25 @@ impl KeyStore {
             .build_query_as::<RequestKindOptionRow>()
             .fetch_all(&self.pool)
             .await?;
-        let legacy_request_kind_sql =
-            request_log_request_kind_key_sql("path", "request_body", "request_kind_key");
         let legacy_label_sql = canonical_request_kind_label_sql(&legacy_request_kind_sql);
         let mut legacy_query = QueryBuilder::<Sqlite>::new(format!(
             "SELECT {legacy_request_kind_sql} AS request_kind_key, {legacy_label_sql} AS request_kind_label, COUNT(*) AS request_count FROM request_logs"
         ));
-        let has_where = Self::push_request_logs_scope(&mut legacy_query, scoped_key_id, since);
-        legacy_query.push(if has_where { " AND " } else { " WHERE " });
-        legacy_query.push(legacy_request_kind_predicate_sql);
+        Self::push_request_logs_catalog_filters(
+            &mut legacy_query,
+            scoped_key_id,
+            since,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
+        legacy_query.push(" AND ");
+        legacy_query.push(legacy_request_kind_predicate_sql.as_str());
         legacy_query.push(" GROUP BY 1, 2");
 
         let legacy_rows = legacy_query
@@ -14257,13 +14751,51 @@ impl KeyStore {
         scoped_key_id: Option<&str>,
         since: Option<i64>,
         require_non_empty: bool,
+        filters: RequestLogsCatalogFilters<'_>,
     ) -> Result<Vec<LogFacetOption>, ProxyError> {
+        let stored_request_kind_sql = "request_kind_key";
+        let legacy_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
+        let legacy_request_kind_sql =
+            request_log_request_kind_key_sql("path", "request_body", "request_kind_key");
+        let stored_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(stored_request_kind_sql, "request_body");
+        let stored_operational_class_case_sql = request_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            &stored_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(&legacy_request_kind_sql, "request_body");
+        let legacy_operational_class_case_sql = request_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            &legacy_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
         let mut query = QueryBuilder::<Sqlite>::new(format!(
             "SELECT {column_expr} AS value, COUNT(*) AS count FROM request_logs"
         ));
-        let has_where = Self::push_request_logs_scope(&mut query, scoped_key_id, since);
+        Self::push_request_logs_catalog_filters(
+            &mut query,
+            scoped_key_id,
+            since,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
         if require_non_empty {
-            query.push(if has_where { " AND " } else { " WHERE " });
+            query.push(" AND ");
             query.push(format!(
                 "{column_expr} IS NOT NULL AND TRIM({column_expr}) <> ''"
             ));
@@ -14286,6 +14818,7 @@ impl KeyStore {
         &self,
         scoped_key_id: Option<&str>,
         since: Option<i64>,
+        filters: RequestLogsCatalogFilters<'_>,
     ) -> Result<Vec<LogFacetOption>, ProxyError> {
         let stored_request_kind_sql = "request_kind_key";
         let legacy_request_kind_predicate_sql =
@@ -14324,7 +14857,19 @@ impl KeyStore {
             FROM request_logs
             "
         ));
-        Self::push_request_logs_scope(&mut query, scoped_key_id, since);
+        Self::push_request_logs_catalog_filters(
+            &mut query,
+            scoped_key_id,
+            since,
+            filters,
+            stored_request_kind_sql,
+            &legacy_request_kind_predicate_sql,
+            &legacy_request_kind_sql,
+            &stored_operational_class_case_sql,
+            &legacy_operational_class_case_sql,
+            &stored_result_bucket_sql,
+            &legacy_result_bucket_sql,
+        );
         query.push(" GROUP BY 1 ORDER BY count DESC, value ASC");
 
         let rows = query.build().fetch_all(&self.pool).await?;
@@ -14345,34 +14890,51 @@ impl KeyStore {
         since: Option<i64>,
         include_token_facets: bool,
         include_key_facets: bool,
+        filters: RequestLogsCatalogFilters<'_>,
     ) -> Result<RequestLogsCatalog, ProxyError> {
-        let cache_key = Self::request_logs_catalog_cache_key(
-            scoped_key_id,
-            since,
-            include_token_facets,
-            include_key_facets,
-        );
-        if let Some(cached) = self.cached_request_logs_catalog(&cache_key).await {
+        let cache_key = Self::request_logs_catalog_filters_are_empty(filters).then(|| {
+            Self::request_logs_catalog_cache_key(
+                scoped_key_id,
+                since,
+                include_token_facets,
+                include_key_facets,
+            )
+        });
+        if let Some(cache_key) = cache_key.as_deref()
+            && let Some(cached) = self.cached_request_logs_catalog(cache_key).await
+        {
             return Ok(cached);
         }
 
         let request_kind_options = self
-            .fetch_request_log_request_kind_options(scoped_key_id, since)
+            .fetch_request_log_request_kind_options(scoped_key_id, since, filters)
             .await?;
         let results = self
-            .fetch_request_log_result_facet_options(scoped_key_id, since)
+            .fetch_request_log_result_facet_options(scoped_key_id, since, filters)
             .await?;
         let key_effects = self
-            .fetch_request_log_facet_options("key_effect_code", scoped_key_id, since, false)
+            .fetch_request_log_facet_options(
+                "key_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                filters,
+            )
             .await?;
         let tokens = if include_token_facets {
-            self.fetch_request_log_facet_options("auth_token_id", scoped_key_id, since, true)
-                .await?
+            self.fetch_request_log_facet_options(
+                "auth_token_id",
+                scoped_key_id,
+                since,
+                true,
+                filters,
+            )
+            .await?
         } else {
             Vec::new()
         };
         let keys = if include_key_facets {
-            self.fetch_request_log_facet_options("api_key_id", scoped_key_id, since, true)
+            self.fetch_request_log_facet_options("api_key_id", scoped_key_id, since, true, filters)
                 .await?
         } else {
             Vec::new()
@@ -14388,7 +14950,9 @@ impl KeyStore {
                 keys,
             },
         };
-        self.cache_request_logs_catalog(cache_key, &catalog).await;
+        if let Some(cache_key) = cache_key {
+            self.cache_request_logs_catalog(cache_key, &catalog).await;
+        }
         Ok(catalog)
     }
 
@@ -14410,10 +14974,6 @@ impl KeyStore {
         let page_size = page_size.clamp(1, 200);
         let query_limit = page_size + 1;
         let normalized_request_kinds = Self::normalize_request_kind_filters(request_kinds);
-        let filtered_request_kinds: Vec<&str> = normalized_request_kinds
-            .iter()
-            .map(String::as_str)
-            .collect();
         let stored_request_kind_sql = "request_kind_key";
         let legacy_request_kind_predicate_sql =
             legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
@@ -14473,7 +15033,7 @@ impl KeyStore {
         Self::push_request_logs_filters(
             &mut items_query,
             RequestLogFilterParams {
-                request_kinds: &filtered_request_kinds,
+                request_kinds: &normalized_request_kinds,
                 result_status: None,
                 key_effect_code,
                 auth_token_id,
@@ -14537,19 +15097,38 @@ impl KeyStore {
 
         let has_older = match direction {
             RequestLogsCursorDirection::Older => has_more,
-            RequestLogsCursorDirection::Newer => cursor.is_some() && !items.is_empty(),
+            RequestLogsCursorDirection::Newer => cursor.is_some(),
         };
         let has_newer = match direction {
-            RequestLogsCursorDirection::Older => cursor.is_some() && !items.is_empty(),
+            RequestLogsCursorDirection::Older => cursor.is_some(),
             RequestLogsCursorDirection::Newer => has_more,
         };
+        let recovery_cursor = cursor.cloned();
 
         Ok(RequestLogsCursorPage {
             next_cursor: has_older
-                .then(|| items.last().map(Self::request_logs_cursor_for_record))
+                .then(|| {
+                    items
+                        .last()
+                        .map(Self::request_logs_cursor_for_record)
+                        .or_else(|| {
+                            matches!(direction, RequestLogsCursorDirection::Newer)
+                                .then(|| recovery_cursor.clone())
+                                .flatten()
+                        })
+                })
                 .flatten(),
             prev_cursor: has_newer
-                .then(|| items.first().map(Self::request_logs_cursor_for_record))
+                .then(|| {
+                    items
+                        .first()
+                        .map(Self::request_logs_cursor_for_record)
+                        .or_else(|| {
+                            matches!(direction, RequestLogsCursorDirection::Older)
+                                .then(|| recovery_cursor.clone())
+                                .flatten()
+                        })
+                })
                 .flatten(),
             items,
             page_size,
@@ -14578,10 +15157,6 @@ impl KeyStore {
         let per_page = per_page.clamp(1, 200);
         let offset = (page - 1) * per_page;
         let normalized_request_kinds = Self::normalize_request_kind_filters(request_kinds);
-        let filtered_request_kinds: Vec<&str> = normalized_request_kinds
-            .iter()
-            .map(String::as_str)
-            .collect();
         let stored_request_kind_sql = "request_kind_key";
         let legacy_request_kind_predicate_sql =
             legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
@@ -14613,7 +15188,7 @@ impl KeyStore {
         Self::push_request_logs_filters(
             &mut total_query,
             RequestLogFilterParams {
-                request_kinds: &filtered_request_kinds,
+                request_kinds: &normalized_request_kinds,
                 result_status: None,
                 key_effect_code,
                 auth_token_id,
@@ -14682,7 +15257,7 @@ impl KeyStore {
         Self::push_request_logs_filters(
             &mut items_query,
             RequestLogFilterParams {
-                request_kinds: &filtered_request_kinds,
+                request_kinds: &normalized_request_kinds,
                 result_status: None,
                 key_effect_code,
                 auth_token_id,
@@ -14723,24 +15298,50 @@ impl KeyStore {
             .map(Self::map_request_log_row)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let empty_filters = RequestLogsCatalogFilters {
+            request_kinds: &[],
+            result_status: None,
+            key_effect_code: None,
+            auth_token_id: None,
+            key_id: None,
+            operational_class: None,
+        };
         let request_kind_options = self
-            .fetch_request_log_request_kind_options(scoped_key_id, since)
+            .fetch_request_log_request_kind_options(scoped_key_id, since, empty_filters)
             .await?;
         let results = self
-            .fetch_request_log_result_facet_options(scoped_key_id, since)
+            .fetch_request_log_result_facet_options(scoped_key_id, since, empty_filters)
             .await?;
         let key_effects = self
-            .fetch_request_log_facet_options("key_effect_code", scoped_key_id, since, false)
+            .fetch_request_log_facet_options(
+                "key_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                empty_filters,
+            )
             .await?;
         let tokens = if include_token_facets {
-            self.fetch_request_log_facet_options("auth_token_id", scoped_key_id, since, true)
-                .await?
+            self.fetch_request_log_facet_options(
+                "auth_token_id",
+                scoped_key_id,
+                since,
+                true,
+                empty_filters,
+            )
+            .await?
         } else {
             Vec::new()
         };
         let keys = if include_key_facets {
-            self.fetch_request_log_facet_options("api_key_id", scoped_key_id, since, true)
-                .await?
+            self.fetch_request_log_facet_options(
+                "api_key_id",
+                scoped_key_id,
+                since,
+                true,
+                empty_filters,
+            )
+            .await?
         } else {
             Vec::new()
         };

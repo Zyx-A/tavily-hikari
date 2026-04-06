@@ -4,9 +4,10 @@ import { addons } from 'storybook/preview-api'
 import { SELECT_STORY } from 'storybook/internal/core-events'
 import { ChartColumnIncreasing } from 'lucide-react'
 
-import type { RequestLog } from '../api'
+import type { RequestLog, RequestLogsCatalog, RequestLogsListPage } from '../api'
 import AdminShell, { type AdminNavItem } from '../admin/AdminShell'
 import { Icon } from '../lib/icons'
+import type { TokenLogRequestKindOption } from '../tokenLogRequestKinds'
 import TokenDetail from './TokenDetail'
 
 const tokenId = 'a1b2'
@@ -87,7 +88,7 @@ const denseMetricsMock = {
   last_activity: 1_762_390_250,
 };
 
-const requestKindOptionsMock = [
+const requestKindOptionsMock: TokenLogRequestKindOption[] = [
   { key: "api:crawl", label: "API | crawl", protocol_group: "api", billing_group: "billable" },
   { key: "api:extract", label: "API | extract", protocol_group: "api", billing_group: "billable" },
   { key: "api:map", label: "API | map", protocol_group: "api", billing_group: "billable" },
@@ -123,6 +124,7 @@ const requestKindOptionsMock = [
 ];
 
 const storyKeyIds = ["MZli", "Qn8R", "U2vK"] as const;
+const TOKEN_LOG_RETENTION_DAYS = 90;
 
 const logTemplates = [
   {
@@ -489,43 +491,58 @@ type MockEventSourceShape = EventSource & {
 
 const activeEventSources = new Set<MockEventSourceShape>();
 
-function buildLogPage(
-  source: RequestLog[],
-  page: number,
-  requestedPerPage: number,
-  responsePerPage = requestedPerPage,
-): {
-  items: RequestLog[];
-  page: number;
-  per_page: number;
-  total: number;
-  request_kind_options: typeof requestKindOptionsMock;
-  facets: {
-    results: Array<{ value: string; count: number }>;
-    key_effects: Array<{ value: string; count: number }>;
-    keys: Array<{ value: string; count: number }>;
-  };
-} {
-  const start = (page - 1) * responsePerPage;
-  const requestKindOptions = requestKindOptionsMock.map((option) => ({
-    ...option,
-    count: source.filter((log) => log.request_kind_key === option.key).length,
-  }));
+function storyCursorForPage(page: number): string {
+  return `page:${page}`;
+}
+
+function parseStoryCursor(cursor: string | null | undefined): number | null {
+  const normalized = cursor?.trim();
+  if (!normalized) return null;
+  const match = normalized.match(/^page:(\d+)$/);
+  if (!match) return null;
+  const page = Number(match[1]);
+  return Number.isFinite(page) && page > 0 ? page : null;
+}
+
+function buildLogsCatalog(source: RequestLog[]): RequestLogsCatalog {
   return {
-    items: source.slice(start, start + responsePerPage).map((log) => ({
-      ...log,
-      request_body: null,
-      response_body: null,
+    retentionDays: TOKEN_LOG_RETENTION_DAYS,
+    requestKindOptions: requestKindOptionsMock.map((option) => ({
+      ...option,
+      count: source.filter((log) => log.request_kind_key === option.key).length,
     })),
-    page,
-    per_page: responsePerPage,
-    total: source.length,
-    request_kind_options: requestKindOptions,
     facets: {
       results: buildFacetOptions(source.map((log) => log.result_status)),
-      key_effects: buildFacetOptions(source.map((log) => log.key_effect_code ?? "none")),
+      keyEffects: buildFacetOptions(source.map((log) => log.key_effect_code ?? "none")),
+      tokens: [],
       keys: buildFacetOptions(source.map((log) => log.key_id)),
     },
+  };
+}
+
+function buildLogsList(
+  source: RequestLog[],
+  limit: number,
+  cursor?: string | null,
+): RequestLogsListPage {
+  const pageSize = Math.max(1, limit);
+  const totalPages = Math.max(1, Math.ceil(source.length / pageSize));
+  const currentPage = Math.min(parseStoryCursor(cursor) ?? 1, totalPages);
+  const start = (currentPage - 1) * pageSize;
+  const items = source.slice(start, start + pageSize).map((log) => ({
+    ...log,
+    request_body: null,
+    response_body: null,
+  }));
+  const hasOlder = currentPage < totalPages;
+  const hasNewer = currentPage > 1;
+  return {
+    items,
+    pageSize,
+    nextCursor: hasOlder ? storyCursorForPage(currentPage + 1) : null,
+    prevCursor: hasNewer ? storyCursorForPage(currentPage - 1) : null,
+    hasOlder,
+    hasNewer,
   };
 }
 
@@ -550,6 +567,12 @@ function installFetchMock(
   const activeTokenId = detailOverride.id;
   let initialLogsResolved = false;
   const storyData = storyDatasets[dataset];
+  const logsCatalog = buildLogsCatalog(
+    [...storyData.logs, ...storyData.logsPageTwo].map((log) => ({
+      ...log,
+      auth_token_id: activeTokenId,
+    })),
+  );
 
   window.fetch = async (
     input: RequestInfo | URL,
@@ -572,18 +595,17 @@ function installFetchMock(
       return jsonResponse(storyData.metrics);
     }
 
-    if (url.pathname === `/api/tokens/${activeTokenId}/logs/page`) {
-      const perPage = Number(url.searchParams.get("per_page") ?? "20");
-      const page = Number(url.searchParams.get("page") ?? "1");
+    if (url.pathname === `/api/tokens/${activeTokenId}/logs/list`) {
+      const perPage = Number(url.searchParams.get("limit") ?? "20");
       const selectedRequestKinds = url.searchParams.getAll("request_kind");
       const selectedResult = url.searchParams.get("result")?.trim() ?? "";
       const selectedKeyEffect = url.searchParams.get("key_effect")?.trim() ?? "";
       const selectedKeyId = url.searchParams.get("key_id")?.trim() ?? "";
-      const source = (page === 2 ? storyData.logsPageTwo : storyData.logs).map((log) => ({
+      const source = [...storyData.logs, ...storyData.logsPageTwo].map((log) => ({
         ...log,
         auth_token_id: activeTokenId,
       }));
-      const facetScopedSource = source.filter((log) => {
+      const filteredSource = source.filter((log) => {
         if (
           selectedRequestKinds.length > 0 &&
           !selectedRequestKinds.includes(log.request_kind_key ?? "")
@@ -593,9 +615,6 @@ function installFetchMock(
         if (selectedKeyId && log.key_id !== selectedKeyId) {
           return false;
         }
-        return true;
-      });
-      const filteredSource = facetScopedSource.filter((log) => {
         if (selectedResult && log.result_status !== selectedResult) {
           return false;
         }
@@ -606,17 +625,18 @@ function installFetchMock(
       });
       if (mode === "initial_loading") {
         await wait(4_000);
-      } else if (mode === "switch_loading" && page === 2) {
+      } else if (mode === "switch_loading" && url.searchParams.get("cursor") === "page:2") {
         await wait(4_000);
-      } else if (mode === "refreshing" && page === 1 && initialLogsResolved) {
+      } else if (mode === "refreshing" && !url.searchParams.get("cursor") && initialLogsResolved) {
         await wait(4_000);
       }
-      const responsePerPage =
-        !initialLogsResolved && page === 1 && storyData.initialPerPage != null
-          ? storyData.initialPerPage
-          : perPage;
+      const responsePerPage = !initialLogsResolved && storyData.initialPerPage != null ? storyData.initialPerPage : perPage;
       initialLogsResolved = true;
-      return jsonResponse(buildLogPage(filteredSource, page, perPage, responsePerPage));
+      return jsonResponse(buildLogsList(filteredSource, responsePerPage, url.searchParams.get("cursor")));
+    }
+
+    if (url.pathname === `/api/tokens/${activeTokenId}/logs/catalog`) {
+      return jsonResponse(logsCatalog);
     }
 
     const detailMatch = url.pathname.match(new RegExp(`^/api/tokens/${activeTokenId}/logs/(\\d+)/details$`));
