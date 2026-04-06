@@ -81,6 +81,7 @@ import {
   type ApiKeyBulkSyncProgressState,
   updateApiKeyBulkSyncProgressState,
 } from './admin/apiKeyBulkSyncProgress'
+import { retainVisibleApiKeySelection } from './admin/apiKeySelection'
 import {
   createApiKeyBulkSyncBubblePinnedPosition,
   type ApiKeyBulkSyncBubblePinnedPosition,
@@ -135,6 +136,7 @@ import {
   applyApiKeyBulkAction,
   syncApiKeyBulkUsageWithProgress,
   type ApiKeyBulkAction,
+  type PaginatedApiKeys,
   fetchApiKeySecret,
   addApiKeysBatch,
   type AddApiKeysBatchItem,
@@ -4429,19 +4431,19 @@ function AdminDashboard(): JSX.Element {
   const selectedVisibleKeyCount = selectedVisibleKeyIds.length
   const allVisibleKeysSelected = visibleKeys.length > 0 && selectedVisibleKeyCount === visibleKeys.length
   const someVisibleKeysSelected = selectedVisibleKeyCount > 0 && !allVisibleKeysSelected
-  const keysSelectionQueryKey = useMemo(
-    () => [
-      route.name === 'module' ? route.module : route.name,
-      keysPage,
-      keysPerPage,
-      selectedKeyGroups.join('\u0000'),
-      selectedKeyStatuses.join('\u0000'),
-      selectedKeyRegistrationIp,
-      selectedKeyRegions.join('\u0000'),
-    ].join(':'),
+  const preservedKeysSelectionQueryKeyRef = useRef<string | null>(null)
+  const buildKeysSelectionQueryKey = useCallback(
+    (page: number, perPage: number) =>
+      [
+        route.name === 'module' ? route.module : route.name,
+        page,
+        perPage,
+        selectedKeyGroups.join('\u0000'),
+        selectedKeyStatuses.join('\u0000'),
+        selectedKeyRegistrationIp,
+        selectedKeyRegions.join('\u0000'),
+      ].join(':'),
     [
-      keysPage,
-      keysPerPage,
       route,
       selectedKeyGroups,
       selectedKeyRegistrationIp,
@@ -4449,6 +4451,11 @@ function AdminDashboard(): JSX.Element {
       selectedKeyStatuses,
     ],
   )
+  const keysSelectionQueryKey = useMemo(
+    () => buildKeysSelectionQueryKey(keysPage, keysPerPage),
+    [buildKeysSelectionQueryKey, keysPage, keysPerPage],
+  )
+  const latestKeysSelectionQueryKeyRef = useRef(keysSelectionQueryKey)
 
   const selectedKeyGroupLabels = useMemo(
     () =>
@@ -4473,6 +4480,11 @@ function AdminDashboard(): JSX.Element {
   }, [someVisibleKeysSelected])
 
   useEffect(() => {
+    latestKeysSelectionQueryKeyRef.current = keysSelectionQueryKey
+    if (preservedKeysSelectionQueryKeyRef.current === keysSelectionQueryKey) {
+      preservedKeysSelectionQueryKeyRef.current = null
+      return
+    }
     setSelectedKeyIds(new Set())
     setKeysBulkFeedback(null)
     setBulkSyncProgress(null)
@@ -5341,20 +5353,25 @@ function AdminDashboard(): JSX.Element {
     })
   }
 
-  const refreshBaseData = async (options?: { includeKeys?: boolean }) => {
+  const refreshBaseData = async (options?: {
+    includeKeys?: boolean
+    preserveSelection?: boolean
+  }): Promise<PaginatedApiKeys | null> => {
     const controller = new AbortController()
     setLoading(true)
     try {
       await loadData({ signal: controller.signal, reason: 'refresh', showGlobalLoading: true })
       if (options?.includeKeys && route.name === 'module' && route.module === 'keys') {
-        await refreshKeysList()
+        return await refreshKeysList({ preserveSelection: options.preserveSelection === true })
       }
+      return null
     } finally {
       controller.abort()
     }
   }
 
-  const refreshKeysList = async () => {
+  const refreshKeysList = async (options?: { preserveSelection?: boolean }): Promise<PaginatedApiKeys | null> => {
+    const requestKeysSelectionQueryKey = buildKeysSelectionQueryKey(keysPage, keysPerPage)
     const pagedKeys = await fetchApiKeys(
       keysPage,
       keysPerPage,
@@ -5365,6 +5382,16 @@ function AdminDashboard(): JSX.Element {
         regions: selectedKeyRegions,
       },
     )
+    if (latestKeysSelectionQueryKeyRef.current !== requestKeysSelectionQueryKey) {
+      return null
+    }
+    if (options?.preserveSelection) {
+      const refreshedKeysSelectionQueryKey = buildKeysSelectionQueryKey(pagedKeys.page, pagedKeys.perPage)
+      preservedKeysSelectionQueryKeyRef.current =
+        refreshedKeysSelectionQueryKey === requestKeysSelectionQueryKey
+          ? null
+          : refreshedKeysSelectionQueryKey
+    }
     setKeys(pagedKeys.items)
     setKeysTotal(pagedKeys.total)
     setKeysPage(pagedKeys.page)
@@ -5961,6 +5988,13 @@ function AdminDashboard(): JSX.Element {
     setSelectedKeyIds(new Set())
   }, [])
 
+  const retainBulkActionSelection = useCallback(
+    (selectedIds: Iterable<string>, visibleKeyIds: Iterable<string>) => {
+      setSelectedKeyIds(new Set(retainVisibleApiKeySelection(selectedIds, visibleKeyIds)))
+    },
+    [],
+  )
+
   const dismissBulkSyncBubble = useCallback(() => {
     setBulkSyncBubbleVisible(false)
     setBulkSyncBubblePinnedPosition(null)
@@ -6028,13 +6062,23 @@ function AdminDashboard(): JSX.Element {
     async (action: ApiKeyBulkAction) => {
       if (selectedVisibleKeyIds.length === 0 || bulkKeyActionInFlight) return
       if (action === 'sync_usage') return
+      const actionSelectedKeyIds = selectedVisibleKeyIds
+      const actionSelectionQueryKey = keysSelectionQueryKey
       setBulkKeyActionInFlight(action)
       setKeysBulkFeedback(null)
       setError(null)
       try {
         const response = await applyApiKeyBulkAction(action, selectedVisibleKeyIds)
-        await refreshBaseData({ includeKeys: true })
-        clearKeySelection()
+        const shouldRetainSelection = latestKeysSelectionQueryKeyRef.current === actionSelectionQueryKey
+        const refreshedKeys = await refreshBaseData({
+          includeKeys: true,
+          preserveSelection: shouldRetainSelection,
+        })
+        if (refreshedKeys) {
+          if (shouldRetainSelection && latestKeysSelectionQueryKeyRef.current === actionSelectionQueryKey) {
+            retainBulkActionSelection(actionSelectedKeyIds, refreshedKeys.items.map((item) => item.id))
+          }
+        }
         setKeysBulkFeedback({
           kind: response.summary.failed > 0 ? 'error' : 'success',
           message: formatBulkActionSummary(action, response.summary),
@@ -6058,11 +6102,13 @@ function AdminDashboard(): JSX.Element {
     },
     [
       bulkKeyActionInFlight,
-      clearKeySelection,
       errorStrings.clearQuarantine,
       errorStrings.deleteKey,
       errorStrings.syncUsage,
       formatBulkActionSummary,
+      keysSelectionQueryKey,
+      refreshBaseData,
+      retainBulkActionSelection,
       selectedVisibleKeyIds,
     ],
   )
@@ -6070,6 +6116,8 @@ function AdminDashboard(): JSX.Element {
   const runBulkSyncUsage = useCallback(async () => {
     if (selectedVisibleKeyIds.length === 0 || bulkKeyActionInFlight) return
 
+    const actionSelectedKeyIds = selectedVisibleKeyIds
+    const actionSelectionQueryKey = keysSelectionQueryKey
     const initialProgress = createApiKeyBulkSyncProgressState(selectedVisibleKeyIds.length)
     setBulkKeyActionInFlight('sync_usage')
     setKeysBulkFeedback(null)
@@ -6095,9 +6143,17 @@ function AdminDashboard(): JSX.Element {
         ),
       )
 
-      await refreshBaseData({ includeKeys: true })
+      const shouldRetainSelection = latestKeysSelectionQueryKeyRef.current === actionSelectionQueryKey
+      const refreshedKeys = await refreshBaseData({
+        includeKeys: true,
+        preserveSelection: shouldRetainSelection,
+      })
       setBulkSyncBubblePinnedPosition(captureBulkSyncBubblePinnedPosition())
-      clearKeySelection()
+      if (refreshedKeys) {
+        if (shouldRetainSelection && latestKeysSelectionQueryKeyRef.current === actionSelectionQueryKey) {
+          retainBulkActionSelection(actionSelectedKeyIds, refreshedKeys.items.map((item) => item.id))
+        }
+      }
 
       setBulkSyncProgress((current) =>
         markApiKeyBulkSyncRefreshDone(
@@ -6141,11 +6197,12 @@ function AdminDashboard(): JSX.Element {
   }, [
     bulkKeyActionInFlight,
     captureBulkSyncBubblePinnedPosition,
-    clearKeySelection,
     errorStrings.syncUsage,
     formatBulkActionSummary,
+    keysSelectionQueryKey,
     keyStrings.bulkSyncProgress.refreshingList,
     refreshBaseData,
+    retainBulkActionSelection,
     selectedVisibleKeyIds,
   ])
 
