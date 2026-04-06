@@ -3098,19 +3098,7 @@ function AdminDashboard(): JSX.Element {
       return
     }
     const controller = new AbortController()
-    const catalogPlan = buildRequestLogsCatalogPlan({
-      hasEmptyMatch: requestLogHasEmptyMatch,
-      requestKinds: requestLogEffectiveKinds,
-      result: requestLogResultFilter,
-      keyEffect: requestLogKeyEffectFilter,
-      keyId: requestLogKeyFilter,
-    })
-
-    if (catalogPlan.kind === 'empty') {
-      setRequestLogRequestKindOptions([])
-      setRequestLogFacets(emptyRequestLogFacets)
-      return () => controller.abort()
-    }
+    const catalogPlan = buildRequestLogsCatalogPlan({})
 
     fetchRequestLogsCatalog(catalogPlan.query, controller.signal)
       .then((catalog) => {
@@ -3130,11 +3118,6 @@ function AdminDashboard(): JSX.Element {
     return () => controller.abort()
   }, [
     route,
-    requestLogEffectiveKindsKey,
-    requestLogHasEmptyMatch,
-    requestLogKeyEffectFilter,
-    requestLogKeyFilter,
-    requestLogResultFilter,
   ])
 
   const handleRequestLogQuickFilters = useCallback(
@@ -4146,32 +4129,21 @@ function AdminDashboard(): JSX.Element {
             }),
         )
       }
-      const catalogPlan = buildRequestLogsCatalogPlan({
-        hasEmptyMatch: requestLogHasEmptyMatch,
-        requestKinds: requestLogEffectiveKinds,
-        result: requestLogResultFilter,
-        keyEffect: requestLogKeyEffectFilter,
-        keyId: requestLogKeyFilter,
-      })
-      if (catalogPlan.kind === 'empty') {
-        setRequestLogRequestKindOptions([])
-        setRequestLogFacets(emptyRequestLogFacets)
-      } else {
-        tasks.push(
-          fetchRequestLogsCatalog(catalogPlan.query, controller.signal)
-            .then((catalog) => {
-              if (controller.signal.aborted) return
-              setRequestLogsCatalog(catalog)
-              setRequestLogRequestKindOptions(catalog.requestKindOptions)
-              setRequestLogFacets(catalog.facets)
-            })
-            .catch((err) => {
-              if ((err as Error).name === 'AbortError' || controller.signal.aborted) return
-              console.error(err)
-              setRequestLogsCatalog(null)
-            }),
-        )
-      }
+      const catalogPlan = buildRequestLogsCatalogPlan({})
+      tasks.push(
+        fetchRequestLogsCatalog(catalogPlan.query, controller.signal)
+          .then((catalog) => {
+            if (controller.signal.aborted) return
+            setRequestLogsCatalog(catalog)
+            setRequestLogRequestKindOptions(catalog.requestKindOptions)
+            setRequestLogFacets(catalog.facets)
+          })
+          .catch((err) => {
+            if ((err as Error).name === 'AbortError' || controller.signal.aborted) return
+            console.error(err)
+            setRequestLogsCatalog(null)
+          }),
+      )
     }
     if (route.name === 'module' && route.module === 'jobs') {
       const request = beginManagedRequest(jobsAbortRef, controller.signal)
@@ -11439,17 +11411,8 @@ export function KeyDetails({
     const controller = new AbortController()
     const since = computeSince()
     const catalogPlan = buildRequestLogsCatalogPlan({
-      hasEmptyMatch: keyLogHasEmptyMatch,
       since,
-      requestKinds: keyLogEffectiveKinds,
-      result: keyLogResultFilter,
-      keyEffect: keyLogKeyEffectFilter,
     })
-    if (catalogPlan.kind === 'empty') {
-      setKeyLogRequestKindOptions([])
-      setKeyLogFacets(emptyRequestLogFacets)
-      return () => controller.abort()
-    }
 
     fetchKeyLogsCatalog(id, catalogPlan.query, controller.signal)
       .then((catalog) => {
@@ -11470,10 +11433,6 @@ export function KeyDetails({
   }, [
     computeSince,
     id,
-    keyLogEffectiveKindsKey,
-    keyLogHasEmptyMatch,
-    keyLogKeyEffectFilter,
-    keyLogResultFilter,
     logsCatalogQueryKey,
   ])
 

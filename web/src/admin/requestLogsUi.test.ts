@@ -32,14 +32,15 @@ describe('requestLogsUi helpers', () => {
     })
   })
 
-  it('short-circuits list and catalog fetches when the current request-type selection has no match', () => {
+  it('short-circuits only the list fetch when the current request-type selection has no match', () => {
     expect(buildRequestLogsListPlan({ limit: 20, hasEmptyMatch: true })).toEqual({ kind: 'empty' })
-    expect(buildRequestLogsCatalogPlan({ hasEmptyMatch: true, requestKinds: ['api:search'] })).toEqual({
-      kind: 'empty',
+    expect(buildRequestLogsCatalogPlan({ requestKinds: ['api:search'] })).toEqual({
+      kind: 'fetch',
+      query: {},
     })
   })
 
-  it('builds scoped catalog queries without pagination params', () => {
+  it('builds scope-only catalog queries without pagination or active filters', () => {
     expect(
       buildRequestLogsCatalogPlan({
         requestKinds: ['mcp:search'],
@@ -52,10 +53,6 @@ describe('requestLogsUi helpers', () => {
     ).toEqual({
       kind: 'fetch',
       query: {
-        requestKinds: ['mcp:search'],
-        result: 'quota_exhausted',
-        tokenId: 'T001',
-        keyId: 'K001',
         sinceIso: '2026-04-01T00:00:00+08:00',
         untilIso: '2026-04-02T00:00:00+08:00',
       },

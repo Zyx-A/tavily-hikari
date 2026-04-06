@@ -29,7 +29,6 @@ export interface RequestLogsListPlanInput extends RequestLogsFilterQueryInput {
 }
 
 export interface RequestLogsCatalogPlanInput extends RequestLogsFilterQueryInput {
-  hasEmptyMatch?: boolean
 }
 
 export type RequestLogsQueryPlan<TQuery> =
@@ -38,6 +37,11 @@ export type RequestLogsQueryPlan<TQuery> =
       kind: 'fetch'
       query: TQuery
     }
+
+export interface RequestLogsFetchPlan<TQuery> {
+  kind: 'fetch'
+  query: TQuery
+}
 
 export function createEmptyRequestLogsListPage(pageSize: number): RequestLogsListPage {
   return {
@@ -81,13 +85,14 @@ export function buildRequestLogsListPlan(input: RequestLogsListPlanInput): Reque
 
 export function buildRequestLogsCatalogPlan(
   input: RequestLogsCatalogPlanInput,
-): RequestLogsQueryPlan<RequestLogsCatalogQuery> {
-  if (input.hasEmptyMatch) {
-    return { kind: 'empty' }
-  }
+): RequestLogsFetchPlan<RequestLogsCatalogQuery> {
   return {
     kind: 'fetch',
-    query: buildRequestLogsFilterQuery(input),
+    query: {
+      since: input.since,
+      sinceIso: input.sinceIso,
+      untilIso: input.untilIso,
+    },
   }
 }
 

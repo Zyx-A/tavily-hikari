@@ -885,19 +885,9 @@ export default function TokenDetail({
     const controller = new AbortController()
     requestKindOptionsAbortRef.current = controller
     const catalogPlan = buildRequestLogsCatalogPlan({
-      hasEmptyMatch: hasQuickRequestKindEmptyMatch,
-      requestKinds: effectiveSelectedRequestKinds,
-      result: resultFilter,
-      keyEffect: keyEffectFilter,
-      keyId: selectedKeyId,
       sinceIso,
       untilIso,
     })
-    if (catalogPlan.kind === 'empty') {
-      setRequestKindOptions([])
-      setLogFacets(emptyRequestLogFacets)
-      return () => controller.abort()
-    }
     const run = async () => {
       try {
         const catalog = await fetchTokenLogsCatalog(id, catalogPlan.query, controller.signal)
@@ -915,12 +905,7 @@ export default function TokenDetail({
     void run()
     return () => controller.abort()
   }, [
-    effectiveSelectedRequestKinds,
-    hasQuickRequestKindEmptyMatch,
     id,
-    keyEffectFilter,
-    resultFilter,
-    selectedKeyId,
     sinceIso,
     untilIso,
   ])
