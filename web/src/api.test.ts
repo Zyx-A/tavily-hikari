@@ -11,12 +11,18 @@ import {
   fetchApiKeys,
   fetchDashboardOverview,
   fetchJobs,
+  fetchKeyLogsCatalog,
   fetchKeyLogDetails,
+  fetchKeyLogsList,
   fetchPublicMetrics,
   fetchRequestLogs,
+  fetchRequestLogsCatalog,
   fetchRequestLogDetails,
+  fetchRequestLogsList,
+  fetchTokenLogsCatalog,
   fetchTokenMetrics,
   fetchTokenLogDetails,
+  fetchTokenLogsList,
   fetchUserDashboard,
   fetchUserTokenDetail,
   fetchUserTokens,
@@ -643,5 +649,124 @@ describe('admin user tag api helpers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/tokens/ZjvC/logs/73/details')
     expect(detail).toEqual({ request_body: '{"tool":"search"}', response_body: null })
+  })
+
+  it('builds cursor-based admin request log list URLs', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            pageSize: 20,
+            nextCursor: '300:3',
+            prevCursor: null,
+            hasOlder: true,
+            hasNewer: false,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchRequestLogsList({
+      limit: 20,
+      cursor: '400:4',
+      direction: 'older',
+      requestKinds: ['api:search', 'mcp:search'],
+      result: 'error',
+      keyId: 'K001',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/logs/list?limit=20&cursor=400%3A4&direction=older&request_kind=api%3Asearch&request_kind=mcp%3Asearch&result=error&key_id=K001',
+    )
+  })
+
+  it('builds admin request log catalog URLs across scopes', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            retentionDays: 32,
+            requestKindOptions: [],
+            facets: { results: [], keyEffects: [], tokens: [], keys: [] },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchRequestLogsCatalog({
+      requestKinds: ['api:search'],
+      result: 'error',
+      keyId: 'K001',
+    })
+    await fetchKeyLogsCatalog('K001', {
+      since: 0,
+      requestKinds: ['mcp:search'],
+      keyEffect: 'quarantined',
+      tokenId: 'T001',
+    })
+    await fetchTokenLogsCatalog('T001', {
+      sinceIso: '2026-04-01T00:00:00+08:00',
+      untilIso: '2026-04-02T00:00:00+08:00',
+      requestKinds: ['api:extract'],
+      result: 'quota_exhausted',
+      keyId: 'K001',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/logs/catalog?request_kind=api%3Asearch&result=error&key_id=K001',
+    )
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/keys/K001/logs/catalog?request_kind=mcp%3Asearch&key_effect=quarantined&auth_token_id=T001&since=0',
+    )
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      '/api/tokens/T001/logs/catalog?request_kind=api%3Aextract&result=quota_exhausted&key_id=K001&since=2026-04-01T00%3A00%3A00%2B08%3A00&until=2026-04-02T00%3A00%3A00%2B08%3A00',
+    )
+  })
+
+  it('builds cursor-based scoped request log list URLs', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            pageSize: 10,
+            nextCursor: null,
+            prevCursor: '200:2',
+            hasOlder: false,
+            hasNewer: true,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchKeyLogsList('K001', {
+      limit: 10,
+      direction: 'newer',
+      cursor: '150:1',
+      since: 100,
+      requestKinds: ['api:extract'],
+    })
+    await fetchTokenLogsList('T001', {
+      limit: 10,
+      direction: 'older',
+      sinceIso: '2026-04-01T00:00:00+08:00',
+      untilIso: '2026-04-02T00:00:00+08:00',
+      keyId: 'K001',
+      operationalClass: 'neutral',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/keys/K001/logs/list?limit=10&cursor=150%3A1&direction=newer&request_kind=api%3Aextract&since=100',
+    )
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/tokens/T001/logs/list?limit=10&direction=older&operational_class=neutral&key_id=K001&since=2026-04-01T00%3A00%3A00%2B08%3A00&until=2026-04-02T00%3A00%3A00%2B08%3A00',
+    )
   })
 })

@@ -21,7 +21,8 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
     use tavily_hikari::{
-        DEFAULT_UPSTREAM, ForwardProxySettings, effective_token_hourly_limit,
+        DEFAULT_UPSTREAM, ForwardProxySettings, effective_auth_token_log_retention_days,
+        effective_request_logs_retention_days, effective_token_hourly_limit,
     };
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
@@ -4068,12 +4069,18 @@ mod tests {
             .route("/api/summary", get(fetch_summary))
             .route("/api/summary/windows", get(fetch_summary_windows))
             .route("/api/logs", get(list_logs))
+            .route("/api/logs/list", get(list_logs_cursor))
+            .route("/api/logs/catalog", get(get_logs_catalog))
             .route("/api/logs/:log_id/details", get(get_log_details))
             .route("/api/keys", get(list_keys))
             .route("/api/keys/:id", get(get_api_key_detail))
             .route("/api/keys/:id/logs", get(get_key_logs))
+            .route("/api/keys/:id/logs/list", get(get_key_logs_list))
+            .route("/api/keys/:id/logs/catalog", get(get_key_logs_catalog))
             .route("/api/keys/:id/logs/page", get(get_key_logs_page))
             .route("/api/keys/:id/logs/:log_id/details", get(get_key_log_details))
+            .route("/api/tokens/:id/logs/list", get(get_token_logs_list))
+            .route("/api/tokens/:id/logs/catalog", get(get_token_logs_catalog))
             .route("/api/keys/batch", post(create_api_keys_batch))
             .with_state(state);
 
@@ -8312,10 +8319,13 @@ colo=LAX
                 request_kind_key: "mcp:session-delete-unsupported".to_string(),
                 request_kind_label: "MCP | session delete unsupported".to_string(),
                 request_kind_detail: None,
+                request_kind_protocol_group: "mcp".to_string(),
+                request_kind_billing_group: "non_billable".to_string(),
                 result_status: "error".to_string(),
                 failure_kind: Some("mcp_method_405".to_string()),
                 key_effect_code: "none".to_string(),
                 key_effect_summary: Some("No automatic status change".to_string()),
+                operational_class: "neutral".to_string(),
                 request_body: Vec::new(),
                 response_body: br#"{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Method Not Allowed: Session termination not supported"}}"#.to_vec(),
                 created_at: 1_700_000_003,
@@ -10200,6 +10210,665 @@ colo=LAX
                 .pointer("/items/0/operationalClass")
                 .and_then(|value| value.as_str()),
             Some("upstream_error")
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_logs_cursor_and_catalog_endpoints_expose_retention_without_blocking_page_counts() {
+        let db_path = temp_db_path("admin-logs-cursor-catalog");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-admin-logs-cursor-catalog".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let key_id = proxy
+            .list_api_key_metrics()
+            .await
+            .expect("list api key metrics")
+            .into_iter()
+            .next()
+            .expect("seeded key exists")
+            .id;
+
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        sqlx::query(
+            r#"
+            INSERT INTO request_logs (
+                api_key_id,
+                auth_token_id,
+                method,
+                path,
+                query,
+                status_code,
+                tavily_status_code,
+                error_message,
+                result_status,
+                request_kind_key,
+                request_kind_label,
+                request_kind_detail,
+                business_credits,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                request_body,
+                response_body,
+                forwarded_headers,
+                dropped_headers,
+                visibility,
+                created_at
+            ) VALUES
+                (?, 'token-a', 'POST', '/api/tavily/search', 'q=a', 200, 200, NULL, 'success', 'api:search', 'API | search', NULL, 2, NULL, 'none', NULL, X'7B7D', X'5B5D', '[]', '[]', 'visible', 100),
+                (?, 'token-b', 'POST', '/api/tavily/search', 'q=b', 500, 500, 'boom', 'error', 'api:search', 'API | search', NULL, NULL, 'upstream_500', 'quarantined', 'The system automatically quarantined this key', X'7B7D', X'5B5D', '[]', '[]', 'visible', 200),
+                (?, 'token-c', 'POST', '/api/tavily/extract', 'q=c', 200, 200, NULL, 'success', 'api:extract', 'API | extract', NULL, 3, NULL, 'none', NULL, X'7B7D', X'5B5D', '[]', '[]', 'visible', 300)
+            "#,
+        )
+        .bind(&key_id)
+        .bind(&key_id)
+        .bind(&key_id)
+        .execute(&pool)
+        .await
+        .expect("insert request logs");
+
+        let proxy_page = proxy
+            .request_logs_list(
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                RequestLogsCursorDirection::Older,
+                20,
+            )
+            .await
+            .expect("proxy cursor logs");
+        assert!(
+            proxy_page
+                .items
+                .iter()
+                .all(|item| item.request_body.is_empty() && item.response_body.is_empty()),
+            "cursor list records should not carry request/response blobs"
+        );
+
+        let admin_password = "admin-logs-cursor-catalog-password";
+        let admin_addr = spawn_builtin_keys_admin_server(proxy, admin_password).await;
+        let (client, admin_cookie) = login_builtin_admin_cookie(admin_addr, admin_password).await;
+
+        let catalog_resp = client
+            .get(format!("http://{}/api/logs/catalog", admin_addr))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("request logs catalog");
+        assert_eq!(catalog_resp.status(), reqwest::StatusCode::OK);
+        let catalog_body: serde_json::Value = catalog_resp.json().await.expect("catalog json");
+        assert_eq!(
+            catalog_body
+                .get("retentionDays")
+                .and_then(|value| value.as_i64()),
+            Some(effective_request_logs_retention_days())
+        );
+        assert!(
+            catalog_body
+                .pointer("/requestKindOptions/0/key")
+                .and_then(|value| value.as_str())
+                .is_some(),
+            "catalog should expose request kind options"
+        );
+        let filtered_catalog_resp = client
+            .get(format!(
+                "http://{}/api/logs/catalog?request_kind=api:extract&result=success",
+                admin_addr
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("filtered request logs catalog");
+        assert_eq!(filtered_catalog_resp.status(), reqwest::StatusCode::OK);
+        let filtered_catalog: serde_json::Value = filtered_catalog_resp
+            .json()
+            .await
+            .expect("filtered catalog json");
+        assert_eq!(
+            filtered_catalog
+                .pointer("/requestKindOptions/0/key")
+                .and_then(|value| value.as_str()),
+            Some("api:extract")
+        );
+        assert_eq!(
+            filtered_catalog
+                .pointer("/facets/results/0/value")
+                .and_then(|value| value.as_str()),
+            Some("success")
+        );
+        assert_eq!(
+            filtered_catalog
+                .pointer("/facets/tokens/0/value")
+                .and_then(|value| value.as_str()),
+            Some("token-c")
+        );
+        let key_list_resp = client
+            .get(format!(
+                "http://{}/api/keys/{}/logs/list?limit=5&since=0&operational_class=success",
+                admin_addr, key_id
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("key logs list");
+        assert_eq!(key_list_resp.status(), reqwest::StatusCode::OK);
+        let key_list_body: serde_json::Value = key_list_resp.json().await.expect("key logs list json");
+        assert_eq!(
+            key_list_body
+                .get("items")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            key_list_body
+                .pointer("/items/0/auth_token_id")
+                .and_then(|value| value.as_str()),
+            Some("token-c")
+        );
+        assert_eq!(
+            key_list_body
+                .pointer("/items/1/auth_token_id")
+                .and_then(|value| value.as_str()),
+            Some("token-a")
+        );
+        let invalid_key_list_resp = client
+            .get(format!(
+                "http://{}/api/keys/{}/logs/list?limit=5&since=0&operational_class=not-real",
+                admin_addr, key_id
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("invalid key logs list");
+        assert_eq!(invalid_key_list_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let invalid_catalog_resp = client
+            .get(format!(
+                "http://{}/api/logs/catalog?operational_class=definitely-not-valid",
+                admin_addr
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("invalid request logs catalog");
+        assert_eq!(invalid_catalog_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let page_resp = client
+            .get(format!("http://{}/api/logs/list?limit=2", admin_addr))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("request logs list");
+        assert_eq!(page_resp.status(), reqwest::StatusCode::OK);
+        let page_body: serde_json::Value = page_resp.json().await.expect("page json");
+        assert!(
+            page_body.get("total").is_none(),
+            "cursor endpoint should not expose total counts"
+        );
+        assert_eq!(page_body.get("pageSize").and_then(|value| value.as_i64()), Some(2));
+        assert_eq!(
+            page_body
+                .pointer("/items/0/auth_token_id")
+                .and_then(|value| value.as_str()),
+            Some("token-c")
+        );
+        assert_eq!(
+            page_body
+                .pointer("/items/1/auth_token_id")
+                .and_then(|value| value.as_str()),
+            Some("token-b")
+        );
+        assert_eq!(
+            page_body.get("hasOlder").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            page_body.get("hasNewer").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        let next_cursor = page_body
+            .get("nextCursor")
+            .and_then(|value| value.as_str())
+            .expect("next cursor");
+
+        let older_resp = client
+            .get(format!(
+                "http://{}/api/logs/list?limit=2&cursor={}&direction=older",
+                admin_addr, next_cursor
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("older request logs list");
+        assert_eq!(older_resp.status(), reqwest::StatusCode::OK);
+        let older_body: serde_json::Value = older_resp.json().await.expect("older page json");
+        assert_eq!(
+            older_body
+                .pointer("/items/0/auth_token_id")
+                .and_then(|value| value.as_str()),
+            Some("token-a")
+        );
+        assert_eq!(
+            older_body.get("hasOlder").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            older_body.get("hasNewer").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+
+        sqlx::query("DELETE FROM request_logs WHERE auth_token_id = 'token-a'")
+            .execute(&pool)
+            .await
+            .expect("delete oldest request log");
+
+        let recovery_resp = client
+            .get(format!(
+                "http://{}/api/logs/list?limit=2&cursor={}&direction=older",
+                admin_addr, next_cursor
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("request logs recovery page");
+        assert_eq!(recovery_resp.status(), reqwest::StatusCode::OK);
+        let recovery_body: serde_json::Value = recovery_resp.json().await.expect("recovery page json");
+        assert_eq!(
+            recovery_body
+                .get("items")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            recovery_body.get("hasOlder").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            recovery_body.get("hasNewer").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            recovery_body
+                .get("prevCursor")
+                .and_then(|value| value.as_str()),
+            Some(next_cursor)
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn key_and_token_logs_catalog_scope_and_cache_invalidation_work() {
+        let db_path = temp_db_path("key-token-logs-catalog");
+        let db_str = db_path.to_string_lossy().to_string();
+        let expected_api_key = "tvly-key-token-logs-catalog";
+        let (upstream_addr, _hits) =
+            spawn_http_search_mock_with_usage(expected_api_key.to_string()).await;
+        let upstream = format!("http://{upstream_addr}");
+
+        let proxy = TavilyProxy::with_endpoint(vec![expected_api_key.to_string()], &upstream, &db_str)
+            .await
+            .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("catalog-scope"))
+            .await
+            .expect("create token");
+        let key_id = proxy
+            .list_api_key_metrics()
+            .await
+            .expect("list api key metrics")
+            .into_iter()
+            .next()
+            .expect("seeded key exists")
+            .id;
+
+        let usage_base = format!("http://{}", upstream_addr);
+        let proxy_addr = spawn_proxy_server(proxy.clone(), usage_base).await;
+        let admin_password = "key-token-logs-catalog-password";
+        let admin_addr = spawn_builtin_keys_admin_server(proxy, admin_password).await;
+        let (client, admin_cookie) = login_builtin_admin_cookie(admin_addr, admin_password).await;
+
+        let since = Utc::now() - ChronoDuration::minutes(5);
+        let until = Utc::now() + ChronoDuration::minutes(5);
+        let token_since = since.to_rfc3339();
+        let token_until = until.to_rfc3339();
+        let pool = connect_sqlite_test_pool(&db_str).await;
+
+        let empty_key_catalog_resp = client
+            .get(format!(
+                "http://{}/api/keys/{}/logs/catalog?since=0",
+                admin_addr, key_id
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("empty key catalog");
+        assert_eq!(empty_key_catalog_resp.status(), reqwest::StatusCode::OK);
+        let empty_key_catalog: serde_json::Value =
+            empty_key_catalog_resp.json().await.expect("empty key catalog json");
+        assert_eq!(
+            empty_key_catalog
+                .pointer("/facets/tokens")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let empty_token_catalog_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/catalog?since={}&until={}",
+                admin_addr,
+                token.id,
+                urlencoding::encode(&token_since),
+                urlencoding::encode(&token_until)
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("empty token catalog");
+        assert_eq!(empty_token_catalog_resp.status(), reqwest::StatusCode::OK);
+        let empty_token_catalog: serde_json::Value = empty_token_catalog_resp
+            .json()
+            .await
+            .expect("empty token catalog json");
+        assert_eq!(
+            empty_token_catalog
+                .get("retentionDays")
+                .and_then(|value| value.as_i64()),
+            Some(effective_auth_token_log_retention_days())
+        );
+        assert_eq!(
+            empty_token_catalog
+                .pointer("/facets/keys")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let search_resp = client
+            .post(format!("http://{}/api/tavily/search", proxy_addr))
+            .header("Authorization", format!("Bearer {}", token.token))
+            .json(&serde_json::json!({ "query": "catalog invalidation" }))
+            .send()
+            .await
+            .expect("search request");
+        assert_eq!(search_resp.status(), reqwest::StatusCode::OK);
+
+        let key_catalog_resp = client
+            .get(format!(
+                "http://{}/api/keys/{}/logs/catalog?since=0",
+                admin_addr, key_id
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("key catalog");
+        assert_eq!(key_catalog_resp.status(), reqwest::StatusCode::OK);
+        let key_catalog: serde_json::Value = key_catalog_resp.json().await.expect("key catalog json");
+        assert_eq!(
+            key_catalog
+                .get("retentionDays")
+                .and_then(|value| value.as_i64()),
+            Some(effective_request_logs_retention_days())
+        );
+        assert_eq!(
+            key_catalog
+                .pointer("/facets/tokens/0/value")
+                .and_then(|value| value.as_str()),
+            Some(token.id.as_str())
+        );
+        let filtered_key_catalog_resp = client
+            .get(format!(
+                "http://{}/api/keys/{}/logs/catalog?since=0&request_kind=api:search&result=success",
+                admin_addr, key_id
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("filtered key catalog");
+        assert_eq!(filtered_key_catalog_resp.status(), reqwest::StatusCode::OK);
+        let filtered_key_catalog: serde_json::Value = filtered_key_catalog_resp
+            .json()
+            .await
+            .expect("filtered key catalog json");
+        assert_eq!(
+            filtered_key_catalog
+                .pointer("/requestKindOptions/0/key")
+                .and_then(|value| value.as_str()),
+            Some("api:search")
+        );
+        let invalid_key_catalog_resp = client
+            .get(format!(
+                "http://{}/api/keys/{}/logs/catalog?since=0&operational_class=totally-invalid",
+                admin_addr, key_id
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("invalid key catalog");
+        assert_eq!(invalid_key_catalog_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let token_catalog_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/catalog?since={}&until={}",
+                admin_addr,
+                token.id,
+                urlencoding::encode(&token_since),
+                urlencoding::encode(&token_until)
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("token catalog");
+        assert_eq!(token_catalog_resp.status(), reqwest::StatusCode::OK);
+        let token_catalog: serde_json::Value = token_catalog_resp
+            .json()
+            .await
+            .expect("token catalog json");
+        assert_eq!(
+            token_catalog
+                .pointer("/facets/keys/0/value")
+                .and_then(|value| value.as_str()),
+            Some(key_id.as_str())
+        );
+        assert!(
+            token_catalog
+                .pointer("/requestKindOptions/0/key")
+                .and_then(|value| value.as_str())
+                .is_some(),
+            "token catalog should refresh after a new token log is written"
+        );
+        let filtered_token_catalog_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/catalog?since={}&until={}&request_kind=api:search&result=success&key_id={}",
+                admin_addr,
+                token.id,
+                urlencoding::encode(&token_since),
+                urlencoding::encode(&token_until),
+                key_id
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("filtered token catalog");
+        assert_eq!(filtered_token_catalog_resp.status(), reqwest::StatusCode::OK);
+        let filtered_token_catalog: serde_json::Value = filtered_token_catalog_resp
+            .json()
+            .await
+            .expect("filtered token catalog json");
+        assert_eq!(
+            filtered_token_catalog
+                .pointer("/requestKindOptions/0/key")
+                .and_then(|value| value.as_str()),
+            Some("api:search")
+        );
+        assert_eq!(
+            filtered_token_catalog
+                .pointer("/facets/keys/0/value")
+                .and_then(|value| value.as_str()),
+            Some(key_id.as_str())
+        );
+        let invalid_token_catalog_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/catalog?since={}&until={}&operational_class=not-real",
+                admin_addr,
+                token.id,
+                urlencoding::encode(&token_since),
+                urlencoding::encode(&token_until)
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("invalid token catalog");
+        assert_eq!(invalid_token_catalog_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id,
+                method,
+                path,
+                query,
+                http_status,
+                mcp_status,
+                request_kind_key,
+                request_kind_label,
+                request_kind_detail,
+                result_status,
+                error_message,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                counts_business_quota,
+                business_credits,
+                billing_state,
+                api_key_id,
+                request_log_id,
+                created_at
+            ) VALUES
+                (?, 'POST', '/mcp', 'seed=a', 200, 200, 'mcp:search', 'MCP | search', NULL, 'success', NULL, NULL, 'none', NULL, 1, 1, 'charged', ?, NULL, ?),
+                (?, 'POST', '/mcp', 'seed=b', 200, 200, 'mcp:search', 'MCP | search', NULL, 'success', NULL, NULL, 'none', NULL, 1, 1, 'charged', ?, NULL, ?),
+                (?, 'POST', '/mcp', 'seed=c', 200, 200, 'mcp:search', 'MCP | search', NULL, 'success', NULL, NULL, 'none', NULL, 1, 1, 'charged', ?, NULL, ?)
+            "#,
+        )
+        .bind(&token.id)
+        .bind(&key_id)
+        .bind(since.timestamp() + 1)
+        .bind(&token.id)
+        .bind(&key_id)
+        .bind(since.timestamp() + 2)
+        .bind(&token.id)
+        .bind(&key_id)
+        .bind(since.timestamp() + 3)
+        .execute(&pool)
+        .await
+        .expect("seed token logs");
+
+        let token_cursor_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/list?limit=2&since={}&until={}&request_kind=mcp:search",
+                admin_addr,
+                token.id,
+                urlencoding::encode(&token_since),
+                urlencoding::encode(&token_until)
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("token cursor list");
+        assert_eq!(token_cursor_resp.status(), reqwest::StatusCode::OK);
+        let token_cursor_body: serde_json::Value = token_cursor_resp
+            .json()
+            .await
+            .expect("token cursor list json");
+        let token_next_cursor = token_cursor_body
+            .get("nextCursor")
+            .and_then(|value| value.as_str())
+            .expect("token next cursor")
+            .to_string();
+
+        sqlx::query("DELETE FROM auth_token_logs WHERE token_id = ? AND query = 'seed=a'")
+            .bind(&token.id)
+            .execute(&pool)
+            .await
+            .expect("delete oldest token log");
+
+        let token_recovery_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/list?limit=2&since={}&until={}&request_kind=mcp:search&cursor={}&direction=older",
+                admin_addr,
+                token.id,
+                urlencoding::encode(&token_since),
+                urlencoding::encode(&token_until),
+                token_next_cursor
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("token recovery list");
+        assert_eq!(token_recovery_resp.status(), reqwest::StatusCode::OK);
+        let token_recovery_body: serde_json::Value = token_recovery_resp
+            .json()
+            .await
+            .expect("token recovery list json");
+        assert_eq!(
+            token_recovery_body
+                .get("items")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            token_recovery_body.get("hasOlder").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            token_recovery_body.get("hasNewer").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            token_recovery_body
+                .get("prevCursor")
+                .and_then(|value| value.as_str()),
+            Some(token_next_cursor.as_str())
+        );
+
+        let token_list_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/list?limit=1&since={}&until={}",
+                admin_addr,
+                token.id,
+                urlencoding::encode(&token_since),
+                urlencoding::encode(&token_until)
+            ))
+            .header(reqwest::header::COOKIE, admin_cookie)
+            .send()
+            .await
+            .expect("token list");
+        assert_eq!(token_list_resp.status(), reqwest::StatusCode::OK);
+        let token_list: serde_json::Value = token_list_resp.json().await.expect("token list json");
+        assert!(
+            token_list.get("total").is_none(),
+            "token cursor endpoint should not expose total counts"
+        );
+        assert_eq!(
+            token_list
+                .pointer("/items/0/auth_token_id")
+                .and_then(|value| value.as_str()),
+            Some(token.id.as_str())
         );
 
         let _ = std::fs::remove_file(db_path);

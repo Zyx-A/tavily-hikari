@@ -72,6 +72,9 @@ jobs:
 
   build-storybook:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      STORYBOOK_DISABLE_TELEMETRY: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,15 +84,13 @@ jobs:
         with:
           bun-version-file: .bun-version
 
-      - name: Install Storybook dependencies
-        run: bun install --cwd web --frozen-lockfile
-
-      - name: Build Storybook
+      - name: Install Storybook dependencies and build
         shell: bash
         run: |
           set -euo pipefail
+          bun install --cwd web --frozen-lockfile
           cd web
-          bun run build-storybook --quiet
+          node ./node_modules/.bin/storybook build --disable-telemetry --quiet
 
       - name: Upload Storybook artifact
         uses: actions/upload-artifact@v4

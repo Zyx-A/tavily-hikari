@@ -20,6 +20,8 @@ import type {
   JobLogView,
   MonthlyBrokenKeyDetail,
   RequestLog,
+  RequestLogsCatalog,
+  RequestLogsListPage,
   SortDirection,
 } from '../api'
 import AdminCompactIntro from '../components/AdminCompactIntro'
@@ -663,6 +665,7 @@ const STORY_REQUEST_KIND_OPTIONS: TokenLogRequestKindOption[] = [
   { key: 'mcp:crawl', label: 'MCP | crawl', protocol_group: 'mcp', billing_group: 'billable' },
   { key: 'mcp:map', label: 'MCP | map', protocol_group: 'mcp', billing_group: 'billable' },
 ]
+const STORY_REQUEST_LOG_RETENTION_DAYS = 32
 
 function buildStoryLogFacetOptions(values: Array<string | null | undefined>): Array<{ value: string; count: number }> {
   const counts = new Map<string, number>()
@@ -702,67 +705,129 @@ function lookupStoryLogBodies(logId: number) {
   }
 }
 
-function buildStoryRequestLogsPage(
+function storyCursorForPage(page: number): string {
+  return `page:${page}`
+}
+
+function parseStoryCursor(cursor: string | null | undefined): number | null {
+  const normalized = cursor?.trim()
+  if (!normalized) return null
+  const match = normalized.match(/^page:(\d+)$/)
+  if (!match) return null
+  const page = Number(match[1])
+  return Number.isFinite(page) && page > 0 ? page : null
+}
+
+function filterStoryRequestLogs(
   logs: RequestLog[],
   {
-    page,
-    perPage,
     requestKinds = [],
     result,
     keyEffect,
     tokenId,
     keyId,
-    showTokens,
-    showKeys,
     forceEmptyMatch = false,
   }: {
-    page: number
-    perPage: number
     requestKinds?: string[]
     result?: string
     keyEffect?: string
     tokenId?: string | null
     keyId?: string | null
-    showTokens: boolean
-    showKeys: boolean
     forceEmptyMatch?: boolean
   },
 ) {
   const normalizedRequestKinds = Array.from(new Set(requestKinds.map((value) => value.trim()).filter(Boolean)))
-  const filtered =
-    forceEmptyMatch
-      ? []
-      : logs.filter((log) => {
-          if (normalizedRequestKinds.length > 0 && !normalizedRequestKinds.includes(log.request_kind_key ?? '')) {
-            return false
-          }
-          if (result && log.result_status !== result) {
-            return false
-          }
-          if (keyEffect && (log.key_effect_code ?? 'none') !== keyEffect) {
-            return false
-          }
-          if (tokenId?.trim() && log.auth_token_id !== tokenId) {
-            return false
-          }
-          if (keyId?.trim() && log.key_id !== keyId) {
-            return false
-          }
-          return true
-        })
-  const start = (page - 1) * perPage
+  return forceEmptyMatch
+    ? []
+    : logs.filter((log) => {
+        if (normalizedRequestKinds.length > 0 && !normalizedRequestKinds.includes(log.request_kind_key ?? '')) {
+          return false
+        }
+        if (result && log.result_status !== result) {
+          return false
+        }
+        if (keyEffect && (log.key_effect_code ?? 'none') !== keyEffect) {
+          return false
+        }
+        if (tokenId?.trim() && log.auth_token_id !== tokenId) {
+          return false
+        }
+        if (keyId?.trim() && log.key_id !== keyId) {
+          return false
+        }
+        return true
+      })
+}
+
+function buildStoryRequestLogsCatalog(
+  logs: RequestLog[],
+  {
+    showTokens,
+    showKeys,
+    retentionDays = STORY_REQUEST_LOG_RETENTION_DAYS,
+  }: {
+    showTokens: boolean
+    showKeys: boolean
+    retentionDays?: number
+  },
+) : RequestLogsCatalog {
   return {
-    items: filtered.slice(start, start + perPage).map(stripRequestLogBodies),
-    page,
-    per_page: perPage,
-    total: filtered.length,
-    request_kind_options: buildStoryRequestKindOptions(logs, STORY_REQUEST_KIND_OPTIONS),
+    retentionDays,
+    requestKindOptions: buildStoryRequestKindOptions(logs, STORY_REQUEST_KIND_OPTIONS),
     facets: {
-      results: buildStoryLogFacetOptions(filtered.map((log) => log.result_status)),
-      key_effects: buildStoryLogFacetOptions(filtered.map((log) => log.key_effect_code ?? 'none')),
-      tokens: showTokens ? buildStoryLogFacetOptions(filtered.map((log) => log.auth_token_id)) : [],
-      keys: showKeys ? buildStoryLogFacetOptions(filtered.map((log) => log.key_id)) : [],
+      results: buildStoryLogFacetOptions(logs.map((log) => log.result_status)),
+      keyEffects: buildStoryLogFacetOptions(logs.map((log) => log.key_effect_code ?? 'none')),
+      tokens: showTokens ? buildStoryLogFacetOptions(logs.map((log) => log.auth_token_id)) : [],
+      keys: showKeys ? buildStoryLogFacetOptions(logs.map((log) => log.key_id)) : [],
     },
+  }
+}
+
+function buildStoryRequestLogsList(
+  logs: RequestLog[],
+  {
+    cursor,
+    limit,
+    requestKinds = [],
+    result,
+    keyEffect,
+    tokenId,
+    keyId,
+    forceEmptyMatch = false,
+  }: {
+    cursor?: string | null
+    limit: number
+    requestKinds?: string[]
+    result?: string
+    keyEffect?: string
+    tokenId?: string | null
+    keyId?: string | null
+    forceEmptyMatch?: boolean
+  },
+): RequestLogsListPage {
+  const filtered = filterStoryRequestLogs(logs, {
+    requestKinds,
+    result,
+    keyEffect,
+    tokenId,
+    keyId,
+    forceEmptyMatch,
+  })
+  const pageSize = Math.max(1, limit)
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize))
+  const currentPage = Math.min(parseStoryCursor(cursor) ?? 1, totalPages)
+  const start = (currentPage - 1) * pageSize
+  const items = filtered.slice(start, start + pageSize).map(stripRequestLogBodies)
+  const hasOlder = currentPage < totalPages
+  const hasNewer = currentPage > 1
+
+  return {
+    items,
+    pageSize,
+    nextCursor: hasOlder ? storyCursorForPage(currentPage + 1) : null,
+    prevCursor: hasNewer ? storyCursorForPage(currentPage - 1) : null,
+    hasOlder,
+    hasNewer,
   }
 }
 
@@ -2526,6 +2591,10 @@ function StoryKeyDetailsCanvas({ id, logs }: { id: string; logs: RequestLog[] })
     const originalFetch = window.fetch.bind(window)
     const key = [...MOCK_KEYS_WITH_QUARANTINE, ...MOCK_KEYS].find((item) => item.id === id) ?? MOCK_KEYS[0]
     const keyLogs = logs.filter((item) => item.key_id === id)
+    const keyLogsCatalog = buildStoryRequestLogsCatalog(keyLogs, {
+      showTokens: true,
+      showKeys: false,
+    })
     const keySummary = {
       total_requests: key.total_requests,
       success_count: key.success_count,
@@ -2541,20 +2610,21 @@ function StoryKeyDetailsCanvas({ id, logs }: { id: string; logs: RequestLog[] })
       if (url.includes(`/api/keys/${encodeURIComponent(id)}/metrics`)) {
         return jsonStoryResponse(keySummary)
       }
-      if (url.includes(`/api/keys/${encodeURIComponent(id)}/logs/page`)) {
+      if (url.includes(`/api/keys/${encodeURIComponent(id)}/logs/list`)) {
         const requestUrl = new URL(url, window.location.origin)
         return jsonStoryResponse(
-          buildStoryRequestLogsPage(keyLogs, {
-            page: Number(requestUrl.searchParams.get('page') ?? '1'),
-            perPage: Number(requestUrl.searchParams.get('per_page') ?? '20'),
+          buildStoryRequestLogsList(keyLogs, {
+            cursor: requestUrl.searchParams.get('cursor'),
+            limit: Number(requestUrl.searchParams.get('limit') ?? '20'),
             requestKinds: requestUrl.searchParams.getAll('request_kind'),
             result: requestUrl.searchParams.get('result') ?? undefined,
             keyEffect: requestUrl.searchParams.get('key_effect') ?? undefined,
             tokenId: requestUrl.searchParams.get('auth_token_id'),
-            showTokens: true,
-            showKeys: false,
           }),
         )
+      }
+      if (url.includes(`/api/keys/${encodeURIComponent(id)}/logs/catalog`)) {
+        return jsonStoryResponse(keyLogsCatalog)
       }
       if (url.includes(`/api/keys/${encodeURIComponent(id)}/logs`)) {
         return jsonStoryResponse(keyLogs)
@@ -3686,7 +3756,7 @@ function RequestsPageCanvas({
   const admin = useTranslate().admin
   const { language } = useLanguage()
   const logStrings = admin.logs
-  const [page, setPage] = useState(1)
+  const [currentPage, setCurrentPage] = useState(1)
   const [perPage, setPerPage] = useState(3)
   const [selectedRequestKinds, setSelectedRequestKinds] = useState<string[]>([])
   const [requestKindQuickBilling, setRequestKindQuickBilling] =
@@ -3722,24 +3792,30 @@ function RequestsPageCanvas({
       requestKindQuickSelection.length === 0,
     [requestKindQuickFilters, requestKindQuickSelection.length],
   )
-  const pageData = useMemo(
+  const catalog = useMemo(
     () =>
-      buildStoryRequestLogsPage(MOCK_REQUESTS, {
-        page,
-        perPage,
+      buildStoryRequestLogsCatalog(MOCK_REQUESTS, {
+        showTokens: true,
+        showKeys: true,
+      }),
+    [],
+  )
+  const listData = useMemo(
+    () =>
+      buildStoryRequestLogsList(MOCK_REQUESTS, {
+        cursor: currentPage > 1 ? storyCursorForPage(currentPage) : null,
+        limit: perPage,
         requestKinds: effectiveSelectedRequestKinds,
         result: outcomeFilter?.kind === 'result' ? outcomeFilter.value : undefined,
         keyEffect: outcomeFilter?.kind === 'keyEffect' ? outcomeFilter.value : undefined,
         keyId: selectedKeyId,
-        showTokens: true,
-        showKeys: true,
         forceEmptyMatch: hasEmptyRequestKindMatch,
       }),
     [
+      currentPage,
       effectiveSelectedRequestKinds,
       hasEmptyRequestKindMatch,
       outcomeFilter,
-      page,
       perPage,
       selectedKeyId,
     ],
@@ -3753,7 +3829,7 @@ function RequestsPageCanvas({
     setRequestKindQuickBilling(billing)
     setRequestKindQuickProtocol(protocol)
     setSelectedRequestKinds(buildRequestKindQuickFilterSelection(STORY_REQUEST_KIND_OPTIONS, nextFilters))
-    setPage(1)
+    setCurrentPage(1)
   }
 
   const handleToggleRequestKind = (key: string) => {
@@ -3767,14 +3843,14 @@ function RequestsPageCanvas({
     setSelectedRequestKinds(nextSelected)
     setRequestKindQuickBilling(nextQuickFilters.billing)
     setRequestKindQuickProtocol(nextQuickFilters.protocol)
-    setPage(1)
+    setCurrentPage(1)
   }
 
   const handleClearRequestKinds = () => {
     setSelectedRequestKinds([])
     setRequestKindQuickBilling(defaultTokenLogRequestKindQuickFilters.billing)
     setRequestKindQuickProtocol(defaultTokenLogRequestKindQuickFilters.protocol)
-    setPage(1)
+    setCurrentPage(1)
   }
 
   return (
@@ -3784,12 +3860,12 @@ function RequestsPageCanvas({
         language={language}
         strings={admin}
         title={logStrings.title}
-        description={logStrings.description}
+        description={logStrings.descriptionWithRetention.replace('{days}', '32')}
         emptyLabel={logStrings.empty.none}
         loadState="ready"
         loadingLabel={logStrings.empty.loading}
-        logs={pageData.items}
-        requestKindOptions={pageData.request_kind_options}
+        logs={listData.items}
+        requestKindOptions={catalog.requestKindOptions}
         requestKindQuickBilling={requestKindQuickBilling}
         requestKindQuickProtocol={requestKindQuickProtocol}
         selectedRequestKinds={selectedRequestKinds}
@@ -3797,30 +3873,29 @@ function RequestsPageCanvas({
         onToggleRequestKind={handleToggleRequestKind}
         onClearRequestKinds={handleClearRequestKinds}
         outcomeFilter={outcomeFilter}
-        resultOptions={pageData.facets.results}
-        keyEffectOptions={pageData.facets.key_effects}
+        resultOptions={catalog.facets.results}
+        keyEffectOptions={catalog.facets.keyEffects}
         onOutcomeFilterChange={(value) => {
           setOutcomeFilter(value)
-          setPage(1)
+          setCurrentPage(1)
         }}
-        keyOptions={pageData.facets.keys}
+        keyOptions={catalog.facets.keys}
         selectedKeyId={selectedKeyId}
         onKeyFilterChange={(value) => {
           setSelectedKeyId(value)
-          setPage(1)
+          setCurrentPage(1)
         }}
         showKeyColumn
         showTokenColumn
-        page={page}
-        perPage={pageData.per_page}
-        total={pageData.total}
-        onPreviousPage={() => setPage((value) => Math.max(1, value - 1))}
-        onNextPage={() =>
-          setPage((value) => Math.min(Math.max(1, Math.ceil(pageData.total / pageData.per_page)), value + 1))
-        }
+        perPage={listData.pageSize}
+        hasOlder={listData.hasOlder}
+        hasNewer={listData.hasNewer}
+        paginationSummary={logStrings.pagination.summaryWithRetention.replace('{days}', '32')}
+        onNewerPage={() => setCurrentPage((value) => Math.max(1, value - 1))}
+        onOlderPage={() => setCurrentPage((value) => value + 1)}
         onPerPageChange={(value) => {
           setPerPage(value)
-          setPage(1)
+          setCurrentPage(1)
         }}
         formatTime={formatTimestamp}
         formatTimeDetail={formatTimestamp}
@@ -5799,6 +5874,20 @@ export const KeysRegistrationFilters: Story = {
 
 export const Requests: Story = {
   render: () => <RequestsPageCanvas />,
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+  },
+}
+
+export const KeyDetailRecentRequests: Story = {
+  render: () => <StoryKeyDetailsCanvas id="MZli" logs={MOCK_REQUESTS} />,
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+  },
+}
+
+export const TokenDetailRecentRequests: Story = {
+  render: () => <TokenDetailStoryCanvas detail={buildRequestStoryTokenDetail('tok_req_001')} />,
   parameters: {
     viewport: { defaultViewport: '1440-device-desktop' },
   },

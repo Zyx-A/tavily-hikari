@@ -83,12 +83,13 @@ export interface AdminRecentRequestsPanelProps {
   onKeyFilterChange?: (value: string | null) => void
   showKeyColumn: boolean
   showTokenColumn: boolean
-  page: number
   perPage: number
-  total: number
+  hasOlder: boolean
+  hasNewer: boolean
+  paginationSummary?: string
   paginationDisabled?: boolean
-  onPreviousPage: () => void | Promise<void>
-  onNextPage: () => void | Promise<void>
+  onOlderPage: () => void | Promise<void>
+  onNewerPage: () => void | Promise<void>
   onPerPageChange: (value: number) => void | Promise<void>
   formatTime: (ts: number | null) => string
   formatTimeDetail?: (ts: number | null) => string
@@ -437,12 +438,13 @@ export default function AdminRecentRequestsPanel({
   onKeyFilterChange,
   showKeyColumn,
   showTokenColumn,
-  page,
   perPage,
-  total,
+  hasOlder,
+  hasNewer,
+  paginationSummary,
   paginationDisabled = false,
-  onPreviousPage,
-  onNextPage,
+  onOlderPage,
+  onNewerPage,
   onPerPageChange,
   formatTime,
   formatTimeDetail,
@@ -612,7 +614,6 @@ export default function AdminRecentRequestsPanel({
     () => summarizeSingleFacet(selectedKeyId, keyOptions, recentRequestsCompactAllLabel),
     [keyOptions, selectedKeyId],
   )
-  const totalPages = Math.max(1, Math.ceil(total / Math.max(1, perPage)) || 1)
   const summaryColumnCount = 6 + Number(showKeyColumn) + Number(showTokenColumn)
   const desktopClassName = `recent-requests-desktop recent-requests-desktop--${variant}`
   const mobileClassName = `recent-requests-mobile-list recent-requests-mobile-list--${variant}`
@@ -1105,16 +1106,17 @@ export default function AdminRecentRequestsPanel({
       </AdminLoadingRegion>
 
       <AdminTablePagination
-        page={page}
-        totalPages={totalPages}
+        page={1}
+        totalPages={1}
+        pageSummary={paginationSummary}
         perPage={perPage}
-        previousLabel={strings.tokens.pagination.prev}
-        nextLabel={strings.tokens.pagination.next}
-        previousDisabled={page <= 1}
-        nextDisabled={page >= totalPages}
+        previousLabel={strings.logs.pagination.newer}
+        nextLabel={strings.logs.pagination.older}
+        previousDisabled={!hasNewer}
+        nextDisabled={!hasOlder}
         disabled={paginationDisabled}
-        onPrevious={onPreviousPage}
-        onNext={onNextPage}
+        onPrevious={onNewerPage}
+        onNext={onOlderPage}
         onPerPageChange={onPerPageChange}
       />
     </section>

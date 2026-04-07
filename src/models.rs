@@ -443,10 +443,13 @@ pub struct RequestLogRecord {
     pub request_kind_key: String,
     pub request_kind_label: String,
     pub request_kind_detail: Option<String>,
+    pub request_kind_protocol_group: String,
+    pub request_kind_billing_group: String,
     pub result_status: String,
     pub failure_kind: Option<String>,
     pub key_effect_code: String,
     pub key_effect_summary: Option<String>,
+    pub operational_class: String,
     pub request_body: Vec<u8>,
     pub response_body: Vec<u8>,
     pub created_at: i64,
@@ -478,6 +481,45 @@ pub struct RequestLogPageFacets {
 pub struct RequestLogsPage {
     pub items: Vec<RequestLogRecord>,
     pub total: i64,
+    pub request_kind_options: Vec<TokenRequestKindOption>,
+    pub facets: RequestLogPageFacets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLogsCursorDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestLogsCursor {
+    pub created_at: i64,
+    pub id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLogsCursorPage {
+    pub items: Vec<RequestLogRecord>,
+    pub page_size: i64,
+    pub next_cursor: Option<RequestLogsCursor>,
+    pub prev_cursor: Option<RequestLogsCursor>,
+    pub has_older: bool,
+    pub has_newer: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenLogsCursorPage {
+    pub items: Vec<TokenLogRecord>,
+    pub page_size: i64,
+    pub next_cursor: Option<RequestLogsCursor>,
+    pub prev_cursor: Option<RequestLogsCursor>,
+    pub has_older: bool,
+    pub has_newer: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLogsCatalog {
+    pub retention_days: i64,
     pub request_kind_options: Vec<TokenRequestKindOption>,
     pub facets: RequestLogPageFacets,
 }
