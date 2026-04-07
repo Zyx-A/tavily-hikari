@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 待实现
+- Status: 已实现（待审查）
 - Created: 2026-04-06
-- Last: 2026-04-06
+- Last: 2026-04-07
 
 ## 背景 / 问题陈述
 
@@ -193,3 +193,8 @@
   ![Empty state](./assets/empty-state.png)
 
   ![Error state](./assets/error-state.png)
+
+## 进展记录
+
+- 2026-04-06：admin recent requests 的 retention-aware 文案、list/catalog 拆分、cursor 分页、路由懒加载与共享 Storybook 证据已完成，PR #219 已创建进入收敛阶段。
+- 2026-04-07：PR merge gate 跟进时发现 GitHub Actions `Docs Pages` 的 `build-storybook` hosted runner 在依赖安装后、进入构建步骤前异常卡死；已将 Storybook 的 install/build 合并为同一 CI step，补上 job timeout，并改用 Node CLI 执行静态构建以降低 runner 卡死面。该 follow-up 不改变本 spec 的产品范围与验收口径。
