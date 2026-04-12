@@ -1586,7 +1586,9 @@ impl XraySupervisor {
     ) -> Result<(ForwardProxyEndpoint, Option<String>), ProxyError> {
         self.reset_if_shared_process_exited().await;
         if endpoint.uses_local_relay
-            && let Some(relay_id) = self.acquire_relay_lease_by_url(endpoint.endpoint_url.as_ref())
+            && let Some(relay_id) = self
+                .acquire_relay_lease_by_url(endpoint.endpoint_url.as_ref())
+                .await
         {
             return Ok((endpoint.clone(), Some(relay_id)));
         }
@@ -1648,7 +1650,11 @@ impl XraySupervisor {
         }
     }
 
-    pub fn acquire_relay_lease_by_url(&mut self, endpoint_url: Option<&Url>) -> Option<String> {
+    pub async fn acquire_relay_lease_by_url(
+        &mut self,
+        endpoint_url: Option<&Url>,
+    ) -> Option<String> {
+        self.reset_if_shared_process_exited().await;
         let endpoint_url = endpoint_url?;
         let relay_id = self.handle_by_url.get(endpoint_url.as_str())?.clone();
         self.acquire_relay_lease(&relay_id)
@@ -5154,6 +5160,7 @@ if __name__ == "__main__":
             .expect("old endpoint url after sync");
         let lease_id = supervisor
             .acquire_relay_lease_by_url(Some(&old_url))
+            .await
             .expect("old relay lease id");
 
         let mut changed = vec![subscription_vless_endpoint(
@@ -5253,6 +5260,53 @@ if __name__ == "__main__":
         assert!(
             snapshot.runtime_files.is_empty(),
             "failed validation probe should not leak runtime files: {:?}",
+            snapshot.runtime_files
+        );
+    }
+
+    #[tokio::test]
+    async fn xray_supervisor_clears_cached_relay_urls_after_shared_process_exit() {
+        let runtime_dir = temp_runtime_dir("shared-xray-dead-process");
+        let mut supervisor = XraySupervisor::new(
+            write_fake_xray_binary("shared-xray-dead-process"),
+            runtime_dir,
+        );
+        let mut endpoints = vec![subscription_vless_endpoint(
+            "node-a",
+            "dead.example.com",
+            "Dead Node",
+        )];
+        supervisor
+            .sync_endpoints(&mut endpoints, None)
+            .await
+            .expect("initial sync");
+        let endpoint_url = endpoints[0]
+            .endpoint_url
+            .clone()
+            .expect("endpoint url after sync");
+
+        let shared = supervisor
+            .shared
+            .as_mut()
+            .expect("shared process after sync");
+        terminate_child_process(&mut shared.child, Duration::from_secs(2))
+            .await
+            .expect("terminate fake shared xray");
+
+        assert_eq!(
+            supervisor
+                .acquire_relay_lease_by_url(Some(&endpoint_url))
+                .await,
+            None
+        );
+        let snapshot = supervisor.debug_snapshot().await;
+        assert_eq!(snapshot.shared_pid, None);
+        assert_eq!(snapshot.active_endpoint_handles, 0);
+        assert_eq!(snapshot.total_handles, 0);
+        assert_eq!(snapshot.retiring_handles, 0);
+        assert!(
+            snapshot.runtime_files.is_empty(),
+            "dead shared process should clear runtime files: {:?}",
             snapshot.runtime_files
         );
     }

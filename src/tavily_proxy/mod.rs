@@ -3163,13 +3163,6 @@ impl TavilyProxy {
     where
         F: FnMut(Client) -> reqwest::RequestBuilder,
     {
-        {
-            let mut manager = self.forward_proxy.lock().await;
-            manager.note_request();
-        }
-        if let Err(err) = self.maybe_run_forward_proxy_maintenance().await {
-            eprintln!("forward-proxy maintenance error: {err}");
-        }
         let mut last_error: Option<ProxyError> = None;
         for candidate in plan {
             let client = match self
@@ -3199,7 +3192,8 @@ impl TavilyProxy {
                     .xray_supervisor
                     .lock()
                     .await
-                    .acquire_relay_lease_by_url(candidate.endpoint_url.as_ref());
+                    .acquire_relay_lease_by_url(candidate.endpoint_url.as_ref())
+                    .await;
                 forward_proxy::ForwardProxyRelayLease::new(
                     Arc::clone(&self.xray_supervisor),
                     relay_id,
@@ -3303,6 +3297,13 @@ impl TavilyProxy {
     where
         F: FnMut(Client) -> reqwest::RequestBuilder,
     {
+        {
+            let mut manager = self.forward_proxy.lock().await;
+            manager.note_request();
+        }
+        if let Err(err) = self.maybe_run_forward_proxy_maintenance().await {
+            eprintln!("forward-proxy maintenance error: {err}");
+        }
         let plan = self
             .build_proxy_attempt_plan(api_key_id)
             .await
@@ -3321,6 +3322,13 @@ impl TavilyProxy {
     where
         F: FnMut(Client) -> reqwest::RequestBuilder,
     {
+        {
+            let mut manager = self.forward_proxy.lock().await;
+            manager.note_request();
+        }
+        if let Err(err) = self.maybe_run_forward_proxy_maintenance().await {
+            eprintln!("forward-proxy maintenance error: {err}");
+        }
         let plan = self
             .build_proxy_attempt_plan_for_record(subject, affinity, false)
             .await
