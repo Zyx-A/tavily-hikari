@@ -3336,18 +3336,6 @@ function AdminDashboard(): JSX.Element {
   ])
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      const normalized = usersQueryInput.trim()
-      setUsersQuery((previous) => {
-        if (previous === normalized) return previous
-        setUsersPage(1)
-        return normalized
-      })
-    }, 250)
-    return () => window.clearTimeout(timer)
-  }, [usersQueryInput])
-
-  useEffect(() => {
     const usersRouteActive =
       isUsersCollectionRoute || route.name === 'user'
     if (!usersRouteActive) return

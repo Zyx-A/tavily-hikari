@@ -3,7 +3,7 @@ import type { Meta, StoryObj } from '@storybook/react-vite'
 import { addons } from 'storybook/preview-api'
 import { SELECT_STORY } from 'storybook/internal/core-events'
 import { ArrowDown, ArrowUp, ArrowUpDown, ChartColumnIncreasing } from 'lucide-react'
-import { Fragment, type ReactNode, useEffect, useLayoutEffect, useMemo, useState } from 'react'
+import { Fragment, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useLayoutEffect, useMemo, useState } from 'react'
 
 import type {
   ApiKeyBulkAction,
@@ -2134,6 +2134,53 @@ function compareAdminUserSummaryRows(
   return compareUserId(left.userId, right.userId)
 }
 
+function normalizeStorySearchQuery(query: string): string {
+  return query.trim()
+}
+
+function useStorySearchController(initialQuery = ''): {
+  queryInput: string
+  query: string
+  applySearch: () => void
+  resetSearch: () => void
+  handleQueryInputChange: (value: string) => void
+  handleQueryInputKeyDown: (event: ReactKeyboardEvent<HTMLInputElement>) => void
+} {
+  const [queryInput, setQueryInput] = useState(initialQuery)
+  const [query, setQuery] = useState(initialQuery)
+
+  const applySearch = () => {
+    const normalized = normalizeStorySearchQuery(queryInput)
+    setQueryInput(normalized)
+    setQuery(normalized)
+  }
+
+  const resetSearch = () => {
+    setQueryInput('')
+    setQuery('')
+  }
+
+  const handleQueryInputChange = (value: string) => {
+    setQueryInput(value)
+  }
+
+  const handleQueryInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      applySearch()
+    }
+  }
+
+  return {
+    queryInput,
+    query,
+    applySearch,
+    resetSearch,
+    handleQueryInputChange,
+    handleQueryInputKeyDown,
+  }
+}
+
 function compareAdminUnboundTokenUsageRows(
   left: AdminUnboundTokenUsageSummary,
   right: AdminUnboundTokenUsageSummary,
@@ -4162,10 +4209,17 @@ function UsersPageCanvas(): JSX.Element {
   const admin = useTranslate().admin
   const { language } = useLanguage()
   const users = admin.users
-  const [query, setQuery] = useState('')
   const [allowRegistration, setAllowRegistration] = useState(true)
   const [sortField, setSortField] = useState<AdminUsersSortField | null>(null)
   const [sortOrder, setSortOrder] = useState<SortDirection | null>(null)
+  const {
+    queryInput,
+    query,
+    applySearch,
+    resetSearch,
+    handleQueryInputChange,
+    handleQueryInputKeyDown,
+  } = useStorySearchController()
   const normalizedQuery = query.trim().toLowerCase()
   const effectiveSortField = sortField ?? ADMIN_USERS_DEFAULT_SORT_FIELD
   const effectiveSortOrder = sortOrder ?? ADMIN_USERS_DEFAULT_SORT_ORDER
@@ -4271,16 +4325,23 @@ function UsersPageCanvas(): JSX.Element {
             />
           </div>
           <div className="users-search-controls">
-            <input
+            <Input
               type="text"
-              className="input input-bordered users-search-input"
+              name="users-search"
+              className="users-search-input"
               placeholder={users.searchPlaceholder}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              value={queryInput}
+              onChange={(event) => handleQueryInputChange(event.target.value)}
+              onKeyDown={handleQueryInputKeyDown}
             />
-            <button type="button" className="btn btn-outline">
+            <Button type="button" variant="outline" onClick={applySearch}>
               {users.search}
-            </button>
+            </Button>
+            {(queryInput.length > 0 || query.length > 0) && (
+              <Button type="button" variant="ghost" onClick={resetSearch}>
+                {users.clear}
+              </Button>
+            )}
           </div>
         </div>
 
@@ -4403,9 +4464,16 @@ function UsersUsagePageCanvas({
   const users = admin.users
   const usageDailyRateLabel = language === 'zh' ? users.usage.table.dailySuccessRate : 'Daily'
   const usageMonthlyRateLabel = language === 'zh' ? users.usage.table.monthlySuccessRate : 'Monthly'
-  const [query, setQuery] = useState('')
   const [sortField, setSortField] = useState<AdminUsersSortField | null>(null)
   const [sortOrder, setSortOrder] = useState<SortDirection | null>(null)
+  const {
+    queryInput,
+    query,
+    applySearch,
+    resetSearch,
+    handleQueryInputChange,
+    handleQueryInputKeyDown,
+  } = useStorySearchController()
   const [monthlyBrokenDrawer, setMonthlyBrokenDrawer] = useState<{
     label: string
     items: MonthlyBrokenKeyDetail[]
@@ -4523,25 +4591,27 @@ function UsersUsagePageCanvas({
           </div>
           <div className="admin-inline-actions" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <div className="admin-stacked-only">
-              <button type="button" className="btn btn-outline" onClick={() => openAdminStory('admin-pages--users')}>
+              <Button type="button" variant="outline" onClick={() => openAdminStory('admin-pages--users')}>
                 {users.usage.back}
-              </button>
+              </Button>
             </div>
             <div className="users-search-controls">
-              <input
+              <Input
                 type="text"
-                className="input input-bordered users-search-input"
+                name="user-usage-search"
+                className="users-search-input"
                 placeholder={users.searchPlaceholder}
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
+                value={queryInput}
+                onChange={(event) => handleQueryInputChange(event.target.value)}
+                onKeyDown={handleQueryInputKeyDown}
               />
-              <button type="button" className="btn btn-outline">
+              <Button type="button" variant="outline" onClick={applySearch}>
                 {users.search}
-              </button>
-              {query.length > 0 && (
-                <button type="button" className="btn btn-ghost" onClick={() => setQuery('')}>
+              </Button>
+              {(queryInput.length > 0 || query.length > 0) && (
+                <Button type="button" variant="ghost" onClick={resetSearch}>
                   {users.clear}
-                </button>
+                </Button>
               )}
             </div>
           </div>
@@ -6012,10 +6082,69 @@ export const Jobs: Story = {
   },
 }
 
+async function waitForStoryUi(ms = 80): Promise<void> {
+  await new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+function updateStorySearchInput(input: HTMLInputElement, value: string): void {
+  input.focus()
+  const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+  if (valueSetter) {
+    valueSetter.call(input, value)
+  } else {
+    input.value = value
+  }
+  input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }))
+}
+
+function submitStorySearchInput(input: HTMLInputElement): void {
+  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+}
+
+function getFirstRenderedUserLabel(root: ParentNode): string | null {
+  return root.querySelector<HTMLElement>('tbody tr strong')?.textContent?.trim() ?? null
+}
+
 export const Users: Story = {
   render: () => <UsersPageCanvas />,
   parameters: {
     viewport: { defaultViewport: '1440-device-desktop' },
+  },
+  play: async ({ canvasElement }) => {
+    await waitForStoryUi()
+    const searchInput = canvasElement.querySelector<HTMLInputElement>('input[name="users-search"]')
+    if (!searchInput) {
+      throw new Error('Expected users story to render the users search input.')
+    }
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Alice Wang') {
+      throw new Error('Expected users story to start with Alice Wang as the first rendered row.')
+    }
+
+    updateStorySearchInput(searchInput, 'bob')
+    await waitForStoryUi(320)
+
+    if (canvasElement.ownerDocument.activeElement !== searchInput) {
+      throw new Error('Expected users search input to keep focus while typing before submitting.')
+    }
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Alice Wang') {
+      throw new Error('Expected users story to keep the unfiltered order before the search is submitted.')
+    }
+
+    submitStorySearchInput(searchInput)
+    await waitForStoryUi()
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Bob Chen') {
+      throw new Error('Expected users story to filter rows only after pressing Enter.')
+    }
+
+    const clearButton = canvasElement.querySelector<HTMLButtonElement>('.users-search-controls button:last-of-type')
+    clearButton?.click()
+    await waitForStoryUi()
+    if (searchInput.value !== '') {
+      throw new Error('Expected users story clear action to reset the search draft.')
+    }
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Alice Wang') {
+      throw new Error('Expected users story clear action to restore the full list.')
+    }
   },
 }
 
@@ -6025,7 +6154,7 @@ export const UsersUsage: Story = {
     viewport: { defaultViewport: '1440-device-desktop' },
   },
   play: async ({ canvasElement }) => {
-    await new Promise((resolve) => window.setTimeout(resolve, 80))
+    await waitForStoryUi()
     const utility = canvasElement.querySelector<HTMLElement>('.admin-sidebar-utility')
     const intro = canvasElement.querySelector<HTMLElement>('.admin-compact-intro')
     if (!utility) {
@@ -6033,6 +6162,40 @@ export const UsersUsage: Story = {
     }
     if (!intro || !intro.textContent?.includes('用量')) {
       throw new Error('Expected user usage page to render a compact intro with the page title.')
+    }
+
+    const searchInput = canvasElement.querySelector<HTMLInputElement>('input[name="user-usage-search"]')
+    if (!searchInput) {
+      throw new Error('Expected users usage story to render the usage search input.')
+    }
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Alice Wang') {
+      throw new Error('Expected users usage story to start with Alice Wang as the first rendered row.')
+    }
+
+    updateStorySearchInput(searchInput, 'charlie')
+    await waitForStoryUi(320)
+
+    if (canvasElement.ownerDocument.activeElement !== searchInput) {
+      throw new Error('Expected users usage search input to keep focus while typing before submitting.')
+    }
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Alice Wang') {
+      throw new Error('Expected users usage story to keep the unfiltered order before the search is submitted.')
+    }
+
+    submitStorySearchInput(searchInput)
+    await waitForStoryUi()
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Charlie Li') {
+      throw new Error('Expected users usage story to filter rows only after pressing Enter.')
+    }
+
+    const clearButton = canvasElement.querySelector<HTMLButtonElement>('.users-search-controls button:last-of-type')
+    clearButton?.click()
+    await waitForStoryUi()
+    if (searchInput.value !== '') {
+      throw new Error('Expected users usage story clear action to reset the search draft.')
+    }
+    if (getFirstRenderedUserLabel(canvasElement) !== 'Alice Wang') {
+      throw new Error('Expected users usage story clear action to restore the full list.')
     }
   },
 }
