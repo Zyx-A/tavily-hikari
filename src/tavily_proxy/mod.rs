@@ -1859,18 +1859,51 @@ impl TavilyProxy {
         ProxyError,
     > {
         let egress_socks5_url = self.current_forward_proxy_egress_socks5_url().await;
-        let resolved = self
-            .xray_supervisor
-            .lock()
-            .await
-            .resolve_validation_endpoint(endpoint, egress_socks5_url.as_ref())
-            .await?;
-        let relay_lease = forward_proxy::ForwardProxyRelayLease::acquire_for_endpoint(
-            Arc::clone(&self.xray_supervisor),
-            &resolved,
-        )
-        .ok_or_else(|| ProxyError::Other("xray_missing".to_string()))?;
+        let (resolved, relay_lease) = {
+            let mut supervisor = self.xray_supervisor.lock().await;
+            let resolved = supervisor
+                .resolve_validation_endpoint(endpoint, egress_socks5_url.as_ref())
+                .await?;
+            let relay_lease = if resolved.uses_local_relay {
+                let relay_handle = supervisor
+                    .acquire_relay_handle_for_endpoint(&resolved)
+                    .ok_or_else(|| ProxyError::Other("xray_missing".to_string()))?;
+                forward_proxy::ForwardProxyRelayLease::from_acquired_handle(
+                    Arc::clone(&self.xray_supervisor),
+                    relay_handle,
+                )
+            } else {
+                forward_proxy::ForwardProxyRelayLease::new(Arc::clone(&self.xray_supervisor))
+            };
+            (resolved, relay_lease)
+        };
         Ok((resolved, relay_lease))
+    }
+
+    async fn recover_forward_proxy_candidate(
+        &self,
+        proxy_key: &str,
+    ) -> Result<Option<forward_proxy::SelectedForwardProxy>, ProxyError> {
+        let egress_socks5_url = self.current_forward_proxy_egress_socks5_url().await;
+        let mut manager = self.forward_proxy.lock().await;
+        let Some(current_endpoint) = manager.endpoint_by_key(proxy_key) else {
+            return Ok(None);
+        };
+        if !current_endpoint.uses_local_relay {
+            return Ok(current_endpoint
+                .is_selectable()
+                .then(|| forward_proxy::SelectedForwardProxy::from_endpoint(&current_endpoint)));
+        }
+        {
+            let mut xray = self.xray_supervisor.lock().await;
+            xray.sync_endpoints(&mut manager.endpoints, egress_socks5_url.as_ref())
+                .await?;
+        }
+        self.sync_forward_proxy_runtime_state(&mut manager).await?;
+        Ok(manager
+            .endpoint_by_key(proxy_key)
+            .filter(|endpoint| endpoint.is_selectable())
+            .map(|endpoint| forward_proxy::SelectedForwardProxy::from_endpoint(&endpoint)))
     }
 
     pub(crate) async fn probe_forward_proxy_endpoint(
@@ -3178,12 +3211,33 @@ impl TavilyProxy {
         let result = async {
             let mut last_error: Option<ProxyError> = None;
             for candidate in plan {
-                let Some(relay_lease) =
-                    forward_proxy::ForwardProxyRelayLease::acquire_for_selection(
-                        Arc::clone(&self.xray_supervisor),
-                        &candidate,
-                    )
-                else {
+                let mut candidate = candidate;
+                let mut attempted_recovery = false;
+                let relay_lease = loop {
+                    if let Some(relay_lease) =
+                        forward_proxy::ForwardProxyRelayLease::acquire_for_selection(
+                            Arc::clone(&self.xray_supervisor),
+                            &candidate,
+                        )
+                    {
+                        break Some(relay_lease);
+                    }
+                    if !candidate.uses_local_relay() || attempted_recovery {
+                        break None;
+                    }
+                    attempted_recovery = true;
+                    match self.recover_forward_proxy_candidate(&candidate.key).await {
+                        Ok(Some(recovered_candidate)) => {
+                            candidate = recovered_candidate;
+                        }
+                        Ok(None) => break None,
+                        Err(err) => {
+                            last_error = Some(err);
+                            break None;
+                        }
+                    }
+                };
+                let Some(relay_lease) = relay_lease else {
                     let _ = self
                         .record_forward_proxy_attempt(
                             &candidate.key,
@@ -3194,7 +3248,9 @@ impl TavilyProxy {
                             Some("xray_missing"),
                         )
                         .await;
-                    last_error = Some(ProxyError::Other("xray_missing".to_string()));
+                    if last_error.is_none() {
+                        last_error = Some(ProxyError::Other("xray_missing".to_string()));
+                    }
                     continue;
                 };
                 let client = match self

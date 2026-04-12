@@ -1165,6 +1165,10 @@ impl SelectedForwardProxy {
             relay_handle: endpoint.relay_handle(),
         }
     }
+
+    pub(crate) fn uses_local_relay(&self) -> bool {
+        self.uses_local_relay
+    }
 }
 
 #[derive(Debug)]
@@ -1178,6 +1182,16 @@ impl ForwardProxyRelayLease {
         Self {
             supervisor,
             relay_handle: None,
+        }
+    }
+
+    pub(crate) fn from_acquired_handle(
+        supervisor: Arc<Mutex<XraySupervisor>>,
+        relay_handle: Arc<SharedXrayRelayHandle>,
+    ) -> Self {
+        Self {
+            supervisor,
+            relay_handle: Some(relay_handle),
         }
     }
 
@@ -1763,6 +1777,18 @@ impl XraySupervisor {
     fn acquire_relay_lease(&mut self, relay_id: &str) -> Option<String> {
         let handle = self.handles.get(relay_id)?.clone();
         handle.try_acquire_lease().then_some(relay_id.to_string())
+    }
+
+    pub(crate) fn acquire_relay_handle_for_endpoint(
+        &mut self,
+        endpoint: &ForwardProxyEndpoint,
+    ) -> Option<Arc<SharedXrayRelayHandle>> {
+        self.reset_if_shared_process_exited();
+        if !endpoint.uses_local_relay {
+            return None;
+        }
+        let relay_handle = endpoint.relay_handle()?;
+        relay_handle.try_acquire_lease().then_some(relay_handle)
     }
 
     async fn create_relay_handle(
@@ -5536,6 +5562,50 @@ if __name__ == "__main__":
     }
 
     #[tokio::test]
+    async fn validation_endpoint_holds_first_lease_before_reap() {
+        let root_dir = temp_runtime_dir("proxy-shared-xray-validation-lease");
+        let db_path = root_dir.join("proxy.db");
+        let runtime_dir = root_dir.join("xray-runtime");
+        let proxy = TavilyProxy::with_options(
+            Vec::<String>::new(),
+            "http://127.0.0.1:9/mcp",
+            db_path
+                .to_str()
+                .expect("database path should be valid utf-8"),
+            TavilyProxyOptions {
+                xray_binary: write_fake_xray_binary("proxy-shared-xray-validation-lease"),
+                xray_runtime_dir: runtime_dir,
+                forward_proxy_trace_url: Url::parse("http://127.0.0.1/cdn-cgi/trace")
+                    .expect("valid trace url"),
+            },
+        )
+        .await
+        .expect("create proxy with fake xray");
+        let endpoint =
+            subscription_vless_endpoint("validate-node", "validate.example.com", "Validate");
+
+        let (_resolved, relay_lease) = proxy
+            .resolve_forward_proxy_validation_endpoint(&endpoint)
+            .await
+            .expect("resolve validation endpoint with held lease");
+
+        {
+            let mut supervisor = proxy.xray_supervisor.lock().await;
+            supervisor.reap_retired_handles_now().await;
+            let snapshot = supervisor.debug_snapshot().await;
+            assert!(snapshot.shared_pid.is_some());
+            assert_eq!(snapshot.total_handles, 1);
+            assert_eq!(snapshot.retiring_handles, 1);
+        }
+
+        relay_lease.release().await;
+        let snapshot = proxy.xray_supervisor.lock().await.debug_snapshot().await;
+        assert_eq!(snapshot.shared_pid, None);
+        assert_eq!(snapshot.total_handles, 0);
+        assert_eq!(snapshot.retiring_handles, 0);
+    }
+
+    #[tokio::test]
     async fn tavily_proxy_probe_failure_releases_validation_lease() {
         let root_dir = temp_runtime_dir("proxy-shared-xray-probe-failure");
         let db_path = root_dir.join("proxy.db");
@@ -5695,6 +5765,84 @@ if __name__ == "__main__":
             second_settings.nodes[0].endpoint_url.as_deref(),
             Some(first_endpoint_url.as_str())
         );
+
+        proxy.xray_supervisor.lock().await.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn send_plan_recovers_after_shared_xray_exit() {
+        let root_dir = temp_runtime_dir("proxy-shared-xray-recover");
+        let db_path = root_dir.join("proxy.db");
+        let runtime_dir = root_dir.join("xray-runtime");
+        let proxy = TavilyProxy::with_options(
+            Vec::<String>::new(),
+            "http://127.0.0.1:9/mcp",
+            db_path
+                .to_str()
+                .expect("database path should be valid utf-8"),
+            TavilyProxyOptions {
+                xray_binary: write_fake_xray_binary("proxy-shared-xray-recover"),
+                xray_runtime_dir: runtime_dir,
+                forward_proxy_trace_url: Url::parse("http://127.0.0.1/cdn-cgi/trace")
+                    .expect("valid trace url"),
+            },
+        )
+        .await
+        .expect("create proxy with fake xray");
+
+        proxy
+            .update_forward_proxy_settings(
+                ForwardProxySettings {
+                    proxy_urls: vec![sample_vless_share_link("recover.example.com", "Recover")],
+                    subscription_urls: Vec::new(),
+                    subscription_update_interval_secs: 3600,
+                    insert_direct: false,
+                    egress_socks5_enabled: false,
+                    egress_socks5_url: String::new(),
+                },
+                true,
+            )
+            .await
+            .expect("save proxy-only settings");
+        let candidate = proxy
+            .build_proxy_attempt_plan_for_record(
+                "subject",
+                &ForwardProxyAffinityRecord::default(),
+                false,
+            )
+            .await
+            .expect("build proxy attempt plan")
+            .into_iter()
+            .next()
+            .expect("proxy-only candidate");
+
+        {
+            let mut supervisor = proxy.xray_supervisor.lock().await;
+            let shared = supervisor
+                .shared
+                .as_mut()
+                .expect("shared process after settings save");
+            terminate_child_process(&mut shared.child, Duration::from_secs(2))
+                .await
+                .expect("terminate fake shared xray");
+        }
+
+        let err = proxy
+            .send_with_forward_proxy_plan("subject", None, "request", vec![candidate], |client| {
+                client.get("http://127.0.0.1:9/")
+            })
+            .await
+            .expect_err("closed upstream should still fail after relay rebuild");
+        assert!(
+            matches!(err, ProxyError::Http(_)),
+            "request path should recover relay after shared exit instead of surfacing xray_missing: {err}"
+        );
+
+        let snapshot = proxy.xray_supervisor.lock().await.debug_snapshot().await;
+        assert!(snapshot.shared_pid.is_some());
+        assert_eq!(snapshot.active_endpoint_handles, 1);
+        assert_eq!(snapshot.total_handles, 1);
+        assert_eq!(snapshot.retiring_handles, 0);
 
         proxy.xray_supervisor.lock().await.shutdown_all().await;
     }
