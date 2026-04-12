@@ -1436,18 +1436,16 @@ impl TavilyProxy {
         let mut last_messages: Vec<Option<String>> = vec![None; probe_total];
         let mut ips: Vec<Option<String>> = vec![None; probe_total];
         let mut locations: Vec<Option<String>> = vec![None; probe_total];
-        let mut temporary_xray_keys = Vec::with_capacity(probe_total);
+        let mut validation_leases = Vec::with_capacity(probe_total);
         let validation_result = async {
             let mut resolved_endpoints = Vec::with_capacity(probe_total);
 
             for endpoint in &endpoints {
                 ensure_forward_proxy_not_cancelled(cancellation)?;
-                let (resolved_endpoint, temporary_xray_key) = self
+                let (resolved_endpoint, relay_lease) = self
                     .resolve_forward_proxy_validation_endpoint(endpoint)
                     .await?;
-                if let Some(temp_key) = temporary_xray_key {
-                    temporary_xray_keys.push(temp_key);
-                }
+                validation_leases.push(relay_lease);
                 resolved_endpoints.push(resolved_endpoint);
             }
 
@@ -1593,9 +1591,8 @@ impl TavilyProxy {
             Ok::<(), ProxyError>(())
         }
         .await;
-        for temp_key in temporary_xray_keys {
-            self.cleanup_forward_proxy_validation_endpoint(Some(temp_key))
-                .await;
+        for relay_lease in validation_leases {
+            relay_lease.release().await;
         }
         validation_result?;
         let mut best_latency: Option<f64> = None;
@@ -1837,26 +1834,26 @@ impl TavilyProxy {
     pub(crate) async fn resolve_forward_proxy_validation_endpoint(
         &self,
         endpoint: &forward_proxy::ForwardProxyEndpoint,
-    ) -> Result<(forward_proxy::ForwardProxyEndpoint, Option<String>), ProxyError> {
+    ) -> Result<
+        (
+            forward_proxy::ForwardProxyEndpoint,
+            forward_proxy::ForwardProxyRelayLease,
+        ),
+        ProxyError,
+    > {
         let egress_socks5_url = self.current_forward_proxy_egress_socks5_url().await;
-        self.xray_supervisor
+        let resolved = self
+            .xray_supervisor
             .lock()
             .await
             .resolve_validation_endpoint(endpoint, egress_socks5_url.as_ref())
-            .await
-    }
-
-    pub(crate) async fn cleanup_forward_proxy_validation_endpoint(
-        &self,
-        relay_lease_id: Option<String>,
-    ) {
-        if let Some(relay_id) = relay_lease_id {
-            self.xray_supervisor
-                .lock()
-                .await
-                .release_relay_lease(&relay_id)
-                .await;
-        }
+            .await?;
+        let relay_lease = forward_proxy::ForwardProxyRelayLease::acquire_for_endpoint(
+            Arc::clone(&self.xray_supervisor),
+            &resolved,
+        )
+        .ok_or_else(|| ProxyError::Other("xray_missing".to_string()))?;
+        Ok((resolved, relay_lease))
     }
 
     pub(crate) async fn probe_forward_proxy_endpoint(
@@ -1867,7 +1864,7 @@ impl TavilyProxy {
         cancellation: Option<&ForwardProxyCancellation>,
     ) -> Result<f64, ProxyError> {
         ensure_forward_proxy_not_cancelled(cancellation)?;
-        let (resolved, temporary_xray_key) = self
+        let (resolved, relay_lease) = self
             .resolve_forward_proxy_validation_endpoint(endpoint)
             .await?;
         let result = run_forward_proxy_future_with_cancel(
@@ -1880,8 +1877,7 @@ impl TavilyProxy {
             ),
         )
         .await;
-        self.cleanup_forward_proxy_validation_endpoint(temporary_xray_key)
-            .await;
+        relay_lease.release().await;
         result?
     }
 
@@ -1902,7 +1898,7 @@ impl TavilyProxy {
             return Some(trace);
         }
         let trace_url = self.forward_proxy_trace_url.clone();
-        let (resolved, temporary_xray_key) = self
+        let (resolved, relay_lease) = self
             .resolve_forward_proxy_validation_endpoint(endpoint)
             .await
             .ok()?;
@@ -1927,8 +1923,7 @@ impl TavilyProxy {
         .await
         .ok()
         .flatten();
-        self.cleanup_forward_proxy_validation_endpoint(temporary_xray_key)
-            .await;
+        relay_lease.release().await;
         result
     }
 
@@ -3164,15 +3159,14 @@ impl TavilyProxy {
         F: FnMut(Client) -> reqwest::RequestBuilder,
     {
         let mut last_error: Option<ProxyError> = None;
-        for candidate in plan {
-            let client = match self
-                .forward_proxy_clients
-                .client_for(candidate.endpoint_url.as_ref())
-                .await
-            {
-                Ok(client) => client,
-                Err(err) => {
-                    let error_code = map_forward_proxy_validation_error_code(&err);
+        let result = 'send: {
+            for candidate in plan {
+                let Some(relay_lease) =
+                    forward_proxy::ForwardProxyRelayLease::acquire_for_selection(
+                        Arc::clone(&self.xray_supervisor),
+                        &candidate,
+                    )
+                else {
                     let _ = self
                         .record_forward_proxy_attempt(
                             &candidate.key,
@@ -3180,112 +3174,128 @@ impl TavilyProxy {
                             request_kind,
                             false,
                             None,
-                            Some(error_code.as_str()),
+                            Some("xray_missing"),
                         )
                         .await;
-                    last_error = Some(err);
+                    last_error = Some(ProxyError::Other("xray_missing".to_string()));
                     continue;
-                }
-            };
-            let relay_lease = {
-                let relay_id = self
-                    .xray_supervisor
-                    .lock()
+                };
+                let client = match self
+                    .forward_proxy_clients
+                    .client_for(candidate.endpoint_url.as_ref())
                     .await
-                    .acquire_relay_lease_by_url(candidate.endpoint_url.as_ref())
-                    .await;
-                forward_proxy::ForwardProxyRelayLease::new(
-                    Arc::clone(&self.xray_supervisor),
-                    relay_id,
-                )
+                {
+                    Ok(client) => client,
+                    Err(err) => {
+                        drop(relay_lease);
+                        let error_code = map_forward_proxy_validation_error_code(&err);
+                        let _ = self
+                            .record_forward_proxy_attempt(
+                                &candidate.key,
+                                affinity_owner_key_id,
+                                request_kind,
+                                false,
+                                None,
+                                Some(error_code.as_str()),
+                            )
+                            .await;
+                        last_error = Some(err);
+                        continue;
+                    }
+                };
+                let started = Instant::now();
+                match build(client).send().await {
+                    Ok(response) => {
+                        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let _ = self
+                            .record_forward_proxy_attempt(
+                                &candidate.key,
+                                affinity_owner_key_id,
+                                request_kind,
+                                true,
+                                Some(latency_ms),
+                                None,
+                            )
+                            .await;
+                        if let Some(api_key_id) = affinity_owner_key_id {
+                            let _ = self
+                                .promote_proxy_affinity_secondary(api_key_id, &candidate.key)
+                                .await;
+                        }
+                        break 'send Ok((response, relay_lease));
+                    }
+                    Err(err) => {
+                        drop(relay_lease);
+                        let failure_kind = forward_proxy::failure_kind_from_http_error(&err);
+                        let _ = self
+                            .record_forward_proxy_attempt(
+                                &candidate.key,
+                                affinity_owner_key_id,
+                                request_kind,
+                                false,
+                                None,
+                                Some(failure_kind),
+                            )
+                            .await;
+                        last_error = Some(ProxyError::Http(err));
+                    }
+                }
+            }
+
+            let direct = {
+                let manager = self.forward_proxy.lock().await;
+                manager
+                    .endpoint_by_key(forward_proxy::FORWARD_PROXY_DIRECT_KEY)
+                    .filter(|endpoint| endpoint.is_selectable())
+                    .map(|endpoint| forward_proxy::SelectedForwardProxy::from_endpoint(&endpoint))
             };
+            let Some(direct) = direct else {
+                break 'send Err(last_error.unwrap_or_else(|| {
+                    ProxyError::Other("no selectable forward proxy endpoints available".to_string())
+                }));
+            };
+            let client = self.forward_proxy_clients.direct_client();
             let started = Instant::now();
             match build(client).send().await {
                 Ok(response) => {
-                    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
                     let _ = self
                         .record_forward_proxy_attempt(
-                            &candidate.key,
+                            &direct.key,
                             affinity_owner_key_id,
                             request_kind,
                             true,
-                            Some(latency_ms),
+                            Some(started.elapsed().as_secs_f64() * 1000.0),
                             None,
                         )
                         .await;
-                    if let Some(api_key_id) = affinity_owner_key_id {
-                        let _ = self
-                            .promote_proxy_affinity_secondary(api_key_id, &candidate.key)
-                            .await;
-                    }
-                    return Ok((response, relay_lease));
+                    break 'send Ok((
+                        response,
+                        forward_proxy::ForwardProxyRelayLease::new(Arc::clone(
+                            &self.xray_supervisor,
+                        )),
+                    ));
                 }
                 Err(err) => {
-                    drop(relay_lease);
-                    let failure_kind = forward_proxy::failure_kind_from_http_error(&err);
                     let _ = self
                         .record_forward_proxy_attempt(
-                            &candidate.key,
+                            &direct.key,
                             affinity_owner_key_id,
                             request_kind,
                             false,
                             None,
-                            Some(failure_kind),
+                            Some(forward_proxy::failure_kind_from_http_error(&err)),
                         )
                         .await;
-                    last_error = Some(ProxyError::Http(err));
+                    break 'send Err(last_error.unwrap_or(ProxyError::Http(err)));
                 }
             }
-        }
-
-        let direct = {
-            let manager = self.forward_proxy.lock().await;
-            manager
-                .endpoint_by_key(forward_proxy::FORWARD_PROXY_DIRECT_KEY)
-                .filter(|endpoint| endpoint.is_selectable())
-                .map(|endpoint| forward_proxy::SelectedForwardProxy::from_endpoint(&endpoint))
         };
-        let Some(direct) = direct else {
-            return Err(last_error.unwrap_or_else(|| {
-                ProxyError::Other("no selectable forward proxy endpoints available".to_string())
-            }));
-        };
-        let client = self.forward_proxy_clients.direct_client();
-        let started = Instant::now();
-        match build(client).send().await {
-            Ok(response) => {
-                let _ = self
-                    .record_forward_proxy_attempt(
-                        &direct.key,
-                        affinity_owner_key_id,
-                        request_kind,
-                        true,
-                        Some(started.elapsed().as_secs_f64() * 1000.0),
-                        None,
-                    )
-                    .await;
-                Ok((
-                    response,
-                    forward_proxy::ForwardProxyRelayLease::new(
-                        Arc::clone(&self.xray_supervisor),
-                        None,
-                    ),
-                ))
-            }
-            Err(err) => {
-                let _ = self
-                    .record_forward_proxy_attempt(
-                        &direct.key,
-                        affinity_owner_key_id,
-                        request_kind,
-                        false,
-                        None,
-                        Some(forward_proxy::failure_kind_from_http_error(&err)),
-                    )
-                    .await;
-                Err(last_error.unwrap_or(ProxyError::Http(err)))
-            }
-        }
+        self.xray_supervisor
+            .lock()
+            .await
+            .reap_retired_handles_now()
+            .await;
+        result
     }
 
     pub(crate) async fn send_with_forward_proxy<F>(

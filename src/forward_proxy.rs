@@ -7,7 +7,10 @@ use std::{
     io,
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -303,6 +306,7 @@ pub struct ForwardProxyEndpoint {
     pub uses_local_relay: bool,
     pub manual_present: bool,
     pub subscription_sources: BTreeSet<String>,
+    relay_handle: Option<Weak<SharedXrayRelayHandle>>,
 }
 
 impl ForwardProxyEndpoint {
@@ -317,6 +321,7 @@ impl ForwardProxyEndpoint {
             uses_local_relay: false,
             manual_present: false,
             subscription_sources: BTreeSet::new(),
+            relay_handle: None,
         }
     }
 
@@ -337,6 +342,7 @@ impl ForwardProxyEndpoint {
             uses_local_relay: false,
             manual_present: true,
             subscription_sources: BTreeSet::new(),
+            relay_handle: None,
         }
     }
 
@@ -358,6 +364,7 @@ impl ForwardProxyEndpoint {
             uses_local_relay: false,
             manual_present: false,
             subscription_sources: BTreeSet::from([subscription_source]),
+            relay_handle: None,
         };
         endpoint.refresh_source();
         endpoint
@@ -413,8 +420,17 @@ impl ForwardProxyEndpoint {
             self.endpoint_url = other.endpoint_url;
             self.raw_url = other.raw_url;
             self.uses_local_relay = other.uses_local_relay;
+            self.relay_handle = None;
         }
         self.refresh_source();
+    }
+
+    pub(crate) fn relay_handle(&self) -> Option<Arc<SharedXrayRelayHandle>> {
+        self.relay_handle.as_ref().and_then(Weak::upgrade)
+    }
+
+    fn set_relay_handle(&mut self, relay_handle: Option<&Arc<SharedXrayRelayHandle>>) {
+        self.relay_handle = relay_handle.map(Arc::downgrade);
     }
 }
 
@@ -1132,6 +1148,8 @@ pub struct SelectedForwardProxy {
     pub kind: String,
     pub endpoint_url: Option<Url>,
     pub endpoint_url_raw: Option<String>,
+    uses_local_relay: bool,
+    relay_handle: Option<Arc<SharedXrayRelayHandle>>,
 }
 
 impl SelectedForwardProxy {
@@ -1143,6 +1161,8 @@ impl SelectedForwardProxy {
             kind: endpoint.protocol.as_str().to_string(),
             endpoint_url: endpoint.endpoint_url.clone(),
             endpoint_url_raw: endpoint.raw_url.clone(),
+            uses_local_relay: endpoint.uses_local_relay,
+            relay_handle: endpoint.relay_handle(),
         }
     }
 }
@@ -1150,40 +1170,79 @@ impl SelectedForwardProxy {
 #[derive(Debug)]
 pub struct ForwardProxyRelayLease {
     supervisor: Arc<Mutex<XraySupervisor>>,
-    relay_id: Option<String>,
+    relay_handle: Option<Arc<SharedXrayRelayHandle>>,
 }
 
 impl ForwardProxyRelayLease {
-    pub fn new(supervisor: Arc<Mutex<XraySupervisor>>, relay_id: Option<String>) -> Self {
+    pub fn new(supervisor: Arc<Mutex<XraySupervisor>>) -> Self {
         Self {
             supervisor,
-            relay_id,
+            relay_handle: None,
         }
     }
 
-    pub fn relay_id(&self) -> Option<&str> {
-        self.relay_id.as_deref()
+    pub fn acquire_for_selection(
+        supervisor: Arc<Mutex<XraySupervisor>>,
+        candidate: &SelectedForwardProxy,
+    ) -> Option<Self> {
+        Self::acquire(
+            supervisor,
+            candidate.uses_local_relay,
+            candidate.relay_handle.clone(),
+        )
+    }
+
+    pub fn acquire_for_endpoint(
+        supervisor: Arc<Mutex<XraySupervisor>>,
+        endpoint: &ForwardProxyEndpoint,
+    ) -> Option<Self> {
+        Self::acquire(
+            supervisor,
+            endpoint.uses_local_relay,
+            endpoint.relay_handle(),
+        )
+    }
+
+    fn acquire(
+        supervisor: Arc<Mutex<XraySupervisor>>,
+        uses_local_relay: bool,
+        relay_handle: Option<Arc<SharedXrayRelayHandle>>,
+    ) -> Option<Self> {
+        if !uses_local_relay {
+            return Some(Self::new(supervisor));
+        }
+        if let Ok(mut locked) = supervisor.try_lock() {
+            locked.reset_if_shared_process_exited();
+        }
+        let relay_handle = relay_handle?;
+        if !relay_handle.try_acquire_lease() {
+            return None;
+        }
+        Some(Self {
+            supervisor,
+            relay_handle: Some(relay_handle),
+        })
     }
 
     pub async fn release(mut self) {
-        if let Some(relay_id) = self.relay_id.take() {
-            self.supervisor
-                .lock()
-                .await
-                .release_relay_lease(&relay_id)
-                .await;
+        if let Some(relay_handle) = self.relay_handle.take() {
+            relay_handle.release_lease();
+            drop(relay_handle);
+            self.supervisor.lock().await.reap_retired_handles().await;
         }
     }
 }
 
 impl Drop for ForwardProxyRelayLease {
     fn drop(&mut self) {
-        let Some(relay_id) = self.relay_id.take() else {
+        let Some(relay_handle) = self.relay_handle.take() else {
             return;
         };
         let supervisor = Arc::clone(&self.supervisor);
         tokio::spawn(async move {
-            supervisor.lock().await.release_relay_lease(&relay_id).await;
+            relay_handle.release_lease();
+            drop(relay_handle);
+            supervisor.lock().await.reap_retired_handles().await;
         });
     }
 }
@@ -1414,8 +1473,8 @@ struct SharedXrayProcess {
     child: Child,
 }
 
-#[derive(Debug, Clone)]
-struct SharedXrayRelayHandle {
+#[derive(Debug)]
+pub(crate) struct SharedXrayRelayHandle {
     relay_id: String,
     endpoint_key: Option<String>,
     route_key: String,
@@ -1425,14 +1484,46 @@ struct SharedXrayRelayHandle {
     outbound_tags: Vec<String>,
     rule_tag: String,
     config_paths: Vec<PathBuf>,
-    lease_count: usize,
+    lease_count: AtomicUsize,
+    invalidated: AtomicBool,
     temporary: bool,
 }
 
 impl SharedXrayRelayHandle {
-    fn drop_runtime_files(&mut self) {
+    fn drop_runtime_files(&self) {
         cleanup_paths(&self.config_paths);
-        self.config_paths.clear();
+    }
+
+    fn try_acquire_lease(&self) -> bool {
+        if self.invalidated.load(Ordering::Acquire) {
+            return false;
+        }
+        self.lease_count.fetch_add(1, Ordering::AcqRel);
+        if self.invalidated.load(Ordering::Acquire) {
+            self.release_lease();
+            return false;
+        }
+        true
+    }
+
+    fn release_lease(&self) {
+        let _ = self
+            .lease_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(1))
+            });
+    }
+
+    fn lease_count(&self) -> usize {
+        self.lease_count.load(Ordering::Acquire)
+    }
+
+    fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
+    }
+
+    fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
     }
 }
 
@@ -1452,7 +1543,7 @@ pub struct XraySupervisor {
     pub runtime_dir: PathBuf,
     shared: Option<SharedXrayProcess>,
     active_endpoint_handles: HashMap<String, String>,
-    handles: HashMap<String, SharedXrayRelayHandle>,
+    handles: HashMap<String, Arc<SharedXrayRelayHandle>>,
     retiring_handles: HashSet<String>,
     handle_by_url: HashMap<String, String>,
     handle_nonce: u64,
@@ -1478,7 +1569,7 @@ impl XraySupervisor {
         egress_socks5_url: Option<&Url>,
     ) -> Result<(), ProxyError> {
         let _ = fs::create_dir_all(&self.runtime_dir);
-        self.reset_if_shared_process_exited().await;
+        self.reset_if_shared_process_exited();
 
         let mut desired_endpoint_keys = HashSet::new();
         let mut retire_ids = Vec::new();
@@ -1487,6 +1578,7 @@ impl XraySupervisor {
             if !endpoint.needs_local_relay(egress_socks5_url) {
                 endpoint.endpoint_url = endpoint_transport_url(endpoint);
                 endpoint.uses_local_relay = false;
+                endpoint.set_relay_handle(None);
                 if let Some(old_id) = self.active_endpoint_handles.remove(&endpoint.key) {
                     retire_ids.push(old_id);
                 }
@@ -1528,6 +1620,7 @@ impl XraySupervisor {
                     Err(_) => {
                         endpoint.endpoint_url = None;
                         endpoint.uses_local_relay = true;
+                        endpoint.set_relay_handle(None);
                         if let Some(previous_id) =
                             self.active_endpoint_handles.remove(&endpoint.key)
                         {
@@ -1538,12 +1631,14 @@ impl XraySupervisor {
                 }
             };
 
-            if let Some(handle) = self.handles.get(&relay_id) {
+            if let Some(handle) = self.handles.get(&relay_id).cloned() {
                 endpoint.endpoint_url = Some(handle.local_proxy_url.clone());
                 endpoint.uses_local_relay = true;
+                endpoint.set_relay_handle(Some(&handle));
             } else {
                 endpoint.endpoint_url = None;
                 endpoint.uses_local_relay = true;
+                endpoint.set_relay_handle(None);
             }
         }
 
@@ -1583,17 +1678,17 @@ impl XraySupervisor {
         &mut self,
         endpoint: &ForwardProxyEndpoint,
         egress_socks5_url: Option<&Url>,
-    ) -> Result<(ForwardProxyEndpoint, Option<String>), ProxyError> {
-        self.reset_if_shared_process_exited().await;
+    ) -> Result<ForwardProxyEndpoint, ProxyError> {
+        self.reset_if_shared_process_exited();
         if endpoint.uses_local_relay
-            && let Some(relay_id) = self
-                .acquire_relay_lease_by_url(endpoint.endpoint_url.as_ref())
-                .await
+            && endpoint
+                .relay_handle()
+                .is_some_and(|handle| !handle.is_invalidated())
         {
-            return Ok((endpoint.clone(), Some(relay_id)));
+            return Ok(endpoint.clone());
         }
         if !endpoint.needs_local_relay(egress_socks5_url) {
-            return Ok((endpoint.clone(), None));
+            return Ok(endpoint.clone());
         }
 
         let route_key = format!(
@@ -1611,8 +1706,7 @@ impl XraySupervisor {
         let relay_id = self
             .create_relay_handle(None, route_key, endpoint, egress_socks5_url, true)
             .await?;
-        let lease_id = self.acquire_relay_lease(&relay_id);
-        let Some(handle) = self.handles.get(&relay_id) else {
+        let Some(handle) = self.handles.get(&relay_id).cloned() else {
             return Err(ProxyError::Other(
                 "shared xray relay handle disappeared before validation".to_string(),
             ));
@@ -1620,21 +1714,26 @@ impl XraySupervisor {
         let mut resolved = endpoint.clone();
         resolved.endpoint_url = Some(handle.local_proxy_url.clone());
         resolved.uses_local_relay = true;
-        Ok((resolved, lease_id))
+        resolved.set_relay_handle(Some(&handle));
+        Ok(resolved)
     }
 
     pub async fn release_relay_lease(&mut self, relay_id: &str) {
         if let Some(handle) = self.handles.get_mut(relay_id)
-            && handle.lease_count > 0
+            && handle.lease_count() > 0
         {
-            handle.lease_count -= 1;
+            handle.release_lease();
         }
+        self.reap_retired_handles().await;
+    }
+
+    pub async fn reap_retired_handles_now(&mut self) {
         self.reap_retired_handles().await;
     }
 
     #[cfg(test)]
     pub async fn debug_snapshot(&mut self) -> XraySupervisorDebugSnapshot {
-        self.reset_if_shared_process_exited().await;
+        self.reset_if_shared_process_exited();
         let runtime_files = fs::read_dir(&self.runtime_dir)
             .ok()
             .into_iter()
@@ -1654,16 +1753,16 @@ impl XraySupervisor {
         &mut self,
         endpoint_url: Option<&Url>,
     ) -> Option<String> {
-        self.reset_if_shared_process_exited().await;
+        self.reset_if_shared_process_exited();
         let endpoint_url = endpoint_url?;
         let relay_id = self.handle_by_url.get(endpoint_url.as_str())?.clone();
-        self.acquire_relay_lease(&relay_id)
+        let handle = self.handles.get(&relay_id)?.clone();
+        handle.try_acquire_lease().then_some(relay_id)
     }
 
     fn acquire_relay_lease(&mut self, relay_id: &str) -> Option<String> {
-        let handle = self.handles.get_mut(relay_id)?;
-        handle.lease_count = handle.lease_count.saturating_add(1);
-        Some(relay_id.to_string())
+        let handle = self.handles.get(relay_id)?.clone();
+        handle.try_acquire_lease().then_some(relay_id.to_string())
     }
 
     async fn create_relay_handle(
@@ -1690,7 +1789,7 @@ impl XraySupervisor {
             self.runtime_dir.join(format!("{relay_id}-outbounds.json")),
             self.runtime_dir.join(format!("{relay_id}-rules.json")),
         ];
-        let mut cleanup_handle = SharedXrayRelayHandle {
+        let cleanup_handle = Arc::new(SharedXrayRelayHandle {
             relay_id: relay_id.clone(),
             endpoint_key: endpoint_key.clone(),
             route_key: route_key.clone(),
@@ -1706,9 +1805,10 @@ impl XraySupervisor {
             },
             rule_tag: rule_tag.clone(),
             config_paths: config_paths.clone(),
-            lease_count: 0,
+            lease_count: AtomicUsize::new(0),
+            invalidated: AtomicBool::new(false),
             temporary,
-        };
+        });
 
         let mut outbound = build_xray_outbound_for_endpoint(endpoint, egress_tag.as_deref())?;
         set_xray_outbound_tag(&mut outbound, &outbound_tag);
@@ -1833,7 +1933,8 @@ impl XraySupervisor {
 
         self.handle_by_url
             .insert(local_proxy_url.to_string(), relay_id.clone());
-        self.handles.insert(relay_id.clone(), cleanup_handle);
+        self.handles
+            .insert(relay_id.clone(), Arc::clone(&cleanup_handle));
         if temporary {
             self.retiring_handles.insert(relay_id.clone());
         }
@@ -1854,7 +1955,7 @@ impl XraySupervisor {
             .filter_map(|relay_id| {
                 self.handles
                     .get(relay_id)
-                    .filter(|handle| handle.lease_count == 0)
+                    .filter(|handle| handle.lease_count() == 0 && Arc::strong_count(handle) == 1)
                     .map(|_| relay_id.clone())
             })
             .collect::<Vec<_>>();
@@ -1868,6 +1969,7 @@ impl XraySupervisor {
         let Some(handle) = self.handles.get(relay_id).cloned() else {
             return;
         };
+        handle.invalidate();
         self.active_endpoint_handles
             .retain(|_, active_relay_id| active_relay_id != relay_id);
         self.handle_by_url.remove(handle.local_proxy_url.as_str());
@@ -1878,16 +1980,17 @@ impl XraySupervisor {
                 self.handles.remove(relay_id);
             }
             Err(_) => {
-                if let Some(tracked) = self.handles.get_mut(relay_id) {
+                if let Some(tracked) = self.handles.get(relay_id) {
                     tracked.drop_runtime_files();
                 }
             }
         }
     }
 
-    fn track_handle_for_retry(&mut self, mut handle: SharedXrayRelayHandle) {
+    fn track_handle_for_retry(&mut self, handle: Arc<SharedXrayRelayHandle>) {
         handle.drop_runtime_files();
-        self.handles.insert(handle.relay_id.clone(), handle.clone());
+        self.handles
+            .insert(handle.relay_id.clone(), Arc::clone(&handle));
         self.retiring_handles.insert(handle.relay_id.clone());
     }
 
@@ -1912,7 +2015,7 @@ impl XraySupervisor {
     }
 
     async fn ensure_shared_process_started(&mut self) -> Result<(), ProxyError> {
-        self.reset_if_shared_process_exited().await;
+        self.reset_if_shared_process_exited();
         if self.shared.is_some() {
             return Ok(());
         }
@@ -2007,7 +2110,7 @@ impl XraySupervisor {
         }
     }
 
-    async fn reset_if_shared_process_exited(&mut self) {
+    fn reset_if_shared_process_exited(&mut self) {
         let Some(shared) = self.shared.as_mut() else {
             return;
         };
@@ -2026,6 +2129,9 @@ impl XraySupervisor {
             .flat_map(|handle| handle.config_paths.iter().cloned())
             .collect::<Vec<_>>();
         cleanup_paths(&runtime_paths);
+        for handle in self.handles.values() {
+            handle.invalidate();
+        }
         self.shared = None;
         self.active_endpoint_handles.clear();
         self.handles.clear();
@@ -4722,8 +4828,8 @@ rule-providers:
             ),
             manual_present: true,
             subscription_sources: BTreeSet::new(),
-
             uses_local_relay: false,
+            relay_handle: None,
         };
 
         assert_eq!(endpoint_host(&endpoint).as_deref(), Some("1.1.1.1"));
@@ -4740,8 +4846,8 @@ rule-providers:
             raw_url: Some("http://example.com:8080".to_string()),
             manual_present: true,
             subscription_sources: BTreeSet::new(),
-
             uses_local_relay: false,
+            relay_handle: None,
         };
 
         assert_eq!(endpoint_host(&endpoint).as_deref(), Some("127.0.0.1"));
@@ -5188,6 +5294,102 @@ if __name__ == "__main__":
     }
 
     #[tokio::test]
+    async fn xray_supervisor_retiring_handle_stays_leaseable_for_selected_plan() {
+        let runtime_dir = temp_runtime_dir("shared-xray-plan-drain");
+        let supervisor = Arc::new(Mutex::new(XraySupervisor::new(
+            write_fake_xray_binary("shared-xray-plan-drain"),
+            runtime_dir,
+        )));
+
+        let selected = {
+            let mut locked = supervisor.lock().await;
+            let mut initial = vec![subscription_vless_endpoint(
+                "node-a",
+                "a.example.com",
+                "Alpha",
+            )];
+            locked
+                .sync_endpoints(&mut initial, None)
+                .await
+                .expect("initial sync");
+            SelectedForwardProxy::from_endpoint(&initial[0])
+        };
+
+        {
+            let mut locked = supervisor.lock().await;
+            let mut changed = vec![subscription_vless_endpoint(
+                "node-a",
+                "changed.example.com",
+                "Alpha New",
+            )];
+            locked
+                .sync_endpoints(&mut changed, None)
+                .await
+                .expect("changed sync");
+            let draining_snapshot = locked.debug_snapshot().await;
+            assert_eq!(draining_snapshot.total_handles, 2);
+            assert_eq!(draining_snapshot.retiring_handles, 1);
+        }
+
+        let lease =
+            ForwardProxyRelayLease::acquire_for_selection(Arc::clone(&supervisor), &selected)
+                .expect("selected plan should still acquire a lease on retiring handle");
+        let draining_snapshot = supervisor.lock().await.debug_snapshot().await;
+        assert_eq!(draining_snapshot.total_handles, 2);
+        assert_eq!(draining_snapshot.retiring_handles, 1);
+
+        lease.release().await;
+        drop(selected);
+        let settled_snapshot = {
+            let mut locked = supervisor.lock().await;
+            locked.reap_retired_handles_now().await;
+            locked.debug_snapshot().await
+        };
+        assert_eq!(settled_snapshot.total_handles, 1);
+        assert_eq!(settled_snapshot.retiring_handles, 0);
+
+        supervisor.lock().await.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_relay_lease_acquire_does_not_wait_for_supervisor_mutex() {
+        let runtime_dir = temp_runtime_dir("shared-xray-lease-fast-path");
+        let supervisor = Arc::new(Mutex::new(XraySupervisor::new(
+            write_fake_xray_binary("shared-xray-lease-fast-path"),
+            runtime_dir,
+        )));
+
+        let selected = {
+            let mut locked = supervisor.lock().await;
+            let mut endpoints = vec![subscription_vless_endpoint(
+                "node-a",
+                "lease.example.com",
+                "Lease Node",
+            )];
+            locked
+                .sync_endpoints(&mut endpoints, None)
+                .await
+                .expect("sync endpoints");
+            SelectedForwardProxy::from_endpoint(&endpoints[0])
+        };
+
+        let held_guard = supervisor.lock().await;
+        let started = Instant::now();
+        let lease =
+            ForwardProxyRelayLease::acquire_for_selection(Arc::clone(&supervisor), &selected)
+                .expect("lease acquisition should use the selected relay handle");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "lease acquisition blocked on the supervisor mutex for {:?}",
+            started.elapsed()
+        );
+        drop(held_guard);
+
+        lease.release().await;
+        supervisor.lock().await.shutdown_all().await;
+    }
+
+    #[tokio::test]
     async fn xray_supervisor_validation_handles_cleanup_idle_shared_process() {
         let runtime_dir = temp_runtime_dir("shared-xray-validate-temp");
         let mut supervisor = XraySupervisor::new(
@@ -5196,11 +5398,14 @@ if __name__ == "__main__":
         );
         let endpoint = subscription_vless_endpoint("validate-node", "validate.example.com", "Temp");
 
-        let (resolved, lease_id) = supervisor
+        let resolved = supervisor
             .resolve_validation_endpoint(&endpoint, None)
             .await
             .expect("resolve validation endpoint");
-        let lease_id = lease_id.expect("temporary validation lease id");
+        let lease_id = supervisor
+            .acquire_relay_lease_by_url(resolved.endpoint_url.as_ref())
+            .await
+            .expect("temporary validation lease");
         assert!(resolved.uses_local_relay);
         assert!(resolved.endpoint_url.is_some());
 
