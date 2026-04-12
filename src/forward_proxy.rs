@@ -1195,18 +1195,14 @@ impl ForwardProxyRelayLease {
         }
     }
 
-    pub fn acquire_for_selection(
+    pub async fn acquire_for_selection(
         supervisor: Arc<Mutex<XraySupervisor>>,
         candidate: &SelectedForwardProxy,
     ) -> Option<Self> {
-        Self::acquire(
-            supervisor,
-            candidate.uses_local_relay,
-            candidate.relay_handle.clone(),
-        )
+        Self::acquire_selection(supervisor, candidate).await
     }
 
-    pub fn acquire_for_endpoint(
+    pub async fn acquire_for_endpoint(
         supervisor: Arc<Mutex<XraySupervisor>>,
         endpoint: &ForwardProxyEndpoint,
     ) -> Option<Self> {
@@ -1215,9 +1211,22 @@ impl ForwardProxyRelayLease {
             endpoint.uses_local_relay,
             endpoint.relay_handle(),
         )
+        .await
     }
 
-    fn acquire(
+    async fn acquire_selection(
+        supervisor: Arc<Mutex<XraySupervisor>>,
+        candidate: &SelectedForwardProxy,
+    ) -> Option<Self> {
+        Self::acquire(
+            supervisor,
+            candidate.uses_local_relay,
+            candidate.relay_handle.clone(),
+        )
+        .await
+    }
+
+    async fn acquire(
         supervisor: Arc<Mutex<XraySupervisor>>,
         uses_local_relay: bool,
         relay_handle: Option<Arc<SharedXrayRelayHandle>>,
@@ -1225,10 +1234,11 @@ impl ForwardProxyRelayLease {
         if !uses_local_relay {
             return Some(Self::new(supervisor));
         }
-        if let Ok(mut locked) = supervisor.try_lock() {
+        let relay_handle = relay_handle?;
+        {
+            let mut locked = supervisor.lock().await;
             locked.reset_if_shared_process_exited();
         }
-        let relay_handle = relay_handle?;
         if !relay_handle.try_acquire_lease() {
             return None;
         }
@@ -2004,17 +2014,13 @@ impl XraySupervisor {
             .retain(|_, active_relay_id| active_relay_id != relay_id);
         self.handle_by_url.remove(handle.local_proxy_url.as_str());
         self.retiring_handles.insert(relay_id.to_string());
-        match self.cleanup_handle_from_shared_process(&handle).await {
-            Ok(()) => {
-                self.retiring_handles.remove(relay_id);
-                self.handles.remove(relay_id);
-            }
-            Err(_) => {
-                if let Some(tracked) = self.handles.get(relay_id) {
-                    tracked.drop_runtime_files();
-                }
-            }
+        if let Err(_) = self.cleanup_handle_from_shared_process(&handle).await
+            && let Some(tracked) = self.handles.get(relay_id)
+        {
+            tracked.drop_runtime_files();
         }
+        self.retiring_handles.remove(relay_id);
+        self.handles.remove(relay_id);
     }
 
     fn track_handle_for_retry(&mut self, handle: Arc<SharedXrayRelayHandle>) {
@@ -5373,6 +5379,7 @@ if __name__ == "__main__":
 
         let lease =
             ForwardProxyRelayLease::acquire_for_selection(Arc::clone(&supervisor), &selected)
+                .await
                 .expect("selected plan should still acquire a lease on retiring handle");
         let draining_snapshot = supervisor.lock().await.debug_snapshot().await;
         assert_eq!(draining_snapshot.total_handles, 2);
@@ -5392,7 +5399,7 @@ if __name__ == "__main__":
     }
 
     #[tokio::test]
-    async fn forward_proxy_relay_lease_acquire_does_not_wait_for_supervisor_mutex() {
+    async fn forward_proxy_relay_lease_acquire_waits_for_supervisor_mutex_reset() {
         let runtime_dir = temp_runtime_dir("shared-xray-lease-fast-path");
         let supervisor = Arc::new(Mutex::new(XraySupervisor::new(
             write_fake_xray_binary("shared-xray-lease-fast-path"),
@@ -5414,16 +5421,31 @@ if __name__ == "__main__":
         };
 
         let held_guard = supervisor.lock().await;
+        let held_started = Instant::now();
         let started = Instant::now();
-        let lease =
-            ForwardProxyRelayLease::acquire_for_selection(Arc::clone(&supervisor), &selected)
-                .expect("lease acquisition should use the selected relay handle");
+        let acquire_task = tokio::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            let selected = selected.clone();
+            async move { ForwardProxyRelayLease::acquire_for_selection(supervisor, &selected).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "lease acquisition blocked on the supervisor mutex for {:?}",
-            started.elapsed()
+            !acquire_task.is_finished(),
+            "lease acquisition should wait for the supervisor mutex before granting the relay"
         );
         drop(held_guard);
+        let lease = acquire_task
+            .await
+            .expect("lease acquisition task should complete")
+            .expect("lease acquisition should use the selected relay handle");
+        assert!(
+            held_started.elapsed() >= Duration::from_millis(50),
+            "expected supervisor mutex wait before acquiring the relay lease"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "lease acquisition should have waited for the held supervisor mutex"
+        );
 
         lease.release().await;
         supervisor.lock().await.shutdown_all().await;
@@ -5770,6 +5792,43 @@ if __name__ == "__main__":
     }
 
     #[tokio::test]
+    async fn shared_xray_cleanup_failure_removes_retired_handle_locally() {
+        let runtime_dir = temp_runtime_dir("shared-xray-cleanup-removes-retired");
+        let mut supervisor = XraySupervisor::new(
+            write_fake_xray_binary_with_api_failure(
+                "shared-xray-cleanup-removes-retired",
+                Some("rmrules"),
+            ),
+            runtime_dir,
+        );
+
+        let mut initial = vec![subscription_vless_endpoint(
+            "node-a",
+            "a.example.com",
+            "Alpha",
+        )];
+        supervisor
+            .sync_endpoints(&mut initial, None)
+            .await
+            .expect("initial sync");
+
+        let mut changed = vec![subscription_vless_endpoint(
+            "node-a",
+            "changed.example.com",
+            "Alpha New",
+        )];
+        supervisor
+            .sync_endpoints(&mut changed, None)
+            .await
+            .expect("changed sync");
+
+        let snapshot = supervisor.debug_snapshot().await;
+        assert_eq!(snapshot.active_endpoint_handles, 1);
+        assert_eq!(snapshot.total_handles, 1);
+        assert_eq!(snapshot.retiring_handles, 0);
+    }
+
+    #[tokio::test]
     async fn send_plan_recovers_after_shared_xray_exit() {
         let root_dir = temp_runtime_dir("proxy-shared-xray-recover");
         let db_path = root_dir.join("proxy.db");
@@ -5836,6 +5895,101 @@ if __name__ == "__main__":
         assert!(
             matches!(err, ProxyError::Http(_)),
             "request path should recover relay after shared exit instead of surfacing xray_missing: {err}"
+        );
+
+        let snapshot = proxy.xray_supervisor.lock().await.debug_snapshot().await;
+        assert!(snapshot.shared_pid.is_some());
+        assert_eq!(snapshot.active_endpoint_handles, 1);
+        assert_eq!(snapshot.total_handles, 1);
+        assert_eq!(snapshot.retiring_handles, 0);
+
+        proxy.xray_supervisor.lock().await.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn send_plan_recovers_after_shared_xray_exit_with_held_supervisor_mutex() {
+        let root_dir = temp_runtime_dir("proxy-shared-xray-recover-held-lock");
+        let db_path = root_dir.join("proxy.db");
+        let runtime_dir = root_dir.join("xray-runtime");
+        let proxy = Arc::new(
+            TavilyProxy::with_options(
+                Vec::<String>::new(),
+                "http://127.0.0.1:9/mcp",
+                db_path
+                    .to_str()
+                    .expect("database path should be valid utf-8"),
+                TavilyProxyOptions {
+                    xray_binary: write_fake_xray_binary("proxy-shared-xray-recover-held-lock"),
+                    xray_runtime_dir: runtime_dir,
+                    forward_proxy_trace_url: Url::parse("http://127.0.0.1/cdn-cgi/trace")
+                        .expect("valid trace url"),
+                },
+            )
+            .await
+            .expect("create proxy with fake xray"),
+        );
+
+        proxy
+            .update_forward_proxy_settings(
+                ForwardProxySettings {
+                    proxy_urls: vec![sample_vless_share_link(
+                        "recover-held-lock.example.com",
+                        "Recover",
+                    )],
+                    subscription_urls: Vec::new(),
+                    subscription_update_interval_secs: 3600,
+                    insert_direct: false,
+                    egress_socks5_enabled: false,
+                    egress_socks5_url: String::new(),
+                },
+                true,
+            )
+            .await
+            .expect("save proxy-only settings");
+        let candidate = proxy
+            .build_proxy_attempt_plan_for_record(
+                "subject",
+                &ForwardProxyAffinityRecord::default(),
+                false,
+            )
+            .await
+            .expect("build proxy attempt plan")
+            .into_iter()
+            .next()
+            .expect("proxy-only candidate");
+
+        let mut supervisor = proxy.xray_supervisor.lock().await;
+        let shared = supervisor
+            .shared
+            .as_mut()
+            .expect("shared process after settings save");
+        terminate_child_process(&mut shared.child, Duration::from_secs(2))
+            .await
+            .expect("terminate fake shared xray");
+
+        let proxy_for_task = Arc::clone(&proxy);
+        let send_task = tokio::spawn(async move {
+            proxy_for_task
+                .send_with_forward_proxy_plan(
+                    "subject",
+                    None,
+                    "request",
+                    vec![candidate],
+                    |client| client.get("http://127.0.0.1:9/"),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(supervisor);
+
+        let err = send_task
+            .await
+            .expect("request task should complete")
+            .expect_err("closed upstream should still fail after relay rebuild");
+        assert!(
+            matches!(err, ProxyError::Http(_)),
+            "request should retry through a rebuilt relay after shared exit: {err}"
         );
 
         let snapshot = proxy.xray_supervisor.lock().await.debug_snapshot().await;

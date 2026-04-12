@@ -3219,6 +3219,7 @@ impl TavilyProxy {
                             Arc::clone(&self.xray_supervisor),
                             &candidate,
                         )
+                        .await
                     {
                         break Some(relay_lease);
                     }
