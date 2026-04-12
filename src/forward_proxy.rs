@@ -5217,6 +5217,47 @@ if __name__ == "__main__":
     }
 
     #[tokio::test]
+    async fn tavily_proxy_probe_failure_releases_validation_lease() {
+        let root_dir = temp_runtime_dir("proxy-shared-xray-probe-failure");
+        let db_path = root_dir.join("proxy.db");
+        let runtime_dir = root_dir.join("xray-runtime");
+        let proxy = TavilyProxy::with_options(
+            Vec::<String>::new(),
+            "http://127.0.0.1:9/mcp",
+            db_path
+                .to_str()
+                .expect("database path should be valid utf-8"),
+            TavilyProxyOptions {
+                xray_binary: write_fake_xray_binary("proxy-shared-xray-probe-failure"),
+                xray_runtime_dir: runtime_dir,
+                forward_proxy_trace_url: Url::parse("http://127.0.0.1/cdn-cgi/trace")
+                    .expect("valid trace url"),
+            },
+        )
+        .await
+        .expect("create proxy with fake xray");
+        let endpoint =
+            subscription_vless_endpoint("validate-node", "validate.example.com", "Validate");
+        let probe_url = Url::parse("http://127.0.0.1:9/").expect("valid probe url");
+
+        proxy
+            .probe_forward_proxy_endpoint(&endpoint, Duration::from_millis(100), &probe_url, None)
+            .await
+            .expect_err("probe should fail against closed probe port");
+
+        let snapshot = proxy.xray_supervisor.lock().await.debug_snapshot().await;
+        assert_eq!(snapshot.shared_pid, None);
+        assert_eq!(snapshot.active_endpoint_handles, 0);
+        assert_eq!(snapshot.total_handles, 0);
+        assert_eq!(snapshot.retiring_handles, 0);
+        assert!(
+            snapshot.runtime_files.is_empty(),
+            "failed validation probe should not leak runtime files: {:?}",
+            snapshot.runtime_files
+        );
+    }
+
+    #[tokio::test]
     async fn tavily_proxy_save_and_revalidate_keep_shared_xray_pid() {
         let root_dir = temp_runtime_dir("proxy-shared-xray-flow");
         let db_path = root_dir.join("proxy.db");

@@ -1879,10 +1879,10 @@ impl TavilyProxy {
                 timeout,
             ),
         )
-        .await?;
+        .await;
         self.cleanup_forward_proxy_validation_endpoint(temporary_xray_key)
             .await;
-        result
+        result?
     }
 
     pub(crate) async fn fetch_forward_proxy_trace(
@@ -8764,7 +8764,7 @@ impl TavilyProxy {
 
         let secret_header = secret.to_string();
         let request_url = url.clone();
-        let resp = match (api_key_id, proxy_affinity) {
+        let (resp, _relay_lease) = match (api_key_id, proxy_affinity) {
             (Some(api_key_id), _) => self
                 .send_with_forward_proxy(api_key_id, request_kind, |client| {
                     let mut req = client
@@ -8776,7 +8776,7 @@ impl TavilyProxy {
                     req
                 })
                 .await
-                .map(|(response, _)| response)?,
+                .map(|(response, relay_lease)| (response, Some(relay_lease)))?,
             (None, Some((subject, proxy_affinity))) => self
                 .send_with_forward_proxy_affinity(subject, request_kind, proxy_affinity, |client| {
                     let mut req = client
@@ -8788,7 +8788,7 @@ impl TavilyProxy {
                     req
                 })
                 .await
-                .map(|(response, _)| response)?,
+                .map(|(response, relay_lease)| (response, Some(relay_lease)))?,
             (None, None) => {
                 let mut req = self
                     .client
@@ -8797,7 +8797,7 @@ impl TavilyProxy {
                 if let Some(timeout) = timeout {
                     req = req.timeout(timeout);
                 }
-                req.send().await.map_err(ProxyError::Http)?
+                (req.send().await.map_err(ProxyError::Http)?, None)
             }
         };
         let status = resp.status();
@@ -8851,7 +8851,7 @@ impl TavilyProxy {
 
         let secret_header = secret.to_string();
         let request_url = url.clone();
-        let resp = match api_key_id {
+        let (resp, _relay_lease) = match api_key_id {
             Some(api_key_id) => self
                 .send_with_forward_proxy(api_key_id, request_kind, |client| {
                     let mut req = client
@@ -8863,7 +8863,7 @@ impl TavilyProxy {
                     req
                 })
                 .await
-                .map(|(response, _)| response)?,
+                .map(|(response, relay_lease)| (response, Some(relay_lease)))?,
             None => {
                 let mut req = self
                     .client
@@ -8872,7 +8872,7 @@ impl TavilyProxy {
                 if let Some(timeout) = timeout {
                     req = req.timeout(timeout);
                 }
-                req.send().await.map_err(ProxyError::Http)?
+                (req.send().await.map_err(ProxyError::Http)?, None)
             }
         };
         let status = resp.status();
