@@ -490,6 +490,7 @@ include!("proxy_http_and_logs.rs");
 include!("proxy_auth_and_oauth.rs");
 include!("proxy_usage_and_metrics.rs");
 include!("proxy_request_limits.rs");
+include!("proxy_alerts.rs");
 
 impl TokenQuota {
     pub(crate) fn new(store: Arc<KeyStore>) -> Self {

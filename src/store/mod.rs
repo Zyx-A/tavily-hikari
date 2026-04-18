@@ -1184,4 +1184,5 @@ include!("key_store_keys.rs");
 include!("key_store_sessions.rs");
 include!("key_store_users_and_oauth.rs");
 include!("key_store_token_logs.rs");
+include!("key_store_alerts.rs");
 include!("key_store_request_logs_and_dashboard.rs");
