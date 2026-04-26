@@ -1311,6 +1311,38 @@
             .mark_key_quota_exhausted_by_secret("tvly-unbound-breakage-sort-key-b")
             .await
             .expect("mark breakage key b exhausted");
+        sqlx::query(
+            r#"INSERT INTO api_key_quarantines
+               (id, key_id, source, reason_code, reason_summary, reason_detail, created_at, cleared_at)
+               VALUES (?, ?, 'system', 'account_deactivated', 'Upstream account deactivated', 'blocked-key test fixture', ?, NULL),
+                      (?, ?, 'system', 'account_deactivated', 'Upstream account deactivated', 'blocked-key test fixture', ?, NULL)"#,
+        )
+        .bind("unbound-breakage-sort-quarantine-a")
+        .bind(&breakage_key_a_id)
+        .bind(now)
+        .bind("unbound-breakage-sort-quarantine-b")
+        .bind(&breakage_key_b_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed active blocked-key quarantines");
+        sqlx::query(
+            r#"UPDATE subject_key_breakages
+               SET key_status = 'quarantined',
+                   reason_code = 'account_deactivated',
+                   reason_summary = 'Upstream account deactivated',
+                   source = 'auto',
+                   updated_at = ?,
+                   latest_break_at = ?
+               WHERE key_id IN (?, ?)"#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&breakage_key_a_id)
+        .bind(&breakage_key_b_id)
+        .execute(&pool)
+        .await
+        .expect("promote breakage fixtures to blocked-key reasons");
 
         let addr = spawn_admin_tokens_server(proxy, true).await;
         let client = Client::new();
@@ -2458,4 +2490,3 @@
 
         let _ = std::fs::remove_file(db_path);
     }
-

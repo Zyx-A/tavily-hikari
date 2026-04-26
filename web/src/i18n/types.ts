@@ -535,10 +535,14 @@ export interface AdminTranslationsShape {
       percentHint: string
       percentDisabledHint: string
       currentPercentValue: string
+      blockedKeyBaseLimitLabel: string
+      blockedKeyBaseLimitHint: string
+      currentBlockedKeyBaseLimitValue: string
       applyScopeHint: string
       invalidRequestRateLimit: string
       invalidCount: string
       invalidPercent: string
+      invalidBlockedKeyBaseLimit: string
       saveFailed: string
     }
     actions: {

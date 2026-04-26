@@ -116,6 +116,27 @@ afterEach(() => {
   window.localStorage.clear()
 })
 
+describe('UserDetailSharedUsagePanel tab presentation', () => {
+  it('orders windows from shortest to longest while keeping 1h as the default active series', async () => {
+    const { container, root } = await mountPanel()
+
+    const labels = Array.from(container.querySelectorAll<HTMLButtonElement>('button[role="radio"]'))
+      .map((button) => button.textContent?.trim())
+
+    expect(labels).toEqual([
+      ZH.admin.users.detail.sharedUsageTabs.fiveMinute,
+      ZH.admin.users.detail.sharedUsageTabs.oneHour,
+      ZH.admin.users.detail.sharedUsageTabs.daily,
+      ZH.admin.users.detail.sharedUsageTabs.monthly,
+    ])
+    expect(container.querySelector<HTMLElement>('.admin-user-shared-usage-panel')?.dataset.activeSeries).toBe('quota1h')
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+})
+
 describe('UserDetailSharedUsagePanel loading behavior', () => {
   it('keeps an in-flight tab request usable after switching away and back', async () => {
     const loader = createAbortableLoader()

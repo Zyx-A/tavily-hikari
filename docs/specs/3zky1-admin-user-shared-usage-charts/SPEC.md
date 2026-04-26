@@ -16,7 +16,7 @@
 ## Goals
 
 - 在用户详情页新增独立的“共享额度趋势”面板，位于有效额度拆解之后、token 列表之前。
-- 共享趋势使用 `1h / 5m / 24h / 月` 四个 tab，默认激活 `1h`，并按需加载数据。
+- 共享趋势使用 `5m / 1h / 24h / 月` 四个 tab，默认仍激活 `1h`，并按需加载数据。
 - 后端新增用户级共享额度趋势接口 `GET /api/users/:id/usage-series`，返回稳定 bucket 序列、当前 limit 与按 bucket 回放的历史 `limitValue`。
 - 新增持久化 rollup 表 `account_usage_rollup_buckets`，分别承载账户共享请求频率与业务 credits 聚合。
 - 新增额度历史快照表，按时间回放请求限流与账户有效额度。
@@ -142,7 +142,7 @@
 ## UI 规格
 
 - 用户详情页新增“共享额度趋势”区块，放在用户级额度/拆解之后、token 列表之前。
-- tabs 文案简写：`1h / 5m / 24h / 月`，默认 `1h`。
+- tabs 文案简写：`5m / 1h / 24h / 月`，默认 `1h`。
 - 首屏只请求 `quota1h`；其他 tab 首次点开才请求，二次切回复用缓存。
 - 图表使用现有 `SegmentedTabs` + `chart.js`：
   - 主数据使用柱状图
@@ -169,6 +169,20 @@
 - `cd web && bun run build-storybook`
 
 ## Visual Evidence
+
+### 共享额度趋势时间窗口顺序
+
+- asset: `docs/specs/3zky1-admin-user-shared-usage-charts/assets/user-detail-shared-usage-tabs-order.png`
+- source_type: `storybook_canvas`
+- story_id_or_title: `admin-pages--user-detail`
+- target_program: `mock-only`
+- capture_scope: `browser-viewport`
+- requested_viewport: `1600x1000`
+- viewport_strategy: `devtools-emulate`
+- submission_gate: `approved`
+- evidence_note: 共享额度趋势 tab 已按时间尺度调整为 `5m / 1h / 24h / 月`；默认激活仍为 `1h`，说明文案明确区分 5m 请求频率与 1h/24h/月业务额度；空白裁剪脚本返回 `ambiguous_border`，因此按原图保留；证据绑定当前实现提交。
+
+![共享额度趋势时间窗口顺序](./assets/user-detail-shared-usage-tabs-order.png)
 
 ### 共享额度趋势（默认 1h）
 
