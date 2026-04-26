@@ -4,15 +4,23 @@ import { Chart as ChartJS, BarElement, CategoryScale, Legend, LinearScale, Toolt
 import { Bar } from 'react-chartjs-2'
 import {
   fetchTokenLogDetails,
-  fetchTokenLogsPage,
+  fetchTokenLogsCatalog,
+  fetchTokenLogsList,
   fetchTokenUsageSeries,
   rotateTokenSecret,
   type RequestLog,
+  type RequestLogsCatalog,
   type RequestLogFacets,
+  type RequestLogsListPage,
   type TokenOwnerSummary,
   type TokenUsageBucket,
 } from '../api'
 import { type QueryLoadState, getBlockingLoadState, getRefreshingLoadState, isBlockingLoadState, isRefreshingLoadState } from '../admin/queryLoadState'
+import {
+  buildRequestLogsCatalogPlan,
+  formatRequestLogsDescription,
+  formatRequestLogsPaginationSummary,
+} from '../admin/requestLogsUi'
 import AdminLoadingRegion from '../components/AdminLoadingRegion'
 import AdminRecentRequestsPanel, { type RecentRequestsOutcomeFilter } from '../components/AdminRecentRequestsPanel'
 import AdminCompactIntro from '../components/AdminCompactIntro'
@@ -41,7 +49,6 @@ import {
   defaultTokenLogRequestKindQuickFilters,
   hasActiveRequestKindQuickFilters,
   resolveEffectiveRequestKindSelection,
-  resolveRequestKindOptionsRefresh,
   resolveManualRequestKindQuickFilters,
   requestKindSelectionsMatch,
   tokenLogRequestKindEmptySelectionKey,
@@ -57,8 +64,35 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend)
 const emptyRequestLogFacets: RequestLogFacets = {
   results: [],
   keyEffects: [],
+  bindingEffects: [],
+  selectionEffects: [],
   tokens: [],
   keys: [],
+}
+
+const emptyRequestLogsListPage: RequestLogsListPage = {
+  items: [],
+  pageSize: 20,
+  nextCursor: null,
+  prevCursor: null,
+  hasOlder: false,
+  hasNewer: false,
+}
+
+function createEmptyTokenLogsListPage(pageSize: number): RequestLogsListPage {
+  return {
+    ...emptyRequestLogsListPage,
+    pageSize,
+  }
+}
+
+function buildTokenLogsListQueryKey(
+  baseKey: string,
+  cursor: string | null,
+  direction: 'older' | 'newer',
+  perPage: number,
+): string {
+  return `${baseKey}:cursor=${cursor ?? ''}:direction=${direction}:perPage=${perPage}`
 }
 
 type Period = 'day' | 'week' | 'month'
@@ -398,14 +432,16 @@ export default function TokenDetail({
   const [sinceInput, setSinceInput] = useState<string>('')
   const [debouncedSinceInput, setDebouncedSinceInput] = useState<string>('')
   const [logs, setLogs] = useState<TokenLog[]>([])
-  const [page, setPage] = useState(1)
   const [perPage, setPerPage] = useState(20)
-  const [total, setTotal] = useState(0)
+  const [logsCursor, setLogsCursor] = useState<string | null>(null)
+  const [logsDirection, setLogsDirection] = useState<'older' | 'newer'>('older')
+  const [logsPageInfo, setLogsPageInfo] = useState<RequestLogsListPage>(emptyRequestLogsListPage)
   const [requestKindOptions, setRequestKindOptions] = useState<TokenLogRequestKindOption[]>([])
   const [selectedRequestKinds, setSelectedRequestKinds] = useState<string[]>([])
   const [requestKindQuickBilling, setRequestKindQuickBilling] = useState<TokenLogRequestKindQuickBilling>('all')
   const [requestKindQuickProtocol, setRequestKindQuickProtocol] = useState<TokenLogRequestKindQuickProtocol>('all')
   const [logFacets, setLogFacets] = useState<RequestLogFacets>(emptyRequestLogFacets)
+  const [logsCatalog, setLogsCatalog] = useState<RequestLogsCatalog | null>(null)
   const [outcomeFilter, setOutcomeFilter] = useState<RecentRequestsOutcomeFilter | null>(null)
   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null)
   const [summaryLoadState, setSummaryLoadState] = useState<QueryLoadState>('initial_loading')
@@ -443,6 +479,8 @@ export default function TokenDetail({
     forceEmptyMatch: boolean
     result?: string
     keyEffect?: string
+    bindingEffect?: string
+    selectionEffect?: string
     keyId?: string
   }>({
     tokenId: id,
@@ -452,24 +490,9 @@ export default function TokenDetail({
     forceEmptyMatch: false,
     result: undefined,
     keyEffect: undefined,
+    bindingEffect: undefined,
+    selectionEffect: undefined,
     keyId: undefined,
-  })
-  const requestKindRefreshContextRef = useRef<{
-    selectedRequestKindsNormalized: string[]
-    requestKindQuickFilters: {
-      billing: TokenLogRequestKindQuickBilling
-      protocol: TokenLogRequestKindQuickProtocol
-    }
-    effectiveSelectedRequestKinds: string[]
-    hasQuickRequestKindEmptyMatch: boolean
-  }>({
-    selectedRequestKindsNormalized: [],
-    requestKindQuickFilters: {
-      billing: 'all',
-      protocol: 'all',
-    },
-    effectiveSelectedRequestKinds: [],
-    hasQuickRequestKindEmptyMatch: false,
   })
 
   useEffect(() => {
@@ -477,13 +500,15 @@ export default function TokenDetail({
     setSummary(null)
     setQuickStats({ day: null, month: null, total: null })
     setLogs([])
-    setPage(1)
-    setTotal(0)
+    setLogsCursor(null)
+    setLogsDirection('older')
+    setLogsPageInfo(emptyRequestLogsListPage)
     setRequestKindOptions([])
     setSelectedRequestKinds([])
     setRequestKindQuickBilling('all')
     setRequestKindQuickProtocol('all')
     setLogFacets(emptyRequestLogFacets)
+    setLogsCatalog(null)
     setOutcomeFilter(null)
     setSelectedKeyId(null)
     setWarning(null)
@@ -518,6 +543,14 @@ export default function TokenDetail({
   const summaryRefreshing = isRefreshingLoadState(summaryLoadState)
   const logsBlocking = isBlockingLoadState(logsLoadState)
   const logsRefreshing = isRefreshingLoadState(logsLoadState)
+  const logsDescription = useMemo(
+    () => formatRequestLogsDescription(translations.admin.logs, logsCatalog?.retentionDays),
+    [logsCatalog?.retentionDays, translations.admin.logs],
+  )
+  const logsPaginationSummary = useMemo(
+    () => formatRequestLogsPaginationSummary(translations.admin.logs, logsCatalog?.retentionDays),
+    [logsCatalog?.retentionDays, translations.admin.logs],
+  )
   const filterControlsDisabled = summaryBlocking || logsBlocking
   const infoRegionLoadState: QueryLoadState = info
     ? (summaryRefreshing ? 'refreshing' : 'ready')
@@ -544,8 +577,15 @@ export default function TokenDetail({
     () => buildRequestKindQuickFilterSelection(requestKindOptions, requestKindQuickFilters),
     [requestKindOptions, requestKindQuickFilters],
   )
-  const resultFilter = outcomeFilter?.kind === 'result' ? outcomeFilter.value : undefined
+  const resultFilter =
+    outcomeFilter?.kind === 'result'
+      ? (outcomeFilter.value as 'success' | 'error' | 'neutral' | 'quota_exhausted')
+      : undefined
   const keyEffectFilter = outcomeFilter?.kind === 'keyEffect' ? outcomeFilter.value : undefined
+  const bindingEffectFilter =
+    outcomeFilter?.kind === 'bindingEffect' ? outcomeFilter.value : undefined
+  const selectionEffectFilter =
+    outcomeFilter?.kind === 'selectionEffect' ? outcomeFilter.value : undefined
   const effectiveSelectedRequestKinds = useMemo(
     () =>
       resolveEffectiveRequestKindSelection(
@@ -565,16 +605,22 @@ export default function TokenDetail({
   )
   const logsQueryBaseKey = useMemo(
     () =>
-      `${summaryQueryBaseKey}:quick=${requestKindQuickBilling}:${requestKindQuickProtocol}:requestKinds=${selectedRequestKindsNormalized.join(',')}:result=${resultFilter ?? ''}:keyEffect=${keyEffectFilter ?? ''}:key=${selectedKeyId ?? ''}`,
+      `${summaryQueryBaseKey}:quick=${requestKindQuickBilling}:${requestKindQuickProtocol}:requestKinds=${selectedRequestKindsNormalized.join(',')}:result=${resultFilter ?? ''}:keyEffect=${keyEffectFilter ?? ''}:bindingEffect=${bindingEffectFilter ?? ''}:selectionEffect=${selectionEffectFilter ?? ''}:key=${selectedKeyId ?? ''}`,
     [
+      bindingEffectFilter,
       keyEffectFilter,
       requestKindQuickBilling,
       requestKindQuickProtocol,
       resultFilter,
       selectedKeyId,
+      selectionEffectFilter,
       selectedRequestKindsNormalized,
       summaryQueryBaseKey,
     ],
+  )
+  const logsListQueryKey = useMemo(
+    () => buildTokenLogsListQueryKey(logsQueryBaseKey, logsCursor, logsDirection, perPage),
+    [logsCursor, logsDirection, logsQueryBaseKey, perPage],
   )
   logsRequestContextRef.current = {
     tokenId: id,
@@ -584,28 +630,21 @@ export default function TokenDetail({
     forceEmptyMatch: hasQuickRequestKindEmptyMatch,
     result: resultFilter,
     keyEffect: keyEffectFilter,
+    bindingEffect: bindingEffectFilter,
+    selectionEffect: selectionEffectFilter,
     keyId: selectedKeyId ?? undefined,
   }
-  requestKindRefreshContextRef.current = {
-    selectedRequestKindsNormalized,
-    requestKindQuickFilters,
-    effectiveSelectedRequestKinds,
-    hasQuickRequestKindEmptyMatch,
-  }
-
   useEffect(() => {
     logsQueryBaseKeyRef.current = logsQueryBaseKey
   }, [logsQueryBaseKey])
 
   useEffect(() => {
-    // Page > 1 responses re-sync active quick presets inside the paginated fetch path
-    // so we do not bounce the user back to page 1 here.
-    if (page !== 1 || !hasActiveQuickRequestKindFilters) return
+    if (logsCursor || !hasActiveQuickRequestKindFilters) return
     if (requestKindSelectionsMatch(selectedRequestKindsNormalized, requestKindQuickSelection)) return
     setSelectedRequestKinds(requestKindQuickSelection)
   }, [
     hasActiveQuickRequestKindFilters,
-    page,
+    logsCursor,
     requestKindQuickSelection,
     selectedRequestKindsNormalized,
   ])
@@ -619,6 +658,8 @@ export default function TokenDetail({
 
   const handleStartChange = (nextPeriod: Period, value: string) => {
     applyStartInput(value, nextPeriod)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }
 
   useEffect(() => {
@@ -684,45 +725,37 @@ export default function TokenDetail({
   }
 
   const loadLogsPage = useCallback(
-    (nextPage: number, nextPerPage = perPageRef.current, signal?: AbortSignal) => {
-      const { tokenId, sinceIso, untilIso, requestKinds, forceEmptyMatch, result, keyEffect, keyId } =
-        logsRequestContextRef.current
-      return fetchTokenLogsPage(
-        tokenId,
-        {
-          page: nextPage,
-          perPage: nextPerPage,
-          sinceIso,
-          untilIso,
-          requestKinds: forceEmptyMatch ? [tokenLogRequestKindEmptySelectionKey] : requestKinds,
-          result: result as 'success' | 'error' | 'quota_exhausted' | undefined,
-          keyEffect,
-          keyId,
-        },
-        signal,
-      )
-    },
-    [],
-  )
-  const loadLogsPageForSelection = useCallback(
     (
-      nextPage: number,
-      requestKinds: string[],
-      forceEmptyMatch: boolean,
+      cursor: string | null,
+      direction: 'older' | 'newer',
       nextPerPage = perPageRef.current,
       signal?: AbortSignal,
     ) => {
-      const { tokenId, sinceIso, untilIso, result, keyEffect, keyId } = logsRequestContextRef.current
-      return fetchTokenLogsPage(
+      const {
+        tokenId,
+        sinceIso,
+        untilIso,
+        requestKinds,
+        forceEmptyMatch,
+        result,
+        keyEffect,
+        bindingEffect,
+        selectionEffect,
+        keyId,
+      } = logsRequestContextRef.current
+      return fetchTokenLogsList(
         tokenId,
         {
-          page: nextPage,
-          perPage: nextPerPage,
+          limit: nextPerPage,
+          cursor,
+          direction,
           sinceIso,
           untilIso,
           requestKinds: forceEmptyMatch ? [tokenLogRequestKindEmptySelectionKey] : requestKinds,
           result: result as 'success' | 'error' | 'quota_exhausted' | undefined,
           keyEffect,
+          bindingEffect,
+          selectionEffect,
           keyId,
         },
         signal,
@@ -730,17 +763,36 @@ export default function TokenDetail({
     },
     [],
   )
-
+  const refreshLogsCatalog = useCallback(
+    (opts?: { preserveOnError?: boolean }) => {
+      requestKindOptionsAbortRef.current?.abort()
+      const controller = new AbortController()
+      requestKindOptionsAbortRef.current = controller
+      const catalogPlan = buildRequestLogsCatalogPlan({
+        sinceIso,
+        untilIso,
+      })
+      fetchTokenLogsCatalog(id, catalogPlan.query, controller.signal)
+        .then((catalog) => {
+          if (controller.signal.aborted) return
+          setLogsCatalog(catalog)
+          setRequestKindOptions(catalog.requestKindOptions)
+          setLogFacets(catalog.facets)
+        })
+        .catch((e) => {
+          if ((e as Error).name === 'AbortError' || controller.signal.aborted) return
+          if (opts?.preserveOnError) return
+          setLogsCatalog(null)
+          setRequestKindOptions([])
+          setLogFacets(emptyRequestLogFacets)
+        })
+      return controller
+    },
+    [id, sinceIso, untilIso],
+  )
   const loadTokenLogBodies = useCallback(
     (log: RequestLog, signal: AbortSignal) => fetchTokenLogDetails(id, log.id, signal),
     [id],
-  )
-
-  const syncRequestKindState = useCallback(
-    (nextOptions: TokenLogRequestKindOption[]) => {
-      setRequestKindOptions(nextOptions)
-    },
-    [],
   )
 
   async function loadQuickStats() {
@@ -874,33 +926,34 @@ export default function TokenDetail({
     }
   }, [id, period, sinceIso, summaryQueryBaseKey, untilIso])
 
-  // load first-page logs when the time window or request-type filter changes
+  // load logs list when the time window, cursor, or filters change
   useEffect(() => {
     logsAbortRef.current?.abort()
-    requestKindOptionsAbortRef.current?.abort()
     const logsController = new AbortController()
     logsAbortRef.current = logsController
+    const requestedPerPage = perPageRef.current
     setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
     setLogs([])
-    setPage(1)
-    setTotal(0)
-    setLogFacets(emptyRequestLogFacets)
+    setLogsPageInfo(createEmptyTokenLogsListPage(requestedPerPage))
     setError(null)
     const run = async () => {
       try {
-        const logsRes = await loadLogsPage(1, perPageRef.current, logsController.signal)
+        const logsRes = await loadLogsPage(logsCursor, logsDirection, requestedPerPage, logsController.signal)
         if (logsController.signal.aborted) return
         setLogs(logsRes.items)
-        setPage(1)
-        setPerPage(logsRes.perPage)
-        setTotal(logsRes.total)
-        setLogFacets(logsRes.facets)
-        syncRequestKindState(logsRes.requestKindOptions ?? [])
+        setLogsPageInfo(logsRes)
         setError(null)
         setLogsLoadState('ready')
-        logsQueryKeyRef.current = `${logsQueryBaseKey}:page=1:perPage=${logsRes.perPage}`
+        logsQueryKeyRef.current = buildTokenLogsListQueryKey(
+          logsQueryBaseKey,
+          logsCursor,
+          logsDirection,
+          logsRes.pageSize,
+        )
       } catch (e) {
         if ((e as Error).name === 'AbortError') return
+        setLogs([])
+        setLogsPageInfo(createEmptyTokenLogsListPage(requestedPerPage))
         setError(e instanceof Error ? e.message : 'Failed to load request records')
         setLogsLoadState('error')
       }
@@ -909,7 +962,12 @@ export default function TokenDetail({
     return () => {
       logsController.abort()
     }
-  }, [loadLogsPage, logsQueryBaseKey, syncRequestKindState])
+  }, [loadLogsPage, logsCursor, logsDirection, logsListQueryKey, logsQueryBaseKey])
+
+  useEffect(() => {
+    const controller = refreshLogsCatalog()
+    return () => controller.abort()
+  }, [refreshLogsCatalog])
 
   // SSE for live updates (refresh first page upon snapshot)
   useEffect(() => {
@@ -922,94 +980,26 @@ export default function TokenDetail({
       }
     }
     const refreshLogs = async () => {
-      if (page !== 1) return
+      if (logsCursor) return
       logsAbortRef.current?.abort()
-      requestKindOptionsAbortRef.current?.abort()
       const controller = new AbortController()
       logsAbortRef.current = controller
+      const requestedPerPage = perPageRef.current
       setLogsLoadState(getRefreshingLoadState(logsQueryKeyRef.current != null))
+      setLogsPageInfo(createEmptyTokenLogsListPage(requestedPerPage))
       try {
-        const data = await loadLogsPage(1, perPageRef.current, controller.signal)
+        const data = await loadLogsPage(null, 'older', requestedPerPage, controller.signal)
         if (controller.signal.aborted) return
         setLogs(data.items)
-        setTotal(data.total)
-        setPerPage(data.perPage)
-        setLogFacets(data.facets)
-        syncRequestKindState(data.requestKindOptions ?? [])
-        setPage(1)
+        setLogsPageInfo(data)
         setLogsLoadState('ready')
-        logsQueryKeyRef.current = `${logsQueryBaseKey}:page=1:perPage=${data.perPage}`
+        logsQueryKeyRef.current = buildTokenLogsListQueryKey(logsQueryBaseKey, null, 'older', data.pageSize)
       } catch {
         if (!controller.signal.aborted) {
+          setLogs([])
+          setLogsPageInfo(createEmptyTokenLogsListPage(requestedPerPage))
           setLogsLoadState('error')
         }
-        // ignore
-      }
-    }
-    const refreshRequestKindOptions = async () => {
-      requestKindOptionsAbortRef.current?.abort()
-      const controller = new AbortController()
-      requestKindOptionsAbortRef.current = controller
-      const requestQueryBaseKey = logsQueryBaseKeyRef.current
-      try {
-        const data = await loadLogsPage(1, perPageRef.current, controller.signal)
-        if (controller.signal.aborted || logsQueryBaseKeyRef.current !== requestQueryBaseKey) return
-        const nextOptions = data.requestKindOptions ?? []
-        const refreshContext = requestKindRefreshContextRef.current
-        const refreshedSelection = resolveRequestKindOptionsRefresh(
-          nextOptions,
-          refreshContext.selectedRequestKindsNormalized,
-          refreshContext.requestKindQuickFilters,
-          refreshContext.effectiveSelectedRequestKinds,
-          refreshContext.hasQuickRequestKindEmptyMatch,
-        )
-        if (refreshedSelection.selectionChanged) {
-          logsAbortRef.current?.abort()
-          const logsController = new AbortController()
-          logsAbortRef.current = logsController
-          setLogsLoadState(getRefreshingLoadState(logsQueryKeyRef.current != null))
-
-          const loadRefreshedPage = async (nextPage: number, nextPerPage = perPageRef.current) =>
-            loadLogsPageForSelection(
-              nextPage,
-              refreshedSelection.effectiveSelection,
-              refreshedSelection.hasEmptyMatch,
-              nextPerPage,
-              logsController.signal,
-            )
-
-          const resolvedPage = Math.max(1, page)
-          let refreshedPage = await loadRefreshedPage(resolvedPage)
-          if (logsController.signal.aborted || logsQueryBaseKeyRef.current !== requestQueryBaseKey) return
-
-          const resolvedPerPage = refreshedPage.perPage ?? perPageRef.current
-          const pageCount = Math.max(1, Math.ceil(refreshedPage.total / resolvedPerPage) || 1)
-          const clampedPage = Math.min(resolvedPage, pageCount)
-
-          if (clampedPage !== resolvedPage) {
-            refreshedPage = await loadRefreshedPage(clampedPage, resolvedPerPage)
-            if (logsController.signal.aborted || logsQueryBaseKeyRef.current !== requestQueryBaseKey) return
-          }
-
-          const finalPerPage = refreshedPage.perPage ?? resolvedPerPage
-          const finalPageCount = Math.max(1, Math.ceil(refreshedPage.total / finalPerPage) || 1)
-          const finalPage = Math.min(clampedPage, finalPageCount)
-          setLogs(refreshedPage.items)
-          setPage(finalPage)
-          setPerPage(finalPerPage)
-          setTotal(refreshedPage.total)
-          setLogFacets(refreshedPage.facets)
-          syncRequestKindState(refreshedPage.requestKindOptions ?? nextOptions)
-          setLogsLoadState('ready')
-          logsQueryKeyRef.current = `${requestQueryBaseKey}:page=${finalPage}:perPage=${finalPerPage}`
-          return
-        }
-
-        setTotal(data.total)
-        setPerPage(data.perPage ?? perPageRef.current)
-        setLogFacets(data.facets)
-        syncRequestKindState(nextOptions)
-      } catch {
         // ignore
       }
     }
@@ -1027,11 +1017,8 @@ export default function TokenDetail({
           setSummaryLoadState('ready')
         }
         void refreshDetail()
-        if (page === 1) {
-          void refreshLogs()
-        } else {
-          void refreshRequestKindOptions()
-        }
+        void refreshLogs()
+        refreshLogsCatalog({ preserveOnError: true })
         void loadQuickStats()
         refreshQuickUsage()
         refreshSnapshotUsage()
@@ -1047,14 +1034,13 @@ export default function TokenDetail({
     debouncedSinceInput,
     id,
     loadLogsPage,
-    loadLogsPageForSelection,
     logsQueryBaseKey,
-    page,
+    logsCursor,
     period,
     refreshQuickUsage,
     refreshSnapshotUsage,
+    refreshLogsCatalog,
     sinceIso,
-    syncRequestKindState,
     untilIso,
   ])
 
@@ -1062,110 +1048,22 @@ export default function TokenDetail({
     ;(window as typeof window & { __TOKEN_PERIOD__?: Period }).__TOKEN_PERIOD__ = period
   }, [period])
 
-  const goToPage = async (next: number, nextPerPage = perPage) => {
-    const pageCount = Math.max(1, Math.ceil(total / nextPerPage) || 1)
-    const p = Math.max(1, Math.min(next, pageCount))
-    logsAbortRef.current?.abort()
-    requestKindOptionsAbortRef.current?.abort()
-    const controller = new AbortController()
-    logsAbortRef.current = controller
-    setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
-    setLogs([])
-    setPage(p)
-    setError(null)
-    const requestQueryBaseKey = logsQueryBaseKeyRef.current
-    try {
-      const data = await loadLogsPage(p, nextPerPage, controller.signal)
-      if (controller.signal.aborted || logsQueryBaseKeyRef.current !== requestQueryBaseKey) return
-      const nextOptions = data.requestKindOptions ?? []
-      const refreshContext = requestKindRefreshContextRef.current
-      const refreshedSelection = resolveRequestKindOptionsRefresh(
-        nextOptions,
-        refreshContext.selectedRequestKindsNormalized,
-        refreshContext.requestKindQuickFilters,
-        refreshContext.effectiveSelectedRequestKinds,
-        refreshContext.hasQuickRequestKindEmptyMatch,
-      )
-      if (refreshedSelection.selectionChanged) {
-        const loadRefreshedPage = async (nextPage: number, pagePerPage = nextPerPage) =>
-          loadLogsPageForSelection(
-            nextPage,
-            refreshedSelection.effectiveSelection,
-            refreshedSelection.hasEmptyMatch,
-            pagePerPage,
-            controller.signal,
-          )
-
-        const requestedPage = Math.max(1, p)
-        let refreshedPage = await loadRefreshedPage(requestedPage)
-        if (controller.signal.aborted || logsQueryBaseKeyRef.current !== requestQueryBaseKey) return
-
-        const resolvedPerPage = refreshedPage.perPage ?? nextPerPage
-        const refreshedPageCount = Math.max(1, Math.ceil(refreshedPage.total / resolvedPerPage) || 1)
-        const clampedPage = Math.min(requestedPage, refreshedPageCount)
-
-        if (clampedPage !== requestedPage) {
-          refreshedPage = await loadRefreshedPage(clampedPage, resolvedPerPage)
-          if (controller.signal.aborted || logsQueryBaseKeyRef.current !== requestQueryBaseKey) return
-        }
-
-        const finalPerPage = refreshedPage.perPage ?? resolvedPerPage
-        const finalPageCount = Math.max(1, Math.ceil(refreshedPage.total / finalPerPage) || 1)
-        const finalPage = Math.min(clampedPage, finalPageCount)
-        setLogs(refreshedPage.items)
-        setPage(finalPage)
-        setPerPage(finalPerPage)
-        setTotal(refreshedPage.total)
-        setLogFacets(refreshedPage.facets)
-        syncRequestKindState(refreshedPage.requestKindOptions ?? nextOptions)
-        setLogsLoadState('ready')
-        logsQueryKeyRef.current = `${requestQueryBaseKey}:page=${finalPage}:perPage=${finalPerPage}`
-        return
-      }
-
-      const resolvedPerPage = data.perPage ?? nextPerPage
-      setLogs(data.items)
-      setPage(data.page)
-      setPerPage(resolvedPerPage)
-      setTotal(data.total)
-      setLogFacets(data.facets)
-      syncRequestKindState(nextOptions)
-      setLogsLoadState('ready')
-      logsQueryKeyRef.current = `${requestQueryBaseKey}:page=${data.page}:perPage=${resolvedPerPage}`
-    } catch (e) {
-      if ((e as Error).name === 'AbortError') return
-      setError(e instanceof Error ? e.message : 'Failed to load page')
-      setLogsLoadState('error')
-    }
+  const goNewerLogsPage = () => {
+    if (!logsPageInfo.prevCursor) return
+    setLogsCursor(logsPageInfo.prevCursor)
+    setLogsDirection('newer')
   }
 
-  const changePerPage = async (nextPerPage: number) => {
-    logsAbortRef.current?.abort()
-    requestKindOptionsAbortRef.current?.abort()
-    const controller = new AbortController()
-    logsAbortRef.current = controller
-    setLogsLoadState(getBlockingLoadState(logsQueryKeyRef.current != null))
-    setLogs([])
+  const goOlderLogsPage = () => {
+    if (!logsPageInfo.nextCursor) return
+    setLogsCursor(logsPageInfo.nextCursor)
+    setLogsDirection('older')
+  }
+
+  const changePerPage = (nextPerPage: number) => {
     setPerPage(nextPerPage)
-    setPage(1)
-    setError(null)
-    try {
-      const data = await loadLogsPage(1, nextPerPage, controller.signal)
-      if (controller.signal.aborted) return
-      const resolvedPerPage = data.perPage ?? nextPerPage
-      setLogs(data.items)
-      setPage(1)
-      setPerPage(resolvedPerPage)
-      setTotal(data.total)
-      setLogFacets(data.facets)
-      syncRequestKindState(data.requestKindOptions ?? [])
-      setLogsLoadState('ready')
-      logsQueryKeyRef.current = `${logsQueryBaseKey}:page=1:perPage=${resolvedPerPage}`
-    } catch (e) {
-      if ((e as Error).name === 'AbortError') return
-      setError(e instanceof Error ? e.message : 'Failed to load page size')
-      setLogsLoadState('error')
-    }
+    setLogsCursor(null)
+    setLogsDirection('older')
   }
 
   const applyRequestKindQuickFilters = useCallback(
@@ -1177,7 +1075,8 @@ export default function TokenDetail({
       setRequestKindQuickBilling(nextBilling)
       setRequestKindQuickProtocol(nextProtocol)
       setSelectedRequestKinds(buildRequestKindQuickFilterSelection(requestKindOptions, nextFilters))
-      setPage(1)
+      setLogsCursor(null)
+      setLogsDirection('older')
     },
     [requestKindOptions],
   )
@@ -1194,7 +1093,8 @@ export default function TokenDetail({
       setSelectedRequestKinds(nextSelected)
       setRequestKindQuickBilling(nextQuickFilters.billing)
       setRequestKindQuickProtocol(nextQuickFilters.protocol)
-      setPage(1)
+      setLogsCursor(null)
+      setLogsDirection('older')
     },
     [
       effectiveSelectedRequestKinds,
@@ -1208,17 +1108,20 @@ export default function TokenDetail({
     setSelectedRequestKinds([])
     setRequestKindQuickBilling(defaultTokenLogRequestKindQuickFilters.billing)
     setRequestKindQuickProtocol(defaultTokenLogRequestKindQuickFilters.protocol)
-    setPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const handleOutcomeFilterChange = useCallback((next: RecentRequestsOutcomeFilter | null) => {
     setOutcomeFilter(next)
-    setPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const handleKeyFilterChange = useCallback((next: string | null) => {
     setSelectedKeyId(next)
-    setPage(1)
+    setLogsCursor(null)
+    setLogsDirection('older')
   }, [])
 
   const handleRotateToken = useCallback(async () => {
@@ -1444,7 +1347,17 @@ export default function TokenDetail({
           <div className="token-period-controls" role="group" aria-label="Period filter">
             <div className="token-period-control">
               <label htmlFor={periodSelectId}>Period</label>
-              <Select value={period} onValueChange={(value) => { const next = value as Period; setPeriod(next); applyStartInput('', next) }} disabled={filterControlsDisabled}>
+              <Select
+                value={period}
+                onValueChange={(value) => {
+                  const next = value as Period
+                  setPeriod(next)
+                  applyStartInput('', next)
+                  setLogsCursor(null)
+                  setLogsDirection('older')
+                }}
+                disabled={filterControlsDisabled}
+              >
                 <SelectTrigger id={periodSelectId} disabled={filterControlsDisabled}>
                   <SelectValue />
                 </SelectTrigger>
@@ -1523,7 +1436,7 @@ export default function TokenDetail({
         language={language}
         strings={translations.admin}
         title={translations.admin.logs.title}
-        description="Newest entries first. Live refresh applies to the first page."
+        description={logsDescription}
         emptyLabel="No logs yet."
         loadState={logsLoadState}
         loadingLabel={logsRefreshing ? loadingStateStrings.refreshing : loadingStateStrings.switching}
@@ -1539,6 +1452,8 @@ export default function TokenDetail({
         outcomeFilter={outcomeFilter}
         resultOptions={logFacets.results}
         keyEffectOptions={logFacets.keyEffects}
+        bindingEffectOptions={logFacets.bindingEffects}
+        selectionEffectOptions={logFacets.selectionEffects}
         onOutcomeFilterChange={handleOutcomeFilterChange}
         keyOptions={logFacets.keys}
         selectedKeyId={selectedKeyId}
@@ -1546,12 +1461,13 @@ export default function TokenDetail({
         showKeyColumn
         showTokenColumn={false}
         onOpenKey={onOpenKey}
-        page={page}
         perPage={perPage}
-        total={total}
+        hasOlder={logsPageInfo.hasOlder}
+        hasNewer={logsPageInfo.hasNewer}
+        paginationSummary={logsPaginationSummary}
         paginationDisabled={logsBlocking}
-        onPreviousPage={() => void goToPage(page - 1)}
-        onNextPage={() => void goToPage(page + 1)}
+        onNewerPage={goNewerLogsPage}
+        onOlderPage={goOlderLogsPage}
         onPerPageChange={(value) => void changePerPage(value)}
         formatTime={(ts) => formatLogTime(ts, period)}
         formatTimeDetail={(ts) => (ts ? dateTimeFormatter.format(new Date(ts * 1000)) : '—')}
@@ -1678,4 +1594,9 @@ function UsageChart({
       )}
     </div>
   )
+}
+
+export const __testables = {
+  buildTokenLogsListQueryKey,
+  createEmptyTokenLogsListPage,
 }

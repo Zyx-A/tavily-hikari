@@ -3,12 +3,15 @@ import { Icon, getGuideClientIconName } from './lib/icons'
 import { StatusBadge, type StatusTone } from './components/StatusBadge'
 import CherryStudioMock from './components/CherryStudioMock'
 import {
+  buildPublicEventsUrl,
+  createBrowserTodayWindow,
   fetchPublicMetrics,
   fetchProfile,
   fetchSummary,
   fetchTokenMetrics,
   fetchUserToken,
   fetchPublicLogs,
+  millisecondsUntilNextBrowserDayBoundary,
   type Profile,
   type PublicMetrics,
   type Summary,
@@ -127,22 +130,20 @@ function PublicHome(): JSX.Element {
   const { viewportMode, contentMode, isCompactLayout } = useResponsiveModes(pageRef)
   const [recentTokenUsage, setRecentTokenUsage] = useState<TokenMetrics | null>(null)
   const [userTokenHydrationDone, setUserTokenHydrationDone] = useState(false)
+  const [todayWindow, setTodayWindow] = useState(() => createBrowserTodayWindow())
 
   useEffect(() => {
-    const hash = window.location.hash.slice(1)
-    const decodedHash = hash ? decodeURIComponent(hash) : null
+    const timer = window.setTimeout(() => {
+      setTodayWindow(createBrowserTodayWindow())
+    }, millisecondsUntilNextBrowserDayBoundary())
+    return () => window.clearTimeout(timer)
+  }, [todayWindow.todayEnd])
+
+  useEffect(() => {
     const tokenStore = loadTokenMap()
     const lastToken = loadLastToken()
 
-    let initialToken: string | null = null
-    if (decodedHash && isFullToken(decodedHash)) {
-      initialToken = decodedHash
-    } else if (decodedHash) {
-      const id = extractTokenId(decodedHash)
-      if (id && tokenStore[id]) {
-        initialToken = tokenStore[id]
-      }
-    }
+    let initialToken = resolveInitialTokenFromHash(window.location.hash, tokenStore)
 
     if (!initialToken && lastToken) {
       initialToken = lastToken
@@ -156,10 +157,12 @@ function PublicHome(): JSX.Element {
     const controller = new AbortController()
     setLoading(true)
     Promise.allSettled([
-      fetchPublicMetrics(controller.signal),
+      fetchPublicMetrics(todayWindow, controller.signal),
       fetchProfile(controller.signal),
       fetchSummary(controller.signal),
-      initialToken && isFullToken(initialToken) ? fetchTokenMetrics(initialToken, controller.signal) : Promise.resolve(null),
+      initialToken && isFullToken(initialToken)
+        ? fetchTokenMetrics(initialToken, todayWindow, controller.signal)
+        : Promise.resolve(null),
     ])
       .then(([metricsResult, profileResult, summaryResult, tokenMetricsResult]) => {
         if (metricsResult.status === 'fulfilled') {
@@ -209,14 +212,12 @@ function PublicHome(): JSX.Element {
         }
       })
   return () => controller.abort()
-  }, [])
+  }, [publicStrings.errors.metrics, publicStrings.errors.summary, todayWindow])
 
   // Realtime metrics via public SSE
   useEffect(() => {
     // build URL with optional token
-    const params = new URLSearchParams()
-    if (token && isFullToken(token)) params.set('token', token)
-    const url = `/api/public/events${params.toString() ? `?${params.toString()}` : ''}`
+    const url = buildPublicEventsUrl(token && isFullToken(token) ? token : undefined, todayWindow)
     const es = new EventSource(url)
     const onMetrics = (ev: MessageEvent) => {
       try {
@@ -248,7 +249,7 @@ function PublicHome(): JSX.Element {
       es.removeEventListener('metrics', onMetrics as unknown as EventListener)
       es.close()
     }
-  }, [token])
+  }, [token, todayWindow])
 
   // Fallback polling: if token metrics未就绪或 SSE 不返回 token 段，定期补一次拉取
   useEffect(() => {
@@ -256,7 +257,7 @@ function PublicHome(): JSX.Element {
     let active = true
     const tick = async () => {
       try {
-        const tm = await fetchTokenMetrics(token)
+        const tm = await fetchTokenMetrics(token, todayWindow)
         if (!active) return
         setTokenMetrics(tm)
         setRecentTokenUsage(tm)
@@ -271,7 +272,7 @@ function PublicHome(): JSX.Element {
       active = false
       window.clearInterval(id)
     }
-  }, [token])
+  }, [token, todayWindow])
 
   const isAdmin = profile?.isAdmin ?? false
   const builtinAuthEnabled = profile?.builtinAuthEnabled ?? false
@@ -377,7 +378,7 @@ function PublicHome(): JSX.Element {
       /* noop */
     }
     // Fetch token-scoped metrics and recent logs
-    void fetchTokenMetrics(next)
+    void fetchTokenMetrics(next, todayWindow)
       .then((tm) => {
         setTokenMetrics(tm)
         setRecentTokenUsage(tm)
@@ -391,7 +392,7 @@ function PublicHome(): JSX.Element {
       .then((ls) => { setPublicLogs(ls); setInvalidToken(false) })
       .catch((err: any) => { setPublicLogs([]); setInvalidToken(Boolean(err?.status) && err.status >= 400 && err.status < 500) })
       .finally(() => setPublicLogsLoading(false))
-  }, [])
+  }, [todayWindow])
 
   const openTokenAccessDialog = useCallback(() => {
     setTokenDraft(token)
@@ -556,7 +557,7 @@ function PublicHome(): JSX.Element {
                     {formatNumber(recentTokenUsage?.quotaDailyUsed ?? 0)}
                     <span>/ {formatNumber(recentTokenUsage?.quotaDailyLimit ?? TOKEN_DAILY_LIMIT)}</span>
                   </div>
-                  <div className="quota-stat-description">Rolling 24-hour window</div>
+                  <div className="quota-stat-description">Server-local calendar day</div>
                 </div>
                 <div className="access-stat quota-stat-card">
                   <div className="quota-stat-label">{publicStrings.accessPanel.stats.monthlyLimit}</div>
@@ -564,7 +565,7 @@ function PublicHome(): JSX.Element {
                     {formatNumber(recentTokenUsage?.quotaMonthlyUsed ?? 0)}
                     <span>/ {formatNumber(recentTokenUsage?.quotaMonthlyLimit ?? TOKEN_MONTHLY_LIMIT)}</span>
                   </div>
-                  <div className="quota-stat-description">Calendar month</div>
+                  <div className="quota-stat-description">UTC calendar month</div>
                 </div>
               </div>
               <div className="access-token-box">
@@ -911,6 +912,7 @@ export default PublicHome
 export const __testables = {
   resolvePublicGuideToken,
   resolveGuideSamples,
+  resolveInitialTokenFromHash,
   shouldRevealPublicGuideToken,
   buildGuideContent,
 }
@@ -1255,6 +1257,21 @@ function resolveGuideSamples(content: GuideContent): GuideSample[] {
 
 function resolvePublicGuideToken(token: string, placeholder: string, revealed: boolean): string {
   return revealed && isFullToken(token) ? token : placeholder
+}
+
+function resolveInitialTokenFromHash(hashValue: string, tokenStore: Record<string, string>): string | null {
+  const normalizedHash = hashValue.startsWith('#') ? hashValue.slice(1) : hashValue
+  const decodedHash = normalizedHash ? decodeURIComponent(normalizedHash) : null
+  if (decodedHash && isFullToken(decodedHash)) {
+    return decodedHash
+  }
+  if (!decodedHash) return null
+
+  const id = extractTokenId(decodedHash)
+  if (id && tokenStore[id]) {
+    return tokenStore[id]
+  }
+  return null
 }
 
 function shouldRevealPublicGuideToken(token: string, revealedToken: string | null): boolean {

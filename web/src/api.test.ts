@@ -1,20 +1,42 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test'
 
 import {
+  buildPublicEventsUrl,
   bindAdminUserTag,
+  createBrowserTodayWindow,
   fetchAdminRegistrationSettings,
   fetchAdminUnboundTokenUsage,
+  fetchAdminUserUsageSeries,
   fetchAdminUsers,
   fetchAdminUserTags,
+  fetchAlertCatalog,
+  fetchAlertEvents,
+  fetchAlertGroups,
   fetchApiKeys,
+  fetchDashboardOverview,
   fetchJobs,
+  fetchKeyLogsCatalog,
   fetchKeyLogDetails,
+  fetchKeyLogsList,
+  fetchPublicMetrics,
   fetchRequestLogs,
+  fetchRequestLogsCatalog,
   fetchRequestLogDetails,
+  fetchRequestLogsList,
+  fetchSystemSettings,
+  fetchTokenLogsCatalog,
+  fetchTokenMetrics,
   fetchTokenLogDetails,
+  fetchTokenLogsList,
+  fetchUserDashboard,
+  postUserLogout,
+  fetchUserTokenDetail,
+  fetchUserTokens,
+  millisecondsUntilNextBrowserDayBoundary,
   updateForwardProxySettingsWithProgress,
   updateAdminRegistrationSettings,
   updateAdminUserQuota,
+  updateSystemSettings,
   validateForwardProxyCandidateWithProgress,
 } from './api'
 
@@ -43,6 +65,394 @@ function createSseResponse(chunks: string[]): Response {
 }
 
 describe('admin user tag api helpers', () => {
+  it('formats browser today windows with explicit ISO8601 offsets', () => {
+    const localNoon = new Date()
+    localNoon.setFullYear(2026, 2, 8)
+    localNoon.setHours(12, 34, 56, 0)
+    const windowRange = createBrowserTodayWindow(localNoon)
+
+    expect(windowRange.todayStart).toMatch(/^2026-03-08T00:00:00[+-]\d{2}:\d{2}$/)
+    expect(windowRange.todayEnd).toMatch(/^2026-03-09T00:00:00[+-]\d{2}:\d{2}$/)
+  })
+
+  it('computes the next browser-day refresh delay from the local clock', () => {
+    const nearMidnight = new Date()
+    nearMidnight.setHours(23, 59, 30, 0)
+    const delay = millisecondsUntilNextBrowserDayBoundary(nearMidnight)
+
+    expect(delay).toBe(30_000)
+  })
+
+  it('appends explicit today windows to user-facing metric endpoints', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({ monthlySuccess: 1, dailySuccess: 2 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const todayWindow = {
+      todayStart: '2026-04-03T00:00:00+08:00',
+      todayEnd: '2026-04-04T00:00:00+08:00',
+    }
+
+    await fetchPublicMetrics(todayWindow)
+    await fetchTokenMetrics('th-a1b2-secretsecret', todayWindow)
+    await fetchUserDashboard(todayWindow)
+    await fetchUserTokens(todayWindow)
+    await fetchUserTokenDetail('a1b2', todayWindow)
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe(
+      '/api/public/metrics?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[1] as [string])[0]).toBe(
+      '/api/token/metrics?token=th-a1b2-secretsecret&today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[2] as [string])[0]).toBe(
+      '/api/user/dashboard?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[3] as [string])[0]).toBe(
+      '/api/user/tokens?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[4] as [string])[0]).toBe(
+      '/api/user/tokens/a1b2?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+  })
+
+  it('treats user logout 204 and 401 as successful sign-out responses', async () => {
+    let status = 204
+    const fetchMock = mock((_input: RequestInfo | URL) => {
+      const response = new Response(null, { status })
+      status = 401
+      return Promise.resolve(response)
+    })
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(postUserLogout()).resolves.toBeUndefined()
+    await expect(postUserLogout()).resolves.toBeUndefined()
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/user/logout')
+    expect((fetchMock.mock.calls[1] as [string])[0]).toBe('/api/user/logout')
+  })
+
+  it('surfaces logout request failures for the caller to render', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response('upstream unavailable', { status: 503 })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(postUserLogout()).rejects.toMatchObject({
+      message: 'upstream unavailable',
+      status: 503,
+    })
+  })
+
+  it('loads the dashboard overview from the dedicated aggregate endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            summary: {
+              total_requests: 1,
+              success_count: 1,
+              error_count: 0,
+              quota_exhausted_count: 0,
+              active_keys: 1,
+              exhausted_keys: 0,
+              quarantined_keys: 0,
+              last_activity: null,
+              total_quota_limit: 10,
+              total_quota_remaining: 9,
+            },
+            summaryWindows: {
+              today: { total_requests: 1, success_count: 1, error_count: 0, quota_exhausted_count: 0, valuable_success_count: 0, valuable_failure_count: 0, other_success_count: 0, other_failure_count: 0, unknown_count: 0, upstream_exhausted_key_count: 0, new_keys: 0, new_quarantines: 0 },
+              yesterday: { total_requests: 0, success_count: 0, error_count: 0, quota_exhausted_count: 0, valuable_success_count: 0, valuable_failure_count: 0, other_success_count: 0, other_failure_count: 0, unknown_count: 0, upstream_exhausted_key_count: 0, new_keys: 0, new_quarantines: 0 },
+              month: { total_requests: 1, success_count: 1, error_count: 0, quota_exhausted_count: 0, valuable_success_count: 0, valuable_failure_count: 0, other_success_count: 0, other_failure_count: 0, unknown_count: 0, upstream_exhausted_key_count: 0, new_keys: 0, new_quarantines: 0 },
+            },
+            siteStatus: {
+              remainingQuota: 9,
+              totalQuotaLimit: 10,
+              activeKeys: 1,
+              quarantinedKeys: 0,
+              exhaustedKeys: 0,
+              availableProxyNodes: 1,
+              totalProxyNodes: 1,
+            },
+            forwardProxy: { availableNodes: 1, totalNodes: 1 },
+            hourlyRequestWindow: {
+              bucketSeconds: 3600,
+              visibleBuckets: 25,
+              retainedBuckets: 49,
+              buckets: Array.from({ length: 49 }, (_, index) => ({
+                bucketStart: 1_775_534_400 + index * 3600,
+                secondarySuccess: 0,
+                primarySuccess: index === 48 ? 1 : 0,
+                secondaryFailure: 0,
+                primaryFailure429: 0,
+                primaryFailureOther: 0,
+                unknown: 0,
+                mcpNonBillable: 0,
+                mcpBillable: 0,
+                apiNonBillable: 0,
+                apiBillable: index === 48 ? 1 : 0,
+              })),
+            },
+            trend: { request: [1, 0, 0, 0, 0, 0, 0, 0], error: [0, 0, 0, 0, 0, 0, 0, 0] },
+            exhaustedKeys: [],
+            recentLogs: [],
+            recentJobs: [],
+            disabledTokens: [],
+            tokenCoverage: 'ok',
+            recentAlerts: {
+              windowHours: 24,
+              totalEvents: 3,
+              groupedCount: 2,
+              countsByType: [
+                { type: 'upstream_rate_limited_429', count: 1 },
+                { type: 'upstream_usage_limit_432', count: 2 },
+              ],
+              topGroups: [
+                {
+                  id: 'group-1',
+                  type: 'upstream_usage_limit_432',
+                  subjectKind: 'user',
+                  subjectId: 'usr_001',
+                  subjectLabel: 'Alice Wang',
+                  user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                  token: { id: 'tok_001', label: 'tok_001' },
+                  key: null,
+                  requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: null },
+                  count: 2,
+                  firstSeen: 1_775_534_400,
+                  lastSeen: 1_775_535_400,
+                  latestEvent: {
+                    id: 'alert_evt_001',
+                    type: 'upstream_usage_limit_432',
+                    title: 'Tavily usage limit 432',
+                    summary: 'Alice Wang hit the upstream Tavily usage limit.',
+                    occurredAt: 1_775_535_400,
+                    subjectKind: 'user',
+                    subjectId: 'usr_001',
+                    subjectLabel: 'Alice Wang',
+                    user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                    token: { id: 'tok_001', label: 'tok_001' },
+                    key: { id: 'key_001', label: 'key_001' },
+                    request: { id: 91, method: 'POST', path: '/api/tavily/search', query: null },
+                    requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: null },
+                    failureKind: null,
+                    resultStatus: 'quota_exhausted',
+                    errorMessage: 'This request exceeds your plan\'s set usage limit.',
+                    reasonCode: null,
+                    reasonSummary: null,
+                    reasonDetail: null,
+                    source: { kind: 'auth_token_log', id: 'log_91' },
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const overview = await fetchDashboardOverview()
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/dashboard/overview')
+    expect(overview.siteStatus.activeKeys).toBe(1)
+    expect(overview.trend.request).toHaveLength(8)
+    expect(overview.hourlyRequestWindow.buckets).toHaveLength(49)
+    expect(overview.tokenCoverage).toBe('ok')
+    expect(overview.recentAlerts.totalEvents).toBe(3)
+    expect(overview.recentAlerts.topGroups[0]?.latestEvent.request?.id).toBe(91)
+  })
+
+  it('formats the admin user usage series URL with the selected series key', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({ limit: 100, points: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchAdminUserUsageSeries('user/abc', 'quotaMonth')
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/users/user%2Fabc/usage-series?series=quotaMonth')
+  })
+
+  it('fetches the alert catalog from the dedicated endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            retentionDays: 30,
+            types: [{ value: 'upstream_rate_limited_429', count: 2 }],
+            requestKindOptions: [
+              {
+                key: 'tavily_search',
+                label: 'Tavily Search',
+                protocol_group: 'api',
+                billing_group: 'billable',
+                count: 2,
+              },
+            ],
+            users: [{ value: 'usr_001', label: 'Alice Wang', count: 2 }],
+            tokens: [{ value: 'tok_001', label: 'tok_001', count: 2 }],
+            keys: [{ value: 'key_001', label: 'key_001', count: 1 }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const catalog = await fetchAlertCatalog()
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/alerts/catalog')
+    expect(catalog.types[0]).toEqual({ value: 'upstream_rate_limited_429', count: 2 })
+    expect(catalog.requestKindOptions[0]?.key).toBe('tavily_search')
+    expect(catalog.users[0]?.label).toBe('Alice Wang')
+  })
+
+  it('builds repeated alert query params and normalizes event payloads', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 'alert_evt_001',
+                type: 'upstream_rate_limited_429',
+                title: 'Upstream 429',
+                summary: 'The upstream returned 429.',
+                occurredAt: 1_775_535_400,
+                subjectKind: 'user',
+                subjectId: 'usr_001',
+                subjectLabel: 'Alice Wang',
+                user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                token: { id: 'tok_001', label: 'tok_001' },
+                key: { id: 'key_001', label: 'key_001' },
+                request: { id: 91, method: 'POST', path: '/api/tavily/search', query: null },
+                requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: 'POST /api/tavily/search' },
+                failureKind: 'upstream_rate_limited_429',
+                resultStatus: 'error',
+                errorMessage: 'HTTP 429',
+                reasonCode: null,
+                reasonSummary: null,
+                reasonDetail: null,
+                source: { kind: 'auth_token_log', id: 'log_91' },
+              },
+            ],
+            total: 1,
+            page: 2,
+            per_page: 50,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const page = await fetchAlertEvents({
+      page: 2,
+      perPage: 50,
+      type: 'upstream_rate_limited_429',
+      since: '2026-04-18T00:00:00+08:00',
+      until: '2026-04-18T12:00:00+08:00',
+      userId: 'usr_001',
+      tokenId: 'tok_001',
+      keyId: 'key_001',
+      requestKinds: ['tavily_search', 'mcp_search'],
+    })
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe(
+      '/api/alerts/events?page=2&per_page=50&type=upstream_rate_limited_429&since=2026-04-18T00%3A00%3A00%2B08%3A00&until=2026-04-18T12%3A00%3A00%2B08%3A00&user_id=usr_001&token_id=tok_001&key_id=key_001&request_kind=tavily_search&request_kind=mcp_search',
+    )
+    expect(page.perPage).toBe(50)
+    expect(page.items[0]?.requestKind?.label).toBe('Tavily Search')
+    expect(page.items[0]?.source.kind).toBe('auth_token_log')
+  })
+
+  it('normalizes grouped alert payloads from the groups endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 'group-1',
+                type: 'upstream_key_blocked',
+                subjectKind: 'key',
+                subjectId: 'key_001',
+                subjectLabel: 'key_001',
+                user: null,
+                token: null,
+                key: { id: 'key_001', label: 'key_001' },
+                requestKind: { key: 'mcp_search', label: 'MCP Search', detail: 'POST /mcp' },
+                count: 2,
+                firstSeen: 1_775_534_400,
+                lastSeen: 1_775_535_400,
+                latestEvent: {
+                  id: 'alert_evt_003',
+                  type: 'upstream_key_blocked',
+                  title: 'Upstream key blocked',
+                  summary: 'The upstream disabled key_001.',
+                  occurredAt: 1_775_535_400,
+                  subjectKind: 'key',
+                  subjectId: 'key_001',
+                  subjectLabel: 'key_001',
+                  user: null,
+                  token: null,
+                  key: { id: 'key_001', label: 'key_001' },
+                  request: null,
+                  requestKind: { key: 'mcp_search', label: 'MCP Search', detail: 'POST /mcp' },
+                  failureKind: null,
+                  resultStatus: null,
+                  errorMessage: null,
+                  reasonCode: 'account_deactivated',
+                  reasonSummary: 'Upstream account deactivated',
+                  reasonDetail: 'quarantined locally',
+                  source: { kind: 'api_key_maintenance_record', id: 'maint_3' },
+                },
+              },
+            ],
+            total: 1,
+            page: 1,
+            perPage: 20,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const page = await fetchAlertGroups({
+      page: 1,
+      perPage: 20,
+      requestKinds: ['mcp_search'],
+    })
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe(
+      '/api/alerts/groups?page=1&per_page=20&request_kind=mcp_search',
+    )
+    expect(page.items[0]?.count).toBe(2)
+    expect(page.items[0]?.latestEvent.reasonCode).toBe('account_deactivated')
+    expect(page.items[0]?.requestKind?.key).toBe('mcp_search')
+  })
+
+  it('builds the public SSE url with token and explicit today windows', () => {
+    expect(buildPublicEventsUrl('th-a1b2-secretsecret', {
+      todayStart: '2026-04-03T00:00:00+08:00',
+      todayEnd: '2026-04-04T00:00:00+08:00',
+    })).toBe(
+      '/api/public/events?token=th-a1b2-secretsecret&today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+  })
+
   it('streams forward proxy validation progress events before returning the final payload', async () => {
     const events: string[] = []
     const fetchMock = mock(() =>
@@ -395,6 +805,14 @@ describe('admin user tag api helpers', () => {
             total: 1,
             page: 1,
             perPage: 10,
+            groupCounts: {
+              all: 4,
+              quota: 1,
+              usage: 1,
+              logs: 1,
+              geo: 0,
+              linuxdo: 1,
+            },
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         ),
@@ -406,6 +824,14 @@ describe('admin user tag api helpers', () => {
 
     expect(jobs.page).toBe(1)
     expect(jobs.perPage).toBe(10)
+    expect(jobs.groupCounts).toEqual({
+      all: 4,
+      quota: 1,
+      usage: 1,
+      logs: 1,
+      geo: 0,
+      linuxdo: 1,
+    })
     expect(jobs.items[0]).toEqual({
       id: 37696,
       job_type: 'quota_sync',
@@ -428,6 +854,14 @@ describe('admin user tag api helpers', () => {
             total: 0,
             page: 1,
             perPage: 10,
+            groupCounts: {
+              all: 0,
+              quota: 0,
+              usage: 0,
+              logs: 0,
+              geo: 0,
+              linuxdo: 0,
+            },
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         ),
@@ -517,5 +951,213 @@ describe('admin user tag api helpers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/tokens/ZjvC/logs/73/details')
     expect(detail).toEqual({ request_body: '{"tool":"search"}', response_body: null })
+  })
+
+  it('builds cursor-based admin request log list URLs', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            pageSize: 20,
+            nextCursor: '300:3',
+            prevCursor: null,
+            hasOlder: true,
+            hasNewer: false,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchRequestLogsList({
+      limit: 20,
+      cursor: '400:4',
+      direction: 'older',
+      requestKinds: ['api:search', 'mcp:search'],
+      result: 'error',
+      keyId: 'K001',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/logs/list?limit=20&cursor=400%3A4&direction=older&request_kind=api%3Asearch&request_kind=mcp%3Asearch&result=error&key_id=K001',
+    )
+  })
+
+  it('builds admin request log catalog URLs across scopes', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            retentionDays: 32,
+            requestKindOptions: [],
+            facets: {
+              results: [],
+              keyEffects: [],
+              bindingEffects: [{ value: 'http_project_affinity_bound', count: 1 }],
+              selectionEffects: [{ value: 'http_project_affinity_pressure_avoided', count: 2 }],
+              tokens: [],
+              keys: [],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchRequestLogsCatalog({
+      requestKinds: ['api:search'],
+      result: 'error',
+      keyId: 'K001',
+    })
+    await fetchKeyLogsCatalog('K001', {
+      since: 0,
+      requestKinds: ['mcp:search'],
+      bindingEffect: 'http_project_affinity_reused',
+      tokenId: 'T001',
+    })
+    await fetchTokenLogsCatalog('T001', {
+      sinceIso: '2026-04-01T00:00:00+08:00',
+      untilIso: '2026-04-02T00:00:00+08:00',
+      requestKinds: ['api:extract'],
+      result: 'quota_exhausted',
+      keyId: 'K001',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/logs/catalog?request_kind=api%3Asearch&result=error&key_id=K001',
+    )
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/keys/K001/logs/catalog?request_kind=mcp%3Asearch&binding_effect=http_project_affinity_reused&auth_token_id=T001&since=0',
+    )
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      '/api/tokens/T001/logs/catalog?request_kind=api%3Aextract&result=quota_exhausted&key_id=K001&since=2026-04-01T00%3A00%3A00%2B08%3A00&until=2026-04-02T00%3A00%3A00%2B08%3A00',
+    )
+    const catalog = await fetchRequestLogsCatalog()
+    expect(catalog.facets.bindingEffects).toEqual([{ value: 'http_project_affinity_bound', count: 1 }])
+    expect(catalog.facets.selectionEffects).toEqual([
+      { value: 'http_project_affinity_pressure_avoided', count: 2 },
+    ])
+  })
+
+  it('builds cursor-based scoped request log list URLs', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            pageSize: 10,
+            nextCursor: null,
+            prevCursor: '200:2',
+            hasOlder: false,
+            hasNewer: true,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchKeyLogsList('K001', {
+      limit: 10,
+      direction: 'newer',
+      cursor: '150:1',
+      since: 100,
+      requestKinds: ['api:extract'],
+    })
+    await fetchTokenLogsList('T001', {
+      limit: 10,
+      direction: 'older',
+      sinceIso: '2026-04-01T00:00:00+08:00',
+      untilIso: '2026-04-02T00:00:00+08:00',
+      keyId: 'K001',
+      selectionEffect: 'mcp_session_init_pressure_avoided',
+      operationalClass: 'neutral',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/keys/K001/logs/list?limit=10&cursor=150%3A1&direction=newer&request_kind=api%3Aextract&since=100',
+    )
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/tokens/T001/logs/list?limit=10&direction=older&selection_effect=mcp_session_init_pressure_avoided&operational_class=neutral&key_id=K001&since=2026-04-01T00%3A00%3A00%2B08%3A00&until=2026-04-02T00%3A00%3A00%2B08%3A00',
+    )
+  })
+
+  it('loads system settings including the request-rate threshold', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            systemSettings: {
+              requestRateLimit: 72,
+              mcpSessionAffinityKeyCount: 3,
+              rebalanceMcpEnabled: true,
+              rebalanceMcpSessionPercent: 35,
+              userBlockedKeyBaseLimit: 8,
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(fetchSystemSettings()).resolves.toEqual({
+      requestRateLimit: 72,
+      mcpSessionAffinityKeyCount: 3,
+      rebalanceMcpEnabled: true,
+      rebalanceMcpSessionPercent: 35,
+      userBlockedKeyBaseLimit: 8,
+    })
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/settings')
+  })
+
+  it('updates system settings with requestRateLimit in the payload body', async () => {
+    const fetchMock = mock((_input: RequestInfo | URL, init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            requestRateLimit: 75,
+            mcpSessionAffinityKeyCount: 4,
+            rebalanceMcpEnabled: false,
+            rebalanceMcpSessionPercent: 100,
+            userBlockedKeyBaseLimit: 5,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(
+      updateSystemSettings({
+        requestRateLimit: 75,
+        mcpSessionAffinityKeyCount: 4,
+        rebalanceMcpEnabled: false,
+        rebalanceMcpSessionPercent: 100,
+        userBlockedKeyBaseLimit: 5,
+      }),
+    ).resolves.toEqual({
+      requestRateLimit: 75,
+      mcpSessionAffinityKeyCount: 4,
+      rebalanceMcpEnabled: false,
+      rebalanceMcpSessionPercent: 100,
+      userBlockedKeyBaseLimit: 5,
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/settings/system')
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requestRateLimit: 75,
+        mcpSessionAffinityKeyCount: 4,
+        rebalanceMcpEnabled: false,
+        rebalanceMcpSessionPercent: 100,
+        userBlockedKeyBaseLimit: 5,
+      }),
+    })
   })
 })

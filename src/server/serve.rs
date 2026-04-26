@@ -66,6 +66,15 @@ pub async fn serve(
             .as_deref()
             .unwrap_or("<none>")
     );
+    let (linuxdo_user_sync_hour, linuxdo_user_sync_minute) = state.linuxdo_oauth.user_sync_time();
+    println!(
+        "LinuxDo user sync: scheduler_enabled={} oauth_ready={} refresh_token_key={} at={:02}:{:02}",
+        state.linuxdo_oauth.is_user_sync_scheduler_enabled(),
+        state.linuxdo_oauth.is_enabled_and_configured(),
+        state.linuxdo_oauth.has_refresh_token_crypt_key(),
+        linuxdo_user_sync_hour,
+        linuxdo_user_sync_minute,
+    );
 
     let mut router = Router::new()
         .route("/health", get(health_check))
@@ -79,6 +88,7 @@ pub async fn serve(
         .route("/api/events", get(sse_dashboard))
         .route("/api/version", get(get_versions))
         .route("/api/profile", get(get_profile))
+        .route("/api/dashboard/overview", get(get_dashboard_overview))
         .route("/auth/linuxdo", get(get_linuxdo_auth).post(post_linuxdo_auth))
         .route("/auth/linuxdo/callback", get(get_linuxdo_callback))
         .route("/api/user/logout", post(post_user_logout))
@@ -88,6 +98,7 @@ pub async fn serve(
         .route("/api/user/tokens/:id", get(get_user_token_detail))
         .route("/api/user/tokens/:id/secret", get(get_user_token_secret))
         .route("/api/user/tokens/:id/logs", get(get_user_token_logs))
+        .route("/api/user/tokens/:id/events", get(sse_user_token))
         .route("/api/admin/registration", get(get_admin_registration_settings))
         .route(
             "/api/admin/registration",
@@ -108,6 +119,7 @@ pub async fn serve(
         .route("/api/summary", get(fetch_summary))
         .route("/api/summary/windows", get(fetch_summary_windows))
         .route("/api/settings", get(get_settings))
+        .route("/api/settings/system", put(put_system_settings))
         .route("/api/settings/forward-proxy", put(put_forward_proxy_settings))
         .route(
             "/api/settings/forward-proxy/validate",
@@ -127,6 +139,7 @@ pub async fn serve(
         .route("/api/keys", post(create_api_key))
         .route("/api/keys/validate", post(post_validate_api_keys))
         .route("/api/keys/batch", post(create_api_keys_batch))
+        .route("/api/keys/bulk-actions", post(post_api_key_bulk_actions))
         .route("/api/keys/:id", get(get_api_key_detail))
         .route("/api/keys/:id/quarantine", delete(delete_api_key_quarantine))
         .route("/api/keys/:id/sync-usage", post(post_sync_key_usage))
@@ -135,13 +148,19 @@ pub async fn serve(
         .route("/api/keys/:id/status", patch(update_api_key_status))
         .route("/api/jobs", get(list_jobs))
         .route("/api/logs", get(list_logs))
+        .route("/api/logs/list", get(list_logs_cursor))
+        .route("/api/logs/catalog", get(get_logs_catalog))
         .route("/api/logs/:log_id/details", get(get_log_details))
+        .route("/api/alerts/catalog", get(get_alert_catalog))
+        .route("/api/alerts/events", get(get_alert_events))
+        .route("/api/alerts/groups", get(get_alert_groups))
         .route("/api/user-tags", get(list_user_tags))
         .route("/api/user-tags", post(create_user_tag))
         .route("/api/user-tags/:tag_id", patch(update_user_tag))
         .route("/api/user-tags/:tag_id", delete(delete_user_tag))
         .route("/api/users", get(list_users))
         .route("/api/users/:id", get(get_user_detail))
+        .route("/api/users/:id/usage-series", get(get_user_usage_series))
         .route("/api/users/:id/quota", patch(update_user_quota))
         .route(
             "/api/users/:id/broken-key-limit",
@@ -153,6 +172,8 @@ pub async fn serve(
         // Key details
         .route("/api/keys/:id/metrics", get(get_key_metrics))
         .route("/api/keys/:id/logs", get(get_key_logs))
+        .route("/api/keys/:id/logs/list", get(get_key_logs_list))
+        .route("/api/keys/:id/logs/catalog", get(get_key_logs_catalog))
         .route("/api/keys/:id/logs/page", get(get_key_logs_page))
         .route("/api/keys/:id/logs/:log_id/details", get(get_key_log_details))
         .route("/api/keys/:id/sticky-users", get(get_key_sticky_users))
@@ -171,6 +192,8 @@ pub async fn serve(
         .route("/api/tokens/leaderboard", get(get_token_leaderboard))
         .route("/api/tokens/unbound-usage", get(list_unbound_token_usage))
         .route("/api/tokens/:id/logs", get(get_token_logs))
+        .route("/api/tokens/:id/logs/list", get(get_token_logs_list))
+        .route("/api/tokens/:id/logs/catalog", get(get_token_logs_catalog))
         .route("/api/tokens/:id/logs/page", get(get_token_logs_page))
         .route("/api/tokens/:id/logs/:log_id/details", get(get_token_log_details))
         .route("/api/tokens/:id/broken-keys", get(get_token_monthly_broken_keys))
@@ -197,6 +220,7 @@ pub async fn serve(
                 router = router.route("/console", get(serve_console_index));
                 router = router.route("/console/", get(serve_console_index));
                 router = router.route("/console.html", get(serve_console_index));
+                router = router.route("/console/*path", get(serve_console_index));
                 router = router.route("/admin/*path", get(serve_admin_index));
                 router = router.route("/login", get(serve_login));
                 router = router.route("/login/", get(serve_login));
@@ -282,7 +306,12 @@ pub async fn serve(
     spawn_quota_sync_scheduler(state.clone());
     spawn_token_usage_rollup_scheduler(state.clone());
     spawn_auth_token_logs_gc_scheduler(state.clone());
+    spawn_mcp_sessions_gc_scheduler(state.clone());
+    spawn_mcp_session_init_backoffs_gc_scheduler(state.clone());
     spawn_request_logs_gc_scheduler(state.clone());
+    if state.linuxdo_oauth.is_user_sync_scheduler_enabled() {
+        spawn_linuxdo_user_status_sync_scheduler(state.clone());
+    }
     let _forward_proxy_geo_refresh_scheduler = spawn_forward_proxy_geo_refresh_scheduler(state.clone());
     spawn_forward_proxy_maintenance_scheduler(state.clone());
 

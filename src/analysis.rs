@@ -444,6 +444,38 @@ pub(crate) fn sanitize_headers_inner(
     }
 }
 
+pub(crate) fn sanitize_rebalance_mcp_http_headers_inner(headers: &HeaderMap) -> SanitizedHeaders {
+    const ALLOWED_HEADERS: &[&str] = &["accept", "content-type"];
+
+    let mut sanitized = HeaderMap::new();
+    let mut forwarded = Vec::new();
+    let mut dropped = Vec::new();
+
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_ascii_lowercase();
+        if ALLOWED_HEADERS.iter().any(|allowed| key == *allowed) {
+            sanitized.insert(name.clone(), value.clone());
+            forwarded.push(key);
+        } else {
+            dropped.push(key);
+        }
+    }
+
+    sanitized.insert(
+        reqwest::header::USER_AGENT,
+        HeaderValue::from_static(MCP_PROXY_USER_AGENT),
+    );
+    if !forwarded.iter().any(|name| name == "user-agent") {
+        forwarded.push("user-agent".to_string());
+    }
+
+    SanitizedHeaders {
+        headers: sanitized,
+        forwarded,
+        dropped,
+    }
+}
+
 pub(crate) fn sanitize_mcp_headers_inner(headers: &HeaderMap) -> SanitizedHeaders {
     const MCP_ALLOWED_HEADERS: &[&str] = &[
         "accept",
@@ -834,6 +866,14 @@ pub(crate) fn build_mcp_unknown_payload_kind(detail: Option<String>) -> TokenReq
     TokenRequestKind::new("mcp:unknown-payload", "MCP | unknown payload", detail)
 }
 
+pub(crate) fn build_mcp_session_delete_unsupported_kind() -> TokenRequestKind {
+    TokenRequestKind::new(
+        "mcp:session-delete-unsupported",
+        "MCP | session delete unsupported",
+        None,
+    )
+}
+
 pub(crate) fn build_mcp_unknown_method_kind(method: &str) -> TokenRequestKind {
     TokenRequestKind::new(
         "mcp:unknown-method",
@@ -902,6 +942,7 @@ pub(crate) fn canonical_request_kind_label(key: &str) -> Option<&'static str> {
         "mcp:initialize" => Some("MCP | initialize"),
         "mcp:ping" => Some("MCP | ping"),
         "mcp:tools/list" => Some("MCP | tools/list"),
+        "mcp:session-delete-unsupported" => Some("MCP | session delete unsupported"),
         "mcp:unsupported-path" => Some("MCP | unsupported path"),
         "mcp:unknown-payload" => Some("MCP | unknown payload"),
         "mcp:unknown-method" => Some("MCP | unknown method"),
@@ -934,6 +975,7 @@ pub fn is_canonical_request_kind_key(key: &str) -> bool {
             | "mcp:initialize"
             | "mcp:ping"
             | "mcp:tools/list"
+            | "mcp:session-delete-unsupported"
             | "mcp:unsupported-path"
             | "mcp:unknown-payload"
             | "mcp:unknown-method"
@@ -1172,10 +1214,63 @@ pub fn canonical_request_kind_key_for_filter(request_kind: &str) -> String {
     trimmed.to_string()
 }
 
+pub(crate) fn matches_mcp_session_delete_unsupported(
+    method: &str,
+    path: &str,
+    http_status: Option<i64>,
+    tavily_status: Option<i64>,
+    failure_kind: Option<&str>,
+    error_message: Option<&str>,
+    response_body: &[u8],
+) -> bool {
+    if !method.trim().eq_ignore_ascii_case("DELETE") || path.trim() != "/mcp" {
+        return false;
+    }
+    if http_status != Some(405) || tavily_status != Some(405) {
+        return false;
+    }
+    if failure_kind != Some(FAILURE_KIND_MCP_METHOD_405) {
+        return false;
+    }
+
+    combined_failure_text(error_message, response_body)
+        .to_ascii_lowercase()
+        .contains("session termination not supported")
+}
+
+pub(crate) struct ResponseRequestKindContext<'a> {
+    pub(crate) method: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) http_status: Option<i64>,
+    pub(crate) tavily_status: Option<i64>,
+    pub(crate) failure_kind: Option<&'a str>,
+    pub(crate) error_message: Option<&'a str>,
+    pub(crate) response_body: &'a [u8],
+}
+
+pub(crate) fn normalize_request_kind_for_response_context(
+    request_kind: TokenRequestKind,
+    context: ResponseRequestKindContext<'_>,
+) -> TokenRequestKind {
+    if matches_mcp_session_delete_unsupported(
+        context.method,
+        context.path,
+        context.http_status,
+        context.tavily_status,
+        context.failure_kind,
+        context.error_message,
+        context.response_body,
+    ) {
+        build_mcp_session_delete_unsupported_kind()
+    } else {
+        request_kind
+    }
+}
+
 pub(crate) fn canonical_request_kind_stored_predicate_sql(expr: &str) -> String {
     let value = format!("COALESCE({expr}, '')");
     format!(
-        "({value} IN ('api:search', 'api:extract', 'api:crawl', 'api:map', 'api:research', 'api:research-result', 'api:usage', 'api:unknown-path', 'mcp:search', 'mcp:extract', 'mcp:crawl', 'mcp:map', 'mcp:research', 'mcp:batch', 'mcp:initialize', 'mcp:ping', 'mcp:tools/list', 'mcp:unsupported-path', 'mcp:unknown-payload', 'mcp:unknown-method', 'mcp:third-party-tool') OR {value} LIKE 'mcp:resources/%' OR {value} LIKE 'mcp:prompts/%' OR {value} LIKE 'mcp:notifications/%')"
+        "({value} IN ('api:search', 'api:extract', 'api:crawl', 'api:map', 'api:research', 'api:research-result', 'api:usage', 'api:unknown-path', 'mcp:search', 'mcp:extract', 'mcp:crawl', 'mcp:map', 'mcp:research', 'mcp:batch', 'mcp:initialize', 'mcp:ping', 'mcp:tools/list', 'mcp:session-delete-unsupported', 'mcp:unsupported-path', 'mcp:unknown-payload', 'mcp:unknown-method', 'mcp:third-party-tool') OR {value} LIKE 'mcp:resources/%' OR {value} LIKE 'mcp:prompts/%' OR {value} LIKE 'mcp:notifications/%')"
     )
 }
 
@@ -1209,6 +1304,7 @@ pub(crate) fn canonical_request_kind_label_sql(kind_expr: &str) -> String {
             WHEN {normalized} = 'mcp:initialize' THEN 'MCP | initialize'
             WHEN {normalized} = 'mcp:ping' THEN 'MCP | ping'
             WHEN {normalized} = 'mcp:tools/list' THEN 'MCP | tools/list'
+            WHEN {normalized} = 'mcp:session-delete-unsupported' THEN 'MCP | session delete unsupported'
             WHEN {normalized} = 'mcp:unsupported-path' THEN 'MCP | unsupported path'
             WHEN {normalized} = 'mcp:unknown-payload' THEN 'MCP | unknown payload'
             WHEN {normalized} = 'mcp:unknown-method' THEN 'MCP | unknown method'
@@ -1255,6 +1351,7 @@ fn token_log_stored_kind_sql(path_expr: &str, key_expr: &str) -> String {
                 'mcp:initialize',
                 'mcp:ping',
                 'mcp:tools/list',
+                'mcp:session-delete-unsupported',
                 'mcp:unsupported-path',
                 'mcp:unknown-payload',
                 'mcp:unknown-method',
@@ -1373,6 +1470,7 @@ pub fn token_request_kind_billing_group(key: &str) -> &'static str {
         || normalized.starts_with("mcp:initialize")
         || normalized.starts_with("mcp:ping")
         || normalized.starts_with("mcp:tools/list")
+        || normalized == "mcp:session-delete-unsupported"
         || normalized == "mcp:unsupported-path"
         || normalized == "mcp:unknown-payload"
         || normalized == "mcp:unknown-method"
@@ -1384,6 +1482,84 @@ pub fn token_request_kind_billing_group(key: &str) -> &'static str {
         "non_billable"
     } else {
         "billable"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestValueBucket {
+    Valuable,
+    Other,
+    Unknown,
+}
+
+fn request_value_bucket_from_kind(key: &str) -> RequestValueBucket {
+    match key.trim() {
+        "api:search"
+        | "api:extract"
+        | "api:crawl"
+        | "api:map"
+        | "api:research"
+        | "api:research-result"
+        | "mcp:search"
+        | "mcp:extract"
+        | "mcp:crawl"
+        | "mcp:map"
+        | "mcp:research" => RequestValueBucket::Valuable,
+        "api:usage" | "mcp:initialize" | "mcp:ping" | "mcp:tools/list" => RequestValueBucket::Other,
+        "api:unknown-path"
+        | "mcp:unknown-method"
+        | "mcp:unknown-payload"
+        | "mcp:unsupported-path"
+        | "mcp:third-party-tool" => RequestValueBucket::Unknown,
+        key if key.starts_with("mcp:resources/")
+            || key.starts_with("mcp:prompts/")
+            || key.starts_with("mcp:notifications/") =>
+        {
+            RequestValueBucket::Other
+        }
+        _ => RequestValueBucket::Unknown,
+    }
+}
+
+fn request_value_bucket_for_batch_body(body: Option<&[u8]>) -> RequestValueBucket {
+    let Some(body) = body else {
+        return RequestValueBucket::Unknown;
+    };
+    let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(body) else {
+        return RequestValueBucket::Unknown;
+    };
+    if items.is_empty() {
+        return RequestValueBucket::Unknown;
+    }
+
+    let mut saw_valuable = false;
+    for item in &items {
+        let Some(kind) = classify_mcp_request_kind_from_message(item) else {
+            return RequestValueBucket::Unknown;
+        };
+        match request_value_bucket_from_kind(&kind.key) {
+            RequestValueBucket::Unknown => return RequestValueBucket::Unknown,
+            RequestValueBucket::Valuable => saw_valuable = true,
+            RequestValueBucket::Other => {}
+        }
+    }
+
+    if saw_valuable {
+        RequestValueBucket::Valuable
+    } else {
+        RequestValueBucket::Other
+    }
+}
+
+pub(crate) fn request_value_bucket_for_request_log(
+    request_kind_key: &str,
+    body: Option<&[u8]>,
+) -> RequestValueBucket {
+    let normalized = request_kind_key.trim();
+    if normalized == "mcp:batch" {
+        request_value_bucket_for_batch_body(body)
+    } else {
+        request_value_bucket_from_kind(normalized)
     }
 }
 
@@ -1451,6 +1627,21 @@ pub fn normalize_operational_class_filter(value: Option<&str>) -> Option<&'stati
     }
 }
 
+fn normalized_result_status(result_status: &str) -> String {
+    result_status.trim().to_ascii_lowercase()
+}
+
+pub fn display_result_status_for_request_kind(
+    request_kind_key: &str,
+    result_status: &str,
+) -> String {
+    if request_kind_key.trim() == "mcp:session-delete-unsupported" {
+        OPERATIONAL_CLASS_NEUTRAL.to_string()
+    } else {
+        normalized_result_status(result_status)
+    }
+}
+
 fn is_client_error_failure_kind(kind: &str) -> bool {
     matches!(
         kind.trim(),
@@ -1489,12 +1680,16 @@ pub fn operational_class_for_token_log(
     failure_kind: Option<&str>,
     counts_business_quota: bool,
 ) -> &'static str {
-    let normalized_result = result_status.trim().to_ascii_lowercase();
-    if normalized_result == OUTCOME_QUOTA_EXHAUSTED {
+    let display_result = display_result_status_for_request_kind(request_kind_key, result_status);
+    if display_result == OUTCOME_QUOTA_EXHAUSTED {
         return OPERATIONAL_CLASS_QUOTA_EXHAUSTED;
     }
 
-    if normalized_result == OUTCOME_ERROR {
+    if display_result == OPERATIONAL_CLASS_NEUTRAL {
+        return OPERATIONAL_CLASS_NEUTRAL;
+    }
+
+    if display_result == OUTCOME_ERROR {
         if let Some(kind) = failure_kind {
             if is_client_error_failure_kind(kind) {
                 return OPERATIONAL_CLASS_CLIENT_ERROR;
@@ -1513,7 +1708,7 @@ pub fn operational_class_for_token_log(
         return OPERATIONAL_CLASS_NEUTRAL;
     }
 
-    if normalized_result == OUTCOME_SUCCESS {
+    if display_result == OUTCOME_SUCCESS {
         OPERATIONAL_CLASS_SUCCESS
     } else {
         OPERATIONAL_CLASS_SYSTEM_ERROR
@@ -1538,6 +1733,9 @@ pub fn operational_class_for_request_path(
 
 fn request_log_counts_business_quota(request_kind_key: &str, body: Option<&[u8]>) -> bool {
     let normalized = request_kind_key.trim();
+    if normalized == "mcp:session-delete-unsupported" {
+        return false;
+    }
     normalized != "mcp:batch" || !mcp_request_body_all_non_billable(body)
 }
 
@@ -1568,10 +1766,10 @@ pub fn operational_class_for_request_log(
     )
 }
 
-fn token_request_kind_non_billable_mcp_sql(expr: &str) -> String {
+pub(crate) fn token_request_kind_non_billable_mcp_sql(expr: &str) -> String {
     let normalized = format!("LOWER(TRIM(COALESCE({expr}, '')))");
     format!(
-        "({normalized} IN ('mcp:initialize', 'mcp:ping', 'mcp:tools/list', 'mcp:unsupported-path', 'mcp:unknown-payload', 'mcp:unknown-method', 'mcp:third-party-tool') OR {normalized} LIKE 'mcp:resources/%' OR {normalized} LIKE 'mcp:prompts/%' OR {normalized} LIKE 'mcp:notifications/%')"
+        "({normalized} IN ('mcp:initialize', 'mcp:ping', 'mcp:tools/list', 'mcp:session-delete-unsupported', 'mcp:unsupported-path', 'mcp:unknown-payload', 'mcp:unknown-method', 'mcp:third-party-tool') OR {normalized} LIKE 'mcp:resources/%' OR {normalized} LIKE 'mcp:prompts/%' OR {normalized} LIKE 'mcp:notifications/%')"
     )
 }
 
@@ -1658,6 +1856,89 @@ fn mcp_request_body_all_non_billable(body: Option<&[u8]>) -> bool {
         })
 }
 
+fn request_value_bucket_from_kind_sql(expr: &str) -> String {
+    let normalized = format!("LOWER(TRIM(COALESCE({expr}, '')))");
+    format!(
+        "
+        CASE
+            WHEN {normalized} IN (
+                'api:search',
+                'api:extract',
+                'api:crawl',
+                'api:map',
+                'api:research',
+                'api:research-result',
+                'mcp:search',
+                'mcp:extract',
+                'mcp:crawl',
+                'mcp:map',
+                'mcp:research'
+            ) THEN 'valuable'
+            WHEN {normalized} IN (
+                'api:usage',
+                'mcp:initialize',
+                'mcp:ping',
+                'mcp:tools/list'
+            )
+              OR {normalized} LIKE 'mcp:resources/%'
+              OR {normalized} LIKE 'mcp:prompts/%'
+              OR {normalized} LIKE 'mcp:notifications/%'
+                THEN 'other'
+            WHEN {normalized} IN (
+                'api:unknown-path',
+                'mcp:unknown-method',
+                'mcp:unknown-payload',
+                'mcp:unsupported-path',
+                'mcp:third-party-tool'
+            ) THEN 'unknown'
+            ELSE 'unknown'
+        END
+        "
+    )
+}
+
+fn request_value_bucket_for_batch_body_sql(body_expr: &str) -> String {
+    let body_json = format!("CAST({body_expr} AS TEXT)");
+    let array_item_kind = mcp_message_request_kind_sql("items.value");
+    let array_item_bucket = request_value_bucket_from_kind_sql(&array_item_kind);
+    format!(
+        "
+        CASE
+            WHEN NOT json_valid({body_json}) OR json_type({body_json}) <> 'array'
+                THEN 'unknown'
+            WHEN NOT EXISTS (SELECT 1 FROM json_each({body_json}) AS items)
+                THEN 'unknown'
+            WHEN EXISTS (
+                SELECT 1
+                FROM json_each({body_json}) AS items
+                WHERE ({array_item_kind}) IS NULL
+                   OR ({array_item_bucket}) = 'unknown'
+            ) THEN 'unknown'
+            WHEN EXISTS (
+                SELECT 1
+                FROM json_each({body_json}) AS items
+                WHERE ({array_item_bucket}) = 'valuable'
+            ) THEN 'valuable'
+            ELSE 'other'
+        END
+        "
+    )
+}
+
+pub(crate) fn request_value_bucket_sql(request_kind_expr: &str, body_expr: &str) -> String {
+    let normalized = format!("LOWER(TRIM(COALESCE({request_kind_expr}, '')))");
+    let batch_bucket = request_value_bucket_for_batch_body_sql(body_expr);
+    let single_bucket = request_value_bucket_from_kind_sql(request_kind_expr);
+    format!(
+        "
+        CASE
+            WHEN {normalized} = 'mcp:batch' THEN ({batch_bucket})
+            ELSE ({single_bucket})
+        END
+        "
+    )
+}
+
 pub(crate) fn token_log_operational_class_case_sql(
     request_kind_expr: &str,
     counts_business_quota_expr: &str,
@@ -1669,6 +1950,7 @@ pub(crate) fn token_log_operational_class_case_sql(
         "
         CASE
             WHEN {result_status_expr} = 'quota_exhausted' THEN '{quota_exhausted}'
+            WHEN {request_kind_expr} = 'mcp:session-delete-unsupported' THEN '{neutral}'
             WHEN {result_status_expr} = 'error' AND {failure_kind_expr} IN (
                 '{mcp_accept_406}',
                 '{tool_argument_validation}',
@@ -1737,10 +2019,31 @@ pub(crate) fn request_log_counts_business_quota_sql(
     format!(
         "
         CASE
+            WHEN {normalized} = 'mcp:session-delete-unsupported' THEN 0
             WHEN {normalized} = 'mcp:batch' AND {batch_non_billable} THEN 0
             ELSE 1
         END
         "
+    )
+}
+
+pub(crate) fn result_bucket_case_sql(
+    operational_class_expr: &str,
+    _result_status_expr: &str,
+) -> String {
+    format!(
+        "
+        CASE
+            WHEN {operational_class_expr} = '{neutral}' THEN '{neutral}'
+            WHEN {operational_class_expr} = '{quota_exhausted}' THEN '{quota_exhausted}'
+            WHEN {operational_class_expr} = '{success}' THEN '{success}'
+            ELSE '{error}'
+        END
+        ",
+        neutral = OPERATIONAL_CLASS_NEUTRAL,
+        quota_exhausted = OUTCOME_QUOTA_EXHAUSTED,
+        success = OUTCOME_SUCCESS,
+        error = OUTCOME_ERROR,
     )
 }
 

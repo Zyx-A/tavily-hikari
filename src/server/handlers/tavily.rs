@@ -95,6 +95,15 @@ fn non_empty_str(value: &Value) -> Option<&str> {
     value.as_str().map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn extract_http_project_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-project-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn chunked_credits(items: usize, chunk_size: usize, credits_per_chunk: i64) -> i64 {
     if items == 0 || credits_per_chunk <= 0 {
         return 0;
@@ -337,15 +346,7 @@ async fn tavily_http_research_result(
                             Some(&message),
                         )
                         .await;
-                    let payload = json!({
-                        "error": "quota_exhausted",
-                        "message": "hourly request limit reached for this token",
-                    });
-                    let resp = Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
-                        .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                        .body(Body::from(payload.to_string()))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    let resp = request_limit_exceeded_response(&verdict)?;
                     return Ok(resp);
                 }
             }
@@ -471,8 +472,12 @@ async fn tavily_http_research_result(
                         analysis.status,
                         None,
                         analysis.failure_kind.as_deref(),
-                        Some(analysis.key_effect.code.as_str()),
-                        analysis.key_effect.summary.as_deref(),
+                        Some(resp.key_effect_code.as_str()),
+                        resp.key_effect_summary.as_deref(),
+                        Some(resp.binding_effect_code.as_str()),
+                        resp.binding_effect_summary.as_deref(),
+                        Some(resp.selection_effect_code.as_str()),
+                        resp.selection_effect_summary.as_deref(),
                         resp.request_log_id,
                     )
                     .await;
@@ -616,6 +621,8 @@ async fn proxy_tavily_http_endpoint(
     }
 
     let token_id_for_logs = auth_token_id.clone();
+    let http_project_id =
+        (!using_dev_open_admin_fallback).then(|| extract_http_project_id(&parts.headers)).flatten();
     let expected_search_credits = (config.upstream_path == "/search").then(|| {
         // Search billing is predictable based on `search_depth`.
         tavily_search_expected_credits(&options)
@@ -674,15 +681,7 @@ async fn proxy_tavily_http_endpoint(
                             Some(&message),
                         )
                         .await;
-                    let payload = json!({
-                        "error": "quota_exhausted",
-                        "message": "hourly request limit reached for this token",
-                    });
-                    let resp = Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
-                        .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                        .body(Body::from(payload.to_string()))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    let resp = request_limit_exceeded_response(&verdict)?;
                     return Ok(resp);
                 }
             }
@@ -781,6 +780,7 @@ async fn proxy_tavily_http_endpoint(
             .proxy_http_research_with_usage_diff(
                 &state.usage_base,
                 auth_token_id.as_deref(),
+                http_project_id.as_deref(),
                 &method,
                 &path,
                 options,
@@ -828,8 +828,12 @@ async fn proxy_tavily_http_endpoint(
                                     subject,
                                     analysis.api_key_id.as_deref(),
                                     analysis.failure_kind.as_deref(),
-                                    Some(analysis.key_effect.code.as_str()),
-                                    analysis.key_effect.summary.as_deref(),
+                                    Some(resp.key_effect_code.as_str()),
+                                    resp.key_effect_summary.as_deref(),
+                                    Some(resp.binding_effect_code.as_str()),
+                                    resp.binding_effect_summary.as_deref(),
+                                    Some(resp.selection_effect_code.as_str()),
+                                    resp.selection_effect_summary.as_deref(),
                                     resp.request_log_id,
                                 )
                                 .await
@@ -849,8 +853,12 @@ async fn proxy_tavily_http_endpoint(
                                     credits,
                                     analysis.api_key_id.as_deref(),
                                     analysis.failure_kind.as_deref(),
-                                    Some(analysis.key_effect.code.as_str()),
-                                    analysis.key_effect.summary.as_deref(),
+                                    Some(resp.key_effect_code.as_str()),
+                                    resp.key_effect_summary.as_deref(),
+                                    Some(resp.binding_effect_code.as_str()),
+                                    resp.binding_effect_summary.as_deref(),
+                                    Some(resp.selection_effect_code.as_str()),
+                                    resp.selection_effect_summary.as_deref(),
                                     resp.request_log_id,
                                 )
                                 .await
@@ -934,8 +942,12 @@ async fn proxy_tavily_http_endpoint(
                             analysis.status,
                             billing_error.as_deref(),
                             analysis.failure_kind.as_deref(),
-                            Some(analysis.key_effect.code.as_str()),
-                            analysis.key_effect.summary.as_deref(),
+                            Some(resp.key_effect_code.as_str()),
+                            resp.key_effect_summary.as_deref(),
+                            Some(resp.binding_effect_code.as_str()),
+                            resp.binding_effect_summary.as_deref(),
+                            Some(resp.selection_effect_code.as_str()),
+                            resp.selection_effect_summary.as_deref(),
                             resp.request_log_id,
                         )
                         .await;
@@ -995,6 +1007,7 @@ async fn proxy_tavily_http_endpoint(
                 .proxy_http_search(
                     &state.usage_base,
                     auth_token_id.as_deref(),
+                    http_project_id.as_deref(),
                     &method,
                     &path,
                     options,
@@ -1009,6 +1022,7 @@ async fn proxy_tavily_http_endpoint(
                     &state.usage_base,
                     config.upstream_path,
                     auth_token_id.as_deref(),
+                    http_project_id.as_deref(),
                     &method,
                     &path,
                     options,
@@ -1060,8 +1074,12 @@ async fn proxy_tavily_http_endpoint(
                                 subject,
                                 analysis.api_key_id.as_deref(),
                                 analysis.failure_kind.as_deref(),
-                                Some(analysis.key_effect.code.as_str()),
-                                analysis.key_effect.summary.as_deref(),
+                                Some(resp.key_effect_code.as_str()),
+                                resp.key_effect_summary.as_deref(),
+                                Some(resp.binding_effect_code.as_str()),
+                                resp.binding_effect_summary.as_deref(),
+                                Some(resp.selection_effect_code.as_str()),
+                                resp.selection_effect_summary.as_deref(),
                                 resp.request_log_id,
                             )
                             .await
@@ -1081,8 +1099,12 @@ async fn proxy_tavily_http_endpoint(
                                 credits,
                                 analysis.api_key_id.as_deref(),
                                 analysis.failure_kind.as_deref(),
-                                Some(analysis.key_effect.code.as_str()),
-                                analysis.key_effect.summary.as_deref(),
+                                Some(resp.key_effect_code.as_str()),
+                                resp.key_effect_summary.as_deref(),
+                                Some(resp.binding_effect_code.as_str()),
+                                resp.binding_effect_summary.as_deref(),
+                                Some(resp.selection_effect_code.as_str()),
+                                resp.selection_effect_summary.as_deref(),
                                 resp.request_log_id,
                             )
                             .await
@@ -1160,8 +1182,12 @@ async fn proxy_tavily_http_endpoint(
                         analysis.status,
                         billing_error.as_deref(),
                         analysis.failure_kind.as_deref(),
-                        Some(analysis.key_effect.code.as_str()),
-                        analysis.key_effect.summary.as_deref(),
+                        Some(resp.key_effect_code.as_str()),
+                        resp.key_effect_summary.as_deref(),
+                        Some(resp.binding_effect_code.as_str()),
+                        resp.binding_effect_summary.as_deref(),
+                        Some(resp.selection_effect_code.as_str()),
+                        resp.selection_effect_summary.as_deref(),
                         resp.request_log_id,
                     )
                     .await;
