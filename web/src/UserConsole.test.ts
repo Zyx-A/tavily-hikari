@@ -1,10 +1,36 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test'
 
-import { __testables } from './UserConsole'
+import { resolveGuideSamples } from './user-console/guide'
+import {
+  applyLoggedOutConsoleReset,
+  buildApiProbeStepDefinitions,
+  buildMcpProbeStepDefinitions,
+  buildMcpToolCallProbeStepDefinitions,
+  createClearedProbeUiState,
+  createMcpProbeIdentityGenerator,
+  extractAdvertisedMcpTools,
+  isActiveGuideRevealContext,
+  isIdentifierLikePropertyName,
+  nextRunningMcpProbeModel,
+  performUserLogoutFlow,
+  resetActiveProbeUiState,
+  resolveDetailLogsPushIssueMessage,
+  resolveGuideRevealContextKey,
+  resolveGuideToken,
+  resolveGuideTokenId,
+  resolvePostLogoutTarget,
+  resolveFallbackLogoutTarget,
+  resolveUserConsoleIdentityName,
+  resolveUserConsoleProviderLabel,
+  resolveUserConsoleView,
+  shouldRedirectToLogoutTarget,
+  shouldRenderLandingGuide,
+  toLoggedOutConsoleProfile,
+} from './user-console/runtime'
 
 const originalFetch = globalThis.fetch
 
-const mcpProbeText: Parameters<typeof __testables.buildMcpProbeStepDefinitions>[0] = {
+const mcpProbeText: Parameters<typeof buildMcpProbeStepDefinitions>[0] = {
   steps: {
     mcpInitialize: 'MCP 会话初始化',
     mcpInitialized: 'MCP initialized 通知',
@@ -18,7 +44,7 @@ const mcpProbeText: Parameters<typeof __testables.buildMcpProbeStepDefinitions>[
   },
 }
 
-const apiProbeText: Parameters<typeof __testables.buildApiProbeStepDefinitions>[0] = {
+const apiProbeText: Parameters<typeof buildApiProbeStepDefinitions>[0] = {
   steps: {
     apiSearch: 'Search API',
     apiExtract: 'Extract API',
@@ -46,12 +72,12 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url
 }
 
-function createMcpProbeContext(overrides: Partial<Parameters<NonNullable<ReturnType<typeof __testables.buildMcpProbeStepDefinitions>[number]['run']>>[1]> = {}) {
+function createMcpProbeContext(overrides: Partial<Parameters<NonNullable<ReturnType<typeof buildMcpProbeStepDefinitions>[number]['run']>>[1]> = {}) {
   return {
     protocolVersion: '2025-03-26',
     sessionId: null,
     clientVersion: '0.29.5-test',
-    identity: __testables.createMcpProbeIdentityGenerator({
+    identity: createMcpProbeIdentityGenerator({
       now: Date.UTC(2026, 2, 27, 8, 15, 42),
       random: () => 0.123456789,
     }),
@@ -60,60 +86,383 @@ function createMcpProbeContext(overrides: Partial<Parameters<NonNullable<ReturnT
 }
 
 describe('UserConsole landing guide helpers', () => {
+  it('derives header view, identity, and provider labels from the active session state', () => {
+    expect(resolveUserConsoleView({ name: 'landing', section: 'dashboard' })).toBe('dashboard')
+    expect(resolveUserConsoleView({ name: 'landing', section: 'tokens' })).toBe('tokens')
+    expect(resolveUserConsoleView({ name: 'token', id: 'a1b2' })).toBe('tokenDetail')
+
+    expect(resolveUserConsoleIdentityName({
+      displayName: 'ops-admin',
+      isAdmin: true,
+      forwardAuthEnabled: true,
+      builtinAuthEnabled: true,
+      allowRegistration: true,
+      userLoggedIn: true,
+      userProvider: 'linuxdo',
+      userDisplayName: 'Ivan',
+    })).toBe('Ivan')
+
+    expect(resolveUserConsoleIdentityName({
+      displayName: 'dev-mode',
+      isAdmin: true,
+      forwardAuthEnabled: true,
+      builtinAuthEnabled: true,
+      allowRegistration: true,
+    })).toBe('dev-mode')
+
+    expect(resolveUserConsoleProviderLabel('linuxdo', { linuxdo: 'LinuxDo' })).toBe('LinuxDo')
+    expect(resolveUserConsoleProviderLabel(null, { linuxdo: 'LinuxDo' })).toBeNull()
+  })
+
+  it('prefers the public home as the logout redirect when it is available', async () => {
+    const probe = mock(async () => ({ ok: true, status: 200 }))
+
+    await expect(resolvePostLogoutTarget({
+      pathname: '/console',
+      search: '',
+    } as Pick<Location, 'pathname' | 'search'>, probe)).resolves.toBe('/')
+    expect(probe).toHaveBeenCalledWith('/', {
+      method: 'HEAD',
+      credentials: 'same-origin',
+    })
+  })
+
+  it('falls back to the active console entry path when the public home is unavailable', async () => {
+    const probe = mock(async () => ({ ok: false, status: 404 }))
+
+    await expect(resolvePostLogoutTarget({
+      pathname: 'console.html',
+      search: '?from=oauth',
+    } as Pick<Location, 'pathname' | 'search'>, probe)).resolves.toBe('/console.html?from=oauth')
+
+    expect(resolveFallbackLogoutTarget({
+      pathname: '',
+      search: '',
+    } as Pick<Location, 'pathname' | 'search'>)).toBe('/')
+  })
+
+  it('treats a root redirect back to the console entry as a console-only deployment', async () => {
+    const probe = mock(async () => ({
+      ok: true,
+      status: 200,
+      redirected: true,
+      url: 'https://app.test/console',
+    }))
+
+    await expect(resolvePostLogoutTarget({
+      pathname: '/console',
+      search: '?from=logout',
+    } as Pick<Location, 'pathname' | 'search'>, probe)).resolves.toBe('/console?from=logout')
+  })
+
+  it('stays on the console entry when the root redirects to an auth page after logout', async () => {
+    const probe = mock(async () => ({
+      ok: true,
+      status: 200,
+      redirected: true,
+      url: 'https://app.test/auth/linuxdo',
+    }))
+
+    await expect(resolvePostLogoutTarget({
+      pathname: '/console',
+      search: '?from=logout',
+    } as Pick<Location, 'pathname' | 'search'>, probe)).resolves.toBe('/console?from=logout')
+  })
+
+  it('keeps nested console paths as the logout fallback when the public home is unavailable', async () => {
+    const probe = mock(async () => ({ ok: false, status: 404 }))
+
+    await expect(resolvePostLogoutTarget({
+      pathname: '/console/tokens/a1b2',
+      search: '?from=logout',
+    } as Pick<Location, 'pathname' | 'search'>, probe)).resolves.toBe('/console/tokens/a1b2?from=logout')
+  })
+
+  it('retries GET when the public home rejects HEAD during logout target probing', async () => {
+    const probe = mock(async (_input, init) => {
+      if (init?.method === 'HEAD') {
+        return {
+          ok: false,
+          status: 405,
+          redirected: false,
+          url: 'https://app.test/',
+        }
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        redirected: false,
+        url: 'https://app.test/',
+      }
+    })
+
+    await expect(resolvePostLogoutTarget({
+      pathname: '/console',
+      search: '',
+    } as Pick<Location, 'pathname' | 'search'>, probe)).resolves.toBe('/')
+    expect(probe.mock.calls).toEqual([
+      ['/', { method: 'HEAD', credentials: 'same-origin' }],
+      ['/', { method: 'GET', credentials: 'same-origin' }],
+    ])
+  })
+
+  it('retries GET when HEAD fails with a non-405 status but the public home still loads', async () => {
+    const probe = mock(async (_input, init) => {
+      if (init?.method === 'HEAD') {
+        return {
+          ok: false,
+          status: 403,
+          redirected: false,
+          url: 'https://app.test/',
+        }
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        redirected: false,
+        url: 'https://app.test/',
+      }
+    })
+
+    await expect(resolvePostLogoutTarget({
+      pathname: '/console',
+      search: '',
+    } as Pick<Location, 'pathname' | 'search'>, probe)).resolves.toBe('/')
+    expect(probe.mock.calls).toEqual([
+      ['/', { method: 'HEAD', credentials: 'same-origin' }],
+      ['/', { method: 'GET', credentials: 'same-origin' }],
+    ])
+  })
+
+  it('does not redirect again when logout already landed on the console fallback entry', () => {
+    expect(shouldRedirectToLogoutTarget({
+      pathname: '/console.html',
+      search: '?from=oauth',
+    } as Pick<Location, 'pathname' | 'search'>, '/console.html?from=oauth')).toBe(false)
+
+    expect(shouldRedirectToLogoutTarget({
+      pathname: '/console/tokens/a1b2',
+      search: '?from=logout',
+    } as Pick<Location, 'pathname' | 'search'>, '/console/tokens/a1b2?from=logout')).toBe(false)
+
+    expect(shouldRedirectToLogoutTarget({
+      pathname: '/console',
+      search: '',
+    } as Pick<Location, 'pathname' | 'search'>, '/')).toBe(true)
+  })
+
+  it('invalidates active probe runs by resetting both probe buttons to idle', () => {
+    expect(createClearedProbeUiState(7)).toEqual({
+      nextRunId: 8,
+      mcpProbe: {
+        state: 'idle',
+        completed: 0,
+        total: 4,
+      },
+      apiProbe: {
+        state: 'idle',
+        completed: 0,
+        total: 6,
+      },
+    })
+  })
+
+  it('aborts the active probe request when the route resets probe state', () => {
+    const abortActiveProbeRun = mock(() => {})
+
+    expect(resetActiveProbeUiState(7, abortActiveProbeRun)).toEqual({
+      nextRunId: 8,
+      mcpProbe: {
+        state: 'idle',
+        completed: 0,
+        total: 4,
+      },
+      apiProbe: {
+        state: 'idle',
+        completed: 0,
+        total: 6,
+      },
+    })
+    expect(abortActiveProbeRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears sensitive console state when profile refresh reports a logged-out session', () => {
+    const events: string[] = []
+
+    applyLoggedOutConsoleReset({
+      clearSensitiveConsoleState: () => {
+        events.push('clear')
+      },
+      setShowLoggedOutState: (value) => {
+        events.push(`show:${String(value)}`)
+      },
+    })
+
+    expect(events).toEqual(['show:false', 'clear'])
+  })
+
+  it('waits for logout success before clearing active console loads', async () => {
+    const events: string[] = []
+    let resolveLogout: (() => void) | null = null
+
+    const logoutRequest = mock(() => new Promise<void>((resolve) => {
+      events.push('logout:start')
+      resolveLogout = () => {
+        events.push('logout:resolved')
+        resolve()
+      }
+    }))
+    const abortActiveConsoleLoads = mock(() => {
+      events.push('abort')
+    })
+    const redirectAfterLogout = mock(async () => {
+      events.push('redirect')
+    })
+
+    const logoutFlow = performUserLogoutFlow({
+      logoutRequest,
+      abortActiveConsoleLoads,
+      redirectAfterLogout,
+    })
+
+    expect(events).toEqual(['logout:start'])
+    expect(abortActiveConsoleLoads).not.toHaveBeenCalled()
+    expect(redirectAfterLogout).not.toHaveBeenCalled()
+
+    resolveLogout?.()
+    await logoutFlow
+
+    expect(events).toEqual([
+      'logout:start',
+      'logout:resolved',
+      'abort',
+      'redirect',
+    ])
+  })
+
+  it('keeps the active console state intact when logout fails', async () => {
+    const abortActiveConsoleLoads = mock(() => {})
+    const redirectAfterLogout = mock(async () => {})
+
+    await expect(performUserLogoutFlow({
+      logoutRequest: async () => {
+        throw new Error('temporary failure')
+      },
+      abortActiveConsoleLoads,
+      redirectAfterLogout,
+    })).rejects.toThrow('temporary failure')
+
+    expect(abortActiveConsoleLoads).not.toHaveBeenCalled()
+    expect(redirectAfterLogout).not.toHaveBeenCalled()
+  })
+
+  it('preserves admin affordances when only the user session logs out', () => {
+    expect(toLoggedOutConsoleProfile({
+      displayName: 'ops-admin',
+      isAdmin: true,
+      forwardAuthEnabled: true,
+      builtinAuthEnabled: false,
+      allowRegistration: true,
+      userLoggedIn: true,
+      userProvider: 'linuxdo',
+      userDisplayName: 'Ivan',
+      userAvatarUrl: 'https://connect.linux.do/avatar.png',
+    })).toEqual({
+      displayName: 'ops-admin',
+      isAdmin: true,
+      forwardAuthEnabled: true,
+      builtinAuthEnabled: false,
+      allowRegistration: true,
+      userLoggedIn: false,
+      userProvider: null,
+      userDisplayName: null,
+      userAvatarUrl: null,
+    })
+  })
+
+  it('materializes a logged-out placeholder profile when the first profile load returns 401', () => {
+    expect(toLoggedOutConsoleProfile(null)).toEqual({
+      displayName: null,
+      isAdmin: false,
+      forwardAuthEnabled: false,
+      builtinAuthEnabled: false,
+      allowRegistration: false,
+      userLoggedIn: false,
+      userProvider: null,
+      userDisplayName: null,
+      userAvatarUrl: null,
+    })
+  })
+
+  it('maps request-log push issues to the expected bubble copy', () => {
+    const copy = {
+      ariaLabel: 'status',
+      browserUnsupported: 'unsupported',
+      reconnecting: 'reconnecting',
+      closed: 'closed',
+    }
+
+    expect(resolveDetailLogsPushIssueMessage('unsupported', copy)).toBe('unsupported')
+    expect(resolveDetailLogsPushIssueMessage('reconnecting', copy)).toBe('reconnecting')
+    expect(resolveDetailLogsPushIssueMessage('closed', copy)).toBe('closed')
+  })
+
   it('shows the landing guide only when exactly one token is visible on the merged landing page', () => {
-    expect(__testables.shouldRenderLandingGuide({ name: 'landing', section: 'dashboard' }, 1)).toBe(true)
-    expect(__testables.shouldRenderLandingGuide({ name: 'landing', section: 'tokens' }, 1)).toBe(true)
-    expect(__testables.shouldRenderLandingGuide({ name: 'landing', section: 'tokens' }, 0)).toBe(false)
-    expect(__testables.shouldRenderLandingGuide({ name: 'landing', section: 'tokens' }, 2)).toBe(false)
-    expect(__testables.shouldRenderLandingGuide({ name: 'token', id: 'a1b2' }, 1)).toBe(false)
+    expect(shouldRenderLandingGuide({ name: 'landing', section: 'dashboard' }, 1)).toBe(true)
+    expect(shouldRenderLandingGuide({ name: 'landing', section: 'tokens' }, 1)).toBe(true)
+    expect(shouldRenderLandingGuide({ name: 'landing', section: 'tokens' }, 0)).toBe(false)
+    expect(shouldRenderLandingGuide({ name: 'landing', section: 'tokens' }, 2)).toBe(false)
+    expect(shouldRenderLandingGuide({ name: 'token', id: 'a1b2' }, 1)).toBe(false)
   })
 
   it('prefers the detail token id and otherwise falls back to the single landing token mask', () => {
-    expect(__testables.resolveGuideToken({ name: 'token', id: 'a1b2' }, [])).toBe(
+    expect(resolveGuideToken({ name: 'token', id: 'a1b2' }, [])).toBe(
       'th-a1b2-************************',
     )
-    expect(__testables.resolveGuideToken(
+    expect(resolveGuideToken(
       { name: 'landing', section: 'tokens' },
       [{ tokenId: 'c3d4' } as any],
     )).toBe('th-c3d4-************************')
-    expect(__testables.resolveGuideToken(
+    expect(resolveGuideToken(
       { name: 'landing', section: 'dashboard' },
       [{ tokenId: 'a1b2' } as any, { tokenId: 'c3d4' } as any],
     )).toBe('th-xxxx-xxxxxxxxxxxx')
   })
 
   it('returns the revealable guide token id only for token detail or single-token landing routes', () => {
-    expect(__testables.resolveGuideTokenId({ name: 'token', id: 'a1b2' }, [])).toBe('a1b2')
-    expect(__testables.resolveGuideTokenId(
+    expect(resolveGuideTokenId({ name: 'token', id: 'a1b2' }, [])).toBe('a1b2')
+    expect(resolveGuideTokenId(
       { name: 'landing', section: 'tokens' },
       [{ tokenId: 'c3d4' } as any],
     )).toBe('c3d4')
-    expect(__testables.resolveGuideTokenId(
+    expect(resolveGuideTokenId(
       { name: 'landing', section: 'dashboard' },
       [{ tokenId: 'a1b2' } as any, { tokenId: 'c3d4' } as any],
     )).toBeNull()
   })
 
   it('derives a distinct guide reveal context for each route and visible token set', () => {
-    expect(__testables.resolveGuideRevealContextKey({ name: 'token', id: 'a1b2' }, [])).toBe('token:a1b2')
-    expect(__testables.resolveGuideRevealContextKey(
+    expect(resolveGuideRevealContextKey({ name: 'token', id: 'a1b2' }, [])).toBe('token:a1b2')
+    expect(resolveGuideRevealContextKey(
       { name: 'landing', section: 'tokens' },
       [{ tokenId: 'c3d4' } as any],
     )).toBe('landing:tokens:c3d4')
-    expect(__testables.resolveGuideRevealContextKey(
+    expect(resolveGuideRevealContextKey(
       { name: 'landing', section: 'dashboard' },
       [{ tokenId: 'a1b2' } as any, { tokenId: 'c3d4' } as any],
     )).toBeNull()
   })
 
   it('renders a revealed guide token only while the reveal context still matches', () => {
-    expect(__testables.isActiveGuideRevealContext('landing:tokens:a1b2', 'landing:tokens:a1b2')).toBe(true)
-    expect(__testables.isActiveGuideRevealContext('landing:tokens:a1b2', 'landing:tokens:b2c3')).toBe(false)
-    expect(__testables.isActiveGuideRevealContext('token:a1b2', null)).toBe(false)
+    expect(isActiveGuideRevealContext('landing:tokens:a1b2', 'landing:tokens:a1b2')).toBe(true)
+    expect(isActiveGuideRevealContext('landing:tokens:a1b2', 'landing:tokens:b2c3')).toBe(false)
+    expect(isActiveGuideRevealContext('token:a1b2', null)).toBe(false)
   })
 
   it('normalizes guide samples so the other tab can render both MCP and API examples', () => {
-    expect(__testables.resolveGuideSamples({
+    expect(resolveGuideSamples({
       title: 'Legacy',
       steps: [],
       sampleTitle: 'Example',
@@ -133,13 +482,13 @@ describe('UserConsole landing guide helpers', () => {
       { title: 'MCP', language: 'json', snippet: '{}' },
       { title: 'API', language: 'bash', snippet: 'curl ...' },
     ]
-    expect(__testables.resolveGuideSamples({ title: 'Other', steps: [], samples })).toBe(samples)
+    expect(resolveGuideSamples({ title: 'Other', steps: [], samples })).toBe(samples)
   })
 })
 
 describe('UserConsole probe step definitions', () => {
   it('keeps MCP lifecycle control-plane steps non-billable so exhausted tokens can still test connectivity', () => {
-    const steps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+    const steps = buildMcpProbeStepDefinitions(mcpProbeText)
 
     expect(steps[0]?.id).toBe('mcp-initialize')
     expect(steps[0]?.billable).toBe(false)
@@ -151,8 +500,29 @@ describe('UserConsole probe step definitions', () => {
     expect(steps[3]?.billable).toBeUndefined()
   })
 
+  it('threads abort signals through MCP probe requests', async () => {
+    const fetchMock = mock(async () => {
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'req-1',
+        result: { ok: true },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const controller = new AbortController()
+    const steps = buildMcpProbeStepDefinitions(mcpProbeText)
+    await expect(steps[0]?.run('th-zjvc-secret', createMcpProbeContext({ signal: controller.signal }))).resolves.toBeNull()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect((fetchMock.mock.calls[0] as [RequestInfo | URL, RequestInit])[1]?.signal).toBe(controller.signal)
+  })
+
   it('preserves every advertised MCP tool name, including legacy aliases', () => {
-    expect(__testables.extractAdvertisedMcpTools({
+    expect(extractAdvertisedMcpTools({
       result: {
         tools: [
           { name: ' tavily_search ' },
@@ -180,7 +550,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, [
+    const steps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, [
       ' tavily_search ',
       'tavily-search',
       {
@@ -254,7 +624,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+    const steps = buildMcpProbeStepDefinitions(mcpProbeText)
 
     await expect(steps[3]?.run('th-zjvc-secret', createMcpProbeContext())).resolves.toEqual({
       discoveredTools: [
@@ -278,14 +648,14 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+    const steps = buildMcpProbeStepDefinitions(mcpProbeText)
     await expect(steps[1]?.run('th-zjvc-secret', createMcpProbeContext({ sessionId: 'session-123' }))).rejects.toThrow(
       'initialized rejected',
     )
   })
 
   it('skips advertised tools only when discovery provides no fixture and no input schema', async () => {
-    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, [{
+    const steps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, [{
       requestName: 'Acme_Lookup',
       displayName: 'Acme_Lookup',
       inputSchema: null,
@@ -315,7 +685,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, ['tavily-search'])
+    const steps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, ['tavily-search'])
 
     await expect(steps[0]?.run('th-zjvc-secret', createMcpProbeContext())).rejects.toThrow('Request failed with status 500')
   })
@@ -341,7 +711,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, ['tavily-research'])
+    const steps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, ['tavily-research'])
 
     await expect(steps[0]?.run('th-zjvc-secret', createMcpProbeContext())).rejects.toThrow(
       "This request exceeds your plan's set usage limit.",
@@ -404,13 +774,13 @@ describe('UserConsole probe step definitions', () => {
     }) as typeof fetch
 
     const token = 'th-zjvc-secret'
-    const baseSteps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
+    const baseSteps = buildMcpProbeStepDefinitions(mcpProbeText)
     const context = createMcpProbeContext()
     await baseSteps[0]?.run(token, context)
     await baseSteps[1]?.run(token, context)
     await baseSteps[2]?.run(token, context)
     const toolsListResult = await baseSteps[3]?.run(token, context)
-    const toolSteps = __testables.buildMcpToolCallProbeStepDefinitions(
+    const toolSteps = buildMcpToolCallProbeStepDefinitions(
       mcpProbeText,
       toolsListResult?.discoveredTools ?? [],
     )
@@ -521,7 +891,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, [{
+    const steps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, [{
       requestName: 'tavily_agents',
       displayName: 'tavily-agents',
       inputSchema: {
@@ -559,7 +929,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, [
+    const steps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, [
       {
         requestName: 'tavily_agents',
         displayName: 'tavily-agents',
@@ -607,14 +977,14 @@ describe('UserConsole probe step definitions', () => {
   })
 
   it('only treats actual identifier-like field names as dynamic identifiers', () => {
-    expect(__testables.isIdentifierLikePropertyName('requestId')).toBe(true)
-    expect(__testables.isIdentifierLikePropertyName('session_id')).toBe(true)
-    expect(__testables.isIdentifierLikePropertyName('traceUuid')).toBe(true)
-    expect(__testables.isIdentifierLikePropertyName('cursor')).toBe(true)
+    expect(isIdentifierLikePropertyName('requestId')).toBe(true)
+    expect(isIdentifierLikePropertyName('session_id')).toBe(true)
+    expect(isIdentifierLikePropertyName('traceUuid')).toBe(true)
+    expect(isIdentifierLikePropertyName('cursor')).toBe(true)
 
-    expect(__testables.isIdentifierLikePropertyName('hybrid')).toBe(false)
-    expect(__testables.isIdentifierLikePropertyName('grid')).toBe(false)
-    expect(__testables.isIdentifierLikePropertyName('valid')).toBe(false)
+    expect(isIdentifierLikePropertyName('hybrid')).toBe(false)
+    expect(isIdentifierLikePropertyName('grid')).toBe(false)
+    expect(isIdentifierLikePropertyName('valid')).toBe(false)
   })
 
   it('skips Tavily tools when required schema fields cannot be synthesized safely', async () => {
@@ -627,7 +997,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, [{
+    const steps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, [{
       requestName: 'tavily-new',
       displayName: 'tavily-new',
       inputSchema: {
@@ -646,8 +1016,8 @@ describe('UserConsole probe step definitions', () => {
   })
 
   it('updates the running MCP progress total after discovering tool call steps', () => {
-    const baseSteps = __testables.buildMcpProbeStepDefinitions(mcpProbeText)
-    const toolSteps = __testables.buildMcpToolCallProbeStepDefinitions(mcpProbeText, [
+    const baseSteps = buildMcpProbeStepDefinitions(mcpProbeText)
+    const toolSteps = buildMcpToolCallProbeStepDefinitions(mcpProbeText, [
       'tavily-search',
       'tavily-extract',
       'tavily-crawl',
@@ -656,7 +1026,7 @@ describe('UserConsole probe step definitions', () => {
     ])
 
     const stepDefinitions = [...baseSteps, ...toolSteps]
-    const nextModel = __testables.nextRunningMcpProbeModel(
+    const nextModel = nextRunningMcpProbeModel(
       { state: 'running', completed: 2, total: 2 },
       stepDefinitions,
       3,
@@ -695,7 +1065,7 @@ describe('UserConsole probe step definitions', () => {
       })
     }) as typeof fetch
 
-    const steps = __testables.buildApiProbeStepDefinitions(apiProbeText)
+    const steps = buildApiProbeStepDefinitions(apiProbeText)
     let requestId: string | null = null
     let researchResultDetail: string | null = null
 
@@ -752,5 +1122,24 @@ describe('UserConsole probe step definitions', () => {
       citation_format: 'numbered',
     })
     expect(researchResultDetail).toBe('Research status: completed')
+  })
+
+  it('threads abort signals through API probe requests', async () => {
+    const calls: Array<{ url: string, init?: RequestInit }> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: requestUrl(input), init })
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const controller = new AbortController()
+    const steps = buildApiProbeStepDefinitions(apiProbeText)
+    await expect(steps[0]?.run('th-zjvc-secret', { requestId: null, signal: controller.signal })).resolves.toBeNull()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe('/api/tavily/search')
+    expect(calls[0]?.init?.signal).toBe(controller.signal)
   })
 })

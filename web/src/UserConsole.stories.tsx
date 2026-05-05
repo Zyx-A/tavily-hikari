@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useState } from 'react'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 
-import type { Profile, UserDashboard, UserTokenSummary } from './api'
+import type { Profile, RequestRate, RequestRateScope, UserDashboard, UserTokenSummary } from './api'
 import UserConsole from './UserConsole'
 import {
   DropdownMenu,
@@ -10,12 +10,13 @@ import {
   DropdownMenuTrigger,
 } from './components/ui/dropdown-menu'
 import { Icon, getGuideClientIconName } from './lib/icons'
-import { userConsoleRouteToHash } from './lib/userConsoleRoutes'
+import { userConsoleRouteToPath } from './lib/userConsoleRoutes'
 
 type ConsoleView = 'Console Home' | 'Token Detail'
 type LandingFocus = 'Overview Focus' | 'Token Focus'
 type TokenListState = 'Single Token' | 'Multiple Tokens' | 'Empty'
 type TokenDetailPreview = 'Overview' | 'Token Revealed'
+type PushStatusPreview = 'Live' | 'Reconnecting' | 'Unsupported'
 
 type CopyRecoveryMode = 'none' | 'list-manual-bubble' | 'detail-inline'
 type GuideRevealMode = 'none' | 'landing-guide' | 'detail-guide'
@@ -26,26 +27,48 @@ interface UserConsoleStoryArgs {
   landingFocus: LandingFocus
   tokenListState: TokenListState
   tokenDetailPreview: TokenDetailPreview
-  routeHashOverride?: string
+  routePathOverride?: string
+  pushStatusPreview?: PushStatusPreview
+  pushStatusBubbleOpen?: boolean
+  autoOpenAccountMenu?: boolean
 }
 
 interface UserConsoleStoryState {
   autoRevealToken: boolean
   isAdmin: boolean
-  routeHash: string
+  routePath: string
   tokenListMode: 'single' | 'multiple' | 'empty'
 }
 
-const TOKEN_DETAIL_HASH = '#/tokens/a1b2'
+type MockEventSourceShape = EventSource & {
+  dispatchEvent: (event: Event) => boolean
+}
+
+const TOKEN_DETAIL_PATH = '/console/tokens/a1b2'
 const guideProofLabels = [
   { id: 'codex', label: 'Codex CLI' },
   { id: 'claude', label: 'Claude Code' },
   { id: 'vscode', label: 'VS Code' },
 ] as const
 
+function createRequestRate(
+  used: number,
+  limit: number,
+  scope: RequestRateScope,
+  windowMinutes = 5,
+): RequestRate {
+  return {
+    used,
+    limit,
+    windowMinutes,
+    scope,
+  }
+}
+
 const dashboardSample: UserDashboard = {
-  hourlyAnyUsed: 126,
-  hourlyAnyLimit: 200,
+  requestRate: createRequestRate(58, 60, 'user'),
+  hourlyAnyUsed: 58,
+  hourlyAnyLimit: 60,
   quotaHourlyUsed: 82,
   quotaHourlyLimit: 100,
   quotaDailyUsed: 356,
@@ -63,8 +86,9 @@ const tokenSample: UserTokenSummary = {
   enabled: true,
   note: 'primary',
   lastUsedAt: 1_762_386_800,
-  hourlyAnyUsed: 126,
-  hourlyAnyLimit: 200,
+  requestRate: createRequestRate(58, 60, 'user'),
+  hourlyAnyUsed: 58,
+  hourlyAnyLimit: 60,
   quotaHourlyUsed: 82,
   quotaHourlyLimit: 100,
   quotaDailyUsed: 356,
@@ -81,8 +105,9 @@ const tokenSecondarySample: UserTokenSummary = {
   enabled: true,
   note: 'backup',
   lastUsedAt: 1_762_386_100,
-  hourlyAnyUsed: 28,
-  hourlyAnyLimit: 200,
+  requestRate: createRequestRate(58, 60, 'user'),
+  hourlyAnyUsed: 58,
+  hourlyAnyLimit: 60,
   quotaHourlyUsed: 12,
   quotaHourlyLimit: 100,
   quotaDailyUsed: 84,
@@ -96,7 +121,8 @@ const tokenSecondarySample: UserTokenSummary = {
 
 const tokenDetailSample: UserTokenSummary = {
   ...tokenSample,
-  hourlyAnyUsed: 131,
+  requestRate: createRequestRate(58, 60, 'user'),
+  hourlyAnyUsed: 58,
   quotaHourlyUsed: 88,
   quotaDailyUsed: 371,
   quotaMonthlyUsed: 4188,
@@ -153,6 +179,22 @@ const tokenLogsSample: ServerPublicTokenLogMock[] = [
   },
 ]
 
+const storyAvatarDataUrl =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#3b82f6" />
+          <stop offset="100%" stop-color="#1d4ed8" />
+        </linearGradient>
+      </defs>
+      <rect width="64" height="64" rx="32" fill="url(#g)" />
+      <circle cx="32" cy="25" r="13" fill="#dbeafe" />
+      <path d="M14 56c2-10 9.7-16 18-16s16 6 18 16" fill="#dbeafe" />
+    </svg>`,
+  )
+
 const profileSample: Profile = {
   displayName: 'Ivan',
   isAdmin: false,
@@ -162,6 +204,7 @@ const profileSample: Profile = {
   userLoggedIn: true,
   userProvider: 'linuxdo',
   userDisplayName: 'Ivan',
+  userAvatarUrl: storyAvatarDataUrl,
 }
 
 const adminProfileSample: Profile = {
@@ -174,6 +217,8 @@ const versionSample = {
   frontend: '0.2.0-dev',
 }
 
+const activeEventSources = new Set<MockEventSourceShape>()
+
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -181,10 +226,10 @@ function jsonResponse(data: unknown, status = 200): Response {
   })
 }
 
-function routeHashFromView(view: ConsoleView, landingFocus: LandingFocus, routeHashOverride?: string): string {
-  if (view === 'Token Detail') return TOKEN_DETAIL_HASH
-  if (typeof routeHashOverride === 'string') return routeHashOverride
-  return userConsoleRouteToHash({
+function routePathFromView(view: ConsoleView, landingFocus: LandingFocus, routePathOverride?: string): string {
+  if (view === 'Token Detail') return TOKEN_DETAIL_PATH
+  if (typeof routePathOverride === 'string') return routePathOverride
+  return userConsoleRouteToPath({
     name: 'landing',
     section: landingFocus === 'Token Focus' ? 'tokens' : 'dashboard',
   })
@@ -202,7 +247,7 @@ function resolveStoryState(args: UserConsoleStoryArgs): UserConsoleStoryState {
   return {
     autoRevealToken: args.consoleView === 'Token Detail' && args.tokenDetailPreview === 'Token Revealed',
     isAdmin: args.isAdmin,
-    routeHash: routeHashFromView(args.consoleView, args.landingFocus, args.routeHashOverride),
+    routePath: routePathFromView(args.consoleView, args.landingFocus, args.routePathOverride),
     tokenListMode,
   }
 }
@@ -314,6 +359,10 @@ function installUserConsoleFetchMock(state: UserConsoleStoryState): () => void {
 
     if (url.pathname === '/api/version') {
       return jsonResponse(versionSample)
+    }
+
+    if (url.pathname === '/api/user/logout') {
+      return new Response(null, { status: 204 })
     }
 
     if (url.pathname === '/api/user/tokens') {
@@ -479,6 +528,111 @@ function installClipboardFailureMock(): () => void {
   }
 }
 
+function installEventSourceMock(mode: PushStatusPreview): () => void {
+  const OriginalEventSource = window.EventSource
+
+  if (mode === 'Unsupported') {
+    ;(window as Window & { EventSource?: typeof EventSource }).EventSource = undefined
+    return () => {
+      window.EventSource = OriginalEventSource
+    }
+  }
+
+  class MockEventSource {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 2
+
+    public readonly url: string
+    public readonly withCredentials = false
+    public readyState = MockEventSource.OPEN
+    public onopen: ((this: EventSource, ev: Event) => unknown) | null = null
+    public onerror: ((this: EventSource, ev: Event) => unknown) | null = null
+    public onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null
+
+    private listeners = new Map<string, Set<EventListenerOrEventListenerObject>>()
+
+    constructor(url: string) {
+      this.url = url
+      activeEventSources.add(this as unknown as MockEventSourceShape)
+      window.setTimeout(() => {
+        if (mode === 'Reconnecting') {
+          this.readyState = MockEventSource.CONNECTING
+          this.onerror?.call(this as unknown as EventSource, new Event('error'))
+          return
+        }
+        this.onopen?.call(this as unknown as EventSource, new Event('open'))
+      }, 0)
+    }
+
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+      if (!this.listeners.has(type)) {
+        this.listeners.set(type, new Set())
+      }
+      this.listeners.get(type)?.add(listener)
+    }
+
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+      this.listeners.get(type)?.delete(listener)
+    }
+
+    dispatchEvent(event: Event): boolean {
+      const bucket = this.listeners.get(event.type)
+      if (!bucket) return true
+      bucket.forEach((listener) => {
+        if (typeof listener === 'function') {
+          listener.call(this, event)
+        } else {
+          listener.handleEvent(event)
+        }
+      })
+      return true
+    }
+
+    close(): void {
+      this.readyState = MockEventSource.CLOSED
+      activeEventSources.delete(this as unknown as MockEventSourceShape)
+    }
+  }
+
+  ;(window as Window & { EventSource: typeof EventSource }).EventSource =
+    MockEventSource as unknown as typeof EventSource
+
+  return () => {
+    window.EventSource = OriginalEventSource
+  }
+}
+
+function emitUserTokenSnapshot(): void {
+  const event = new MessageEvent('snapshot', {
+    data: JSON.stringify({
+      token: {
+        ...tokenDetailSample,
+        hourlyAnyUsed: tokenDetailSample.hourlyAnyUsed + 3,
+        quotaHourlyUsed: tokenDetailSample.quotaHourlyUsed + 2,
+        quotaDailyUsed: tokenDetailSample.quotaDailyUsed + 6,
+      },
+      logs: [
+        {
+          id: 104,
+          method: 'POST',
+          path: '/mcp',
+          query: null,
+          httpStatus: 200,
+          mcpStatus: 200,
+          resultStatus: 'success',
+          errorMessage: null,
+          createdAt: 1_762_386_780,
+        },
+        ...tokenLogsSample,
+      ],
+    }),
+  })
+  activeEventSources.forEach((source) => {
+    source.dispatchEvent(event)
+  })
+}
+
 function UserConsoleStory(
   args: UserConsoleStoryArgs & {
     copyRecoveryMode?: CopyRecoveryMode
@@ -488,25 +642,29 @@ function UserConsoleStory(
   const [ready, setReady] = useState(false)
   const storyState = useMemo(
     () => resolveStoryState(args),
-    [args.consoleView, args.isAdmin, args.landingFocus, args.tokenListState, args.tokenDetailPreview, args.routeHashOverride],
+    [args.consoleView, args.isAdmin, args.landingFocus, args.tokenListState, args.tokenDetailPreview, args.routePathOverride],
   )
   const copyRecoveryMode = args.copyRecoveryMode ?? 'none'
   const guideRevealMode = args.guideRevealMode ?? 'none'
+  const pushStatusPreview = args.pushStatusPreview ?? 'Live'
+  const pushStatusBubbleOpen = args.pushStatusBubbleOpen ?? false
 
   useLayoutEffect(() => {
-    const previousHash = window.location.hash
+    const previousLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`
     const cleanupFetch = installUserConsoleFetchMock(storyState)
+    const cleanupEventSource = installEventSourceMock(pushStatusPreview)
     const cleanupClipboard = copyRecoveryMode === 'none' ? null : installClipboardFailureMock()
-    window.location.hash = storyState.routeHash
+    window.history.replaceState(null, '', storyState.routePath)
     setReady(true)
 
     return () => {
       cleanupFetch()
+      cleanupEventSource()
       cleanupClipboard?.()
-      window.location.hash = previousHash
+      window.history.replaceState(null, '', previousLocation)
       setReady(false)
     }
-  }, [copyRecoveryMode, storyState.isAdmin, storyState.routeHash, storyState.tokenListMode])
+  }, [copyRecoveryMode, pushStatusPreview, storyState.isAdmin, storyState.routePath, storyState.tokenListMode])
 
   useEffect(() => {
     if (!ready || !storyState.autoRevealToken) return
@@ -538,16 +696,46 @@ function UserConsoleStory(
     return () => window.clearTimeout(timer)
   }, [guideRevealMode, ready])
 
+  useEffect(() => {
+    if (!ready || storyState.routePath !== TOKEN_DETAIL_PATH || pushStatusPreview !== 'Live') return
+    const timer = window.setTimeout(() => {
+      emitUserTokenSnapshot()
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [pushStatusPreview, ready, storyState.routePath])
+
+  useEffect(() => {
+    if (!ready || !pushStatusBubbleOpen || storyState.routePath !== TOKEN_DETAIL_PATH) return
+    const timer = window.setTimeout(() => {
+      const trigger = document.querySelector<HTMLButtonElement>('.user-console-push-status-trigger')
+      trigger?.focus()
+    }, 220)
+    return () => window.clearTimeout(timer)
+  }, [pushStatusBubbleOpen, ready, storyState.routePath])
+
+  useEffect(() => {
+    if (!ready || args.autoOpenAccountMenu !== true) return
+    const timer = window.setTimeout(() => {
+      const trigger = document.querySelector<HTMLButtonElement>('.user-console-account-trigger')
+      if (!trigger) return
+      trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }))
+      trigger.click()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [args.autoOpenAccountMenu, ready])
+
   if (!ready) {
     return <div style={{ minHeight: '100vh' }} />
   }
 
   const storyKey = [
-    storyState.routeHash,
+    storyState.routePath,
     storyState.isAdmin ? 'admin' : 'user',
     storyState.tokenListMode,
     storyState.autoRevealToken ? 'revealed' : 'hidden',
     guideRevealMode,
+    pushStatusPreview,
+    pushStatusBubbleOpen ? 'push-open' : 'push-closed',
   ].join(':')
 
   return <UserConsole key={storyKey} />
@@ -556,6 +744,7 @@ function UserConsoleStory(
 const meta = {
   title: 'User Console/UserConsole',
   excludeStories: ['__testables'],
+  tags: ['autodocs'],
   parameters: {
     controls: { expanded: true },
     docs: {
@@ -591,7 +780,7 @@ const meta = {
     },
     landingFocus: {
       name: 'Landing focus',
-      description: 'Preview which merged section the legacy hash should auto-focus.',
+      description: 'Preview which merged section the path route should auto-focus.',
       options: ['Overview Focus', 'Token Focus'],
       control: { type: 'inline-radio' },
       if: { arg: 'consoleView', eq: 'Console Home' },
@@ -610,7 +799,19 @@ const meta = {
       control: { type: 'select' },
       if: { arg: 'consoleView', eq: 'Token Detail' },
     },
-    routeHashOverride: {
+    routePathOverride: {
+      table: { disable: true },
+      control: false,
+    },
+    pushStatusPreview: {
+      table: { disable: true },
+      control: false,
+    },
+    pushStatusBubbleOpen: {
+      table: { disable: true },
+      control: false,
+    },
+    autoOpenAccountMenu: {
       table: { disable: true },
       control: false,
     },
@@ -628,6 +829,20 @@ export const ConsoleHome: Story = {
     isAdmin: false,
     landingFocus: 'Overview Focus',
   },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 120))
+
+    for (const selector of [
+      '.user-console-header',
+      '.user-console-header-inline-meta',
+      '.user-console-account-trigger',
+      '.user-console-landing-stack',
+    ]) {
+      if (canvasElement.querySelector(selector) == null) {
+        throw new Error(`Expected ConsoleHome to render ${selector}`)
+      }
+    }
+  },
 }
 
 export const ConsoleHomeRoot: Story = {
@@ -636,7 +851,7 @@ export const ConsoleHomeRoot: Story = {
     consoleView: 'Console Home',
     isAdmin: false,
     landingFocus: 'Overview Focus',
-    routeHashOverride: '',
+    routePathOverride: '/console',
   },
 }
 
@@ -655,6 +870,50 @@ export const ConsoleHomeAdminMobile: Story = {
     consoleView: 'Console Home',
     isAdmin: true,
     landingFocus: 'Overview Focus',
+  },
+  parameters: {
+    viewport: { defaultViewport: '0390-device-iphone-14' },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 120))
+
+    for (const selector of [
+      '.user-console-header',
+      '.user-console-header-actions',
+      '.user-console-account-trigger',
+    ]) {
+      if (canvasElement.querySelector(selector) == null) {
+        throw new Error(`Expected ConsoleHomeAdminMobile to render ${selector}`)
+      }
+    }
+
+    const menuTrigger = canvasElement.querySelector<HTMLElement>('.user-console-account-trigger')
+    if (menuTrigger == null) {
+      throw new Error('Expected ConsoleHomeAdminMobile to render a compact account menu trigger.')
+    }
+
+    menuTrigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }))
+    menuTrigger.click()
+    await new Promise((resolve) => window.setTimeout(resolve, 120))
+
+    for (const selector of [
+      '.user-console-account-menu-admin',
+      '.user-console-account-menu-logout',
+    ]) {
+      if (canvasElement.ownerDocument.querySelector(selector) == null) {
+        throw new Error(`Expected ConsoleHomeAdminMobile menu to render ${selector}`)
+      }
+    }
+  },
+}
+
+export const ConsoleHomeAdminMobileMenuOpen: Story = {
+  name: 'Console Home Admin Mobile Menu Open',
+  args: {
+    consoleView: 'Console Home',
+    isAdmin: true,
+    landingFocus: 'Overview Focus',
+    autoOpenAccountMenu: true,
   },
   parameters: {
     viewport: { defaultViewport: '0390-device-iphone-14' },
@@ -730,6 +989,28 @@ export const TokenDetailOverview: Story = {
     isAdmin: false,
     landingFocus: 'Overview Focus',
     tokenDetailPreview: 'Overview',
+  },
+}
+
+export const TokenDetailLiveLogs: Story = {
+  name: 'Token Detail Live Logs',
+  args: {
+    consoleView: 'Token Detail',
+    isAdmin: false,
+    landingFocus: 'Overview Focus',
+    tokenDetailPreview: 'Overview',
+  },
+}
+
+export const TokenDetailPushWarning: Story = {
+  name: 'Token Detail Push Warning',
+  args: {
+    consoleView: 'Token Detail',
+    isAdmin: false,
+    landingFocus: 'Overview Focus',
+    tokenDetailPreview: 'Overview',
+    pushStatusPreview: 'Reconnecting',
+    pushStatusBubbleOpen: true,
   },
 }
 

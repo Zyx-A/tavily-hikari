@@ -9,10 +9,11 @@ mod tests;
 pub use analysis::{
     analyze_http_attempt, analyze_mcp_attempt, canonical_request_kind_key_for_filter,
     canonicalize_request_log_request_kind, classify_token_request_kind,
-    extract_mcp_has_error_by_id_from_bytes, extract_mcp_usage_credits_by_id_from_bytes,
-    extract_usage_credits_from_json_bytes, extract_usage_credits_total_from_json_bytes,
-    failure_kind_solution_guidance, finalize_token_request_kind, is_canonical_request_kind_key,
-    mcp_response_has_any_error, mcp_response_has_any_success, normalize_operational_class_filter,
+    display_result_status_for_request_kind, extract_mcp_has_error_by_id_from_bytes,
+    extract_mcp_usage_credits_by_id_from_bytes, extract_usage_credits_from_json_bytes,
+    extract_usage_credits_total_from_json_bytes, failure_kind_solution_guidance,
+    finalize_token_request_kind, is_canonical_request_kind_key, mcp_response_has_any_error,
+    mcp_response_has_any_success, normalize_operational_class_filter,
     operational_class_for_request_kind, operational_class_for_request_log,
     operational_class_for_request_path, operational_class_for_token_log,
     should_append_solution_guidance, token_request_kind_billing_group,
@@ -53,9 +54,9 @@ use reqwest::{
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Executor, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use url::form_urlencoded;
 
 pub type ForwardProxyProgressCallback = dyn Fn(ForwardProxyProgressEvent) + Send + Sync;
@@ -289,6 +290,39 @@ fn compute_latency_median(samples: &[f64]) -> Option<f64> {
 /// Tavily MCP upstream默认端点。
 pub const DEFAULT_UPSTREAM: &str = "https://mcp.tavily.com/mcp";
 
+fn join_url_paths(prefix_path: &str, appended_path: &str) -> String {
+    let prefix = prefix_path.trim_matches('/');
+    let appended = appended_path.trim_matches('/');
+    match (prefix.is_empty(), appended.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{appended}"),
+        (false, true) => format!("/{prefix}"),
+        (false, false) => format!("/{prefix}/{appended}"),
+    }
+}
+
+pub(crate) fn build_path_prefixed_url(base: &Url, appended_path: &str) -> Url {
+    let mut url = base.clone();
+    url.set_path(&join_url_paths(base.path(), appended_path));
+    url
+}
+
+pub(crate) fn build_mcp_upstream_url(base: &Url, request_path: &str) -> Url {
+    if matches!(base.path(), "" | "/") {
+        return build_path_prefixed_url(base, request_path);
+    }
+
+    let appended_path = if request_path == "/mcp" {
+        ""
+    } else if let Some(relative) = request_path.strip_prefix("/mcp/") {
+        relative
+    } else {
+        request_path
+    };
+
+    build_path_prefixed_url(base, appended_path)
+}
+
 const STATUS_ACTIVE: &str = "active";
 const STATUS_EXHAUSTED: &str = "exhausted";
 const STATUS_DISABLED: &str = "disabled";
@@ -305,6 +339,7 @@ const REQUEST_KIND_CANONICAL_MIGRATION_WAIT_POLL_MS: u64 = 200;
 const REQUEST_KIND_CANONICAL_MIGRATION_STALE_SECS: i64 = 300;
 const FAILURE_KIND_UPSTREAM_GATEWAY_5XX: &str = "upstream_gateway_5xx";
 const FAILURE_KIND_UPSTREAM_RATE_LIMITED_429: &str = "upstream_rate_limited_429";
+const FAILURE_KIND_UPSTREAM_UNKNOWN_403: &str = "upstream_unknown_403";
 const FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401: &str = "upstream_account_deactivated_401";
 const FAILURE_KIND_TRANSPORT_SEND_ERROR: &str = "transport_send_error";
 const FAILURE_KIND_MCP_ACCEPT_406: &str = "mcp_accept_406";
@@ -321,11 +356,35 @@ const KEY_EFFECT_NONE: &str = "none";
 const KEY_EFFECT_QUARANTINED: &str = "quarantined";
 const KEY_EFFECT_MARKED_EXHAUSTED: &str = "marked_exhausted";
 const KEY_EFFECT_RESTORED_ACTIVE: &str = "restored_active";
+const KEY_EFFECT_TRANSIENT_BACKOFF_SET: &str = "transient_backoff_set";
+const KEY_EFFECT_TRANSIENT_BACKOFF_CLEARED: &str = "transient_backoff_cleared";
+const KEY_EFFECT_MCP_SESSION_INIT_BACKOFF_SET: &str = "mcp_session_init_backoff_set";
+const KEY_EFFECT_MCP_SESSION_RETRY_WAITED: &str = "mcp_session_retry_waited";
+const KEY_EFFECT_MCP_SESSION_RETRY_SCHEDULED: &str = "mcp_session_retry_scheduled";
+const KEY_EFFECT_MCP_SESSION_INIT_COOLDOWN_AVOIDED: &str = "mcp_session_init_cooldown_avoided";
+const KEY_EFFECT_MCP_SESSION_INIT_RATE_LIMIT_AVOIDED: &str = "mcp_session_init_rate_limit_avoided";
+const KEY_EFFECT_MCP_SESSION_INIT_PRESSURE_AVOIDED: &str = "mcp_session_init_pressure_avoided";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_REUSED: &str = "http_project_affinity_reused";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_BOUND: &str = "http_project_affinity_bound";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_REBOUND: &str = "http_project_affinity_rebound";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_COOLDOWN_AVOIDED: &str =
+    "http_project_affinity_cooldown_avoided";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_RATE_LIMIT_AVOIDED: &str =
+    "http_project_affinity_rate_limit_avoided";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_PRESSURE_AVOIDED: &str =
+    "http_project_affinity_pressure_avoided";
+const KEY_EFFECT_API_REBALANCE_ROUTE_REUSED: &str = "api_rebalance_route_reused";
+const KEY_EFFECT_API_REBALANCE_ROUTE_BOUND: &str = "api_rebalance_route_bound";
+const KEY_EFFECT_API_REBALANCE_ROUTE_REBOUND: &str = "api_rebalance_route_rebound";
+const KEY_EFFECT_API_REBALANCE_COOLDOWN_AVOIDED: &str = "api_rebalance_cooldown_avoided";
+const KEY_EFFECT_API_REBALANCE_RATE_LIMIT_AVOIDED: &str = "api_rebalance_rate_limit_avoided";
+const KEY_EFFECT_API_REBALANCE_PRESSURE_AVOIDED: &str = "api_rebalance_pressure_avoided";
 const MAINTENANCE_SOURCE_SYSTEM: &str = "system";
 const MAINTENANCE_SOURCE_ADMIN: &str = "admin";
 const MAINTENANCE_OP_AUTO_QUARANTINE: &str = "auto_quarantine";
 const MAINTENANCE_OP_AUTO_MARK_EXHAUSTED: &str = "auto_mark_exhausted";
 const MAINTENANCE_OP_AUTO_RESTORE_ACTIVE: &str = "auto_restore_active";
+const MAINTENANCE_OP_AUTO_CLEAR_TRANSIENT_BACKOFF: &str = "auto_clear_transient_backoff";
 const MAINTENANCE_OP_MANUAL_CLEAR_QUARANTINE: &str = "manual_clear_quarantine";
 const MAINTENANCE_OP_MANUAL_MARK_EXHAUSTED: &str = "manual_mark_exhausted";
 const API_KEY_IP_GEO_BATCH_FIELDS: &str = "?fields=city,subdivision,asn";
@@ -341,6 +400,20 @@ const DEV_OPEN_ADMIN_TOKEN_SECRET: &str = "dev-open-admin";
 const DEV_OPEN_ADMIN_TOKEN_NOTE: &str = "[system] dev-open-admin placeholder";
 pub const USER_MONTHLY_BROKEN_LIMIT_DEFAULT: i64 = 5;
 pub const UNBOUND_TOKEN_MONTHLY_BROKEN_LIMIT_DEFAULT: i64 = 2;
+pub const LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT: i64 = 15;
+const BLOCKED_KEY_REASON_ACCOUNT_DEACTIVATED: &str = "account_deactivated";
+const BLOCKED_KEY_REASON_KEY_REVOKED: &str = "key_revoked";
+const BLOCKED_KEY_REASON_INVALID_API_KEY: &str = "invalid_api_key";
+const MCP_SESSION_INIT_BACKOFF_SCOPE: &str = "mcp_session_init";
+const HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE: &str = "http_project_affinity";
+const HTTP_GLOBAL_BACKOFF_SCOPE: &str = "http_global";
+const API_REBALANCE_HTTP_BACKOFF_SCOPE: &str = "api_rebalance_http";
+const MCP_SESSION_INIT_BACKOFF_DEFAULT_SECS: i64 = 60;
+const MCP_SESSION_INIT_BACKOFF_MIN_SECS: i64 = 30;
+const MCP_SESSION_INIT_BACKOFF_MAX_SECS: i64 = 300;
+const UNKNOWN_403_TRANSIENT_BACKOFF_DEFAULT_SECS: i64 = 120;
+const MCP_SESSION_INIT_RECENT_PRESSURE_WINDOW_SECS: i64 = 60;
+const HTTP_PROJECT_AFFINITY_RECENT_PRESSURE_WINDOW_SECS: i64 = 60;
 const BROKEN_KEY_SUBJECT_USER: &str = "user";
 const BROKEN_KEY_SUBJECT_TOKEN: &str = "token";
 const BROKEN_KEY_SOURCE_AUTO: &str = "auto";
@@ -374,6 +447,51 @@ const BLOCKED_HEADERS: &[&str] = &[
     "cdn-loop",
 ];
 
+pub(crate) fn is_binding_effect_code(code: &str) -> bool {
+    matches!(
+        code,
+        KEY_EFFECT_NONE
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_BOUND
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_REUSED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_REBOUND
+            | KEY_EFFECT_API_REBALANCE_ROUTE_BOUND
+            | KEY_EFFECT_API_REBALANCE_ROUTE_REUSED
+            | KEY_EFFECT_API_REBALANCE_ROUTE_REBOUND
+    )
+}
+
+pub(crate) fn is_selection_effect_code(code: &str) -> bool {
+    matches!(
+        code,
+        KEY_EFFECT_NONE
+            | KEY_EFFECT_MCP_SESSION_INIT_COOLDOWN_AVOIDED
+            | KEY_EFFECT_MCP_SESSION_INIT_RATE_LIMIT_AVOIDED
+            | KEY_EFFECT_MCP_SESSION_INIT_PRESSURE_AVOIDED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_COOLDOWN_AVOIDED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_RATE_LIMIT_AVOIDED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_PRESSURE_AVOIDED
+            | KEY_EFFECT_API_REBALANCE_COOLDOWN_AVOIDED
+            | KEY_EFFECT_API_REBALANCE_RATE_LIMIT_AVOIDED
+            | KEY_EFFECT_API_REBALANCE_PRESSURE_AVOIDED
+    )
+}
+
+pub(crate) fn is_key_effect_code(code: &str) -> bool {
+    matches!(
+        code,
+        KEY_EFFECT_NONE
+            | KEY_EFFECT_QUARANTINED
+            | KEY_EFFECT_MARKED_EXHAUSTED
+            | KEY_EFFECT_RESTORED_ACTIVE
+            | KEY_EFFECT_TRANSIENT_BACKOFF_SET
+            | KEY_EFFECT_TRANSIENT_BACKOFF_CLEARED
+            | "cleared_quarantine"
+            | KEY_EFFECT_MCP_SESSION_INIT_BACKOFF_SET
+            | KEY_EFFECT_MCP_SESSION_RETRY_WAITED
+            | KEY_EFFECT_MCP_SESSION_RETRY_SCHEDULED
+    )
+}
+
 const ALLOWED_HEADERS: &[&str] = &[
     "accept",
     "accept-encoding",
@@ -403,15 +521,31 @@ const ALLOWED_PREFIXES: &[&str] = &["x-mcp-", "x-tavily-", "tavily-"];
 pub const TOKEN_HOURLY_LIMIT: i64 = 100;
 pub const TOKEN_DAILY_LIMIT: i64 = 500;
 pub const TOKEN_MONTHLY_LIMIT: i64 = 5000;
-// Default per-token raw request limit (any request type) per hour.
-// This is enforced separately from the business quota above, and counts every
-// successful token-authenticated request regardless of MCP method.
+// Legacy per-token raw request limit defaults that still back stored quota rows and
+// deprecated read aliases. The active runtime request-rate limiter now uses a fixed
+// rolling 5-minute window and no longer reads these values.
 pub const TOKEN_HOURLY_REQUEST_LIMIT: i64 = 500;
+pub const REQUEST_RATE_LIMIT_WINDOW_MINUTES: i64 = 5;
+pub const REQUEST_RATE_LIMIT_WINDOW_SECS: i64 = REQUEST_RATE_LIMIT_WINDOW_MINUTES * SECS_PER_MINUTE;
+pub const REQUEST_RATE_LIMIT: i64 = 100;
+pub const REQUEST_RATE_LIMIT_MIN: i64 = 1;
 // Keep a request_id -> key affinity for Tavily research result polling.
 // This avoids switching keys between POST /research and GET /research/{request_id}.
 const RESEARCH_REQUEST_AFFINITY_TTL_SECS: i64 = 24 * 60 * 60;
-const MCP_SESSION_IDLE_TTL_SECS: i64 = 24 * 60 * 60;
+const MCP_SESSION_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const MCP_PROXY_USER_AGENT: &str = "tavily-hikari-mcp-proxy/1.0";
+pub const MCP_SESSION_AFFINITY_KEY_COUNT_DEFAULT: i64 = 5;
+pub const MCP_SESSION_AFFINITY_KEY_COUNT_MIN: i64 = 1;
+pub const MCP_SESSION_AFFINITY_KEY_COUNT_MAX: i64 = 1_000;
+pub const REBALANCE_MCP_ENABLED_DEFAULT: bool = false;
+pub const REBALANCE_MCP_SESSION_PERCENT_DEFAULT: i64 = 100;
+pub const REBALANCE_MCP_SESSION_PERCENT_MIN: i64 = 0;
+pub const REBALANCE_MCP_SESSION_PERCENT_MAX: i64 = 100;
+pub const MCP_GATEWAY_MODE_UPSTREAM: &str = "upstream_mcp";
+pub const MCP_GATEWAY_MODE_REBALANCE: &str = "rebalance_http";
+pub const MCP_EXPERIMENT_VARIANT_CONTROL: &str = "control";
+pub const MCP_EXPERIMENT_VARIANT_REBALANCE: &str = "rebalance";
+pub const REBALANCE_MCP_HTTP_BACKOFF_SCOPE: &str = "rebalance_mcp_http";
 // Hard cap on the number of token→key affinity entries kept in memory to prevent
 // unbounded growth under churny traffic (many distinct tokens).
 const TOKEN_AFFINITY_MAX_ENTRIES: usize = 10_000;
@@ -422,6 +556,8 @@ const TOKEN_BINDING_CACHE_TTL_SECS: u64 = 30;
 const TOKEN_BINDING_CACHE_MAX_ENTRIES: usize = 10_000;
 const ACCOUNT_QUOTA_RESOLUTION_CACHE_TTL_SECS: u64 = 5;
 const ACCOUNT_QUOTA_RESOLUTION_CACHE_MAX_ENTRIES: usize = 10_000;
+const ADMIN_REQUEST_LOGS_CATALOG_CACHE_TTL_SECS: i64 = 30;
+const ADMIN_HEAVY_READ_CONCURRENCY: usize = 1;
 // Keep the lease TTL below the acquisition wait so a crashed holder can be recovered
 // by the next in-flight request instead of blocking the subject for minutes.
 const QUOTA_SUBJECT_LOCK_TTL_SECS: u64 = 20;
@@ -429,8 +565,9 @@ const QUOTA_SUBJECT_LOCK_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const QUOTA_SUBJECT_LOCK_REFRESH_SECS: u64 = 5;
 const QUOTA_SUBJECT_LOCK_REFRESH_RETRY_SECS: u64 = 1;
 
-const REQUEST_LOGS_MIN_RETENTION_DAYS: i64 = 7;
+const REQUEST_LOGS_MIN_RETENTION_DAYS: i64 = 32;
 
+const BILLING_STATE_NONE: &str = "none";
 const BILLING_STATE_PENDING: &str = "pending";
 const BILLING_STATE_CHARGED: &str = "charged";
 
@@ -438,17 +575,18 @@ static QUOTA_SUBJECT_LOCK_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const GRANULARITY_MINUTE: &str = "minute";
 const GRANULARITY_HOUR: &str = "hour";
+const GRANULARITY_DAY: &str = "day";
 // Per-token raw request counter (any request type), aggregated per minute.
+#[allow(dead_code)]
 const GRANULARITY_REQUEST_MINUTE: &str = "request_minute";
 const BUCKET_RETENTION_SECS: i64 = 2 * 24 * 3600; // 48h，足够覆盖 24h 窗口
 const CLEANUP_INTERVAL_SECS: i64 = 600;
 const SECS_PER_MINUTE: i64 = 60;
+const SECS_PER_FIVE_MINUTES: i64 = 5 * SECS_PER_MINUTE;
 const SECS_PER_HOUR: i64 = 3600;
 const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
 const TOKEN_USAGE_STATS_BUCKET_SECS: i64 = SECS_PER_HOUR;
 const USAGE_PROBE_TIMEOUT_SECS: u64 = 8;
-const USAGE_PROBE_RETRY_ATTEMPTS: usize = 3;
-const USAGE_PROBE_RETRY_DELAY_MS: u64 = 200;
 
 // Time-based retention for per-token access logs (auth_token_logs).
 // This is purely time-driven and must not depend on access token enable/disable/delete status,
@@ -460,12 +598,34 @@ const META_KEY_TOKEN_USAGE_ROLLUP_TS: &str = "token_usage_rollup_last_ts";
 const META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2: &str = "token_usage_rollup_last_log_id_v2";
 const META_KEY_HEAL_ORPHAN_TOKENS_V1: &str = "heal_orphan_auth_tokens_from_logs_v1";
 const META_KEY_API_KEY_USAGE_BUCKETS_V1_DONE: &str = "api_key_usage_buckets_v1_done";
+const META_KEY_API_KEY_USAGE_BUCKETS_REQUEST_VALUE_V2_DONE: &str =
+    "api_key_usage_buckets_request_value_v2_done";
+const META_KEY_DASHBOARD_REQUEST_ROLLUP_BUCKETS_V1_DONE: &str =
+    "dashboard_request_rollup_buckets_v1_done";
+const META_KEY_REQUEST_LOG_CATALOG_ROLLUP_V1_DONE: &str = "request_log_catalog_rollup_v1_done";
+const META_KEY_REQUEST_LOG_CATALOG_ROLLUP_V1_RETENTION_DAYS: &str =
+    "request_log_catalog_rollup_v1_retention_days";
 const META_KEY_ACCOUNT_QUOTA_BACKFILL_V1: &str = "account_quota_backfill_v1";
 const META_KEY_ACCOUNT_QUOTA_INHERITS_DEFAULTS_BACKFILL_V1: &str =
     "account_quota_inherits_defaults_backfill_v1";
 const META_KEY_ACCOUNT_QUOTA_ZERO_BASE_CUTOVER_V1: &str = "account_quota_zero_base_cutover_v1";
 const META_KEY_FORCE_USER_RELOGIN_V1: &str = "force_user_relogin_v1";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_V1_DONE: &str = "account_usage_rollup_v1_done";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_RATE5M_COVERAGE_START: &str =
+    "account_usage_rollup_rate5m_coverage_start";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_QUOTA1H_COVERAGE_START: &str =
+    "account_usage_rollup_quota1h_coverage_start";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_QUOTA24H_COVERAGE_START: &str =
+    "account_usage_rollup_quota24h_coverage_start";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_QUOTA_MONTH_COVERAGE_START: &str =
+    "account_usage_rollup_quota_month_coverage_start";
+const META_KEY_ACCOUNT_LIMIT_SNAPSHOT_BACKFILL_V1: &str = "account_limit_snapshot_backfill_v1";
 const META_KEY_ALLOW_REGISTRATION_V1: &str = "allow_registration_v1";
+const META_KEY_REQUEST_RATE_LIMIT_V1: &str = "request_rate_limit_v1";
+const META_KEY_MCP_SESSION_AFFINITY_KEY_COUNT_V1: &str = "mcp_session_affinity_key_count_v1";
+const META_KEY_REBALANCE_MCP_ENABLED_V1: &str = "rebalance_mcp_enabled_v1";
+const META_KEY_REBALANCE_MCP_SESSION_PERCENT_V1: &str = "rebalance_mcp_session_percent_v1";
+const META_KEY_USER_BLOCKED_KEY_BASE_LIMIT_V1: &str = "user_blocked_key_base_limit_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_V1: &str = "linuxdo_system_tag_defaults_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_TUPLE_V1: &str = "linuxdo_system_tag_defaults_tuple_v1";
 const META_KEY_REQUEST_KIND_CANONICAL_MIGRATION_V1_STATE: &str =
@@ -486,6 +646,13 @@ const META_KEY_API_KEY_CREATED_AT_BACKFILL_V1: &str = "api_key_created_at_backfi
 // lightweight counters once and start charging by upstream credits going forward.
 const META_KEY_BUSINESS_QUOTA_CREDITS_CUTOVER_V1: &str = "business_quota_credits_cutover_v1";
 const META_KEY_BUSINESS_QUOTA_MONTHLY_REBASE_V1: &str = "business_quota_monthly_rebase_v1";
+const ACCOUNT_USAGE_ROLLUP_REQUEST_BACKFILL_SECS: i64 = SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_BUSINESS_BACKFILL_SECS: i64 = 90 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_MONTH_CHART_MONTHS: i32 = 12;
+const ACCOUNT_USAGE_ROLLUP_FIVE_MINUTE_RETENTION_SECS: i64 = 2 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_HOUR_RETENTION_SECS: i64 = 8 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_DAY_RETENTION_SECS: i64 = 400 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_MONTH_RETENTION_MONTHS: i32 = 24;
 const API_KEY_UPSERT_TRANSIENT_RETRY_BACKOFF_MS: [u64; 2] = [20, 50];
 const TOKEN_USAGE_ROLLUP_TRANSIENT_RETRY_BACKOFF_MS: [u64; 3] = [20, 50, 100];
 
@@ -546,13 +713,17 @@ pub fn effective_request_logs_gc_at() -> (u32, u32) {
 
 /// Effective request log retention days (minimum enforced), including environment overrides.
 ///
-/// Environment variable: `REQUEST_LOGS_RETENTION_DAYS` (positive integer; min 7).
+/// Environment variable: `REQUEST_LOGS_RETENTION_DAYS` (positive integer; min 32).
 pub fn effective_request_logs_retention_days() -> i64 {
     let days = token_limit_from_env(
         "REQUEST_LOGS_RETENTION_DAYS",
         REQUEST_LOGS_MIN_RETENTION_DAYS,
     );
     days.max(REQUEST_LOGS_MIN_RETENTION_DAYS)
+}
+
+pub fn effective_auth_token_log_retention_days() -> i64 {
+    AUTH_TOKEN_LOG_RETENTION_SECS / SECS_PER_DAY
 }
 
 /// Effective hourly quota limit per access token, including environment overrides.
@@ -581,6 +752,18 @@ pub fn effective_token_monthly_limit() -> i64 {
 /// Environment variable: `TOKEN_HOURLY_REQUEST_LIMIT` (must be a positive integer).
 pub fn effective_token_hourly_request_limit() -> i64 {
     token_limit_from_env("TOKEN_HOURLY_REQUEST_LIMIT", TOKEN_HOURLY_REQUEST_LIMIT)
+}
+
+pub fn request_rate_limit_window_minutes() -> i64 {
+    REQUEST_RATE_LIMIT_WINDOW_MINUTES
+}
+
+pub fn request_rate_limit_window_secs() -> i64 {
+    REQUEST_RATE_LIMIT_WINDOW_SECS
+}
+
+pub fn request_rate_limit() -> i64 {
+    REQUEST_RATE_LIMIT
 }
 
 #[derive(Debug, Clone)]

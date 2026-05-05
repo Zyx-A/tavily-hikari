@@ -1,5 +1,7 @@
 use crate::store::*;
 use crate::*;
+use chrono::Timelike;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub(crate) struct ApiKeyLease {
@@ -22,6 +24,16 @@ pub(crate) struct AttemptLog<'a> {
     pub(crate) failure_kind: Option<&'a str>,
     pub(crate) key_effect_code: &'a str,
     pub(crate) key_effect_summary: Option<&'a str>,
+    pub(crate) binding_effect_code: &'a str,
+    pub(crate) binding_effect_summary: Option<&'a str>,
+    pub(crate) selection_effect_code: &'a str,
+    pub(crate) selection_effect_summary: Option<&'a str>,
+    pub(crate) gateway_mode: Option<&'a str>,
+    pub(crate) experiment_variant: Option<&'a str>,
+    pub(crate) proxy_session_id: Option<&'a str>,
+    pub(crate) routing_subject_hash: Option<&'a str>,
+    pub(crate) upstream_operation: Option<&'a str>,
+    pub(crate) fallback_reason: Option<&'a str>,
     pub(crate) forwarded_headers: &'a [String],
     pub(crate) dropped_headers: &'a [String],
 }
@@ -36,6 +48,13 @@ pub struct ProxyRequest {
     pub body: Bytes,
     pub auth_token_id: Option<String>,
     pub pinned_api_key_id: Option<String>,
+    pub prefer_mcp_session_affinity: bool,
+    pub gateway_mode: Option<String>,
+    pub experiment_variant: Option<String>,
+    pub proxy_session_id: Option<String>,
+    pub routing_subject_hash: Option<String>,
+    pub upstream_operation: Option<String>,
+    pub fallback_reason: Option<String>,
 }
 
 /// 透传响应。
@@ -48,6 +67,10 @@ pub struct ProxyResponse {
     pub request_log_id: Option<i64>,
     pub key_effect_code: String,
     pub key_effect_summary: Option<String>,
+    pub binding_effect_code: String,
+    pub binding_effect_summary: Option<String>,
+    pub selection_effect_code: String,
+    pub selection_effect_summary: Option<String>,
 }
 
 /// Token quota verdict used by the HTTP layer to decide whether to forward.
@@ -64,7 +87,7 @@ pub struct TokenQuotaVerdict {
 }
 
 impl TokenQuotaVerdict {
-    pub(crate) fn new(
+    pub fn new(
         hourly_used_raw: i64,
         hourly_limit: i64,
         daily_used_raw: i64,
@@ -245,16 +268,51 @@ pub struct MonthlyQuotaRebaseReport {
     pub meta_updated: bool,
 }
 
-/// Lightweight verdict for the per-token hourly raw request limiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestRateScope {
+    User,
+    Token,
+}
+
+impl RequestRateScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Token => "token",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestRateView {
+    pub used: i64,
+    pub limit: i64,
+    pub window_minutes: i64,
+    pub scope: RequestRateScope,
+}
+
+/// Lightweight verdict for the rolling request-rate limiter that counts all
+/// authenticated requests for a bound user or unbound token subject.
 #[derive(Debug, Clone)]
 pub struct TokenHourlyRequestVerdict {
     pub allowed: bool,
     pub hourly_used: i64,
     pub hourly_limit: i64,
+    pub window_minutes: i64,
+    pub scope: RequestRateScope,
+    pub retry_after_seconds: i64,
 }
 
 impl TokenHourlyRequestVerdict {
-    pub(crate) fn new(hourly_used_raw: i64, hourly_limit: i64) -> Self {
+    pub fn new(
+        hourly_used_raw: i64,
+        hourly_limit: i64,
+        window_minutes: i64,
+        scope: RequestRateScope,
+        retry_after_seconds: i64,
+    ) -> Self {
         let hourly_limit = hourly_limit.max(0);
         let hourly_used_raw = hourly_used_raw.max(0);
         let allowed = hourly_limit > 0 && hourly_used_raw <= hourly_limit;
@@ -263,6 +321,18 @@ impl TokenHourlyRequestVerdict {
             allowed,
             hourly_used,
             hourly_limit,
+            window_minutes: window_minutes.max(1),
+            scope,
+            retry_after_seconds: retry_after_seconds.max(0),
+        }
+    }
+
+    pub fn request_rate(&self) -> RequestRateView {
+        RequestRateView {
+            used: self.hourly_used,
+            limit: self.hourly_limit,
+            window_minutes: self.window_minutes,
+            scope: self.scope,
         }
     }
 }
@@ -303,6 +373,7 @@ pub struct ApiKeyMetrics {
     pub error_count: i64,
     pub quota_exhausted_count: i64,
     pub quarantine: Option<ApiKeyQuarantine>,
+    pub transient_backoff: Option<ApiKeyTransientBackoff>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,6 +405,14 @@ pub struct ApiKeyQuarantine {
     pub reason_summary: String,
     pub reason_detail: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyTransientBackoff {
+    pub reason_code: String,
+    pub cooldown_until: i64,
+    pub retry_after_secs: i64,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,19 +480,67 @@ pub(crate) struct TokenPrimaryApiKeyAffinity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct HttpProjectAffinityBinding {
+    pub owner_subject: String,
+    pub project_id_hash: String,
+    pub api_key_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct HttpProjectAffinityContext {
+    pub owner_subject: String,
+    pub project_id_hash: String,
+    pub affinity_subject: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApiRouteAffinityBinding {
+    pub owner_subject: String,
+    pub route_key_hash: String,
+    pub api_key_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApiRouteAffinityContext {
+    pub owner_subject: String,
+    pub route_key_hash: String,
+    pub affinity_subject: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpSessionBinding {
     pub proxy_session_id: String,
-    pub upstream_session_id: String,
-    pub upstream_key_id: String,
+    pub upstream_session_id: Option<String>,
+    pub upstream_key_id: Option<String>,
     pub auth_token_id: Option<String>,
     pub user_id: Option<String>,
     pub protocol_version: Option<String>,
     pub last_event_id: Option<String>,
+    pub gateway_mode: String,
+    pub experiment_variant: String,
+    pub ab_bucket: Option<i64>,
+    pub routing_subject_hash: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub rate_limited_until: Option<i64>,
+    pub last_rate_limited_at: Option<i64>,
+    pub last_rate_limit_reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub expires_at: i64,
     pub revoked_at: Option<i64>,
     pub revoke_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemSettings {
+    pub request_rate_limit: i64,
+    pub mcp_session_affinity_key_count: i64,
+    pub rebalance_mcp_enabled: bool,
+    pub rebalance_mcp_session_percent: i64,
+    pub user_blocked_key_base_limit: i64,
 }
 
 /// 单条请求日志记录的关键信息。
@@ -432,10 +559,23 @@ pub struct RequestLogRecord {
     pub request_kind_key: String,
     pub request_kind_label: String,
     pub request_kind_detail: Option<String>,
+    pub request_kind_protocol_group: String,
+    pub request_kind_billing_group: String,
     pub result_status: String,
     pub failure_kind: Option<String>,
     pub key_effect_code: String,
     pub key_effect_summary: Option<String>,
+    pub binding_effect_code: String,
+    pub binding_effect_summary: Option<String>,
+    pub selection_effect_code: String,
+    pub selection_effect_summary: Option<String>,
+    pub gateway_mode: Option<String>,
+    pub experiment_variant: Option<String>,
+    pub proxy_session_id: Option<String>,
+    pub routing_subject_hash: Option<String>,
+    pub upstream_operation: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub operational_class: String,
     pub request_body: Vec<u8>,
     pub response_body: Vec<u8>,
     pub created_at: i64,
@@ -459,6 +599,8 @@ pub struct LogFacetOption {
 pub struct RequestLogPageFacets {
     pub results: Vec<LogFacetOption>,
     pub key_effects: Vec<LogFacetOption>,
+    pub binding_effects: Vec<LogFacetOption>,
+    pub selection_effects: Vec<LogFacetOption>,
     pub tokens: Vec<LogFacetOption>,
     pub keys: Vec<LogFacetOption>,
 }
@@ -471,6 +613,201 @@ pub struct RequestLogsPage {
     pub facets: RequestLogPageFacets,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLogsCursorDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestLogsCursor {
+    pub created_at: i64,
+    pub id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLogsCursorPage {
+    pub items: Vec<RequestLogRecord>,
+    pub page_size: i64,
+    pub next_cursor: Option<RequestLogsCursor>,
+    pub prev_cursor: Option<RequestLogsCursor>,
+    pub has_older: bool,
+    pub has_newer: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenLogsCursorPage {
+    pub items: Vec<TokenLogRecord>,
+    pub page_size: i64,
+    pub next_cursor: Option<RequestLogsCursor>,
+    pub prev_cursor: Option<RequestLogsCursor>,
+    pub has_older: bool,
+    pub has_newer: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLogsCatalog {
+    pub retention_days: i64,
+    pub request_kind_options: Vec<TokenRequestKindOption>,
+    pub facets: RequestLogPageFacets,
+}
+
+pub const ALERT_TYPE_UPSTREAM_RATE_LIMITED_429: &str = "upstream_rate_limited_429";
+pub const ALERT_TYPE_UPSTREAM_USAGE_LIMIT_432: &str = "upstream_usage_limit_432";
+pub const ALERT_TYPE_UPSTREAM_KEY_BLOCKED: &str = "upstream_key_blocked";
+pub const ALERT_TYPE_USER_REQUEST_RATE_LIMITED: &str = "user_request_rate_limited";
+pub const ALERT_TYPE_USER_QUOTA_EXHAUSTED: &str = "user_quota_exhausted";
+
+pub const ALERT_SOURCE_AUTH_TOKEN_LOG: &str = "auth_token_log";
+pub const ALERT_SOURCE_API_KEY_MAINTENANCE_RECORD: &str = "api_key_maintenance_record";
+
+pub const ALERT_SUBJECT_USER: &str = "user";
+pub const ALERT_SUBJECT_TOKEN: &str = "token";
+pub const ALERT_SUBJECT_KEY: &str = "key";
+
+pub fn is_supported_alert_type(value: &str) -> bool {
+    matches!(
+        value,
+        ALERT_TYPE_UPSTREAM_RATE_LIMITED_429
+            | ALERT_TYPE_UPSTREAM_USAGE_LIMIT_432
+            | ALERT_TYPE_UPSTREAM_KEY_BLOCKED
+            | ALERT_TYPE_USER_REQUEST_RATE_LIMITED
+            | ALERT_TYPE_USER_QUOTA_EXHAUSTED
+    )
+}
+
+pub fn default_alert_type_counts() -> Vec<AlertTypeCount> {
+    [
+        ALERT_TYPE_UPSTREAM_RATE_LIMITED_429,
+        ALERT_TYPE_UPSTREAM_USAGE_LIMIT_432,
+        ALERT_TYPE_UPSTREAM_KEY_BLOCKED,
+        ALERT_TYPE_USER_REQUEST_RATE_LIMITED,
+        ALERT_TYPE_USER_QUOTA_EXHAUSTED,
+    ]
+    .into_iter()
+    .map(|alert_type| AlertTypeCount {
+        alert_type: alert_type.to_string(),
+        count: 0,
+    })
+    .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertEntityRef {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertUserRef {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertRequestRef {
+    pub id: i64,
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertSourceRef {
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertEventRecord {
+    pub id: String,
+    pub alert_type: String,
+    pub title: String,
+    pub summary: String,
+    pub occurred_at: i64,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub subject_label: String,
+    pub user: Option<AlertUserRef>,
+    pub token: Option<AlertEntityRef>,
+    pub key: Option<AlertEntityRef>,
+    pub request: Option<AlertRequestRef>,
+    pub request_kind: Option<TokenRequestKind>,
+    pub failure_kind: Option<String>,
+    pub result_status: Option<String>,
+    pub error_message: Option<String>,
+    pub reason_code: Option<String>,
+    pub reason_summary: Option<String>,
+    pub reason_detail: Option<String>,
+    pub source: AlertSourceRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginatedAlertEvents {
+    pub items: Vec<AlertEventRecord>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertGroupRecord {
+    pub id: String,
+    pub alert_type: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub subject_label: String,
+    pub user: Option<AlertUserRef>,
+    pub token: Option<AlertEntityRef>,
+    pub key: Option<AlertEntityRef>,
+    pub request_kind: Option<TokenRequestKind>,
+    pub count: i64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub latest_event: AlertEventRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginatedAlertGroups {
+    pub items: Vec<AlertGroupRecord>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertFacetOption {
+    pub value: String,
+    pub label: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertCatalog {
+    pub retention_days: i64,
+    pub types: Vec<LogFacetOption>,
+    pub request_kind_options: Vec<TokenRequestKindOption>,
+    pub users: Vec<AlertFacetOption>,
+    pub tokens: Vec<AlertFacetOption>,
+    pub keys: Vec<AlertFacetOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertTypeCount {
+    pub alert_type: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentAlertsSummary {
+    pub window_hours: i64,
+    pub total_events: i64,
+    pub grouped_count: i64,
+    pub counts_by_type: Vec<AlertTypeCount>,
+    pub top_groups: Vec<AlertGroupRecord>,
+}
+
 /// 汇总统计信息，用于展示整体代理运行状况。
 #[derive(Debug, Clone)]
 pub struct ProxySummary {
@@ -481,9 +818,19 @@ pub struct ProxySummary {
     pub active_keys: i64,
     pub exhausted_keys: i64,
     pub quarantined_keys: i64,
+    pub temporary_isolated_keys: i64,
     pub last_activity: Option<i64>,
     pub total_quota_limit: i64,
     pub total_quota_remaining: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SummaryQuotaCharge {
+    pub local_estimated_credits: i64,
+    pub upstream_actual_credits: i64,
+    pub sampled_key_count: i64,
+    pub stale_key_count: i64,
+    pub latest_sync_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -492,9 +839,15 @@ pub struct SummaryWindowMetrics {
     pub success_count: i64,
     pub error_count: i64,
     pub quota_exhausted_count: i64,
+    pub valuable_success_count: i64,
+    pub valuable_failure_count: i64,
+    pub other_success_count: i64,
+    pub other_failure_count: i64,
+    pub unknown_count: i64,
     pub upstream_exhausted_key_count: i64,
     pub new_keys: i64,
     pub new_quarantines: i64,
+    pub quota_charge: SummaryQuotaCharge,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -502,6 +855,31 @@ pub struct SummaryWindows {
     pub today: SummaryWindowMetrics,
     pub yesterday: SummaryWindowMetrics,
     pub month: SummaryWindowMetrics,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardHourlyRequestBucket {
+    pub bucket_start: i64,
+    pub secondary_success: i64,
+    pub primary_success: i64,
+    pub secondary_failure: i64,
+    pub primary_failure_429: i64,
+    pub primary_failure_other: i64,
+    pub unknown: i64,
+    pub mcp_non_billable: i64,
+    pub mcp_billable: i64,
+    pub api_non_billable: i64,
+    pub api_billable: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardHourlyRequestWindow {
+    pub bucket_seconds: i64,
+    pub visible_buckets: i64,
+    pub retained_buckets: i64,
+    pub buckets: Vec<DashboardHourlyRequestBucket>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -529,6 +907,16 @@ pub struct JobLog {
     pub message: Option<String>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobGroupCounts {
+    pub all: i64,
+    pub quota: i64,
+    pub usage: i64,
+    pub logs: i64,
+    pub geo: i64,
+    pub linuxdo: i64,
 }
 
 pub(crate) fn random_string(alphabet: &[u8], len: usize) -> String {
@@ -627,6 +1015,7 @@ pub struct AdminUserQuotaDetails {
 
 #[derive(Debug, Clone)]
 pub struct UserDashboardSummary {
+    pub request_rate: RequestRateView,
     pub hourly_any_used: i64,
     pub hourly_any_limit: i64,
     pub quota_hourly_used: i64,
@@ -658,6 +1047,46 @@ pub struct TokenLogMetricsSummary {
     pub monthly_success: i64,
     pub monthly_failure: i64,
     pub last_activity: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminUserUsageSeriesKind {
+    Rate5m,
+    Quota1h,
+    Quota24h,
+    QuotaMonth,
+}
+
+impl AdminUserUsageSeriesKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "rate5m" => Some(Self::Rate5m),
+            "quota1h" => Some(Self::Quota1h),
+            "quota24h" => Some(Self::Quota24h),
+            "quotaMonth" => Some(Self::QuotaMonth),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminUserUsageSeriesPoint {
+    pub bucket_start: i64,
+    pub display_bucket_start: Option<i64>,
+    pub value: Option<i64>,
+    pub limit_value: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminUserUsageSeries {
+    pub limit: i64,
+    pub points: Vec<AdminUserUsageSeriesPoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeRangeUtc {
+    pub start: i64,
+    pub end: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -738,6 +1167,7 @@ pub struct UserTokenSummary {
     pub enabled: bool,
     pub note: Option<String>,
     pub last_used_at: Option<i64>,
+    pub request_rate: RequestRateView,
     pub hourly_any_used: i64,
     pub hourly_any_limit: i64,
     pub quota_hourly_used: i64,
@@ -762,6 +1192,18 @@ pub struct OAuthAccountProfile {
     pub active: bool,
     pub trust_level: Option<i64>,
     pub raw_payload_json: Option<String>,
+}
+
+/// OAuth account record that is eligible for refresh-token based profile sync.
+#[derive(Debug, Clone)]
+pub struct OAuthAccountRefreshTokenRecord {
+    pub provider: String,
+    pub provider_user_id: String,
+    pub user_id: String,
+    pub username: Option<String>,
+    pub name: Option<String>,
+    pub refresh_token_ciphertext: String,
+    pub refresh_token_nonce: String,
 }
 
 /// Local user identity resolved from oauth_accounts/users.
@@ -851,6 +1293,16 @@ pub struct TokenLogRecord {
     pub failure_kind: Option<String>,
     pub key_effect_code: String,
     pub key_effect_summary: Option<String>,
+    pub binding_effect_code: String,
+    pub binding_effect_summary: Option<String>,
+    pub selection_effect_code: String,
+    pub selection_effect_summary: Option<String>,
+    pub gateway_mode: Option<String>,
+    pub experiment_variant: Option<String>,
+    pub proxy_session_id: Option<String>,
+    pub routing_subject_hash: Option<String>,
+    pub upstream_operation: Option<String>,
+    pub fallback_reason: Option<String>,
     pub created_at: i64,
 }
 
@@ -1032,6 +1484,20 @@ pub(crate) fn start_of_next_month(
         .expect("valid start of next month")
 }
 
+pub(crate) fn shift_month_start_utc_ts(current_month_start_utc_ts: i64, delta_months: i32) -> i64 {
+    let Some(current_month_start) = Utc.timestamp_opt(current_month_start_utc_ts, 0).single()
+    else {
+        return current_month_start_utc_ts;
+    };
+    let zero_indexed = current_month_start.month0() as i32 + delta_months;
+    let year = current_month_start.year() + zero_indexed.div_euclid(12);
+    let month0 = zero_indexed.rem_euclid(12) as u32;
+    Utc.with_ymd_and_hms(year, month0 + 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid shifted month start")
+        .timestamp()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BillingLedgerWindows {
     generated_at: i64,
@@ -1039,6 +1505,7 @@ struct BillingLedgerWindows {
     hour_bucket_start: i64,
     hour_window_start: i64,
     day_window_start: i64,
+    day_window_end: i64,
     month_window_start: i64,
 }
 
@@ -1047,12 +1514,14 @@ impl BillingLedgerWindows {
         let generated_at = now.timestamp();
         let minute_bucket_start = generated_at - (generated_at % SECS_PER_MINUTE);
         let hour_bucket_start = generated_at - (generated_at % SECS_PER_HOUR);
+        let day_window = server_local_day_window_utc(now.with_timezone(&Local));
         Self {
             generated_at,
             minute_bucket_start,
             hour_bucket_start,
             hour_window_start: minute_bucket_start - 59 * SECS_PER_MINUTE,
-            day_window_start: hour_bucket_start - 23 * SECS_PER_HOUR,
+            day_window_start: day_window.start,
+            day_window_end: day_window.end,
             month_window_start: start_of_month(now).timestamp(),
         }
     }
@@ -1398,9 +1867,9 @@ pub(crate) async fn audit_business_quota_ledger_with_pool(
 
         for (token_id, total_credits) in fetch_token_quota_window(
             &mut *conn,
-            GRANULARITY_HOUR,
+            GRANULARITY_DAY,
             windows.day_window_start,
-            windows.hour_bucket_start,
+            windows.day_window_start,
         )
         .await?
         {
@@ -1409,11 +1878,24 @@ pub(crate) async fn audit_business_quota_ledger_with_pool(
                 .or_default()
                 .day_quota = total_credits;
         }
-        for (user_id, total_credits) in fetch_account_quota_window(
+        for (token_id, total_credits) in fetch_token_quota_window(
             &mut *conn,
             GRANULARITY_HOUR,
             windows.day_window_start,
-            windows.hour_bucket_start,
+            windows.day_window_end.saturating_sub(1),
+        )
+        .await?
+        {
+            subjects
+                .entry(format!("token:{token_id}"))
+                .or_default()
+                .day_quota += total_credits;
+        }
+        for (user_id, total_credits) in fetch_account_quota_window(
+            &mut *conn,
+            GRANULARITY_DAY,
+            windows.day_window_start,
+            windows.day_window_start,
         )
         .await?
         {
@@ -1421,6 +1903,19 @@ pub(crate) async fn audit_business_quota_ledger_with_pool(
                 .entry(format!("account:{user_id}"))
                 .or_default()
                 .day_quota = total_credits;
+        }
+        for (user_id, total_credits) in fetch_account_quota_window(
+            &mut *conn,
+            GRANULARITY_HOUR,
+            windows.day_window_start,
+            windows.day_window_end.saturating_sub(1),
+        )
+        .await?
+        {
+            subjects
+                .entry(format!("account:{user_id}"))
+                .or_default()
+                .day_quota += total_credits;
         }
 
         for (token_id, stored_month_start, month_count) in
@@ -1646,13 +2141,6 @@ pub(crate) async fn rebase_current_month_business_quota_with_pool(
     Ok(report)
 }
 
-pub(crate) fn start_of_day(now: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
-    now.date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("valid start of day")
-        .and_utc()
-}
-
 pub(crate) fn local_date_start_utc_ts(
     date: chrono::NaiveDate,
     fallback_now: chrono::DateTime<Local>,
@@ -1679,6 +2167,14 @@ pub(crate) fn start_of_local_day_utc_ts(now: chrono::DateTime<Local>) -> i64 {
     local_date_start_utc_ts(now.date_naive(), now)
 }
 
+pub(crate) fn start_of_local_hour_utc_ts(now: chrono::DateTime<Local>) -> i64 {
+    let naive = now
+        .date_naive()
+        .and_hms_opt(now.hour(), 0, 0)
+        .expect("valid start of local hour");
+    local_naive_datetime_utc_ts(naive, now)
+}
+
 pub(crate) fn previous_local_day_start_utc_ts(now: chrono::DateTime<Local>) -> i64 {
     let previous_date = now
         .date_naive()
@@ -1701,6 +2197,92 @@ pub(crate) fn local_day_bucket_start_utc_ts(created_at_utc_ts: i64) -> i64 {
         return 0;
     };
     start_of_local_day_utc_ts(utc_dt.with_timezone(&Local))
+}
+
+pub(crate) fn next_local_day_start_utc_ts(current_day_start_utc_ts: i64) -> i64 {
+    let Some(utc_dt) = Utc.timestamp_opt(current_day_start_utc_ts, 0).single() else {
+        return current_day_start_utc_ts.saturating_add(SECS_PER_DAY);
+    };
+    let local_dt = utc_dt.with_timezone(&Local);
+    let next_date = local_dt
+        .date_naive()
+        .succ_opt()
+        .unwrap_or_else(|| local_dt.date_naive());
+    local_date_start_utc_ts(next_date, local_dt)
+}
+
+pub(crate) fn shift_local_day_start_utc_ts(current_day_start_utc_ts: i64, delta_days: i32) -> i64 {
+    let Some(utc_dt) = Utc.timestamp_opt(current_day_start_utc_ts, 0).single() else {
+        return current_day_start_utc_ts;
+    };
+    let local_dt = utc_dt.with_timezone(&Local);
+    let target_date = if delta_days >= 0 {
+        local_dt
+            .date_naive()
+            .checked_add_days(chrono::Days::new(delta_days as u64))
+            .unwrap_or_else(|| local_dt.date_naive())
+    } else {
+        local_dt
+            .date_naive()
+            .checked_sub_days(chrono::Days::new(delta_days.unsigned_abs() as u64))
+            .unwrap_or_else(|| local_dt.date_naive())
+    };
+    local_date_start_utc_ts(target_date, local_dt)
+}
+
+pub(crate) fn server_local_day_window_utc(now: chrono::DateTime<Local>) -> TimeRangeUtc {
+    let start = start_of_local_day_utc_ts(now);
+    let end = next_local_day_start_utc_ts(start);
+    TimeRangeUtc { start, end }
+}
+
+pub fn parse_explicit_today_window(
+    today_start: Option<&str>,
+    today_end: Option<&str>,
+) -> Result<Option<TimeRangeUtc>, String> {
+    let normalized_start = today_start.map(str::trim).filter(|value| !value.is_empty());
+    let normalized_end = today_end.map(str::trim).filter(|value| !value.is_empty());
+    match (normalized_start, normalized_end) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("today_start and today_end must be provided together".to_string())
+        }
+        (Some(raw_start), Some(raw_end)) => {
+            let start = chrono::DateTime::parse_from_rfc3339(raw_start).map_err(|_| {
+                "today_start must be a valid ISO8601 datetime with offset".to_string()
+            })?;
+            let end = chrono::DateTime::parse_from_rfc3339(raw_end).map_err(|_| {
+                "today_end must be a valid ISO8601 datetime with offset".to_string()
+            })?;
+            if end <= start {
+                return Err("today_end must be later than today_start".to_string());
+            }
+            if start.time() != chrono::NaiveTime::MIN || end.time() != chrono::NaiveTime::MIN {
+                return Err("today_start and today_end must align to local midnight".to_string());
+            }
+            let duration = end.signed_duration_since(start);
+            if duration < chrono::Duration::hours(23) || duration > chrono::Duration::hours(25) {
+                return Err(
+                    "today_start and today_end must describe exactly one natural-day window"
+                        .to_string(),
+                );
+            }
+            let next_date = start
+                .date_naive()
+                .succ_opt()
+                .ok_or_else(|| "today_start must be a single natural-day window".to_string())?;
+            if end.date_naive() != next_date {
+                return Err(
+                    "today_start and today_end must describe exactly one natural-day window"
+                        .to_string(),
+                );
+            }
+            Ok(Some(TimeRangeUtc {
+                start: start.with_timezone(&Utc).timestamp(),
+                end: end.with_timezone(&Utc).timestamp(),
+            }))
+        }
+    }
 }
 
 pub(crate) fn request_logs_retention_threshold_utc_ts(retention_days: i64) -> i64 {

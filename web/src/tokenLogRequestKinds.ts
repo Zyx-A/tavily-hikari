@@ -80,6 +80,12 @@ const canonicalTokenLogRequestKindOptions: TokenLogRequestKindOption[] = [
     billing_group: 'non_billable',
   },
   { key: 'mcp:search', label: 'MCP | search', protocol_group: 'mcp', billing_group: 'billable' },
+  {
+    key: 'mcp:session-delete-unsupported',
+    label: 'MCP | session delete unsupported',
+    protocol_group: 'mcp',
+    billing_group: 'non_billable',
+  },
   { key: 'mcp:third-party-tool', label: 'MCP | third-party tool', protocol_group: 'mcp', billing_group: 'non_billable' },
   { key: 'mcp:tools/list', label: 'MCP | tools/list', protocol_group: 'mcp', billing_group: 'non_billable' },
   { key: 'mcp:unknown-method', label: 'MCP | unknown method', protocol_group: 'mcp', billing_group: 'non_billable' },

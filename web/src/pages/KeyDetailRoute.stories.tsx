@@ -38,6 +38,21 @@ const keyDetailMock: ApiKeyStats = {
   error_count: 624,
   quota_exhausted_count: 0,
   quarantine: null,
+  transient_backoff: null,
+}
+
+const quarantinedKeyDetailMock: ApiKeyStats = {
+  ...keyDetailMock,
+  status: 'disabled',
+  quota_remaining: 1_240,
+  quarantine: {
+    source: '/api/tavily/usage',
+    reasonCode: 'account_deactivated',
+    reasonSummary: 'Tavily account deactivated (HTTP 401)',
+    reasonDetail: 'The account associated with this API key has been deactivated.',
+    createdAt: Math.floor((REVIEW_AT - 11 * 60 * 1000) / 1000),
+  },
+  transient_backoff: null,
 }
 
 const keyMetricsMock: KeySummary = {
@@ -213,7 +228,7 @@ function buildKeyLogsPage(source: RequestLog[], searchParams: URLSearchParams) {
   }
 }
 
-function installKeyDetailFetchMock(): () => void {
+function installKeyDetailFetchMock(detailMock: ApiKeyStats = keyDetailMock): () => void {
   const originalFetch = window.fetch.bind(window)
 
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -221,7 +236,7 @@ function installKeyDetailFetchMock(): () => void {
     const url = new URL(request.url, window.location.origin)
 
     if (url.pathname === `/api/keys/${REVIEW_KEY_ID}`) {
-      return jsonResponse(keyDetailMock)
+      return jsonResponse(detailMock)
     }
 
     if (url.pathname === `/api/keys/${REVIEW_KEY_ID}/metrics`) {
@@ -275,7 +290,11 @@ function installKeyDetailFetchMock(): () => void {
   }
 }
 
-function KeyDetailRouteSurface(): JSX.Element {
+function KeyDetailRouteSurface({
+  detailMock = keyDetailMock,
+}: {
+  detailMock?: ApiKeyStats
+} = {}): JSX.Element {
   const adminStrings = useTranslate().admin
 
   const navItems: AdminNavItem[] = [
@@ -297,29 +316,33 @@ function KeyDetailRouteSurface(): JSX.Element {
       skipToContentLabel={adminStrings.accessibility.skipToContent}
       onSelectItem={() => undefined}
     >
-      <KeyDetails id={REVIEW_KEY_ID} onBack={() => undefined} onOpenUser={() => undefined} />
+      <KeyDetails id={detailMock.id} onBack={() => undefined} onOpenUser={() => undefined} />
     </AdminShell>
   )
 }
 
-function KeyDetailRouteStoryCanvas(): JSX.Element {
+function KeyDetailRouteStoryCanvas({
+  detailMock = keyDetailMock,
+}: {
+  detailMock?: ApiKeyStats
+} = {}): JSX.Element {
   const [ready, setReady] = useState(false)
 
   useLayoutEffect(() => {
-    const cleanupFetch = installKeyDetailFetchMock()
+    const cleanupFetch = installKeyDetailFetchMock(detailMock)
     setReady(true)
 
     return () => {
       cleanupFetch()
       setReady(false)
     }
-  }, [])
+  }, [detailMock])
 
   if (!ready) {
     return <div style={{ minHeight: '100vh', background: 'hsl(var(--background))' }} />
   }
 
-  return <KeyDetailRouteSurface />
+  return <KeyDetailRouteSurface detailMock={detailMock} />
 }
 
 const meta = {
@@ -377,5 +400,16 @@ export const CBoXReviewStacked: Story = {
   ...CBoXReview,
   parameters: {
     viewport: { defaultViewport: '1100-breakpoint-admin-stack-max' },
+  },
+}
+
+export const CBoXQuarantinedSyncReady: Story = {
+  render: () => <KeyDetailRouteStoryCanvas detailMock={quarantinedKeyDetailMock} />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
   },
 }
