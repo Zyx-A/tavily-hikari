@@ -1,10 +1,10 @@
 # Tavily HTTP API 中转设计（`/api/tavily/*`）
 
-本文档描述在 Tavily Hikari 中新增一组 HTTP API 端点，用于为任意 **Tavily HTTP 客户端**（包括 Cherry Studio）提供带密钥池与配额控制的中转能力。
+本文档描述 Tavily Hikari 的 HTTP API façade，用于为任意 **Tavily HTTP 客户端**（包括 Cherry Studio）提供带密钥池与配额控制的中转能力。
 
 重点是：**客户端将 Hikari 当作 Tavily HTTP 服务来调用**，只需要更换 Base URL 与“API 密钥”，即可复用现有的 Tavily 请求格式与返回结构。
 
-> 本文档只涵盖设计，不包含具体实现细节。实现阶段可以以此为基线做微调。
+本文档是当前实现的接入与维护基线。
 
 ---
 
@@ -14,7 +14,7 @@
 
 - Hikari 已通过 `TavilyProxy` 实现了对 Tavily MCP 上游的代理与密钥调度（`/mcp` 路径）。
 - 用户态流量通过 **访问令牌（`th-<id>-<secret>`）** 进入 `/mcp`，在 `TavilyProxy` 内部被映射到一组 Tavily API Key，并记录完整的请求日志与配额使用。
-- 后台还通过 `TAVILY_USAGE_BASE` → `/usage` 与 Tavily Usage API 对接，用于同步 Key 配额。
+- 后台可通过 `TAVILY_USAGE_BASE` → `/usage` 与 Tavily Usage API 对接，用于内部 Key 校验、运维诊断和配额同步。
 
 需求：
 
@@ -24,10 +24,10 @@
 
 目标：
 
-1. 在 `/api` 下新增一组 **Tavily HTTP façade 端点**：`/api/tavily/search` 为第一阶段，其余端点预留设计。
-2. 对外保持 Tavily HTTP API 的请求/响应结构尽量一致，减少客户端改动。
+1. 在 `/api/tavily/*` 下提供 Tavily HTTP façade 端点。
+2. 对外保持免费上游账号可用的 Tavily HTTP API 请求/响应结构尽量一致，减少客户端改动。
 3. 对内复用现有 `TavilyProxy`、KeyStore、配额与日志体系。
-4. 确保不会在日志中泄露客户端访问令牌或 Tavily 官方 API key。
+4. 确保不会在日志或下游响应中泄露客户端访问令牌、Tavily 官方 API key、上游账号额度、套餐或 PAYG 信息。
 
 ---
 
@@ -35,26 +35,32 @@
 
 统一前缀：`/api/tavily/*`
 
-计划分阶段实现：
+| Method | Path                               | 对应 Tavily 端点             | 说明                        |
+| ------ | ---------------------------------- | ---------------------------- | --------------------------- |
+| POST   | `/api/tavily/search`               | `POST /search`               | 搜索                        |
+| POST   | `/api/tavily/extract`              | `POST /extract`              | 内容提取                    |
+| POST   | `/api/tavily/crawl`                | `POST /crawl`                | 深度爬取                    |
+| POST   | `/api/tavily/map`                  | `POST /map`                  | 站点结构映射                |
+| POST   | `/api/tavily/research`             | `POST /research`             | Research 请求               |
+| GET    | `/api/tavily/research/:request_id` | `GET /research/{request_id}` | Research 结果查询           |
+| GET    | `/api/tavily/usage`                | （自定义）                   | 按 **token** 聚合的用量视图 |
 
-### 2.1 第一阶段（Cherry Studio 立即可用）
+`/api/tavily/usage` 是 Hikari 自定义下游用量端点，不是 Tavily 原生 `GET /usage`
+的透明代理。它只返回 Hikari 访问令牌维度的本地统计，不返回上游 Tavily key、账号套餐、
+`plan_limit`、`paygo_limit`、`current_plan` 等上游账号信息。
 
-| Method | Path                 | 说明                                  | 认证         |
-| ------ | -------------------- | ------------------------------------- | ------------ |
-| POST   | `/api/tavily/search` | Tavily `/search` 的代理与负载均衡入口 | Hikari Token |
+Hikari 不提供 `/api/tavily/org-usage`。官方 `POST /org-usage` 属于 Tavily Enterprise 组织用量能力，
+不属于免费上游账号兼容范围，也不应暴露给下游用户。
 
-### 2.2 预留后续端点（不在首阶段实现）
+### 2.1 免费账号兼容边界
 
-这些端点先在文档中预留语义，具体实现按需求推进：
+Hikari 的下游合同只覆盖上游免费账号可用、且当前代理可正确计费和审计的能力：
 
-| Method | Path                  | 对应 Tavily 端点 | 说明                        |
-| ------ | --------------------- | ---------------- | --------------------------- |
-| POST   | `/api/tavily/extract` | `POST /extract`  | 内容提取                    |
-| POST   | `/api/tavily/crawl`   | `POST /crawl`    | 深度爬取                    |
-| POST   | `/api/tavily/map`     | `POST /map`      | 站点结构映射                |
-| GET    | `/api/tavily/usage`   | （自定义）       | 按 **token** 聚合的用量视图 |
-
-> 说明：`/api/tavily/usage` 更偏向 Hikari 自己的 Usage API，而不是 Tavily 原生的 `/usage` 代理；它将依赖本地 `token_usage_stats` 等表。
+- 支持：`search`、`extract`、`crawl`、`map`、非流式 `research`、`research/{request_id}`。
+- 不支持：Enterprise-only `safe_search`；请求会在本地返回 `400 invalid_request`，不会打到上游。
+- 不支持：`research` 的 `stream=true`；当前代理不提供真实 SSE streaming 转发，请使用非流式 Research。
+- 不支持：官方 `/usage` 透明代理和 `/org-usage`。
+- `include_usage` 由 Hikari 在上游请求中按计费需要内部控制，不作为下游公开可控字段。
 
 ---
 
@@ -93,7 +99,7 @@
 ### 3.2 配额检查与错误返回
 
 1. 从 token 提取 `token_id`（`th-<id>-<secret>` 中的 `<id>`）。
-2. 通过 `proxy.check_token_quota(token_id)` 获取配额 verdict：
+2. 通过 `proxy.check_token_quota(token_id)` 做现有业务 credits 配额预检查：
    - 若 `allowed == false`：
      - 调用 `record_token_attempt` 写入一条 `result_status = "quota_exhausted"` 的 token 日志；
      - 返回 `429 Too Many Requests`，body 为简短 JSON：
@@ -103,7 +109,11 @@
          "message": "daily / hourly limit reached for this token"
        }
        ```
-3. 若通过配额校验，则进入 Tavily 上游调用流程（见后文）。
+3. 对会映射到账户共享额度的 billable 请求，在真正出站前执行 account 级 `businessCalls1h` 预占：
+   - 通过 `reserve_token_business_calls_1h_limit(...)` 或对应的 subject 变体，按“最近 1h 已完成业务调用 + 未过期 reservation”做 admission；
+   - 若 reservation 被拒绝，则记录一次本地 `quota_exhausted` 尝试并直接返回 `429`，不会命中上游；
+   - reservation 只用于内部限流，不会直接出现在用户/管理员看到的 `businessCalls1h` 图表与摘要中。
+4. 若 credits 预检查与 `businessCalls1h` reservation 都通过，则进入 Tavily 上游调用流程（见后文）。
 
 ### 3.3 开发模式
 
@@ -141,6 +151,7 @@
 行为约定：
 
 - 除 `api_key` 外，其余字段按 Tavily 官方文档含义原样透传上游；
+- 免费账号不具备的 `safe_search` 会被本地拒绝；
 - `max_results` 等数值字段不在 Hikari 侧做业务校验，仅在明显非法时（如负数）返回 400；
 - 后续如果 Tavily 新增字段，Hikari 可以统一视为“透传字段”，不做强约束。
 
@@ -183,10 +194,11 @@
    - 读取 headers / body，获得访问令牌 `th-...`，以及 token_id；
    - 解析 JSON body，获取 `options`。
 2. 配额检查：
-   - 调 `check_token_quota(token_id)`，不允许时按 3.2 逻辑返回 429。
+   - 先调 `check_token_quota(token_id)` 做 credits 预检查，不允许时按 3.2 逻辑返回 429；
+   - 再对 account 级 `businessCalls1h` 执行 reservation，拒绝时返回 `429 quota_exhausted`，不会命中上游。
 3. 调用 Tavily HTTP：
    - 使用 `acquire_key_for(Some(token_id))` 从 Tavily Key 池选一把 key（`lease.secret`）；
-   - 构造上游 URL：`{usage_base}/search`，其中 `usage_base` 使用 CLI 的 `--usage-base` / `TAVILY_USAGE_BASE`（默认 `https://api.tavily.com`）；
+   - 构造上游 URL：在 `usage_base` 后追加 `/search`，其中 `usage_base` 使用 CLI 的 `--usage-base` / `TAVILY_USAGE_BASE`（默认 `https://api.tavily.com`）；若 `usage_base` 自带 path prefix，则保持 prefix 并继续追加；
    - 构造上游请求 body：
      - 以原始 `options` 为基础；
      - 移除其中的 `api_key` 字段（避免将访问令牌当成 Tavily key 透传上游）；
@@ -201,27 +213,30 @@
      - `tavily_status_code` 为结构化状态码；
      - `request_body` / `response_body` 中需要对敏感字段脱敏（见 6.1）。
    - 若 `OUTCOME_QUOTA_EXHAUSTED`，调用 `mark_quota_exhausted(lease.secret)`；否则调用 `restore_active_status(lease.secret)`。
+   - 若该请求已经实际上游，则无论本地 `auth_token_logs` / pending billing 写入是否成功，都要把前面的 `businessCalls1h` reservation 结转为 completed success/failure，避免后续并发错误穿透。
 5. Token 维度日志：
    - 调用 `record_token_attempt(token_id, ...)`：
      - `http_status` 使用 `status.as_u16()`；
      - `mcp_status` 字段可复用为 “上游结构化状态码”，虽然此处不是 MCP，但复用同一列；
      - `result_status` 使用上一步计算结果（`success` / `error` / `quota_exhausted`）；
      - `error_message` 仅在 Hikari 自身出错或 Tavily 返回严重错误时写入。
-6. 返回响应：
+6. Reservation 收口：
+   - pre-upstream 拒绝、本地 parse/validation 失败、或代理层 transport error 未命中上游时，释放 reservation；
+   - 已经实际上游的请求按最终 `analysis.status` finalize reservation；
+   - `quota_exhausted` 与其他 pre-upstream blocked 请求不会变成 completed `businessCalls1h` 点位。
+7. 返回响应：
    - 若 Tavily HTTP 调用成功，原样返回 `status` 与 `body_bytes`；
    - 若 Hikari 自身失败，则返回 502/500，并确保也写入 token 日志（`result_status = "error"`）。
 
 ---
 
-## 5. 其它 Tavily HTTP 端点设计草案
-
-本节仅给出未来可实现的方向，具体实施时可根据需求裁剪。
+## 5. 其它 Tavily HTTP 端点
 
 ### 5.1 `/api/tavily/extract`
 
 - 语义：代理 Tavily `POST /extract`，用于从给定 URL 提取内容。
 - 请求体：
-  - 与 Tavily 官方文档一致（例如 `urls`, `include_images`, `max_pages` 等），额外接受 `api_key` 作为 Hikari token。
+  - 与 Tavily 官方文档一致（例如 `urls`, `query`, `extract_depth`, `include_images`, `format`, `timeout` 等），额外接受 `api_key` 作为 Hikari token。
 - 内部流程与 `/search` 类似：
   - 通过 token 进行配额检查；
   - 使用 `acquire_key_for` 选择 Tavily key；
@@ -235,21 +250,35 @@
 - 需要注意的是，这类调用可能持续时间较长、流量较大：
   - 建议在配额检查策略上保守一些（例如在 `TokenQuotaVerdict` 中设定单次调用的权重）。
 
-### 5.3 `/api/tavily/usage`（Hikari 自定义）
+### 5.3 `/api/tavily/research`
+
+- 语义：代理 Tavily `POST /research`，用于创建 Research 请求。
+- 免费账号边界：
+  - `model` 仅接受 `mini`、`auto`、`pro`；
+  - `stream=true` 会被本地拒绝，因为当前代理不提供真实 SSE streaming 转发；
+  - `output_schema`、`citation_format`、`include_domains`、`exclude_domains`、`output_length`、`files`
+    可按官方非流式 Research 语义透传。
+- 计费：
+  - Research 响应没有稳定的单请求 `usage.credits` 可供共享上游 key 场景归因；
+  - Hikari 使用本地模型估算进行下游配额控制，不通过官方 `/usage` 差分向下游暴露上游账号数据。
+
+### 5.4 `/api/tavily/usage`（Hikari 自定义）
 
 - 目标：给调用方提供按 **访问令牌** 维度的用量统计，而不是暴露底层 Tavily key 的 `/usage`。
 - 数据源：
   - `token_usage_stats` 与 `request_logs` / `token_logs` 的聚合结果；
   - 可以从现有用于用户总览页的查询复用逻辑。
+- 响应不得包含官方 Tavily `/usage` 中的上游账号字段，例如 `key`、`account`、
+  `plan_limit`、`paygo_limit`、`current_plan`、上游 key limit 或 PAYG 成本。
 - 响应示例：
 
   ```json
   {
-    "token_id": "abc123",
-    "daily_success": 120,
-    "daily_error": 3,
-    "monthly_success": 840,
-    "monthly_quota_exhausted": 2
+    "tokenId": "abc123",
+    "dailySuccess": 120,
+    "dailyError": 3,
+    "monthlySuccess": 840,
+    "monthlyQuotaExhausted": 2
   }
   ```
 
@@ -359,7 +388,7 @@ const result = await client.search("hello from Hikari proxy", {
 
 ### 8.2 Cherry Studio 设置示意界面（前端 HTML Mock）
 
-为帮助终端用户快速理解 Cherry Studio 中的配置路径，前端需要在「用户总览页」的 Cherry Studio 指南区域，使用纯 HTML/CSS（React + Tailwind + DaisyUI）构建一个简化版的设置页示意界面。
+为帮助终端用户快速理解 Cherry Studio 中的配置路径，前端需要在「用户总览页」的 Cherry Studio 指南区域，使用纯 HTML/CSS（React + Tailwind + 项目现有设计 token）构建一个简化版的设置页示意界面。
 
 该示意界面的设计要求：
 
@@ -393,7 +422,7 @@ const result = await client.search("hello from Hikari proxy", {
 实现细节建议：
 
 - 将该示意界面实现为独立的 React 组件（例如 `CherryStudioMock`），仅在 Public 用户首页的 Cherry Studio 指南 tab 下展示。
-- 使用现有的 Tailwind + DaisyUI 工具类构建布局和样式；整体风格与用户总览页其它卡片保持一致（圆角、浅灰背景、轻微阴影等）。
+- 使用现有的 Tailwind 工具类、项目设计 token 与共享 UI 组件构建布局和样式；整体风格与用户总览页其它卡片保持一致（圆角、浅灰背景、轻微阴影等）。
 - 所有文字文案（标题、字段名、说明）应通过 `web/src/i18n.tsx` 的 i18n 管线管理，保证中英双语切换时示意界面同步更新。
 
 示意界面对应的 UI 参考截图应保存到仓库的 `docs/assets` 目录，例如：

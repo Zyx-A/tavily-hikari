@@ -1,0 +1,3584 @@
+use super::*;
+use super::core_support_and_parsing::*;
+use super::linuxdo_oauth_and_admin_keys::*;
+use super::upstream_support_and_manual_jobs::*;
+
+    async fn explain_query_plan_details(pool: &sqlx::SqlitePool, sql: &str) -> Vec<String> {
+        sqlx::query(sql)
+            .fetch_all(pool)
+            .await
+            .expect("explain query plan")
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("detail").expect("plan detail"))
+            .collect()
+    }
+
+    fn assert_request_logs_user_ip_index_plan(details: &[String]) {
+        let joined = details.join("\n");
+        assert!(
+            joined.contains("idx_request_logs_user_ip_time"),
+            "expected request user/ip index in query plan, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("idx_request_logs_visibility_time"),
+            "expected query plan not to use visibility/time index, got:\n{joined}"
+        );
+    }
+
+    fn assert_account_usage_rollup_metric_index_plan(details: &[String]) {
+        let joined = details.join("\n");
+        assert!(
+            joined.contains("idx_account_usage_rollup_metric_lookup"),
+            "expected metric-first account usage rollup index in query plan, got:\n{joined}"
+        );
+    }
+
+    fn assert_account_usage_rollup_user_lookup_plan(details: &[String]) {
+        let joined = details.join("\n");
+        assert!(
+            joined.contains("idx_account_usage_rollup_lookup")
+                || joined.contains("sqlite_autoindex_account_usage_rollup_buckets_1"),
+            "expected user-first account usage rollup lookup in query plan, got:\n{joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_sse_snapshot_refreshes_when_recent_alerts_change() {
+        let db_path = temp_db_path("admin-dashboard-snapshot-recent-alerts-change");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-admin-dashboard-recent-alerts-change".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+
+        let admin_password = "admin-dashboard-recent-alerts-change-password";
+        let (admin_addr, state) =
+            spawn_builtin_keys_admin_server_with_state(proxy, admin_password).await;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+
+        let login_resp = client
+            .post(format!("http://{}/api/admin/login", admin_addr))
+            .json(&serde_json::json!({ "password": admin_password }))
+            .send()
+            .await
+            .expect("admin login");
+        assert_eq!(login_resp.status(), reqwest::StatusCode::OK);
+        let admin_cookie = find_cookie_pair(login_resp.headers(), BUILTIN_ADMIN_COOKIE_NAME)
+            .expect("admin session cookie");
+
+        let mut events_resp = client
+            .get(format!("http://{}/api/events", admin_addr))
+            .header(reqwest::header::COOKIE, admin_cookie)
+            .send()
+            .await
+            .expect("admin events request");
+        assert_eq!(events_resp.status(), reqwest::StatusCode::OK);
+
+        let mut first_text = String::new();
+        while !first_text.contains("\n\n") {
+            let chunk = events_resp
+                .chunk()
+                .await
+                .expect("read initial event chunk")
+                .expect("initial snapshot chunk exists");
+            first_text.push_str(std::str::from_utf8(&chunk).expect("initial snapshot chunk utf8"));
+        }
+
+        let initial_snapshot = first_text
+            .split("\n\n")
+            .find(|chunk| chunk.contains("event: snapshot"))
+            .expect("initial snapshot event");
+        let initial_data = initial_snapshot
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("initial snapshot data");
+        let _initial_json: serde_json::Value =
+            serde_json::from_str(initial_data).expect("initial snapshot payload json");
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open db pool");
+
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id,
+                method,
+                path,
+                query,
+                http_status,
+                mcp_status,
+                request_kind_key,
+                request_kind_label,
+                request_kind_detail,
+                result_status,
+                error_message,
+                key_effect_code,
+                binding_effect_code,
+                selection_effect_code,
+                counts_business_quota,
+                created_at
+            ) VALUES ('alerts-bound', 'POST', '/mcp', NULL, 429, -1, 'mcp_search', 'MCP Search', 'POST /mcp', 'quota_exhausted', 'hourly any-request limit exceeded', 'none', 'none', 'none', 0, ?)
+            "#,
+        )
+            .bind(Utc::now().timestamp())
+            .execute(&pool)
+            .await
+            .expect("insert recent alert auth token log");
+
+        for _ in 0..6 {
+            state
+                .proxy
+                .advance_dashboard_alert_projection_slice()
+                .await
+                .expect("advance alert projection after alert write");
+        }
+        let projection_pool = connect_sqlite_test_pool(&db_str).await;
+        sqlx::query(
+            "UPDATE observability.dashboard_alert_projection_recent_summaries SET computed_at = ? WHERE window_hours = 24",
+        )
+        .bind(Utc::now().timestamp() - 61)
+        .execute(&projection_pool)
+        .await
+        .expect("expire materialized alert summary refresh window");
+        state
+            .proxy
+            .advance_dashboard_alert_projection_scheduler_step()
+            .await
+            .expect("refresh alert projection after its rate-limit window");
+        projection_pool.close().await;
+        expire_dashboard_overview_freshness_probe(&state).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut buffer = String::new();
+        let mut refreshed_snapshot: Option<serde_json::Value> = None;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let chunk = tokio::time::timeout(remaining, events_resp.chunk())
+                .await
+                .expect("await refreshed event chunk in time")
+                .expect("read refreshed event chunk")
+                .expect("refreshed event chunk exists");
+            buffer.push_str(std::str::from_utf8(&chunk).expect("refreshed event chunk utf8"));
+            while let Some((event_chunk, rest)) = buffer.split_once("\n\n") {
+                let event_chunk = event_chunk.to_string();
+                buffer = rest.to_string();
+                if !event_chunk.contains("event: snapshot") {
+                    continue;
+                }
+                let Some(data) = event_chunk
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                else {
+                    continue;
+                };
+                let payload: serde_json::Value =
+                    serde_json::from_str(data).expect("refreshed snapshot payload json");
+                refreshed_snapshot = Some(payload);
+                break;
+            }
+            if refreshed_snapshot.is_some() {
+                break;
+            }
+        }
+
+        let refreshed_snapshot = refreshed_snapshot.expect("dashboard snapshot refresh");
+        assert!(refreshed_snapshot.get("summary").is_some());
+        assert!(refreshed_snapshot.get("recentAlerts").is_some());
+        assert_eq!(
+            refreshed_snapshot
+                .pointer("/recentAlerts/totalEvents")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+
+        drop(events_resp);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn account_usage_rollup_queries_use_bounded_indexes_for_active_user_ranking_and_series() {
+        let db_path = temp_db_path("account-usage-rollup-query-plan");
+        let db_str = db_path.to_string_lossy().to_string();
+        let _proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-account-usage-rollup-query-plan".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_str)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_secs(5)),
+            )
+            .await
+            .expect("open query plan pool");
+
+        let active_users_plan = explain_query_plan_details(
+            &pool,
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(DISTINCT user_id)
+            FROM account_usage_rollup_buckets
+            WHERE metric_kind = 'request_count'
+              AND bucket_kind = 'day'
+              AND bucket_start >= 0
+              AND value > 0
+            "#,
+        )
+        .await;
+        assert_account_usage_rollup_metric_index_plan(&active_users_plan);
+
+        let ranking_plan = explain_query_plan_details(
+            &pool,
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT user_id, COALESCE(SUM(value), 0) AS total
+            FROM account_usage_rollup_buckets
+            WHERE metric_kind = 'primary_success'
+              AND bucket_kind = 'five_minute'
+              AND bucket_start >= 0
+              AND bucket_start < 4102444800
+            GROUP BY user_id
+            HAVING total > 0
+            "#,
+        )
+        .await;
+        assert_account_usage_rollup_metric_index_plan(&ranking_plan);
+
+        let user_series_plan = explain_query_plan_details(
+            &pool,
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT bucket_start, value
+            FROM account_usage_rollup_buckets
+            WHERE user_id = 'alice-user'
+              AND metric_kind = 'request_count'
+              AND bucket_kind = 'five_minute'
+              AND bucket_start >= 0
+              AND bucket_start < 4102444800
+            ORDER BY bucket_start ASC
+            "#,
+        )
+        .await;
+        assert_account_usage_rollup_user_lookup_plan(&user_series_plan);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_user_management_lists_details_and_updates_quota() {
+        let db_path = temp_db_path("admin-users");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let alice = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-users-alice".to_string(),
+                username: Some("alice".to_string()),
+                name: Some("Alice".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert alice");
+        let bob = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-users-bob".to_string(),
+                username: Some("bob".to_string()),
+                name: Some("Bob".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(1),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert bob");
+        let charlie = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-users-charlie".to_string(),
+                username: Some("charlie".to_string()),
+                name: Some("Charlie".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(0),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert charlie");
+
+        let alice_token = proxy
+            .ensure_user_token_binding(&alice.user_id, Some("linuxdo:alice"))
+            .await
+            .expect("bind alice token");
+        let bob_token = proxy
+            .ensure_user_token_binding(&bob.user_id, Some("linuxdo:bob"))
+            .await
+            .expect("bind bob token");
+        let charlie_token = proxy
+            .ensure_user_token_binding(&charlie.user_id, Some("linuxdo:charlie"))
+            .await
+            .expect("bind charlie token");
+        let vip_tag = proxy
+            .create_user_tag(
+                "vip_plus",
+                "VIP+",
+                Some("star"),
+                "quota_delta",
+                10,
+                20,
+                30,
+            )
+            .await
+            .expect("create vip tag");
+        proxy
+            .bind_user_tag_to_user(&alice.user_id, &vip_tag.id)
+            .await
+            .expect("bind vip tag");
+        let legacy_logs_tag = proxy
+            .create_user_tag(
+                "legacy_logs",
+                "Legacy Logs",
+                Some("history"),
+                "quota_delta",
+                0,
+                0,
+                0,
+            )
+            .await
+            .expect("create legacy logs tag");
+        proxy
+            .bind_user_tag_to_user(&alice.user_id, &legacy_logs_tag.id)
+            .await
+            .expect("bind legacy logs tag to alice");
+        proxy
+            .bind_user_tag_to_user(&charlie.user_id, &legacy_logs_tag.id)
+            .await
+            .expect("bind legacy logs tag to charlie");
+
+        let _ = proxy
+            .check_token_hourly_requests(&alice_token.id)
+            .await
+            .expect("seed hourly-any");
+        let _ = proxy
+            .check_token_quota(&alice_token.id)
+            .await
+            .expect("seed business quota");
+        proxy
+            .record_token_attempt(
+                &alice_token.id,
+                &Method::POST,
+                "/mcp",
+                None,
+                Some(200),
+                Some(0),
+                true,
+                "success",
+                None,
+            )
+            .await
+            .expect("record success");
+        proxy
+            .record_token_attempt(
+                &alice_token.id,
+                &Method::POST,
+                "/mcp",
+                None,
+                Some(500),
+                Some(-32001),
+                true,
+                "error",
+                Some("upstream error"),
+            )
+            .await
+            .expect("record error");
+
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        let now = Utc::now();
+        let local_now = now.with_timezone(&Local);
+        let day_start = Local
+            .with_ymd_and_hms(
+                local_now.year(),
+                local_now.month(),
+                local_now.day(),
+                0,
+                0,
+                0,
+            )
+            .single()
+            .expect("local day start")
+            .timestamp();
+        let now = now.timestamp();
+        let charlie_daily_success_at = day_start + 3_601;
+        let charlie_latest_activity_at = now + 3_601;
+        let request_kind = classify_token_request_kind("/api/tavily/search", None);
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id,
+                method,
+                path,
+                query,
+                http_status,
+                mcp_status,
+                request_kind_key,
+                request_kind_label,
+                result_status,
+                key_effect_code,
+                binding_effect_code,
+                selection_effect_code,
+                counts_business_quota,
+                billing_state,
+                created_at
+            ) VALUES
+                (?, 'POST', '/mcp', NULL, 200, 200, 'mcp:search', 'MCP | search', 'success', 'none', 'none', 'none', 1, 'none', ?),
+                (?, 'POST', '/mcp', NULL, 200, 200, 'mcp:search', 'MCP | search', 'success', 'none', 'none', 'none', 1, 'none', ?),
+                (?, 'POST', '/mcp', NULL, 200, 200, 'mcp:search', 'MCP | search', 'success', 'none', 'none', 'none', 1, 'none', ?),
+                (?, 'POST', '/mcp', NULL, 500, -32001, 'mcp:search', 'MCP | search', 'error', 'none', 'none', 'none', 1, 'none', ?)
+            "#,
+        )
+        .bind(&charlie_token.id)
+        .bind(charlie_daily_success_at)
+        .bind(&charlie_token.id)
+        .bind(charlie_daily_success_at + 1)
+        .bind(&charlie_token.id)
+        .bind(charlie_daily_success_at + 2)
+        .bind(&charlie_token.id)
+        .bind(charlie_latest_activity_at)
+        .execute(&pool)
+        .await
+        .expect("insert legacy null request_user_id auth logs");
+        for token_id in [&alice_token.id, &bob_token.id] {
+            for index in 0..20 {
+                sqlx::query(
+                    r#"
+                    INSERT INTO auth_token_logs (
+                        token_id,
+                        method,
+                        path,
+                        query,
+                        http_status,
+                        mcp_status,
+                        request_kind_key,
+                        request_kind_label,
+                        result_status,
+                        key_effect_code,
+                        binding_effect_code,
+                        selection_effect_code,
+                        counts_business_quota,
+                        billing_state,
+                        created_at
+                    ) VALUES (?, 'POST', '/mcp', NULL, 500, -32001, 'mcp:search', 'MCP | search', 'error', 'none', 'none', 'none', 1, 'none', ?)
+                    "#,
+                )
+                .bind(token_id)
+                .bind(now - 10 - index)
+                .execute(&pool)
+                .await
+                .expect("insert non-charlie failure log");
+            }
+        }
+        sqlx::query(
+            "UPDATE auth_token_logs SET created_at = ? WHERE token_id IN (?, ?)",
+        )
+        .bind(now.saturating_sub(10))
+        .bind(&alice_token.id)
+        .bind(&bob_token.id)
+        .execute(&pool)
+        .await
+        .expect("normalize non-charlie log activity time");
+        proxy
+            .record_token_attempt(
+                &bob_token.id,
+                &Method::POST,
+                "/mcp",
+                None,
+                Some(200),
+                Some(200),
+                true,
+                "success",
+                None,
+            )
+            .await
+            .expect("record bob active request");
+        proxy
+            .flush_request_stats_writes_for_test()
+            .await
+            .expect("persist bob activity before durable admin read");
+
+        let alice_request_log_success: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO request_logs (
+                api_key_id,
+                method,
+                path,
+                status_code,
+                tavily_status_code,
+                result_status,
+                request_kind_key,
+                request_kind_label,
+                counts_business_quota,
+                request_user_id,
+                upstream_operation,
+                created_at
+            ) VALUES ('key-admin-users-alice-success', 'POST', '/api/tavily/search', 200, 200, 'success', 'api:search', 'API | search', 1, ?, 'http_search', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(&alice.user_id)
+        .bind(now - 600)
+        .fetch_one(&pool)
+        .await
+        .expect("insert alice request success");
+        proxy
+            .record_token_attempt_with_kind_request_log_metadata(
+                &alice_token.id,
+                &Method::POST,
+                "/api/tavily/search",
+                Some("q=admin-users-success"),
+                Some(200),
+                Some(200),
+                true,
+                "success",
+                None,
+                &request_kind,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(alice_request_log_success),
+            )
+            .await
+            .expect("record alice request success");
+
+        let alice_request_log_failure: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO request_logs (
+                api_key_id,
+                method,
+                path,
+                status_code,
+                tavily_status_code,
+                result_status,
+                request_kind_key,
+                request_kind_label,
+                counts_business_quota,
+                request_user_id,
+                upstream_operation,
+                created_at
+            ) VALUES ('key-admin-users-alice-failure', 'POST', '/api/tavily/search', 500, 500, 'error', 'api:search', 'API | search', 1, ?, 'http_search', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(&alice.user_id)
+        .bind(now - 300)
+        .fetch_one(&pool)
+        .await
+        .expect("insert alice request failure");
+        proxy
+            .record_token_attempt_with_kind_request_log_metadata(
+                &alice_token.id,
+                &Method::POST,
+                "/api/tavily/search",
+                Some("q=admin-users-failure"),
+                Some(500),
+                Some(500),
+                true,
+                "error",
+                Some("upstream error"),
+                &request_kind,
+                Some("upstream_error"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(alice_request_log_failure),
+            )
+            .await
+            .expect("record alice request failure");
+
+        for (client_ip, created_at, visibility) in [
+            ("203.0.113.7", now - 300, "visible"),
+            ("198.51.100.10", now - 3_600, "visible"),
+            ("203.0.113.7", now - 7_200, "visible"),
+            ("192.0.2.44", now - 26 * 3_600, "visible"),
+            ("198.51.100.200", now - 8 * 86_400, "visible"),
+            ("", now - 600, "visible"),
+            (
+                "203.0.113.250",
+                now - 120,
+                tavily_hikari::REQUEST_LOG_VISIBILITY_SUPPRESSED_RETRY_SHADOW,
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO request_logs (
+                    auth_token_id,
+                    request_user_id,
+                    method,
+                    path,
+                    status_code,
+                    tavily_status_code,
+                    result_status,
+                    request_kind_key,
+                    request_kind_label,
+                    client_ip,
+                    client_ip_source,
+                    client_ip_trusted,
+                    visibility,
+                    created_at
+                ) VALUES (?, ?, 'POST', '/mcp', 200, 200, 'success', 'mcp:search', 'MCP | search', ?, 'x-forwarded-for', 1, ?, ?)
+                "#,
+            )
+            .bind(&alice_token.id)
+            .bind(&alice.user_id)
+            .bind(client_ip)
+            .bind(visibility)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert client ip request log");
+        }
+
+        for index in 0..120 {
+            sqlx::query(
+                r#"
+                INSERT INTO request_logs (
+                    auth_token_id,
+                    request_user_id,
+                    method,
+                    path,
+                    status_code,
+                    tavily_status_code,
+                    result_status,
+                    request_kind_key,
+                    request_kind_label,
+                    client_ip,
+                    client_ip_source,
+                    client_ip_trusted,
+                    visibility,
+                    created_at
+                ) VALUES (?, ?, 'POST', '/mcp', 200, 200, 'success', 'mcp:search', 'MCP | search', ?, 'x-forwarded-for', 1, 'visible', ?)
+                "#,
+            )
+            .bind(&bob_token.id)
+            .bind(&bob.user_id)
+            .bind(format!("10.20.0.{index}"))
+            .bind(now - index)
+            .execute(&pool)
+            .await
+            .expect("insert high-cardinality client ip request log");
+        }
+
+        let ip_count_plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT request_user_id, COUNT(DISTINCT client_ip) AS ip_count
+            FROM request_logs INDEXED BY idx_request_logs_user_ip_time
+            WHERE visibility = ?
+              AND request_user_id IN (?, ?)
+              AND created_at >= ?
+              AND client_ip IS NOT NULL
+              AND TRIM(client_ip) != ''
+            GROUP BY request_user_id
+            "#,
+        )
+        .bind(tavily_hikari::REQUEST_LOG_VISIBILITY_VISIBLE)
+        .bind(&alice.user_id)
+        .bind(&bob.user_id)
+        .bind(now - 7 * 86_400)
+        .fetch_all(&pool)
+        .await
+        .expect("explain recent client ip count plan");
+        let ip_count_plan = ip_count_plan_rows
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("detail").ok())
+            .collect::<Vec<_>>();
+        assert_request_logs_user_ip_index_plan(&ip_count_plan);
+
+        let ip_addresses_plan = explain_query_plan_details(
+            &pool,
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT client_ip, MAX(created_at) AS latest_seen_at
+            FROM request_logs INDEXED BY idx_request_logs_user_ip_time
+            WHERE request_user_id = 'alice-user'
+              AND created_at >= 0
+              AND visibility = 'visible'
+              AND client_ip IS NOT NULL
+              AND TRIM(client_ip) != ''
+            GROUP BY client_ip
+            ORDER BY latest_seen_at DESC, client_ip ASC
+            LIMIT 100
+            "#,
+        )
+        .await;
+        assert_request_logs_user_ip_index_plan(&ip_addresses_plan);
+
+        let ip_timeline_plan = explain_query_plan_details(
+            &pool,
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT client_ip, MIN(created_at) AS first_seen_at, MAX(created_at) AS last_seen_at,
+                   COUNT(*) AS request_count
+            FROM request_logs INDEXED BY idx_request_logs_user_ip_time
+            WHERE request_user_id = 'alice-user'
+              AND created_at >= 0
+              AND visibility = 'visible'
+              AND client_ip IS NOT NULL
+              AND TRIM(client_ip) != ''
+            GROUP BY client_ip
+            ORDER BY last_seen_at DESC, client_ip ASC
+            LIMIT 40
+            "#,
+        )
+        .await;
+        assert_request_logs_user_ip_index_plan(&ip_timeline_plan);
+
+        for index in 0..4 {
+            let api_key_id = proxy
+                .add_or_undelete_key(&format!("tvly-admin-users-associated-key-{index}"))
+                .await
+                .expect("create associated api key");
+            let pending_binding_log_id = proxy
+                .record_pending_billing_attempt(
+                    &alice_token.id,
+                    &Method::POST,
+                    "/api/tavily/search",
+                    None,
+                    Some(200),
+                    Some(200),
+                    true,
+                    "success",
+                    None,
+                    1,
+                    Some(&api_key_id),
+                )
+                .await
+                .expect("record pending associated key binding");
+            proxy
+                .settle_pending_billing_attempt(pending_binding_log_id)
+                .await
+                .expect("settle associated key binding");
+        }
+
+        let direct_proxy = proxy.clone();
+        let addr = spawn_admin_users_server(proxy, true).await;
+        let client = Client::new();
+
+        let list_url = format!("http://{}/api/users?page=1&per_page=20", addr);
+        let list_resp = client
+            .get(&list_url)
+            .send()
+            .await
+            .expect("list users request");
+        assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
+        let list_body: serde_json::Value = list_resp.json().await.expect("list users json");
+        let items = list_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("items is array");
+        let default_ordered_user_ids: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                item.get("userId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let alice_item = items
+            .iter()
+            .find(|item| {
+                item.get("userId")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == alice.user_id)
+            })
+            .expect("alice row exists");
+        assert_eq!(
+            alice_item
+                .get("tokenCount")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            alice_item
+                .get("apiKeyCount")
+                .and_then(|value| value.as_i64()),
+            Some(4)
+        );
+        assert!(
+            alice_item
+                .get("requestRate")
+                .and_then(|value| value.get("used"))
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default()
+                >= 1
+        );
+        assert!(
+            alice_item
+                .get("businessCalls1h")
+                .and_then(|value| value.get("totalCount"))
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default()
+                >= 1
+        );
+        assert_eq!(
+            alice_item
+                .get("recentIpCount24h")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            alice_item
+                .get("recentIpCount7d")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        let list_tags = alice_item
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .expect("list tags array");
+        assert!(
+            list_tags.iter().any(|value| {
+                value.get("displayName").and_then(|it| it.as_str()) == Some("VIP+")
+            })
+        );
+        assert!(list_tags.iter().any(|value| {
+            value.get("systemKey").and_then(|it| it.as_str()) == Some("linuxdo_l2")
+        }));
+
+        let tag_search_url = format!(
+            "http://{}/api/users?page=1&per_page=20&q={}",
+            addr,
+            urlencoding::encode("VIP+")
+        );
+        let tag_search_resp = client
+            .get(&tag_search_url)
+            .send()
+            .await
+            .expect("tag search request");
+        assert_eq!(tag_search_resp.status(), reqwest::StatusCode::OK);
+        let tag_search_body: serde_json::Value =
+            tag_search_resp.json().await.expect("tag search json");
+        let tag_search_items = tag_search_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("tag search items array");
+        assert!(tag_search_items.iter().any(|item| {
+            item.get("userId")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == alice.user_id)
+        }));
+
+        let active_only_url = format!(
+            "http://{}/api/users?page=1&per_page=20&activityScope=active90d",
+            addr
+        );
+        let active_only_resp = client
+            .get(&active_only_url)
+            .send()
+            .await
+            .expect("active-only list request");
+        assert_eq!(active_only_resp.status(), reqwest::StatusCode::OK);
+        let active_only_body: serde_json::Value =
+            active_only_resp.json().await.expect("active-only list json");
+        assert_eq!(
+            active_only_body.get("total").and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        let active_only_items = active_only_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("active-only items array");
+        assert_eq!(active_only_items.len(), 2);
+        let active_only_user_ids = active_only_items
+            .iter()
+            .filter_map(|item| item.get("userId").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(active_only_user_ids.contains(&alice.user_id.as_str()));
+        assert!(active_only_user_ids.contains(&bob.user_id.as_str()));
+        assert!(!active_only_user_ids.contains(&charlie.user_id.as_str()));
+
+        let active_only_search_url = format!(
+            "http://{}/api/users?page=1&per_page=20&q={}&activityScope=active90d",
+            addr,
+            urlencoding::encode("Charlie")
+        );
+        let active_only_search_resp = client
+            .get(&active_only_search_url)
+            .send()
+            .await
+            .expect("active-only search request");
+        assert_eq!(active_only_search_resp.status(), reqwest::StatusCode::OK);
+        let active_only_search_body: serde_json::Value = active_only_search_resp
+            .json()
+            .await
+            .expect("active-only search json");
+        assert_eq!(
+            active_only_search_body
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            active_only_search_body
+                .get("items")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let active_only_quota_sort_url = format!(
+            "http://{}/api/users?page=1&per_page=20&activityScope=active90d&sort=monthlyCreditsUsed&order=desc",
+            addr
+        );
+        let active_only_quota_sort_resp = client
+            .get(&active_only_quota_sort_url)
+            .send()
+            .await
+            .expect("active-only quota sort request");
+        assert_eq!(active_only_quota_sort_resp.status(), reqwest::StatusCode::OK);
+        let active_only_quota_sort_body: serde_json::Value = active_only_quota_sort_resp
+            .json()
+            .await
+            .expect("active-only quota sort json");
+        assert_eq!(
+            active_only_quota_sort_body
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        let active_only_quota_sort_user_ids = active_only_quota_sort_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("active-only quota sort items")
+            .iter()
+            .filter_map(|item| item.get("userId").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(active_only_quota_sort_user_ids.contains(&alice.user_id.as_str()));
+        assert!(active_only_quota_sort_user_ids.contains(&bob.user_id.as_str()));
+
+        let order_only_url = format!("http://{}/api/users?page=1&per_page=20&order=asc", addr);
+        let order_only_resp = client
+            .get(&order_only_url)
+            .send()
+            .await
+            .expect("order-only list request");
+        assert_eq!(order_only_resp.status(), reqwest::StatusCode::OK);
+        let order_only_body: serde_json::Value =
+            order_only_resp.json().await.expect("order-only list json");
+        let order_only_user_ids: Vec<String> = order_only_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("order-only items array")
+            .iter()
+            .filter_map(|item| {
+                item.get("userId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(order_only_user_ids, default_ordered_user_ids);
+
+        let ip_sort_desc_url = format!(
+            "http://{}/api/users?page=1&per_page=20&sort=recentIpCount7d&order=desc",
+            addr
+        );
+        let ip_sort_desc_resp = client
+            .get(&ip_sort_desc_url)
+            .send()
+            .await
+            .expect("recent ip count desc sort request");
+        assert_eq!(ip_sort_desc_resp.status(), reqwest::StatusCode::OK);
+        let ip_sort_desc_body: serde_json::Value =
+            ip_sort_desc_resp.json().await.expect("recent ip count desc sort json");
+        let ip_sort_desc_items = ip_sort_desc_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("recent ip count desc sort items array");
+        assert_eq!(
+            ip_sort_desc_items
+                .first()
+                .and_then(|item| item.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(bob.user_id.as_str())
+        );
+        assert_eq!(
+            ip_sort_desc_items
+                .first()
+                .and_then(|item| item.get("recentIpCount7d"))
+                .and_then(|value| value.as_i64()),
+            Some(120)
+        );
+
+        use chrono::{Datelike as _, TimeZone as _};
+
+        let now = Utc::now();
+        let month_start = Utc
+            .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+            .single()
+            .expect("current month start")
+            .timestamp();
+        for (user_id, monthly_used) in [
+            (alice.user_id.as_str(), 15_i64),
+            (bob.user_id.as_str(), 90_i64),
+            (charlie.user_id.as_str(), 40_i64),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO account_monthly_quota (user_id, month_start, month_count)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    month_start = excluded.month_start,
+                    month_count = excluded.month_count
+                "#,
+            )
+            .bind(user_id)
+            .bind(month_start)
+            .bind(monthly_used)
+            .execute(&pool)
+            .await
+            .expect("seed account monthly quota");
+        }
+
+        let quota_sort_page_1_url = format!(
+            "http://{}/api/users?page=1&per_page=1&sort=monthlyCreditsUsed&order=desc",
+            addr
+        );
+        let quota_sort_page_1_resp = client
+            .get(&quota_sort_page_1_url)
+            .send()
+            .await
+            .expect("quota monthly desc sort page 1 request");
+        assert_eq!(quota_sort_page_1_resp.status(), reqwest::StatusCode::OK);
+        let quota_sort_page_1: serde_json::Value = quota_sort_page_1_resp
+            .json()
+            .await
+            .expect("quota monthly desc sort page 1 json");
+        assert_eq!(
+            quota_sort_page_1.get("total").and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        let quota_sort_page_1_items = quota_sort_page_1
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("quota monthly desc sort page 1 items array");
+        assert_eq!(quota_sort_page_1_items.len(), 1);
+        assert_eq!(
+            quota_sort_page_1_items
+                .first()
+                .and_then(|item| item.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(bob.user_id.as_str())
+        );
+        assert_eq!(
+            quota_sort_page_1_items
+                .first()
+                .and_then(|item| item.get("monthlyCreditsUsed"))
+                .and_then(|value| value.as_i64()),
+            Some(90)
+        );
+
+        let quota_sort_page_2_url = format!(
+            "http://{}/api/users?page=2&per_page=1&sort=monthlyCreditsUsed&order=desc",
+            addr
+        );
+        let quota_sort_page_2_resp = client
+            .get(&quota_sort_page_2_url)
+            .send()
+            .await
+            .expect("quota monthly desc sort page 2 request");
+        assert_eq!(quota_sort_page_2_resp.status(), reqwest::StatusCode::OK);
+        let quota_sort_page_2: serde_json::Value = quota_sort_page_2_resp
+            .json()
+            .await
+            .expect("quota monthly desc sort page 2 json");
+        let quota_sort_page_2_items = quota_sort_page_2
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("quota monthly desc sort page 2 items array");
+        assert_eq!(quota_sort_page_2_items.len(), 1);
+        assert_eq!(
+            quota_sort_page_2_items
+                .first()
+                .and_then(|item| item.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(charlie.user_id.as_str())
+        );
+
+        let tagged_quota_sort_url = format!(
+            "http://{}/api/users?page=1&per_page=20&q={}&tagId={}&sort=monthlyCreditsUsed&order=desc",
+            addr,
+            urlencoding::encode("VIP+"),
+            urlencoding::encode(&vip_tag.id)
+        );
+        let tagged_quota_sort_resp = client
+            .get(&tagged_quota_sort_url)
+            .send()
+            .await
+            .expect("tagged quota monthly sort request");
+        assert_eq!(tagged_quota_sort_resp.status(), reqwest::StatusCode::OK);
+        let tagged_quota_sort: serde_json::Value = tagged_quota_sort_resp
+            .json()
+            .await
+            .expect("tagged quota monthly sort json");
+        assert_eq!(
+            tagged_quota_sort
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            tagged_quota_sort
+                .get("items")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(alice.user_id.as_str())
+        );
+
+        let daily_success_sort_url = format!(
+            "http://{}/api/users?page=1&per_page=1&tagId={}&sort=dailySuccessRate&order=desc",
+            addr,
+            urlencoding::encode(&legacy_logs_tag.id)
+        );
+        let daily_success_sort_resp = client
+            .get(&daily_success_sort_url)
+            .send()
+            .await
+            .expect("daily success desc sort request");
+        assert_eq!(daily_success_sort_resp.status(), reqwest::StatusCode::OK);
+        let daily_success_sort: serde_json::Value = daily_success_sort_resp
+            .json()
+            .await
+            .expect("daily success desc sort json");
+        let daily_success_item = daily_success_sort
+            .get("items")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .expect("daily success first item");
+        assert_eq!(
+            daily_success_item
+                .get("userId")
+                .and_then(|value| value.as_str()),
+            Some(charlie.user_id.as_str())
+        );
+        assert_eq!(
+            daily_success_item
+                .get("dailySuccess")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
+
+        let last_activity_sort_url = format!(
+            "http://{}/api/users?page=1&per_page=1&tagId={}&sort=lastActivity&order=desc",
+            addr,
+            urlencoding::encode(&legacy_logs_tag.id)
+        );
+        let last_activity_sort_resp = client
+            .get(&last_activity_sort_url)
+            .send()
+            .await
+            .expect("last activity desc sort request");
+        assert_eq!(last_activity_sort_resp.status(), reqwest::StatusCode::OK);
+        let last_activity_sort: serde_json::Value = last_activity_sort_resp
+            .json()
+            .await
+            .expect("last activity desc sort json");
+        assert_eq!(
+            last_activity_sort
+                .get("items")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(charlie.user_id.as_str())
+        );
+
+        let detail_url = format!("http://{}/api/users/{}", addr, alice.user_id);
+        let detail_resp = client
+            .get(&detail_url)
+            .send()
+            .await
+            .expect("user detail request");
+        assert_eq!(detail_resp.status(), reqwest::StatusCode::OK);
+        let detail_body: serde_json::Value = detail_resp.json().await.expect("user detail json");
+        let before_request_rate_used = detail_body
+            .get("requestRate")
+            .and_then(|value| value.get("used"))
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default();
+        assert_eq!(
+            detail_body
+                .get("apiKeyCount")
+                .and_then(|value| value.as_i64()),
+            Some(4)
+        );
+        assert_eq!(
+            detail_body
+                .get("recentIpCount24h")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            detail_body
+                .get("recentIpCount7d")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            detail_body
+                .get("recentIpAddresses24h")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            detail_body
+                .get("recentIpAddresses7d")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            detail_body
+                .get("recentIpTimeline7d")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(3)
+        );
+        let bob_detail_url = format!("http://{}/api/users/{}", addr, bob.user_id);
+        let bob_detail_resp = client
+            .get(&bob_detail_url)
+            .send()
+            .await
+            .expect("bob user detail request");
+        assert_eq!(bob_detail_resp.status(), reqwest::StatusCode::OK);
+        let bob_detail_body: serde_json::Value =
+            bob_detail_resp.json().await.expect("bob detail json");
+        assert_eq!(
+            bob_detail_body
+                .get("recentIpCount7d")
+                .and_then(|value| value.as_i64()),
+            Some(120)
+        );
+        assert_eq!(
+            bob_detail_body
+                .get("recentIpAddresses7d")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(100)
+        );
+        assert_eq!(
+            bob_detail_body
+                .get("recentIpTimeline7d")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(40)
+        );
+        let tokens = detail_body
+            .get("tokens")
+            .and_then(|value| value.as_array())
+            .expect("tokens is array");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens
+                .first()
+                .and_then(|value| value.get("tokenId"))
+                .and_then(|value| value.as_str()),
+            Some(alice_token.id.as_str())
+        );
+        let detail_tags = detail_body
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .expect("detail tags array");
+        assert_eq!(detail_tags.len(), 3);
+        let system_tag = detail_tags
+            .iter()
+            .find(|value| value.get("systemKey").and_then(|it| it.as_str()) == Some("linuxdo_l2"))
+            .expect("linuxdo system tag in detail");
+        let system_hourly_delta = system_tag
+            .get("businessCalls1hDelta")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default();
+        let system_daily_delta = system_tag
+            .get("dailyCreditsDelta")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default();
+        let system_monthly_delta = system_tag
+            .get("monthlyCreditsDelta")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default();
+        let quota_base = detail_body.get("quotaBase").expect("quotaBase present");
+        let effective_quota = detail_body
+            .get("effectiveQuota")
+            .expect("effectiveQuota present");
+        assert_eq!(
+            effective_quota
+                .get("businessCalls1hLimit")
+                .and_then(|value| value.as_i64()),
+            quota_base
+                .get("businessCalls1hLimit")
+                .and_then(|value| value.as_i64())
+                .map(|value| value + system_hourly_delta + 10)
+        );
+        assert_eq!(
+            effective_quota
+                .get("businessCalls1hLimit")
+                .and_then(|value| value.as_i64()),
+            quota_base
+                .get("businessCalls1hLimit")
+                .and_then(|value| value.as_i64())
+                .map(|value| value + system_hourly_delta + 10)
+        );
+        assert!(
+            detail_body
+                .get("quotaBreakdown")
+                .and_then(|value| value.as_array())
+                .is_some_and(|items| items.iter().any(|entry| {
+                    entry.get("tagId").and_then(|value| value.as_str()) == Some(vip_tag.id.as_str())
+                }))
+        );
+
+        let base_hourly = quota_base
+            .get("businessCalls1hLimit")
+            .and_then(|value| value.as_i64())
+            .expect("quota base hourly");
+        let base_daily = quota_base
+            .get("dailyCreditsLimit")
+            .and_then(|value| value.as_i64())
+            .expect("quota base daily");
+        let base_monthly = quota_base
+            .get("monthlyCreditsLimit")
+            .and_then(|value| value.as_i64())
+            .expect("quota base monthly");
+        let target_base_hourly = base_hourly + 45;
+        let target_base_daily = base_daily + 678;
+        let target_base_monthly = base_monthly + 910;
+        let base_delta_hourly = target_base_hourly - base_hourly;
+        let base_delta_daily = target_base_daily - base_daily;
+        let base_delta_monthly = target_base_monthly - base_monthly;
+
+        let entitlement_url = format!("http://{}/api/users/{}/entitlements", addr, alice.user_id);
+        let create_base_resp = client
+            .post(&entitlement_url)
+            .json(&serde_json::json!({
+                "scopeKind": "base",
+                "monthStart": null,
+                "businessCalls1hDelta": base_delta_hourly,
+                "dailyCreditsDelta": base_delta_daily,
+                "monthlyCreditsDelta": base_delta_monthly,
+                "frontendNote": "base quota ledger correction",
+            }))
+            .send()
+            .await
+            .expect("create base entitlement request");
+        assert_eq!(create_base_resp.status(), reqwest::StatusCode::CREATED);
+        let created_base: serde_json::Value = create_base_resp
+            .json()
+            .await
+            .expect("created base entitlement json");
+        assert_eq!(
+            created_base
+                .get("scopeKind")
+                .and_then(|value| value.as_str()),
+            Some("base")
+        );
+        assert_eq!(
+            created_base
+                .get("backendNote")
+                .and_then(|value| value.as_str()),
+            Some("")
+        );
+        assert_eq!(
+            created_base
+                .get("frontendNote")
+                .and_then(|value| value.as_str()),
+            Some("base quota ledger correction")
+        );
+
+        let direct_quota = direct_proxy
+            .get_admin_user_quota_details(&alice.user_id)
+            .await
+            .expect("direct quota details after base entitlement")
+            .expect("admin quota details exist");
+        assert_eq!(
+            direct_quota.base.business_calls_1h_limit,
+            target_base_hourly,
+            "direct quota resolution must observe the committed entitlement"
+        );
+
+        let detail_after_resp = client
+            .get(&detail_url)
+            .send()
+            .await
+            .expect("user detail after base entitlement request");
+        assert_eq!(detail_after_resp.status(), reqwest::StatusCode::OK);
+        let detail_after: serde_json::Value = detail_after_resp
+            .json()
+            .await
+            .expect("user detail after base entitlement json");
+        assert_eq!(
+            detail_after
+                .get("requestRate")
+                .and_then(|value| value.get("limit"))
+                .and_then(|value| value.as_i64()),
+            Some(request_rate_limit())
+        );
+        assert_eq!(
+            detail_after
+                .get("requestRate")
+                .and_then(|value| value.get("windowMinutes"))
+                .and_then(|value| value.as_i64()),
+            Some(request_rate_limit_window_minutes())
+        );
+        assert_eq!(
+            detail_after
+                .get("requestRate")
+                .and_then(|value| value.get("scope"))
+                .and_then(|value| value.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            detail_after
+                .get("quotaBase")
+                .and_then(|value| value.get("businessCalls1hLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(target_base_hourly)
+        );
+        assert_eq!(
+            detail_after
+                .get("quotaBase")
+                .and_then(|value| value.get("dailyCreditsLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(target_base_daily)
+        );
+        assert_eq!(
+            detail_after
+                .get("quotaBase")
+                .and_then(|value| value.get("monthlyCreditsLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(target_base_monthly)
+        );
+        assert_eq!(
+            detail_after
+                .get("effectiveQuota")
+                .and_then(|value| value.get("businessCalls1hLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(target_base_hourly + system_hourly_delta + 10)
+        );
+        assert_eq!(
+            detail_after
+                .get("effectiveQuota")
+                .and_then(|value| value.get("dailyCreditsLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(target_base_daily + system_daily_delta + 20)
+        );
+        assert_eq!(
+            detail_after
+                .get("effectiveQuota")
+                .and_then(|value| value.get("monthlyCreditsLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(target_base_monthly + system_monthly_delta + 30)
+        );
+        assert_eq!(
+            detail_after
+                .get("requestRate")
+                .and_then(|value| value.get("limit"))
+                .and_then(|value| value.as_i64()),
+            Some(request_rate_limit())
+        );
+        assert_eq!(
+            detail_after
+                .get("businessCalls1h")
+                .and_then(|value| value.get("limit"))
+                .and_then(|value| value.as_i64()),
+            Some(target_base_hourly + system_hourly_delta + 10)
+        );
+        assert_eq!(
+            detail_after
+                .get("dailyCreditsLimit")
+                .and_then(|value| value.as_i64()),
+                Some(target_base_daily + system_daily_delta + 20)
+        );
+        assert_eq!(
+            detail_after
+                .get("monthlyCreditsLimit")
+                .and_then(|value| value.as_i64()),
+                Some(target_base_monthly + system_monthly_delta + 30)
+        );
+        assert_eq!(
+            detail_after
+                .get("requestRate")
+                .and_then(|value| value.get("used"))
+                .and_then(|value| value.as_i64()),
+            Some(before_request_rate_used)
+        );
+        assert_eq!(
+            detail_after
+                .get("entitlements")
+                .and_then(|value| value.get("currentBaseDelta"))
+                .and_then(|value| value.get("monthlyCreditsDelta"))
+                .and_then(|value| value.as_i64()),
+            Some(base_delta_monthly)
+        );
+
+        let missing_frontend_note_resp = client
+            .post(&entitlement_url)
+            .json(&serde_json::json!({
+                "scopeKind": "base",
+                "monthStart": null,
+                "businessCalls1hDelta": 1,
+                "dailyCreditsDelta": 1,
+                "monthlyCreditsDelta": 1,
+                "backendNote": "optional backend note",
+                "frontendNote": " ",
+            }))
+            .send()
+            .await
+            .expect("create base entitlement without frontend note");
+        assert_eq!(
+            missing_frontend_note_resp.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+
+        let legacy_patch_resp = client
+            .patch(format!("http://{}/api/users/{}/quota", addr, alice.user_id))
+            .json(&serde_json::json!({
+                "businessCalls1hLimit": 1,
+                "dailyCreditsLimit": 1,
+                "monthlyCreditsLimit": 1,
+            }))
+            .send()
+            .await
+            .expect("legacy quota patch request");
+        assert_eq!(
+            legacy_patch_resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "legacy quota patch route should be removed"
+        );
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_user_tag_crud_and_system_guards_work() {
+        let db_path = temp_db_path("admin-user-tags");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-user-tags-user".to_string(),
+                username: Some("taguser".to_string()),
+                name: Some("Tag User".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(4),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert user");
+        proxy
+            .ensure_user_token_binding(&user.user_id, Some("linuxdo:taguser"))
+            .await
+            .expect("bind token");
+
+        let addr = spawn_admin_users_server(proxy, true).await;
+        let client = Client::new();
+
+        let list_tags_resp = client
+            .get(format!("http://{}/api/user-tags", addr))
+            .send()
+            .await
+            .expect("list user tags request");
+        assert_eq!(list_tags_resp.status(), reqwest::StatusCode::OK);
+        let list_tags_body: serde_json::Value =
+            list_tags_resp.json().await.expect("list user tags json");
+        let items = list_tags_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("user tags items array");
+        assert_eq!(items.len(), 5);
+        let system_tag = items
+            .iter()
+            .find(|item| {
+                item.get("systemKey").and_then(|value| value.as_str()) == Some("linuxdo_l4")
+            })
+            .expect("linuxdo_l4 system tag present");
+        assert!(
+            system_tag
+                .get("businessCalls1hDelta")
+                .and_then(|value| value.as_i64())
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            system_tag
+                .get("dailyCreditsDelta")
+                .and_then(|value| value.as_i64())
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            system_tag
+                .get("monthlyCreditsDelta")
+                .and_then(|value| value.as_i64())
+                .is_some_and(|value| value > 0)
+        );
+        let system_tag_id = system_tag
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("system tag id")
+            .to_string();
+
+        let update_system_effect_resp = client
+            .patch(format!("http://{}/api/user-tags/{}", addr, system_tag_id))
+            .json(&serde_json::json!({
+                "name": "linuxdo_l4",
+                "displayName": "L4",
+                "icon": "linuxdo",
+                "effectKind": "quota_delta",
+                "businessCalls1hDelta": 0,
+                "dailyCreditsDelta": 0,
+                "monthlyCreditsDelta": 0,
+            }))
+            .send()
+            .await
+            .expect("update system tag effect request");
+        assert_eq!(update_system_effect_resp.status(), reqwest::StatusCode::OK);
+
+        let update_system_name_resp = client
+            .patch(format!("http://{}/api/user-tags/{}", addr, system_tag_id))
+            .json(&serde_json::json!({
+                "name": "linuxdo_l4",
+                "displayName": "L4 blocked",
+                "icon": "linuxdo",
+                "effectKind": "quota_delta",
+                "businessCalls1hDelta": 0,
+                "dailyCreditsDelta": 0,
+                "monthlyCreditsDelta": 0,
+            }))
+            .send()
+            .await
+            .expect("update system tag display name request");
+        assert_eq!(
+            update_system_name_resp.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+
+        let bind_system_resp = client
+            .post(format!("http://{}/api/users/{}/tags", addr, user.user_id))
+            .json(&serde_json::json!({ "tagId": system_tag_id }))
+            .send()
+            .await
+            .expect("bind system tag request");
+        assert_eq!(bind_system_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let create_custom_resp = client
+            .post(format!("http://{}/api/user-tags", addr))
+            .json(&serde_json::json!({
+                "name": "suspended_manual",
+                "displayName": "Suspended",
+                "icon": "ban",
+                "effectKind": "quota_delta",
+                "businessCalls1hDelta": -9,
+                "dailyCreditsDelta": -9,
+                "monthlyCreditsDelta": -9,
+            }))
+            .send()
+            .await
+            .expect("create custom tag request");
+        assert_eq!(create_custom_resp.status(), reqwest::StatusCode::OK);
+        let custom_tag: serde_json::Value =
+            create_custom_resp.json().await.expect("custom tag json");
+        let custom_tag_id = custom_tag
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("custom tag id")
+            .to_string();
+
+        let update_custom_resp = client
+            .patch(format!("http://{}/api/user-tags/{}", addr, custom_tag_id))
+            .json(&serde_json::json!({
+                "name": "suspended_manual",
+                "displayName": "Suspended Now",
+                "icon": "ban",
+                "effectKind": "block_all",
+                "businessCalls1hDelta": 0,
+                "dailyCreditsDelta": 0,
+                "monthlyCreditsDelta": 0,
+            }))
+            .send()
+            .await
+            .expect("update custom tag request");
+        assert_eq!(update_custom_resp.status(), reqwest::StatusCode::OK);
+
+        let bind_custom_resp = client
+            .post(format!("http://{}/api/users/{}/tags", addr, user.user_id))
+            .json(&serde_json::json!({ "tagId": custom_tag_id }))
+            .send()
+            .await
+            .expect("bind custom tag request");
+        assert_eq!(bind_custom_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let filtered_users_resp = client
+            .get(format!(
+                "http://{}/api/users?page=1&per_page=20&q=Suspended%20Now&tagId={}",
+                addr, custom_tag_id
+            ))
+            .send()
+            .await
+            .expect("filtered users request");
+        assert_eq!(filtered_users_resp.status(), reqwest::StatusCode::OK);
+        let filtered_users_body: serde_json::Value = filtered_users_resp
+            .json()
+            .await
+            .expect("filtered users json");
+        assert_eq!(
+            filtered_users_body
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            filtered_users_body
+                .get("items")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|value| value.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(user.user_id.as_str())
+        );
+
+        let detail_resp = client
+            .get(format!("http://{}/api/users/{}", addr, user.user_id))
+            .send()
+            .await
+            .expect("detail request");
+        assert_eq!(detail_resp.status(), reqwest::StatusCode::OK);
+        let detail_body: serde_json::Value = detail_resp.json().await.expect("detail json");
+        assert_eq!(
+            detail_body
+                .get("effectiveQuota")
+                .and_then(|value| value.get("businessCalls1hLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            detail_body
+                .get("effectiveQuota")
+                .and_then(|value| value.get("monthlyCreditsLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        let breakdown_entries = detail_body
+            .get("quotaBreakdown")
+            .and_then(|value| value.as_array())
+            .expect("quotaBreakdown array");
+        assert!(breakdown_entries.iter().any(|entry| {
+            entry.get("effectKind").and_then(|value| value.as_str()) == Some("block_all")
+        }));
+        assert!(breakdown_entries.iter().any(|entry| {
+            entry.get("kind").and_then(|value| value.as_str()) == Some("effective")
+                && entry
+                    .get("businessCalls1hDelta")
+                    .and_then(|value| value.as_i64())
+                    == Some(0)
+                && entry
+                    .get("monthlyCreditsDelta")
+                    .and_then(|value| value.as_i64())
+                    == Some(0)
+        }));
+
+        let unbind_system_resp = client
+            .delete(format!(
+                "http://{}/api/users/{}/tags/{}",
+                addr, user.user_id, system_tag_id
+            ))
+            .send()
+            .await
+            .expect("unbind system tag request");
+        assert_eq!(
+            unbind_system_resp.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+
+        let delete_system_resp = client
+            .delete(format!("http://{}/api/user-tags/{}", addr, system_tag_id))
+            .send()
+            .await
+            .expect("delete system tag request");
+        assert_eq!(
+            delete_system_resp.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+
+        let delete_custom_resp = client
+            .delete(format!("http://{}/api/user-tags/{}", addr, custom_tag_id))
+            .send()
+            .await
+            .expect("delete custom tag request");
+        assert_eq!(delete_custom_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let filtered_users_after_delete_resp = client
+            .get(format!(
+                "http://{}/api/users?page=1&per_page=20&tagId={}",
+                addr, custom_tag_id
+            ))
+            .send()
+            .await
+            .expect("filtered users after delete request");
+        assert_eq!(
+            filtered_users_after_delete_resp.status(),
+            reqwest::StatusCode::OK
+        );
+        let filtered_users_after_delete: serde_json::Value = filtered_users_after_delete_resp
+            .json()
+            .await
+            .expect("filtered users after delete json");
+        assert_eq!(
+            filtered_users_after_delete
+                .get("total")
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+
+        let detail_after_resp = client
+            .get(format!("http://{}/api/users/{}", addr, user.user_id))
+            .send()
+            .await
+            .expect("detail after delete request");
+        assert_eq!(detail_after_resp.status(), reqwest::StatusCode::OK);
+        let detail_after: serde_json::Value = detail_after_resp
+            .json()
+            .await
+            .expect("detail after delete json");
+        assert!(
+            detail_after
+                .get("tags")
+                .and_then(|value| value.as_array())
+                .is_some_and(|tags| tags.iter().all(|tag| {
+                    tag.get("tagId").and_then(|value| value.as_str())
+                        != Some(custom_tag_id.as_str())
+                }))
+        );
+        assert_eq!(
+            detail_after
+                .get("effectiveQuota")
+                .and_then(|value| value.get("monthlyCreditsLimit"))
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_unbound_token_usage_lists_only_unbound_tokens_with_search_sort_and_pagination() {
+        let db_path = temp_db_path("admin-unbound-token-usage");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let alice = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-unbound-token-usage-alice".to_string(),
+                username: Some("alice".to_string()),
+                name: Some("Alice".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert alice");
+
+        let bound = proxy
+            .ensure_user_token_binding(&alice.user_id, Some("bound-owner"))
+            .await
+            .expect("bind alice token");
+        let unbound_primary = proxy
+            .create_access_token(Some("manual-unbound-alpha"))
+            .await
+            .expect("create primary unbound token");
+        let grouped_unbound = proxy
+            .create_access_tokens_batch("ops", 1, Some("grouped-unbound"))
+            .await
+            .expect("create grouped unbound token")
+            .into_iter()
+            .next()
+            .expect("grouped token exists");
+        let never_used_unbound = proxy
+            .create_access_token(Some("never-used-unbound"))
+            .await
+            .expect("create never-used unbound token");
+
+        for _ in 0..2 {
+            let _ = proxy
+                .check_token_hourly_requests(&unbound_primary.id)
+                .await
+                .expect("seed primary hourly-any");
+        }
+        for _ in 0..3 {
+            let _ = proxy
+                .check_token_quota(&unbound_primary.id)
+                .await
+                .expect("seed primary quota");
+        }
+        for _ in 0..2 {
+            proxy
+                .record_token_attempt(
+                    &unbound_primary.id,
+                    &Method::POST,
+                    "/mcp",
+                    None,
+                    Some(200),
+                    Some(0),
+                    true,
+                    "success",
+                    None,
+                )
+                .await
+                .expect("record primary success");
+        }
+        proxy
+            .record_token_attempt(
+                &unbound_primary.id,
+                &Method::POST,
+                "/mcp",
+                None,
+                Some(500),
+                Some(-32001),
+                true,
+                "error",
+                Some("upstream error"),
+            )
+            .await
+            .expect("record primary error");
+
+        let _ = proxy
+            .check_token_hourly_requests(&grouped_unbound.id)
+            .await
+            .expect("seed grouped hourly-any");
+        let _ = proxy
+            .check_token_quota(&grouped_unbound.id)
+            .await
+            .expect("seed grouped quota");
+        proxy
+            .record_token_attempt(
+                &grouped_unbound.id,
+                &Method::POST,
+                "/mcp",
+                None,
+                Some(200),
+                Some(0),
+                true,
+                "success",
+                None,
+            )
+            .await
+            .expect("record grouped success");
+
+        let _ = proxy
+            .check_token_hourly_requests(&bound.id)
+            .await
+            .expect("seed bound hourly-any");
+        let _ = proxy
+            .check_token_quota(&bound.id)
+            .await
+            .expect("seed bound quota");
+        proxy
+            .record_token_attempt(
+                &bound.id,
+                &Method::POST,
+                "/mcp",
+                None,
+                Some(200),
+                Some(0),
+                true,
+                "success",
+                None,
+            )
+            .await
+            .expect("record bound success");
+
+        let (breakage_key_a_id, _) = proxy
+            .add_or_undelete_key_with_status("tvly-unbound-breakage-sort-key-a")
+            .await
+            .expect("create breakage key a");
+        let (breakage_key_b_id, _) = proxy
+            .add_or_undelete_key_with_status("tvly-unbound-breakage-sort-key-b")
+            .await
+            .expect("create breakage key b");
+        let now = chrono::Utc::now().timestamp();
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        sqlx::query(
+            r#"INSERT INTO token_api_key_bindings (token_id, api_key_id, created_at, updated_at, last_success_at)
+               VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)"#,
+        )
+        .bind(&unbound_primary.id)
+        .bind(&breakage_key_a_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(&grouped_unbound.id)
+        .bind(&breakage_key_a_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(&grouped_unbound.id)
+        .bind(&breakage_key_b_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed token api key bindings");
+        proxy
+            .mark_key_quota_exhausted_by_secret("tvly-unbound-breakage-sort-key-a")
+            .await
+            .expect("mark breakage key a exhausted");
+        proxy
+            .mark_key_quota_exhausted_by_secret("tvly-unbound-breakage-sort-key-b")
+            .await
+            .expect("mark breakage key b exhausted");
+        sqlx::query(
+            r#"INSERT INTO api_key_quarantines
+               (id, key_id, source, reason_code, reason_summary, reason_detail, created_at, cleared_at)
+               VALUES (?, ?, 'system', 'account_deactivated', 'Upstream account deactivated', 'blocked-key test fixture', ?, NULL),
+                      (?, ?, 'system', 'account_deactivated', 'Upstream account deactivated', 'blocked-key test fixture', ?, NULL)"#,
+        )
+        .bind("unbound-breakage-sort-quarantine-a")
+        .bind(&breakage_key_a_id)
+        .bind(now)
+        .bind("unbound-breakage-sort-quarantine-b")
+        .bind(&breakage_key_b_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed active blocked-key quarantines");
+        sqlx::query(
+            r#"UPDATE subject_key_breakages
+               SET key_status = 'quarantined',
+                   reason_code = 'account_deactivated',
+                   reason_summary = 'Upstream account deactivated',
+                   source = 'auto',
+                   updated_at = ?,
+                   latest_break_at = ?
+               WHERE key_id IN (?, ?)"#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&breakage_key_a_id)
+        .bind(&breakage_key_b_id)
+        .execute(&pool)
+        .await
+        .expect("promote breakage fixtures to blocked-key reasons");
+
+        let addr = spawn_admin_tokens_server(proxy, true).await;
+        let client = Client::new();
+
+        let list_resp = client
+            .get(format!(
+                "http://{}/api/tokens/unbound-usage?page=1&per_page=20",
+                addr
+            ))
+            .send()
+            .await
+            .expect("list unbound token usage request");
+        assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
+        let list_body: serde_json::Value = list_resp
+            .json()
+            .await
+            .expect("list unbound token usage json");
+        let items = list_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("items array");
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|item| item.get("tokenId").and_then(|value| value.as_str()))
+            .collect();
+        assert_eq!(
+            list_body.get("total").and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        assert!(ids.contains(&unbound_primary.id.as_str()));
+        assert!(ids.contains(&grouped_unbound.id.as_str()));
+        assert!(ids.contains(&never_used_unbound.id.as_str()));
+        assert!(!ids.contains(&bound.id.as_str()));
+
+        let search_resp = client
+            .get(format!(
+                "http://{}/api/tokens/unbound-usage?page=1&per_page=20&q={}",
+                addr,
+                urlencoding::encode("grouped-unbound")
+            ))
+            .send()
+            .await
+            .expect("search unbound token usage request");
+        assert_eq!(search_resp.status(), reqwest::StatusCode::OK);
+        let search_body: serde_json::Value = search_resp
+            .json()
+            .await
+            .expect("search unbound token usage json");
+        let search_items = search_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("search items array");
+        assert_eq!(search_items.len(), 1);
+        assert_eq!(
+            search_items[0]
+                .get("tokenId")
+                .and_then(|value| value.as_str()),
+            Some(grouped_unbound.id.as_str())
+        );
+        assert_eq!(
+            search_items[0]
+                .get("group")
+                .and_then(|value| value.as_str()),
+            Some("ops")
+        );
+
+        let sorted_resp = client
+            .get(format!(
+                "http://{}/api/tokens/unbound-usage?page=1&per_page=20&sort=dailySuccessRate&order=desc",
+                addr
+            ))
+            .send()
+            .await
+            .expect("sort unbound token usage request");
+        assert_eq!(sorted_resp.status(), reqwest::StatusCode::OK);
+        let sorted_body: serde_json::Value = sorted_resp
+            .json()
+            .await
+            .expect("sort unbound token usage json");
+        let sorted_items = sorted_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("sorted items array");
+        assert_eq!(
+            sorted_items[0]
+                .get("tokenId")
+                .and_then(|value| value.as_str()),
+            Some(grouped_unbound.id.as_str())
+        );
+        assert_eq!(
+            sorted_items[0]
+                .get("dailySuccess")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            sorted_items[0]
+                .get("dailyFailure")
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+
+        let broken_sorted_resp = client
+            .get(format!(
+                "http://{}/api/tokens/unbound-usage?page=1&per_page=20&sort=monthlyBrokenCount&order=desc",
+                addr
+            ))
+            .send()
+            .await
+            .expect("monthly broken sort unbound token usage request");
+        assert_eq!(broken_sorted_resp.status(), reqwest::StatusCode::OK);
+        let broken_sorted_body: serde_json::Value = broken_sorted_resp
+            .json()
+            .await
+            .expect("monthly broken sort unbound token usage json");
+        let broken_sorted_items = broken_sorted_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("monthly broken sorted items array");
+        assert_eq!(
+            broken_sorted_items[0]
+                .get("tokenId")
+                .and_then(|value| value.as_str()),
+            Some(grouped_unbound.id.as_str())
+        );
+        assert_eq!(
+            broken_sorted_items[0]
+                .get("monthlyBrokenCount")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            broken_sorted_items[1]
+                .get("tokenId")
+                .and_then(|value| value.as_str()),
+            Some(unbound_primary.id.as_str())
+        );
+        assert_eq!(
+            broken_sorted_items[1]
+                .get("monthlyBrokenCount")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert!(
+            broken_sorted_items[2]
+                .get("monthlyBrokenCount")
+                .is_some_and(|value| value.is_null())
+        );
+
+        let last_used_asc_resp = client
+            .get(format!(
+                "http://{}/api/tokens/unbound-usage?page=1&per_page=20&sort=lastUsedAt&order=asc",
+                addr
+            ))
+            .send()
+            .await
+            .expect("last-used asc unbound token usage request");
+        assert_eq!(last_used_asc_resp.status(), reqwest::StatusCode::OK);
+        let last_used_asc_body: serde_json::Value = last_used_asc_resp
+            .json()
+            .await
+            .expect("last-used asc unbound token usage json");
+        let last_used_asc_items = last_used_asc_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("last-used asc items array");
+        assert_eq!(
+            last_used_asc_items[0]
+                .get("tokenId")
+                .and_then(|value| value.as_str()),
+            Some(never_used_unbound.id.as_str())
+        );
+        assert!(
+            last_used_asc_items[0]
+                .get("lastUsedAt")
+                .is_some_and(|value| value.is_null())
+        );
+
+        let paged_resp = client
+            .get(format!(
+                "http://{}/api/tokens/unbound-usage?page=2&per_page=1&sort=quotaMonthlyUsed&order=desc",
+                addr
+            ))
+            .send()
+            .await
+            .expect("paged unbound token usage request");
+        assert_eq!(paged_resp.status(), reqwest::StatusCode::OK);
+        let paged_body: serde_json::Value = paged_resp
+            .json()
+            .await
+            .expect("paged unbound token usage json");
+        let paged_items = paged_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("paged items array");
+        assert_eq!(
+            paged_body.get("total").and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            paged_body.get("page").and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert_eq!(paged_items.len(), 1);
+        assert_eq!(
+            paged_items[0]
+                .get("tokenId")
+                .and_then(|value| value.as_str()),
+            Some(grouped_unbound.id.as_str())
+        );
+
+        let empty_resp = client
+            .get(format!(
+                "http://{}/api/tokens/unbound-usage?page=1&per_page=20&q={}",
+                addr,
+                urlencoding::encode("missing-token")
+            ))
+            .send()
+            .await
+            .expect("empty unbound token usage request");
+        assert_eq!(empty_resp.status(), reqwest::StatusCode::OK);
+        let empty_body: serde_json::Value = empty_resp
+            .json()
+            .await
+            .expect("empty unbound token usage json");
+        assert_eq!(
+            empty_body.get("total").and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        assert!(
+            empty_body
+                .get("items")
+                .and_then(|value| value.as_array())
+                .is_some_and(|items| items.is_empty())
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_user_detail_can_create_and_delete_user_tokens_with_last_token_guard() {
+        let db_path = temp_db_path("admin-user-detail-token-controls");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let alice = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-user-token-controls-alice".to_string(),
+                username: Some("alice".to_string()),
+                name: Some("Alice".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert alice");
+        let bob = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-user-token-controls-bob".to_string(),
+                username: Some("bob".to_string()),
+                name: Some("Bob".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert bob");
+        let alice_initial = proxy
+            .ensure_user_token_binding(&alice.user_id, Some("alice-initial"))
+            .await
+            .expect("bind alice initial token");
+        let bob_initial = proxy
+            .ensure_user_token_binding(&bob.user_id, Some("bob-initial"))
+            .await
+            .expect("bind bob initial token");
+
+        let addr = spawn_admin_users_server(proxy, true).await;
+        let client = Client::new();
+
+        let create_resp = client
+            .post(format!("http://{}/api/users/{}/tokens", addr, alice.user_id))
+            .send()
+            .await
+            .expect("create user token request");
+        assert_eq!(create_resp.status(), reqwest::StatusCode::CREATED);
+        let create_body: serde_json::Value = create_resp.json().await.expect("create token json");
+        let created_token = create_body
+            .get("token")
+            .and_then(|value| value.as_str())
+            .expect("created full token");
+        assert!(created_token.starts_with("th-"));
+        let created_token_id = created_token
+            .split('-')
+            .nth(1)
+            .expect("created token id segment")
+            .to_string();
+        assert_ne!(created_token_id, alice_initial.id);
+
+        let detail_resp = client
+            .get(format!("http://{}/api/users/{}", addr, alice.user_id))
+            .send()
+            .await
+            .expect("user detail after create");
+        assert_eq!(detail_resp.status(), reqwest::StatusCode::OK);
+        let detail_body: serde_json::Value = detail_resp.json().await.expect("detail json");
+        let token_ids: Vec<String> = detail_body
+            .get("tokens")
+            .and_then(|value| value.as_array())
+            .expect("tokens array")
+            .iter()
+            .filter_map(|token| token.get("tokenId").and_then(|value| value.as_str()))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(token_ids.len(), 2);
+        assert!(token_ids.contains(&alice_initial.id));
+        assert!(token_ids.contains(&created_token_id));
+
+        let delete_other_user_resp = client
+            .delete(format!(
+                "http://{}/api/users/{}/tokens/{}",
+                addr, alice.user_id, bob_initial.id
+            ))
+            .send()
+            .await
+            .expect("delete other user token request");
+        assert_eq!(delete_other_user_resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let delete_created_resp = client
+            .delete(format!(
+                "http://{}/api/users/{}/tokens/{}",
+                addr, alice.user_id, created_token_id
+            ))
+            .send()
+            .await
+            .expect("delete created user token request");
+        assert_eq!(delete_created_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let delete_last_resp = client
+            .delete(format!(
+                "http://{}/api/users/{}/tokens/{}",
+                addr, alice.user_id, alice_initial.id
+            ))
+            .send()
+            .await
+            .expect("delete last user token request");
+        assert_eq!(delete_last_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let final_detail_resp = client
+            .get(format!("http://{}/api/users/{}", addr, alice.user_id))
+            .send()
+            .await
+            .expect("user detail after delete");
+        assert_eq!(final_detail_resp.status(), reqwest::StatusCode::OK);
+        let final_detail: serde_json::Value =
+            final_detail_resp.json().await.expect("final detail json");
+        let final_tokens = final_detail
+            .get("tokens")
+            .and_then(|value| value.as_array())
+            .expect("final tokens array");
+        assert_eq!(final_tokens.len(), 1);
+        assert_eq!(
+            final_tokens
+                .first()
+                .and_then(|token| token.get("tokenId"))
+                .and_then(|value| value.as_str()),
+            Some(alice_initial.id.as_str())
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_token_log_views_include_business_credits() {
+        let db_path = temp_db_path("admin-token-log-business-credits");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let token = proxy
+            .create_access_token(Some("admin-token-log-business-credits"))
+            .await
+            .expect("create token");
+
+        proxy
+            .record_token_attempt(
+                &token.id,
+                &Method::POST,
+                "/mcp/sse",
+                None,
+                Some(200),
+                Some(0),
+                false,
+                "success",
+                None,
+            )
+            .await
+            .expect("record legacy log without credits");
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open db pool");
+        sqlx::query(
+            r#"
+            UPDATE auth_token_logs
+            SET request_kind_key = 'mcp:raw:/mcp',
+                request_kind_label = 'MCP | /mcp'
+            WHERE token_id = ?
+              AND path = '/mcp/sse'
+            "#,
+        )
+        .bind(&token.id)
+        .execute(&pool)
+        .await
+        .expect("downgrade legacy mcp raw row to stale root fallback");
+
+        proxy
+            .record_token_attempt(
+                &token.id,
+                &Method::POST,
+                "/api/tavily/search",
+                None,
+                Some(200),
+                Some(200),
+                true,
+                "success",
+                None,
+            )
+            .await
+            .expect("record api search log");
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id,
+                method,
+                path,
+                query,
+                http_status,
+                mcp_status,
+                request_kind_key,
+                request_kind_label,
+                request_kind_detail,
+                result_status,
+                error_message,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                created_at,
+                counts_business_quota,
+                billing_state
+            ) VALUES (?, 'POST', '/mcp', NULL, 202, NULL, 'mcp:notifications/initialized', 'MCP | notifications/initialized', NULL, 'unknown', NULL, NULL, 'none', NULL, ?, 0, 'none')
+            "#,
+        )
+        .bind(&token.id)
+        .bind(Utc::now().timestamp() + 2)
+        .execute(&pool)
+        .await
+        .expect("insert neutral token log");
+        sqlx::query(
+            r#"
+            INSERT INTO auth_token_logs (
+                token_id,
+                method,
+                path,
+                query,
+                http_status,
+                mcp_status,
+                request_kind_key,
+                request_kind_label,
+                request_kind_detail,
+                result_status,
+                error_message,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                created_at,
+                counts_business_quota,
+                billing_state
+            ) VALUES (?, 'DELETE', '/mcp', NULL, 405, 405, 'mcp:session-delete-unsupported', 'MCP | session delete unsupported', NULL, 'error', 'Method Not Allowed: Session termination not supported', 'mcp_method_405', 'none', NULL, ?, 0, 'none')
+            "#,
+        )
+        .bind(&token.id)
+        .bind(Utc::now().timestamp() + 3)
+        .execute(&pool)
+        .await
+        .expect("insert session delete neutral token log");
+
+        let mcp_search_kind = classify_token_request_kind(
+            "/mcp",
+            Some(
+                br#"{
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": "tavily-search" }
+                }"#,
+            ),
+        );
+        let charged_log_id = proxy
+            .record_pending_billing_attempt_with_kind(
+                &token.id,
+                &Method::POST,
+                "/mcp",
+                None,
+                Some(200),
+                Some(0),
+                true,
+                "success",
+                None,
+                4,
+                &mcp_search_kind,
+                None,
+            )
+            .await
+            .expect("record pending billing log");
+        assert_eq!(
+            proxy
+                .settle_pending_billing_attempt(charged_log_id)
+                .await
+                .expect("settle pending billing log"),
+            PendingBillingSettleOutcome::Charged
+        );
+
+        let addr = spawn_admin_tokens_server(proxy, true).await;
+        let client = Client::new();
+
+        let logs_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs?limit=20",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("logs request");
+        assert_eq!(logs_resp.status(), reqwest::StatusCode::OK);
+        let logs_body: serde_json::Value = logs_resp.json().await.expect("logs json");
+        let logs = logs_body.as_array().expect("logs array");
+        assert_eq!(logs.len(), 5);
+        let charged_log = logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:search")
+            })
+            .expect("mcp search log");
+        assert_eq!(
+            charged_log
+                .get("business_credits")
+                .and_then(|value| value.as_i64()),
+            Some(4)
+        );
+        assert_eq!(
+            charged_log
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | search")
+        );
+        let legacy_log = logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:unsupported-path")
+            })
+            .expect("canonical unsupported-path log");
+        assert_eq!(
+            legacy_log
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | unsupported path")
+        );
+        assert_eq!(
+            legacy_log
+                .get("request_kind_detail")
+                .and_then(|value| value.as_str()),
+            Some("/mcp/sse")
+        );
+        assert!(
+            legacy_log.get("legacyRequestKindKey").is_none(),
+            "token log payload should not expose legacy request-kind snapshots"
+        );
+        let neutral_log = logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:notifications/initialized")
+            })
+            .expect("neutral mcp notification log");
+        assert_eq!(
+            neutral_log
+                .get("operationalClass")
+                .and_then(|value| value.as_str()),
+            Some("neutral")
+        );
+        assert_eq!(
+            neutral_log
+                .get("requestKindBillingGroup")
+                .and_then(|value| value.as_str()),
+            Some("non_billable")
+        );
+        let session_delete_log = logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:session-delete-unsupported")
+            })
+            .expect("session delete token log");
+        assert_eq!(
+            session_delete_log
+                .get("result_status")
+                .and_then(|value| value.as_str()),
+            Some("neutral")
+        );
+
+        let page_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("logs page request");
+        assert_eq!(page_resp.status(), reqwest::StatusCode::OK);
+        let page_body: serde_json::Value = page_resp.json().await.expect("logs page json");
+        let items = page_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("logs page items");
+        let request_kind_options = page_body
+            .get("request_kind_options")
+            .and_then(|value| value.as_array())
+            .expect("request kind options array");
+        assert_eq!(items.len(), 5);
+        assert_eq!(request_kind_options.len(), 5);
+        let search_option = request_kind_options
+            .iter()
+            .find(|value| {
+                value
+                    .get("key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:search")
+            })
+            .expect("mcp search option");
+        assert_eq!(
+            search_option
+                .get("protocol_group")
+                .and_then(|value| value.as_str()),
+            Some("mcp")
+        );
+        assert_eq!(
+            search_option
+                .get("billing_group")
+                .and_then(|value| value.as_str()),
+            Some("billable")
+        );
+        assert_eq!(
+            search_option.get("count").and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        let legacy_option = request_kind_options
+            .iter()
+            .find(|value| {
+                value
+                    .get("key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:unsupported-path")
+            })
+            .expect("unsupported-path option");
+        assert_eq!(
+            legacy_option
+                .get("protocol_group")
+                .and_then(|value| value.as_str()),
+            Some("mcp")
+        );
+        assert_eq!(
+            legacy_option
+                .get("billing_group")
+                .and_then(|value| value.as_str()),
+            Some("non_billable")
+        );
+        assert_eq!(
+            legacy_option.get("count").and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        let session_delete_option = request_kind_options
+            .iter()
+            .find(|value| {
+                value
+                    .get("key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:session-delete-unsupported")
+            })
+            .expect("session-delete option");
+        assert_eq!(
+            session_delete_option
+                .get("billing_group")
+                .and_then(|value| value.as_str()),
+            Some("non_billable")
+        );
+        assert_eq!(
+            session_delete_option
+                .get("count")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        let page_search_log = items
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:search")
+            })
+            .expect("paged mcp search log");
+        assert_eq!(
+            page_search_log
+                .get("business_credits")
+                .and_then(|value| value.as_i64()),
+            Some(4)
+        );
+        assert_eq!(
+            page_search_log
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | search")
+        );
+        assert_eq!(
+            page_search_log
+                .get("operationalClass")
+                .and_then(|value| value.as_str()),
+            Some("success")
+        );
+        assert_eq!(
+            page_search_log
+                .get("requestKindProtocolGroup")
+                .and_then(|value| value.as_str()),
+            Some("mcp")
+        );
+        assert_eq!(
+            page_search_log
+                .get("requestKindBillingGroup")
+                .and_then(|value| value.as_str()),
+            Some("billable")
+        );
+        let paged_legacy_log = items
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:unsupported-path")
+            })
+            .expect("paged unsupported-path log");
+        assert_eq!(
+            paged_legacy_log
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | unsupported path")
+        );
+        assert!(
+            paged_legacy_log.get("legacyRequestKindKey").is_none(),
+            "paged token log payload should not expose legacy request-kind snapshots"
+        );
+        let paged_session_delete_log = items
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:session-delete-unsupported")
+            })
+            .expect("paged session delete log");
+        assert_eq!(
+            paged_session_delete_log
+                .get("result_status")
+                .and_then(|value| value.as_str()),
+            Some("neutral")
+        );
+
+        let neutral_page_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&operational_class=neutral",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("neutral token logs page request");
+        assert_eq!(neutral_page_resp.status(), reqwest::StatusCode::OK);
+        let neutral_page_body: serde_json::Value = neutral_page_resp
+            .json()
+            .await
+            .expect("neutral token logs page json");
+        let neutral_items = neutral_page_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("neutral token logs page items");
+        assert_eq!(neutral_items.len(), 3);
+        let neutral_kinds = neutral_items
+            .iter()
+            .filter_map(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|inner| inner.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert!(neutral_kinds.contains(&"mcp:notifications/initialized"));
+        assert!(neutral_kinds.contains(&"mcp:session-delete-unsupported"));
+        assert!(neutral_kinds.contains(&"mcp:unsupported-path"));
+
+        let neutral_result_page_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&result=neutral",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("neutral result token logs page request");
+        assert_eq!(neutral_result_page_resp.status(), reqwest::StatusCode::OK);
+        let neutral_result_page_body: serde_json::Value = neutral_result_page_resp
+            .json()
+            .await
+            .expect("neutral result token logs page json");
+        let neutral_result_items = neutral_result_page_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("neutral result token logs items");
+        assert_eq!(neutral_result_items.len(), 3);
+        assert!(neutral_result_items.iter().any(|value| {
+            value.get("request_kind_key").and_then(|kind| kind.as_str())
+                == Some("mcp:session-delete-unsupported")
+        }));
+        assert!(
+            neutral_result_items
+                .iter()
+                .find(|value| {
+                    value.get("request_kind_key").and_then(|kind| kind.as_str())
+                        == Some("mcp:session-delete-unsupported")
+                })
+                .and_then(|value| value
+                    .get("result_status")
+                    .and_then(|status| status.as_str()))
+                == Some("neutral")
+        );
+
+        let error_result_page_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&result=error",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("error result token logs page request");
+        assert_eq!(error_result_page_resp.status(), reqwest::StatusCode::OK);
+        let error_result_page_body: serde_json::Value = error_result_page_resp
+            .json()
+            .await
+            .expect("error result token logs page json");
+        let error_result_items = error_result_page_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("error result token logs items");
+        assert!(error_result_items.iter().all(|value| {
+            value.get("request_kind_key").and_then(|kind| kind.as_str())
+                != Some("mcp:session-delete-unsupported")
+        }));
+
+        let filtered_page_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&request_kind=api%3Asearch&request_kind=mcp%3Asearch",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("filtered logs page request");
+        assert_eq!(filtered_page_resp.status(), reqwest::StatusCode::OK);
+        let filtered_page_body: serde_json::Value = filtered_page_resp
+            .json()
+            .await
+            .expect("filtered logs page json");
+        let filtered_items = filtered_page_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("filtered logs page items");
+        assert_eq!(filtered_items.len(), 2);
+        let filtered_keys = filtered_items
+            .iter()
+            .filter_map(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            filtered_keys,
+            std::collections::BTreeSet::from(["api:search".to_string(), "mcp:search".to_string(),])
+        );
+
+        let filtered_legacy_resp = client
+            .get(format!(
+                "http://{}/api/tokens/{}/logs/page?page=1&per_page=20&since=0&request_kind=mcp%3Araw%3A%2Fmcp%2Fsse",
+                addr, token.id
+            ))
+            .send()
+            .await
+            .expect("filtered legacy logs page request");
+        assert_eq!(filtered_legacy_resp.status(), reqwest::StatusCode::OK);
+        let filtered_legacy_body: serde_json::Value = filtered_legacy_resp
+            .json()
+            .await
+            .expect("filtered legacy logs page json");
+        let filtered_legacy_items = filtered_legacy_body
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("filtered legacy logs page items");
+        assert_eq!(filtered_legacy_items.len(), 1);
+        assert_eq!(
+            filtered_legacy_items[0]
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | unsupported path")
+        );
+
+        let mut events_resp = client
+            .get(format!("http://{}/api/tokens/{}/events", addr, token.id))
+            .send()
+            .await
+            .expect("events request");
+        assert_eq!(events_resp.status(), reqwest::StatusCode::OK);
+        let snapshot_event = read_sse_event_until(
+            &mut events_resp,
+            |chunk| chunk.contains("data: "),
+            "token snapshot event",
+        )
+        .await;
+        let snapshot_line = snapshot_event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("snapshot data line");
+        let snapshot_json: serde_json::Value =
+            serde_json::from_str(snapshot_line).expect("snapshot payload json");
+        let snapshot_logs = snapshot_json
+            .get("logs")
+            .and_then(|value| value.as_array())
+            .expect("snapshot logs array");
+        assert_eq!(snapshot_logs.len(), 5);
+        let snapshot_search_log = snapshot_logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:search")
+            })
+            .expect("snapshot mcp search log");
+        assert_eq!(
+            snapshot_search_log
+                .get("business_credits")
+                .and_then(|value| value.as_i64()),
+            Some(4)
+        );
+        assert_eq!(
+            snapshot_search_log
+                .get("request_kind_label")
+                .and_then(|value| value.as_str()),
+            Some("MCP | search")
+        );
+        let snapshot_neutral_log = snapshot_logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:notifications/initialized")
+            })
+            .expect("snapshot neutral log");
+        assert_eq!(
+            snapshot_neutral_log
+                .get("operationalClass")
+                .and_then(|value| value.as_str()),
+            Some("neutral")
+        );
+        let snapshot_session_delete_log = snapshot_logs
+            .iter()
+            .find(|value| {
+                value
+                    .get("request_kind_key")
+                    .and_then(|kind| kind.as_str())
+                    .is_some_and(|kind| kind == "mcp:session-delete-unsupported")
+            })
+            .expect("snapshot session delete log");
+        assert_eq!(
+            snapshot_session_delete_log
+                .get("operationalClass")
+                .and_then(|value| value.as_str()),
+            Some("neutral")
+        );
+        assert_eq!(
+            snapshot_session_delete_log
+                .get("result_status")
+                .and_then(|value| value.as_str()),
+            Some("neutral")
+        );
+        drop(events_resp);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_user_rankings_http_and_sse_include_identity_and_windowed_leaderboards() {
+        let db_path = temp_db_path("admin-user-rankings");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let alice = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-rankings-alice".to_string(),
+                username: Some("alice".to_string()),
+                name: Some("Alice Chen".to_string()),
+                avatar_template: Some("/avatar/alice/{size}/1.png".to_string()),
+                active: true,
+                trust_level: Some(2),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert alice");
+        let bob = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-rankings-bob".to_string(),
+                username: Some("bob".to_string()),
+                name: Some("Bob Lin".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(1),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert bob");
+
+        let alice_token = proxy
+            .ensure_user_token_binding(&alice.user_id, Some("linuxdo:alice-rankings"))
+            .await
+            .expect("bind alice token");
+        let bob_token = proxy
+            .ensure_user_token_binding(&bob.user_id, Some("linuxdo:bob-rankings"))
+            .await
+            .expect("bind bob token");
+
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        let now = Utc::now().timestamp();
+        let recent = now - 600;
+        let week_recent = now - 2 * 86_400;
+        let month_recent = now - 12 * 86_400;
+
+        for created_at in [recent, week_recent, month_recent] {
+            sqlx::query(
+                r#"
+                INSERT INTO auth_token_logs (
+                    token_id,
+                    method,
+                    path,
+                    query,
+                    http_status,
+                    mcp_status,
+                    request_kind_key,
+                    request_kind_label,
+                    request_kind_detail,
+                    result_status,
+                    error_message,
+                    failure_kind,
+                    key_effect_code,
+                    key_effect_summary,
+                    binding_effect_code,
+                    binding_effect_summary,
+                    selection_effect_code,
+                    selection_effect_summary,
+                    created_at,
+                    counts_business_quota,
+                    billing_subject,
+                    billing_state,
+                    business_credits,
+                    request_user_id
+                ) VALUES
+                    (?, 'POST', '/api/tavily/search', NULL, 200, NULL, 'api:search', 'API | search', NULL, 'success', NULL, NULL, 'none', NULL, 'none', NULL, 'none', NULL, ?, 1, ?, 'charged', ?, ?),
+                    (?, 'POST', '/api/tavily/search', NULL, 200, NULL, 'api:search', 'API | search', NULL, 'success', NULL, NULL, 'none', NULL, 'none', NULL, 'none', NULL, ?, 1, ?, 'charged', ?, ?)
+                "#,
+            )
+            .bind(&alice_token.id)
+            .bind(created_at)
+            .bind(format!("account:{}", alice.user_id))
+            .bind(7_i64)
+            .bind(&alice.user_id)
+            .bind(&bob_token.id)
+            .bind(created_at + 1)
+            .bind(format!("account:{}", bob.user_id))
+            .bind(3_i64)
+            .bind(&bob.user_id)
+            .execute(&pool)
+            .await
+            .expect("insert ranking auth logs");
+        }
+
+        for (user_id, client_ip, created_at) in [
+            (&alice.user_id, "198.51.100.10", recent),
+            (&alice.user_id, "198.51.100.10", recent + 5),
+            (&alice.user_id, "198.51.100.11", week_recent),
+            (&alice.user_id, "198.51.100.12", month_recent),
+            (&bob.user_id, "203.0.113.20", recent + 1),
+            (&bob.user_id, "203.0.113.21", week_recent + 1),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO request_logs (
+                    method,
+                    path,
+                    status_code,
+                    tavily_status_code,
+                    result_status,
+                    request_kind_key,
+                    request_kind_label,
+                    response_body,
+                    created_at,
+                    request_user_id,
+                    visibility,
+                    remote_addr,
+                    client_ip,
+                    client_ip_source,
+                    client_ip_trusted,
+                    ip_headers
+                ) VALUES (
+                    'POST', '/api/tavily/search', 200, 200, 'success', 'api:search', 'HTTP | search', NULL, ?, ?, ?, NULL, ?, 'cf-connecting-ip', 1, NULL
+                )
+                "#,
+            )
+            .bind(created_at)
+            .bind(user_id)
+            .bind(tavily_hikari::REQUEST_LOG_VISIBILITY_VISIBLE)
+            .bind(client_ip)
+            .execute(&pool)
+            .await
+            .expect("insert ranking request logs");
+        }
+
+        proxy
+            .rebuild_ha_recovery_rollups()
+            .await
+            .expect("rebuild ranking rollups");
+
+        let admin_password = "admin-user-rankings-password";
+        let admin_addr = spawn_builtin_keys_admin_server(proxy, admin_password).await;
+        let (client, admin_cookie) = login_builtin_admin_cookie(admin_addr, admin_password).await;
+
+        let rankings_resp = client
+            .get(format!("http://{}/api/users/rankings", admin_addr))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("rankings request");
+        assert_eq!(rankings_resp.status(), reqwest::StatusCode::OK);
+        let rankings_json: serde_json::Value = rankings_resp
+            .json()
+            .await
+            .expect("rankings json");
+        let expected_primary_top = if alice.user_id <= bob.user_id {
+            (&alice.user_id, "Alice Chen", "alice")
+        } else {
+            (&bob.user_id, "Bob Lin", "bob")
+        };
+
+        assert_eq!(
+            rankings_json
+                .get("refreshIntervalSecs")
+                .and_then(|value| value.as_i64()),
+            Some(10)
+        );
+        assert_eq!(
+            rankings_json.get("stale").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last24h/primarySuccessTop/0/user/userId")
+                .and_then(|value| value.as_str()),
+            Some(expected_primary_top.0.as_str())
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last24h/primarySuccessTop/0/user/displayName")
+                .and_then(|value| value.as_str()),
+            Some(expected_primary_top.1)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last24h/primarySuccessTop/0/value")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last7d/primarySuccessTop/0/value")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last30d/businessCreditsTop/0/value")
+                .and_then(|value| value.as_i64()),
+            Some(21)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last24h/uniqueIpTop/0/value")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last7d/uniqueIpTop/0/value")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        let alice_primary_row = rankings_json
+            .get("last24h")
+            .and_then(|value| value.get("primarySuccessTop"))
+            .and_then(|value| value.as_array())
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.pointer("/user/userId").and_then(|value| value.as_str())
+                        == Some(alice.user_id.as_str())
+                })
+            })
+            .expect("alice primary success row");
+        assert!(
+            alice_primary_row
+                .pointer("/user/avatarUrl")
+                .and_then(|value| value.as_str())
+                .is_some(),
+            "expected avatar url to be resolved for alice"
+        );
+
+        let mut events_resp = client
+            .get(format!("http://{}/api/users/rankings/events", admin_addr))
+            .header(reqwest::header::COOKIE, admin_cookie)
+            .send()
+            .await
+            .expect("rankings sse request");
+        assert_eq!(events_resp.status(), reqwest::StatusCode::OK);
+
+        let snapshot_event = read_sse_event_until(
+            &mut events_resp,
+            |chunk| chunk.contains("event: snapshot"),
+            "rankings snapshot event",
+        )
+        .await;
+        let snapshot_json = decode_sse_json_text(&snapshot_event);
+
+        assert_eq!(
+            snapshot_json
+                .pointer("/last30d/primarySuccessTop/0/user/userId")
+                .and_then(|value| value.as_str()),
+            Some(expected_primary_top.0.as_str())
+        );
+        assert_eq!(
+            snapshot_json.get("stale").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot_json
+                .pointer("/last30d/uniqueIpTop/0/value")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            snapshot_json
+                .pointer("/last30d/primarySuccessTop/0/user/username")
+                .and_then(|value| value.as_str()),
+            Some(expected_primary_top.2)
+        );
+        assert_eq!(
+            snapshot_json
+                .pointer("/last30d/businessCreditsTop/1/user/displayName")
+                .and_then(|value| value.as_str()),
+            Some("Bob Lin")
+        );
+
+        drop(events_resp);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_user_rankings_http_and_sse_surface_stale_fallback_snapshots() {
+        let db_path = temp_db_path("admin-user-rankings-stale-fallback");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+
+        let user = proxy
+            .upsert_oauth_account(&OAuthAccountProfile {
+                provider: "linuxdo".to_string(),
+                provider_user_id: "admin-rankings-stale".to_string(),
+                username: Some("stale_rankings".to_string()),
+                name: Some("Stale Rankings".to_string()),
+                avatar_template: None,
+                active: true,
+                trust_level: Some(1),
+                raw_payload_json: None,
+            })
+            .await
+            .expect("upsert stale rankings user");
+
+        let created_at = Utc::now()
+            .timestamp()
+            .saturating_sub(5 * 60 + 1);
+        let pool = connect_sqlite_test_pool(&db_str).await;
+        sqlx::query(
+            r#"
+            INSERT INTO request_logs (
+                method,
+                path,
+                status_code,
+                tavily_status_code,
+                result_status,
+                request_kind_key,
+                request_kind_label,
+                response_body,
+                created_at,
+                request_user_id,
+                visibility,
+                remote_addr,
+                client_ip,
+                client_ip_source,
+                client_ip_trusted,
+                ip_headers
+            ) VALUES (
+                'POST', '/api/tavily/search', 200, 200, 'success', 'api:search', 'HTTP | search', NULL, ?, ?, ?, NULL, ?, 'cf-connecting-ip', 1, NULL
+            )
+            "#,
+        )
+        .bind(created_at)
+        .bind(&user.user_id)
+        .bind(tavily_hikari::REQUEST_LOG_VISIBILITY_VISIBLE)
+        .bind("198.51.100.88")
+        .execute(&pool)
+        .await
+        .expect("insert visible request log");
+
+        proxy
+            .enqueue_user_rankings_rollup_for_test(&user.user_id, created_at, "success")
+            .await;
+
+        let lock_options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_str)
+            .create_if_missing(false)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let mut lock_conn = sqlx::SqliteConnection::connect_with(&lock_options)
+            .await
+            .expect("open lock connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock_conn)
+            .await
+            .expect("lock writer");
+
+        let admin_password = "admin-user-rankings-stale-password";
+        let admin_addr = spawn_builtin_keys_admin_server(proxy, admin_password).await;
+        let (client, admin_cookie) = login_builtin_admin_cookie(admin_addr, admin_password).await;
+
+        let rankings_resp = client
+            .get(format!("http://{}/api/users/rankings", admin_addr))
+            .header(reqwest::header::COOKIE, admin_cookie.clone())
+            .send()
+            .await
+            .expect("rankings request");
+        assert_eq!(rankings_resp.status(), reqwest::StatusCode::OK);
+        let rankings_json: serde_json::Value = rankings_resp
+            .json()
+            .await
+            .expect("rankings json");
+        assert_eq!(
+            rankings_json.get("stale").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            rankings_json
+                .get("generatedAt")
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last24h/primarySuccessTop")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            rankings_json
+                .pointer("/last24h/uniqueIpTop")
+                .and_then(|value| value.as_array())
+                .and_then(|value| value.first())
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+
+        let mut events_resp = client
+            .get(format!("http://{}/api/users/rankings/events", admin_addr))
+            .header(reqwest::header::COOKIE, admin_cookie)
+            .send()
+            .await
+            .expect("rankings sse request");
+        assert_eq!(events_resp.status(), reqwest::StatusCode::OK);
+
+        let snapshot_event = read_sse_event_until(
+            &mut events_resp,
+            |chunk| chunk.contains("event: snapshot"),
+            "rankings stale snapshot event",
+        )
+        .await;
+        let snapshot_json = decode_sse_json_text(&snapshot_event);
+        assert_eq!(
+            snapshot_json.get("stale").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot_json
+                .get("generatedAt")
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            snapshot_json
+                .pointer("/last24h/uniqueIpTop")
+                .and_then(|value| value.as_array())
+                .and_then(|value| value.first())
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut lock_conn)
+            .await
+            .expect("release writer lock");
+        lock_conn.close().await.expect("close lock connection");
+
+        drop(events_resp);
+        let _ = std::fs::remove_file(db_path);
+    }

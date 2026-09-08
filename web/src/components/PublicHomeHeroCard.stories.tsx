@@ -22,7 +22,7 @@ function HeroStory(args: HeroStoryArgs): JSX.Element {
   })()
 
   return (
-    <div style={{ maxWidth: 1120, margin: '0 auto' }}>
+    <div style={{ width: 'min(100%, 1120px)', minWidth: 0, maxWidth: 1120, margin: '0 auto', overflowX: 'clip' }}>
       <PublicHomeHeroCard
         {...args}
         adminActionLabel={resolvedAdminLabel}
@@ -39,7 +39,8 @@ function HeroStory(args: HeroStoryArgs): JSX.Element {
 }
 
 const baseArgs: HeroStoryArgs = {
-  loading: false,
+  metricsLoading: false,
+  summaryLoading: false,
   error: null,
   metrics: {
     monthlySuccess: 1240,
@@ -47,6 +48,8 @@ const baseArgs: HeroStoryArgs = {
   },
   availableKeys: 7,
   totalKeys: 12,
+  showAuthStatusLoading: false,
+  showAuthStatusUnavailable: false,
   showLinuxDoLogin: false,
   showRegistrationPausedNotice: false,
   showTokenAccessButton: false,
@@ -56,6 +59,7 @@ const baseArgs: HeroStoryArgs = {
 
 const meta = {
   title: 'Public/PublicHomeHeroCard',
+  tags: ['autodocs'],
   parameters: {
     layout: 'padded',
   },
@@ -66,12 +70,71 @@ export default meta
 
 type Story = StoryObj<typeof meta>
 
+export const AuthStatusCheckingSlowStats: Story = {
+  args: {
+    ...baseArgs,
+    metrics: null,
+    availableKeys: null,
+    totalKeys: null,
+    metricsLoading: true,
+    summaryLoading: true,
+    showAuthStatusLoading: true,
+    showTokenAccessButton: false,
+    showAdminAction: false,
+  },
+}
+
+export const AuthStatusUnavailable: Story = {
+  args: {
+    ...baseArgs,
+    showAuthStatusUnavailable: true,
+    showTokenAccessButton: true,
+    showAdminAction: false,
+  },
+}
+
 export const LoggedOutNoToken: Story = {
   args: {
     ...baseArgs,
     showLinuxDoLogin: true,
     showTokenAccessButton: true,
     showAdminAction: false,
+  },
+}
+
+export const LoadBalancerVisualProof: Story = {
+  args: {
+    ...baseArgs,
+    showLinuxDoLogin: true,
+    showTokenAccessButton: true,
+    showAdminAction: false,
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story:
+          'Owner-approved public hero load-balancer visual. The static image is the first-frame reference; motion layers only add subtle routing highlights.',
+      },
+    },
+  },
+}
+
+export const LoadBalancerVisualProofMobile: Story = {
+  args: {
+    ...baseArgs,
+    showLinuxDoLogin: true,
+    showTokenAccessButton: true,
+    showAdminAction: false,
+  },
+  parameters: {
+    viewport: { defaultViewport: '0390-device-iphone-14' },
+    docs: {
+      description: {
+        story:
+          'Mobile proof for the same load-balancer visual, verifying the image scales without cropped labels or route nodes.',
+      },
+    },
   },
 }
 

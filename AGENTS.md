@@ -9,17 +9,22 @@
 
 ## Build, Test, and Development Commands
 
+- Repo tooling
+  - `bun install --frozen-lockfile` — install root tooling deps and run the shared hook installer.
+  - `bun run hooks:install` — reinstall the shared `post-checkout` hook and refresh `lefthook` commit hooks when the binary is available on `PATH`.
+  - `bun run worktree:setup` — force a strict linked-worktree repair for env/deps/`cargo fetch`.
+  - `bun run test:worktree-bootstrap` — run the linked-worktree bootstrap smoke contract.
 - Backend
   - `cargo build` — compile the server.
   - `cargo run -- --help` — show CLI flags; `--bind/--port/--db-path` etc.
-  - `cargo fmt` — format Rust code; `cargo clippy -- -D warnings` — lint.
+  - `cargo fmt` — format Rust code; `cargo clippy --locked -j 2 -- -D warnings` — lint.
   - `cargo test` — run tests (add as you go).
 - Frontend (`web/`)
   - `bun install --frozen-lockfile` — install deps; `bun run --bun dev` — local dev (Vite under Bun runtime).
   - `bun run build` — build SPA to `web/dist`; `bun run preview` — preview build.
   - `bun run storybook` — run Storybook dev server at `http://127.0.0.1:56006`.
 - Hooks
-  - `lefthook install` — enable pre-commit (`cargo fmt`, `clippy`, Markdown format) and commitlint.
+  - `bun install --frozen-lockfile` or `bun run hooks:install` — install the shared `post-checkout` hook; if `lefthook` exists on `PATH`, also refresh pre-commit (`cargo fmt`, `clippy`, Markdown format) and commitlint.
 
 ## Coding Style & Naming Conventions
 
@@ -31,6 +36,7 @@
 
 - Rust: prefer module unit tests via `#[cfg(test)]` and integration tests under `tests/` when needed. Run with `cargo test`.
 - Frontend: no test tooling preconfigured; if introducing tests, prefer Vitest + React Testing Library in `web/`.
+- Backend execution: before selecting focused, shard, full, release, or Compose validation, read `docs/agents/testing.md`.
 
 ## Commit & Pull Request Guidelines
 
@@ -42,6 +48,20 @@
 
 - Configure keys via `.env` or env vars (`TAVILY_API_KEYS`).
 - Do not commit secrets or local DB files. Backend can serve `web/dist` when present.
+
+## Agent skills
+
+### Issue tracker
+
+Engineering work is tracked in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical five-role triage vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+The repository uses a single-context domain layout. See `docs/agents/domain.md`.
 
 ## Agent Runtime Conventions (Dev)
 
@@ -58,6 +78,13 @@
   - `scripts/start-frontend-dev.sh` automatically installs dependencies if `node_modules` is missing, then starts Vite with `bun run --bun dev`.
   - Build for static serving: `cd web && bun run build`, then run backend with `scripts/start-backend-dev.sh` so it picks up `web/dist`.
 
+- Linked worktrees:
+  - The first checkout in a linked worktree now runs a best-effort bootstrap through the shared `post-checkout` hook.
+  - Auto bootstrap only copies missing root `.env` / `.env.*` files from the primary worktree, restores missing root / `web` / `docs-site` Bun dependencies, and runs `cargo fetch --locked`.
+  - Auto bootstrap never blocks checkout; missing `lefthook`, `bun`, `cargo`, or source env files only warn.
+  - `bun run worktree:setup` is the explicit strict repair entrypoint.
+  - The contract intentionally does not restore `*.db`, `web/dist`, `web/storybook-static`, `downloads/`, browser caches, or other runtime artifacts.
+
 - Stop services:
   - Use the process manager or shell session that launched each service.
   - Avoid terminating unrelated sessions; only stop processes you started for this task.
@@ -69,11 +96,11 @@
 
 - Storybook:
   - Start: `cd web && bun install --frozen-lockfile && bun run storybook` → `http://127.0.0.1:56006` (Storybook CLI forced through Bun runtime by the package script).
-  - Keep it in the current shell for short sessions, or run it under any team-approved background strategy.
+  - 仅在任务需要 Storybook 的 UI/浏览器验证时，于验证期间将其保留在当前 shell 或使用团队认可的后台策略；验证完成后释放该进程和会话。
 
 - Validation:
-  - Keep Playwright/Chrome DevTools sessions open for review; verify `/api/*`, `/mcp`, and SPA routes.
-  - Health: `curl -s http://127.0.0.1:58087/health` → `200`; Summary: `curl -s http://127.0.0.1:58087/api/summary | jq .`.
+  - 当任务需要交互验收、UI/浏览器验证或 HTTP 集成测试时，保持相关的 Playwright/Chrome DevTools 会话以供复核，并验证任务涉及的 `/api/*`、`/mcp` 和 SPA 路由。
+  - 后端服务参与该验证时，Health: `curl -s http://127.0.0.1:58087/health` → `200`; Summary: `curl -s http://127.0.0.1:58087/api/summary | jq .`.
 
 **IMPORTANT**
 
@@ -82,9 +109,11 @@
 ### Project-Specific Notes
 
 - 2025-03-??: During high-anonymity testing we accidentally hit the official Tavily MCP endpoint. All future tests must target a local/mock upstream. Never hit production Tavily without explicit approval.
-- daisyUI llms.txt: https://daisyui.com/llms.txt give me a light daisyUI 5 theme with tropical color palette
 
-## Agent Review Prep
+## Local Service Review
 
-- 工作收尾时，心羽需确保后端服务正在运行（dev 模式可加 `--dev-open-admin`），以便主人可以立即访问 `/` 或 `/admin` 进行验收。若需关闭服务，必须先征得主人确认再停。
-- 心羽在“工作就绪”进入评审前，必须确保开发服务器已就绪：后端监听在 `127.0.0.1:58087` 且健康检查通过，前端 Vite Dev Server 运行在 `127.0.0.1:55173`，页面可直接打开并完成交互验证（必要时保持 Playwright 会话开启供主人复查）。
+- 仅在主人要求交互验收、任务的 UI/浏览器验证，或集成测试需要运行中的应用时，启动本地后端或前端服务。
+- 对文档、配置、构建、CI 与其他非交互任务，使用任务对应的验证；完成工作本身不启动或保留本地服务、浏览器会话或固定端口。
+- 启动服务时说明用途并限定于当前任务；仅管理当前任务启动的进程，并保留不终止无关进程的安全边界。
+- 交付 localhost URL 时，仅在已请求的复核或验证期间保持相应端口和会话，并遵守全局端口租约规则。
+- 相关复核或验证结束后，关闭当前任务打开的浏览器会话，停止当前任务启动的服务并释放所持端口；不得影响无关进程。

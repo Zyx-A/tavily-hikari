@@ -1,17 +1,31 @@
+import BrandLockup from '../components/BrandLockup'
 import { Icon } from '../lib/icons'
-import { createContext, type PropsWithChildren, type ReactNode, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, type PropsWithChildren, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ADMIN_SIDEBAR_STACK_MAX, useResponsiveModes } from '../lib/responsive'
 
 import AdminNavButton from './AdminNavButton'
-import type { AdminModuleId } from './routes'
+import type { AdminAnalysisView, AdminModuleId } from './routes'
 
-export type AdminNavTarget = AdminModuleId | 'user-usage'
+export type AdminNavTarget =
+  | AdminModuleId
+  | 'analysis-usage'
+  | 'analysis-rankings'
+  | 'analysis-pressure'
+  | 'system-settings-status'
+  | 'system-settings-admin'
+  | 'system-settings-ha'
+
+export interface AdminNavSubItem {
+  target: AdminNavTarget
+  label: string
+}
 
 export interface AdminNavItem {
   target: AdminNavTarget
   label: string
   icon: ReactNode
+  children?: AdminNavSubItem[]
 }
 
 interface AdminShellProps extends PropsWithChildren {
@@ -37,6 +51,7 @@ export default function AdminShell({
 }: AdminShellProps): JSX.Element {
   const contentRef = useRef<HTMLElement>(null)
   const { viewportMode, contentMode, isCompactLayout } = useResponsiveModes(contentRef)
+  const activeLayoutClass = `admin-layout--${activeItem.replaceAll('_', '-')}`
   const [isStackedSidebar, setIsStackedSidebar] = useState<boolean>(() => readStackedSidebarMode())
   const [isMenuOpen, setIsMenuOpen] = useState(false)
   const [sidebarUtilityHost, setSidebarUtilityHost] = useState<HTMLDivElement | null>(null)
@@ -74,10 +89,15 @@ export default function AdminShell({
     }
   }, [isMenuOpen, isStackedSidebar])
 
+  const handleSelectItem = useCallback((target: AdminNavTarget) => {
+    if (isStackedSidebar) setIsMenuOpen(false)
+    onSelectItem(target)
+  }, [isStackedSidebar, onSelectItem])
+
   return (
     <AdminSidebarUtilityContext.Provider value={sidebarUtilityHost}>
       <div
-        className={`admin-layout viewport-${viewportMode} content-${contentMode}${isCompactLayout ? ' is-compact-layout' : ''}`}
+        className={`admin-layout ${activeLayoutClass} viewport-${viewportMode} content-${contentMode}${isCompactLayout ? ' is-compact-layout' : ''}`}
       >
         <a className="admin-skip-link" href="#admin-main-content">
           {skipToContentLabel}
@@ -94,10 +114,12 @@ export default function AdminShell({
 
         <aside className={`admin-sidebar surface${isStackedSidebar ? ' is-stacked' : ''}`} aria-label="Admin navigation">
           <div className="admin-sidebar-topbar">
-            <div className="admin-sidebar-brand">
-              <span className="admin-sidebar-brand-dot" aria-hidden="true" />
-              <span>Tavily Hikari</span>
-            </div>
+            <BrandLockup
+              title="Tavily Hikari"
+              variant="responsive"
+              className="admin-sidebar-brand"
+              markClassName="admin-sidebar-brand-mark"
+            />
             {isStackedSidebar && (
               <button
                 type="button"
@@ -115,19 +137,38 @@ export default function AdminShell({
             <nav id="admin-sidebar-nav" className="admin-sidebar-nav">
               {navItems.map((item) => {
                 const active = item.target === activeItem
+                const childActive = item.children?.some((child) => child.target === activeItem) ?? false
                 return (
-                  <AdminNavButton
-                    key={item.target}
-                    icon={item.icon}
-                    active={active}
-                    onClick={() => onSelectItem(item.target)}
-                  >
-                    <span>{item.label}</span>
-                  </AdminNavButton>
+                  <div key={item.target} className="admin-nav-group">
+                    <AdminNavButton
+                      icon={item.icon}
+                      active={active}
+                      className={childActive ? 'admin-nav-item-parent-active' : undefined}
+                      onClick={() => handleSelectItem(item.target)}
+                    >
+                      <span>{item.label}</span>
+                    </AdminNavButton>
+                    {item.children && item.children.length > 0 && (
+                      <div className="admin-nav-subitems" aria-label={item.label}>
+                        {item.children.map((child) => (
+                          <button
+                            key={child.target}
+                            type="button"
+                            className={`admin-nav-subitem${child.target === activeItem ? ' admin-nav-subitem-active' : ''}`}
+                            aria-current={child.target === activeItem ? 'page' : undefined}
+                            onClick={() => handleSelectItem(child.target)}
+                          >
+                            <span className="admin-nav-subitem-marker" aria-hidden="true" />
+                            <span>{child.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )
               })}
             </nav>
-            <div ref={setSidebarUtilityHost} className="admin-sidebar-utility admin-desktop-only" />
+            <div ref={setSidebarUtilityHost} className="admin-sidebar-utility" />
           </div>
         </aside>
 
@@ -148,7 +189,7 @@ export function AdminShellSidebarUtility({ children }: PropsWithChildren): JSX.E
   const host = useContext(AdminSidebarUtilityContext)
 
   if (!host) {
-    return <div className="admin-sidebar-utility admin-sidebar-utility-fallback admin-desktop-only">{children}</div>
+    return null
   }
 
   return createPortal(children, host)

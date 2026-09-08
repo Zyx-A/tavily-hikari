@@ -1,11 +1,58 @@
-import type { ApiKeyStats, AuthToken, JobLogView, RequestLog } from '../api'
-import type { AdminModuleId } from './routes'
+import { useId, useMemo } from 'react'
+
+import type {
+  AlertGroup,
+  DashboardHourlyRequestWindow,
+  DashboardRollupIntegrityStatus,
+  DashboardMonthSeries,
+  JobLogView,
+  RecentAlertsSummary,
+  RequestLog,
+  SummaryWindowsResponse,
+} from '../api'
+import RollingNumber from '../components/RollingNumber'
+import { StatusBadge, type StatusTone } from '../components/StatusBadge'
+import { Line } from 'react-chartjs-2'
+import {
+  CategoryScale,
+  Chart as ChartJS,
+  Filler,
+  Legend,
+  LinearScale,
+  LineElement,
+  PointElement,
+  Tooltip,
+  type ChartData,
+  type ChartOptions,
+} from 'chart.js'
+import DashboardTrendPanel from './DashboardTrendPanel'
+import {
+  type DashboardCreditSeriesId,
+  type DashboardHourlyChartMode,
+  type DashboardResultSeriesId,
+  type DashboardTypeSeriesId,
+} from './dashboardHourlyCharts'
+import {
+  buildMonthSeriesBackdropSeries,
+  buildPeriodBackdropSeries,
+  getBackdropMetricKey,
+  type DashboardBackdropMetricKey,
+  type DashboardCardBackdropMap,
+  type DashboardCardBackdropSeries,
+} from './dashboardCardBackdrops'
+
+ChartJS.register(CategoryScale, LinearScale, LineElement, PointElement, Filler, Tooltip, Legend)
 
 export interface DashboardMetricCard {
   id: string
   label: string
   value: string
+  valueNumber?: number
+  marker?: string
+  markerTone?: 'primary' | 'secondary' | 'neutral'
+  valueMeta?: string
   subtitle?: string
+  fullWidth?: boolean
   comparison?: {
     label: string
     value: string
@@ -14,9 +61,23 @@ export interface DashboardMetricCard {
   }
 }
 
-export interface DashboardOverviewStrings {
+export interface DashboardQuotaChargeCardData {
   title: string
-  description: string
+  localLabel: string
+  localValue: string
+  localValueNumber?: number
+  upstreamLabel: string
+  upstreamValue: string
+  upstreamValueNumber?: number
+  deltaLabel: string
+  deltaValue: string
+  deltaValueNumber?: number
+  deltaTone?: 'positive' | 'negative' | 'neutral'
+  coverage: string
+  freshness: string
+}
+
+export interface DashboardOverviewStrings {
   loading: string
   summaryUnavailable: string
   statusUnavailable: string
@@ -24,76 +85,140 @@ export interface DashboardOverviewStrings {
   todayDescription: string
   monthTitle: string
   monthDescription: string
+  monthComparisonEmpty: string
   currentStatusTitle: string
   currentStatusDescription: string
   trendsTitle: string
   trendsDescription: string
   requestTrend: string
   errorTrend: string
-  riskTitle: string
-  riskDescription: string
-  riskEmpty: string
+  chartModeResults: string
+  chartModeTypes: string
+  chartModeCredits: string
+  chartModeResultsArea: string
+  chartModeTypesArea: string
+  chartModeCreditsArea: string
+  chartVisibleSeries: string
+  chartEmpty: string
+  chartUtcWindow: string
+  chartRollingWindow: string
+  chartIntegrityHealthy: string
+  chartIntegrityRepairing: string
+  chartIntegrityDegraded: string
+  chartIntegrityLastVerified: string
+  chartResultSecondarySuccess: string
+  chartResultPrimarySuccess: string
+  chartResultSecondaryFailure: string
+  chartResultPrimaryFailure429: string
+  chartResultPrimaryFailureOther: string
+  chartResultUnknown: string
+  chartTypeMcpNonBillable: string
+  chartTypeMcpBillable: string
+  chartTypeApiNonBillable: string
+  chartTypeApiBillable: string
+  chartCreditLocalEstimate: string
+  chartCreditUpstreamActual: string
   actionsTitle: string
   actionsDescription: string
   recentRequests: string
   recentJobs: string
-  openModule: string
-  openToken: string
-  openKey: string
-  disabledTokenRisk: string
-  exhaustedKeyRisk: string
-  failedJobRisk: string
-  tokenCoverageTruncated: string
-  tokenCoverageError: string
+  recentAlertsTitle: string
+  recentAlertsDescription: string
+  recentAlertsOverviewTitle: string
+  recentAlertsOverviewSummary: string
+  recentAlertsCurrentWindow: string
+  recentAlertsWindowLabels: {
+    hour1: string
+    hour24: string
+    day7: string
+  }
+  recentAlertsColumns: {
+    alert: string
+    requestKind: string
+    timeRange: string
+    hits: string
+    review: string
+  }
+  recentAlertsHits: string
+  recentAlertsTimeRange: string
+  recentAlertsEmpty: string
+  recentAlertsOpen: string
+  recentAlertsOpenGroup: string
+  recentAlertsOpenUser: string
+  recentAlertsTypeLabels: Record<
+    | 'upstream_rate_limited_429'
+    | 'upstream_usage_limit_432'
+    | 'upstream_key_blocked'
+    | 'user_request_rate_limited'
+    | 'user_quota_exhausted'
+    | 'api_key_exhausted'
+    | 'job_failed',
+    string
+  >
 }
+
+export type DashboardRecentAlertGroup = AlertGroup
 
 interface DashboardOverviewProps {
   strings: DashboardOverviewStrings
   overviewReady: boolean
   statusLoading: boolean
   todayMetrics: DashboardMetricCard[]
+  todayQuotaCharge?: DashboardQuotaChargeCardData | null
   monthMetrics: DashboardMetricCard[]
+  monthQuotaCharge?: DashboardQuotaChargeCardData | null
   statusMetrics: DashboardMetricCard[]
-  trend: {
-    request: number[]
-    error: number[]
-  }
-  tokenCoverage: 'ok' | 'truncated' | 'error'
-  tokens: AuthToken[]
-  keys: ApiKeyStats[]
+  summaryWindows?: SummaryWindowsResponse | null
+  hourlyRequestWindow: DashboardHourlyRequestWindow
+  rollupIntegrity: DashboardRollupIntegrityStatus
+  monthSeries?: DashboardMonthSeries | null
   logs: RequestLog[]
   jobs: JobLogView[]
-  onOpenModule: (module: AdminModuleId) => void
-  onOpenToken: (id: string) => void
-  onOpenKey: (id: string) => void
+  recentAlerts: RecentAlertsSummary
+  onOpenRecentAlerts: () => void
+  onOpenRecentAlertGroup?: (group: DashboardRecentAlertGroup) => void
+  onOpenUser?: (id: string) => void
+  initialChartMode?: DashboardHourlyChartMode
+  initialVisibleResultSeries?: ReadonlyArray<DashboardResultSeriesId>
+  initialVisibleTypeSeries?: ReadonlyArray<DashboardTypeSeriesId>
+  initialVisibleCreditSeries?: ReadonlyArray<DashboardCreditSeriesId>
+  chartPersistenceKey?: string | null
+  chartLabelTimeZone?: string | null
 }
 
-function toPoints(values: number[]): string {
-  if (values.length === 0) return ''
-  const max = Math.max(...values, 1)
-  const min = Math.min(...values, 0)
-  const width = 220
-  const height = 64
-  return values
-    .map((value, index) => {
-      const x = values.length === 1 ? 0 : (index / (values.length - 1)) * width
-      const normalized = (value - min) / Math.max(max - min, 1)
-      const y = height - normalized * height
-      return `${x.toFixed(2)},${y.toFixed(2)}`
-    })
-    .join(' ')
+function readChartColorVar(name: string, fallback: string): string {
+  if (typeof document === 'undefined') return fallback
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return value.length > 0 ? `hsl(${value})` : fallback
 }
 
-function Sparkline({ values }: { values: number[] }): JSX.Element {
-  const points = toPoints(values)
-  return (
-    <svg viewBox="0 0 220 64" className="dashboard-sparkline" aria-hidden="true" preserveAspectRatio="none">
-      <polyline points={points} fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
-    </svg>
-  )
+function withOpacity(color: string, opacity: number): string {
+  return color.startsWith('hsl(') && color.endsWith(')')
+    ? `${color.slice(0, -1)} / ${opacity})`
+    : color
 }
 
-function MetricValue({ value, compact = false }: { value: string; compact?: boolean }): JSX.Element {
+function buildCumulativeNullableSeries(
+  values: ReadonlyArray<number | null>,
+  initialValue = 0,
+): Array<number | null> {
+  let runningTotal = initialValue
+  return values.map((value) => {
+    if (value == null) return null
+    runningTotal += Math.max(0, value)
+    return runningTotal
+  })
+}
+
+function MetricValue({
+  value,
+  valueNumber,
+  compact = false,
+}: {
+  value: string
+  valueNumber?: number
+  compact?: boolean
+}): JSX.Element {
   const splitValue = value.split(' / ')
   if (splitValue.length === 2) {
     return (
@@ -104,10 +229,28 @@ function MetricValue({ value, compact = false }: { value: string; compact?: bool
     )
   }
 
+  if (typeof valueNumber === 'number' && Number.isFinite(valueNumber)) {
+    return (
+      <div className={`metric-value dashboard-metric-value${compact ? ' dashboard-metric-value-compact' : ''}`}>
+        <RollingNumber value={valueNumber} />
+      </div>
+    )
+  }
+
   return <div className="metric-value dashboard-metric-value">{value}</div>
 }
 
-function SummaryMetricCard({ metric, compact = false }: { metric: DashboardMetricCard; compact?: boolean }): JSX.Element {
+function SummaryMetricCard({
+  metric,
+  compact = false,
+  backdrop,
+  backdropNotice,
+}: {
+  metric: DashboardMetricCard
+  compact?: boolean
+  backdrop?: DashboardCardBackdropSeries
+  backdropNotice?: string | null
+}): JSX.Element {
   const deltaTone = metric.comparison?.tone ?? (
     metric.comparison?.direction === 'flat'
       ? 'neutral'
@@ -117,30 +260,287 @@ function SummaryMetricCard({ metric, compact = false }: { metric: DashboardMetri
   )
 
   return (
-    <div className={`metric-card dashboard-summary-card${compact ? ' dashboard-summary-card-compact' : ''}`}>
-      <h3>{metric.label}</h3>
-      <MetricValue value={metric.value} compact={compact} />
-      {metric.comparison ? (
-        <div className={`metric-delta metric-delta-${deltaTone}`}>
-          <span className="metric-delta-label">{metric.comparison.label}</span>
-          <span className="metric-delta-value">{metric.comparison.value}</span>
-        </div>
-      ) : metric.subtitle ? (
-        <div className="metric-subtitle">{metric.subtitle}</div>
+    <div
+      className={`metric-card dashboard-summary-card${backdrop ? ' dashboard-summary-card-with-backdrop' : ''}${compact ? ' dashboard-summary-card-compact' : ''}${metric.fullWidth ? ' dashboard-summary-card-full-width' : ''}`}
+    >
+      {backdrop ? (
+        <DashboardUsageBackdropChart
+          ariaLabel={metric.label}
+          className="dashboard-summary-card-backdrop"
+          primaryValues={backdrop.current}
+          comparisonValues={backdrop.comparison}
+          primaryColor={backdrop.color ?? readChartColorVar('--primary', 'hsl(262 83% 58%)')}
+          comparisonColor={backdrop.comparisonColor}
+          primaryInitialValue={backdrop.baseline ?? 0}
+          comparisonInitialValue={backdrop.baseline ?? 0}
+        />
       ) : null}
-      {metric.comparison && metric.subtitle ? <div className="metric-subtitle">{metric.subtitle}</div> : null}
+      <div className="dashboard-summary-card-content">
+        <div className="dashboard-summary-card-heading">
+          <h3>{metric.label}</h3>
+          {metric.marker ? (
+            <span className={`dashboard-summary-card-marker dashboard-summary-card-marker-${metric.markerTone ?? 'neutral'}`}>
+              {metric.marker}
+            </span>
+          ) : null}
+        </div>
+        <div className="dashboard-summary-card-value-row">
+          <MetricValue value={metric.value} valueNumber={metric.valueNumber} compact={compact} />
+        </div>
+        {metric.comparison ? (
+          <div className="dashboard-summary-card-comparison-stack">
+            {metric.valueMeta ? <div className="dashboard-summary-card-value-meta">{metric.valueMeta}</div> : null}
+            <div className={`metric-delta metric-delta-${deltaTone}`}>
+              <span className="metric-delta-label">{metric.comparison.label}</span>
+              <span className="metric-delta-value">{metric.comparison.value}</span>
+            </div>
+          </div>
+        ) : metric.subtitle ? (
+          <div className="metric-subtitle">{metric.subtitle}</div>
+        ) : null}
+        {metric.comparison && metric.subtitle ? <div className="metric-subtitle">{metric.subtitle}</div> : null}
+        {!metric.comparison && backdropNotice ? <div className="metric-subtitle">{backdropNotice}</div> : null}
+      </div>
     </div>
   )
 }
 
-function TodayMetricCard({ metric }: { metric: DashboardMetricCard }): JSX.Element {
+function QuotaChargeCard({
+  card,
+  backdrop,
+}: {
+  card: DashboardQuotaChargeCardData
+  backdrop?: DashboardCardBackdropSeries
+}): JSX.Element {
   return (
-    <div className="metric-card dashboard-summary-card dashboard-today-card">
-      <h3>{metric.label}</h3>
-      <MetricValue value={metric.value} />
-      {metric.subtitle ? <div className="metric-subtitle">{metric.subtitle}</div> : null}
+    <article className="metric-card dashboard-summary-card dashboard-summary-card-with-backdrop dashboard-quota-charge-card">
+      {backdrop ? (
+        <DashboardUsageBackdropChart
+          ariaLabel={card.title}
+          className="dashboard-summary-card-backdrop"
+          primaryValues={backdrop.current}
+          comparisonValues={backdrop.comparison}
+          primaryColor={backdrop.color ?? readChartColorVar('--primary', 'hsl(262 83% 58%)')}
+          comparisonColor={backdrop.comparisonColor}
+          primaryInitialValue={backdrop.baseline ?? 0}
+          comparisonInitialValue={backdrop.baseline ?? 0}
+        />
+      ) : null}
+      <div className="dashboard-summary-card-content">
+        <div className="dashboard-summary-card-heading">
+          <h3>{card.title}</h3>
+        </div>
+        <div className="dashboard-quota-charge-grid">
+          <div className="dashboard-quota-charge-value">
+            <span className="dashboard-quota-charge-label">{card.localLabel}</span>
+            <MetricValue value={card.localValue} valueNumber={card.localValueNumber} />
+          </div>
+          <div className="dashboard-quota-charge-value">
+            <span className="dashboard-quota-charge-label">{card.upstreamLabel}</span>
+            <MetricValue value={card.upstreamValue} valueNumber={card.upstreamValueNumber} />
+          </div>
+        </div>
+        <div className="dashboard-quota-charge-footer">
+          <div className={`metric-delta metric-delta-${card.deltaTone ?? 'neutral'}`}>
+            <span className="metric-delta-label">{card.deltaLabel}</span>
+            <span className="metric-delta-value">{card.deltaValue}</span>
+          </div>
+          <div className="dashboard-quota-charge-meta">
+            <span>{card.coverage}</span>
+            <span>{card.freshness}</span>
+          </div>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+function DashboardUsageBackdropChart({
+  ariaLabel,
+  primaryValues,
+  primaryColor,
+  comparisonValues,
+  comparisonColor,
+  primaryInitialValue = 0,
+  comparisonInitialValue = 0,
+  className,
+}: {
+  ariaLabel: string
+  primaryValues: ReadonlyArray<number | null>
+  primaryColor: string
+  comparisonValues?: ReadonlyArray<number | null>
+  comparisonColor?: string
+  primaryInitialValue?: number
+  comparisonInitialValue?: number
+  className?: string
+}): JSX.Element | null {
+  const chartData = useMemo<ChartData<'line'>>(() => {
+    if (primaryValues.length === 0) {
+      return { labels: [], datasets: [] }
+    }
+
+    const labels = primaryValues.map((_, index) => String(index + 1))
+    const datasets: ChartData<'line'>['datasets'] = [
+      {
+        label: 'current',
+        data: buildCumulativeNullableSeries(primaryValues, primaryInitialValue),
+        borderColor: primaryColor,
+        backgroundColor: withOpacity(primaryColor, 0.12),
+        fill: true,
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHitRadius: 0,
+        tension: 0.38,
+        spanGaps: false,
+        order: 1,
+      },
+    ]
+
+    if (comparisonValues && comparisonValues.length > 0) {
+      datasets.push({
+        label: 'comparison',
+        data: buildCumulativeNullableSeries(comparisonValues, comparisonInitialValue),
+        borderColor: comparisonColor ?? primaryColor,
+        backgroundColor: 'transparent',
+        fill: false,
+        borderWidth: 1.5,
+        borderDash: [5, 4],
+        pointRadius: 0,
+        pointHitRadius: 0,
+        tension: 0.34,
+        spanGaps: false,
+        order: 0,
+      })
+    }
+
+    return { labels, datasets }
+  }, [comparisonColor, comparisonInitialValue, comparisonValues, primaryColor, primaryInitialValue, primaryValues])
+
+  const chartOptions = useMemo<ChartOptions<'line'>>(() => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: {
+      duration: 560,
+      easing: 'easeOutCubic',
+    },
+    events: [],
+    plugins: {
+      legend: { display: false },
+      tooltip: { enabled: false },
+    },
+    layout: {
+      padding: 0,
+    },
+    elements: {
+      line: {
+        borderCapStyle: 'round',
+        borderJoinStyle: 'round',
+      },
+    },
+    scales: {
+      x: {
+        display: false,
+        grid: { display: false },
+        border: { display: false },
+      },
+      y: {
+        display: false,
+        grid: { display: false },
+        border: { display: false },
+      },
+    },
+  }), [])
+
+  if (chartData.datasets.length === 0) return null
+
+  return (
+    <div className={className} aria-hidden="true">
+      <Line aria-label={ariaLabel} options={chartOptions} data={chartData} />
     </div>
   )
+}
+
+function alertSummaryTone(type: keyof DashboardOverviewStrings['recentAlertsTypeLabels']): StatusTone {
+  switch (type) {
+    case 'api_key_exhausted':
+    case 'job_failed':
+    case 'upstream_key_blocked':
+    case 'user_quota_exhausted':
+      return 'error'
+    case 'upstream_usage_limit_432':
+    case 'upstream_rate_limited_429':
+    case 'user_request_rate_limited':
+      return 'warning'
+    default:
+      return 'neutral'
+  }
+}
+
+function formatAlertRange(timestamp: number): string {
+  const parsed = new Date(timestamp * 1000)
+  const month = String(parsed.getMonth() + 1).padStart(2, '0')
+  const day = String(parsed.getDate()).padStart(2, '0')
+  const hours = String(parsed.getHours()).padStart(2, '0')
+  const minutes = String(parsed.getMinutes()).padStart(2, '0')
+  const seconds = String(parsed.getSeconds()).padStart(2, '0')
+  return `${month}/${day} ${hours}:${minutes}:${seconds}`
+}
+
+function compactWindowCountLabel(
+  strings: DashboardOverviewStrings,
+  windowHours: number,
+): string {
+  switch (windowHours) {
+    case 1:
+      return strings.recentAlertsWindowLabels.hour1.replace('Last ', '').replace('最近 ', '')
+    case 24:
+      return strings.recentAlertsWindowLabels.hour24.replace('Last ', '').replace('最近 ', '')
+    case 24 * 7:
+      return strings.recentAlertsWindowLabels.day7.replace('Last ', '').replace('最近 ', '')
+    default:
+      return `${windowHours}h`
+  }
+}
+
+function extractRecentAlertWindowMinutes(group: DashboardRecentAlertGroup): number | null {
+  const eventWindowMinutes = group.latestEvent.semanticWindow?.windowMinutes
+  if (typeof eventWindowMinutes === 'number' && eventWindowMinutes > 0) {
+    return eventWindowMinutes
+  }
+
+  const windowText = [
+    group.latestEvent.summary,
+    group.latestEvent.errorMessage,
+  ].filter(Boolean).join(' ')
+  const match = windowText.match(/\b(?:rolling\s+)?(\d+)m\b/i) ?? windowText.match(/\bwindow=(\d+)m\b/i)
+  if (match) {
+    const parsed = Number.parseInt(match[1] ?? '', 10)
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed
+    }
+  }
+
+  return typeof group.semanticWindowMinutes === 'number' && group.semanticWindowMinutes > 0
+    ? group.semanticWindowMinutes
+    : null
+}
+
+function getRecentAlertRateWindowLabel(group: DashboardRecentAlertGroup): string | null {
+  const windowMinutes = extractRecentAlertWindowMinutes(group)
+  return windowMinutes != null ? `${windowMinutes}m window` : null
+}
+
+function getRecentAlertReasonBadgeLabel(group: DashboardRecentAlertGroup, typeLabel: string): string {
+  const parts = [typeLabel]
+  if (group.type === 'user_request_rate_limited') {
+    const windowLabel = getRecentAlertRateWindowLabel(group)
+    if (windowLabel) parts.push(windowLabel)
+  }
+  return parts.join(' · ')
+}
+
+function formatAlertDateTimeIso(timestamp: number): string {
+  return new Date(timestamp * 1000).toISOString()
 }
 
 export default function DashboardOverview({
@@ -148,82 +548,349 @@ export default function DashboardOverview({
   overviewReady,
   statusLoading,
   todayMetrics,
+  todayQuotaCharge,
   monthMetrics,
+  monthQuotaCharge,
   statusMetrics,
-  trend,
-  tokenCoverage,
-  tokens,
-  keys,
+  summaryWindows,
+  hourlyRequestWindow,
+  rollupIntegrity,
+  monthSeries,
   logs,
   jobs,
-  onOpenModule,
-  onOpenToken,
-  onOpenKey,
+  recentAlerts,
+  onOpenRecentAlerts,
+  onOpenRecentAlertGroup,
+  onOpenUser,
+  initialChartMode,
+  initialVisibleResultSeries,
+  initialVisibleTypeSeries,
+  initialVisibleCreditSeries,
+  chartPersistenceKey,
+  chartLabelTimeZone,
 }: DashboardOverviewProps): JSX.Element {
-  const disabledTokens = tokens.filter((item) => !item.enabled).slice(0, 5)
-  const exhaustedKeys = keys.filter((item) => item.status === 'exhausted').slice(0, 5)
-  const failingJobs = jobs
-    .filter((item) => {
-      const normalized = item.status.trim().toLowerCase()
-      return normalized === 'error' || normalized === 'failed'
-    })
-    .slice(0, 5)
+  const recentAlertsTableId = useId()
+  const recentAlertsAlertHeaderId = `${recentAlertsTableId}-alert`
+  const recentAlertsWindowHeaderId = `${recentAlertsTableId}-window`
+  const recentAlertsReviewHeaderId = `${recentAlertsTableId}-review`
 
-  const riskItems: Array<{ id: string; label: string; action?: () => void }> = []
-  if (tokenCoverage === 'truncated') {
-    riskItems.push({
-      id: 'token-coverage-truncated',
-      label: strings.tokenCoverageTruncated,
-      action: () => onOpenModule('tokens'),
-    })
-  }
-  if (tokenCoverage === 'error') {
-    riskItems.push({
-      id: 'token-coverage-error',
-      label: strings.tokenCoverageError,
-      action: () => onOpenModule('tokens'),
-    })
-  }
-  for (const token of disabledTokens) {
-    riskItems.push({
-      id: `token-${token.id}`,
-      label: strings.disabledTokenRisk.replace('{id}', token.id),
-      action: () => onOpenToken(token.id),
-    })
-  }
-  for (const key of exhaustedKeys) {
-    riskItems.push({
-      id: `key-${key.id}`,
-      label: strings.exhaustedKeyRisk.replace('{id}', key.id),
-      action: () => onOpenKey(key.id),
-    })
-  }
-  for (const job of failingJobs) {
-    riskItems.push({
-      id: `job-${job.id}`,
-      label: strings.failedJobRisk.replace('{id}', String(job.id)).replace('{status}', job.status),
-      action: () => onOpenModule('jobs'),
-    })
+  const openRecentAlertGroup = (group: DashboardRecentAlertGroup): void => {
+    if (onOpenRecentAlertGroup) {
+      onOpenRecentAlertGroup(group)
+      return
+    }
+    onOpenRecentAlerts()
   }
 
   const hasTodaySummary = todayMetrics.length > 0
   const hasMonthSummary = monthMetrics.length > 0
   const hasStatusSummary = statusMetrics.length > 0
+  const todayTotalMetric = todayMetrics.find((metric) => metric.id === 'today-total') ?? null
+  const todayDetailMetrics = todayMetrics.filter((metric) => metric.id !== 'today-total')
+  const monthTotalMetric = monthMetrics.find((metric) => metric.id === 'month-total') ?? null
+  const monthDetailMetrics = monthMetrics.filter((metric) => metric.id !== 'month-total')
+  const summaryWindowValues = summaryWindows ?? {
+    today: {
+      total_requests: 0,
+      success_count: 0,
+      error_count: 0,
+      quota_exhausted_count: 0,
+      valuable_success_count: 0,
+      valuable_failure_count: 0,
+      other_success_count: 0,
+      other_failure_count: 0,
+      unknown_count: 0,
+      upstream_exhausted_key_count: 0,
+      new_keys: 0,
+      new_quarantines: 0,
+    },
+    yesterday: {
+      total_requests: 0,
+      success_count: 0,
+      error_count: 0,
+      quota_exhausted_count: 0,
+      valuable_success_count: 0,
+      valuable_failure_count: 0,
+      other_success_count: 0,
+      other_failure_count: 0,
+      unknown_count: 0,
+      upstream_exhausted_key_count: 0,
+      new_keys: 0,
+      new_quarantines: 0,
+    },
+    month: {
+      total_requests: 0,
+      success_count: 0,
+      error_count: 0,
+      quota_exhausted_count: 0,
+      valuable_success_count: 0,
+      valuable_failure_count: 0,
+      other_success_count: 0,
+      other_failure_count: 0,
+      unknown_count: 0,
+      upstream_exhausted_key_count: 0,
+      new_keys: 0,
+      new_quarantines: 0,
+    },
+    today_start: 0,
+    today_end: 0,
+    yesterday_start: 0,
+    yesterday_end: 0,
+    month_start: 0,
+    month_end: 0,
+  }
+  const backdropColors = {
+    today: readChartColorVar('--primary', 'hsl(262 83% 58%)'),
+    yesterday: readChartColorVar('--secondary', 'hsl(330 80% 51%)'),
+    month: readChartColorVar('--info', 'hsl(199 89% 48%)'),
+  }
+  const comparisonRangeStart = summaryWindowValues.yesterday_start
+  const comparisonRangeEnd = summaryWindowValues.today_start
+  const todayPeriodEnd = summaryWindowValues.today_period_end ?? summaryWindowValues.today_end
+  const monthSeriesValue = monthSeries ?? { current: [], comparison: [] }
+  const todayBackdrop = useMemo(
+    () => buildPeriodBackdropSeries({
+      hourlyRequestWindow,
+      currentValueRange: {
+        rangeStart: summaryWindowValues.today_start,
+        rangeEnd: summaryWindowValues.today_end,
+      },
+      currentDisplayRange: {
+        rangeStart: summaryWindowValues.today_start,
+        rangeEnd: todayPeriodEnd,
+      },
+      comparisonValueRange: {
+        rangeStart: comparisonRangeStart,
+        rangeEnd: comparisonRangeEnd,
+      },
+      comparisonDisplayRange: {
+        rangeStart: comparisonRangeStart,
+        rangeEnd: comparisonRangeEnd,
+      },
+      displayBucketSeconds: 3600,
+      metricKey: 'total',
+    }),
+    [
+      comparisonRangeEnd,
+      comparisonRangeStart,
+      hourlyRequestWindow,
+      summaryWindowValues.today_end,
+      summaryWindowValues.today_start,
+      todayPeriodEnd,
+    ],
+  )
+  const todayCardBackdrops = useMemo<DashboardCardBackdropMap>(() => (
+    {
+      total: {
+        ...todayBackdrop,
+        color: backdropColors.today,
+        comparisonColor: backdropColors.yesterday,
+      },
+      valuableSuccess: {
+        ...buildPeriodBackdropSeries({
+          hourlyRequestWindow,
+          currentValueRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: summaryWindowValues.today_end,
+          },
+          currentDisplayRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: todayPeriodEnd,
+          },
+          comparisonValueRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          comparisonDisplayRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          displayBucketSeconds: 3600,
+          metricKey: 'valuableSuccess',
+        }),
+        color: backdropColors.today,
+        comparisonColor: backdropColors.yesterday,
+      },
+      valuableFailure: {
+        ...buildPeriodBackdropSeries({
+          hourlyRequestWindow,
+          currentValueRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: summaryWindowValues.today_end,
+          },
+          currentDisplayRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: todayPeriodEnd,
+          },
+          comparisonValueRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          comparisonDisplayRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          displayBucketSeconds: 3600,
+          metricKey: 'valuableFailure',
+        }),
+        color: readChartColorVar('--destructive', 'hsl(0 84% 60%)'),
+        comparisonColor: backdropColors.yesterday,
+      },
+      otherSuccess: {
+        ...buildPeriodBackdropSeries({
+          hourlyRequestWindow,
+          currentValueRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: summaryWindowValues.today_end,
+          },
+          currentDisplayRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: todayPeriodEnd,
+          },
+          comparisonValueRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          comparisonDisplayRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          displayBucketSeconds: 3600,
+          metricKey: 'otherSuccess',
+        }),
+        color: readChartColorVar('--success', 'hsl(160 84% 39%)'),
+        comparisonColor: backdropColors.yesterday,
+      },
+      otherFailure: {
+        ...buildPeriodBackdropSeries({
+          hourlyRequestWindow,
+          currentValueRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: summaryWindowValues.today_end,
+          },
+          currentDisplayRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: todayPeriodEnd,
+          },
+          comparisonValueRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          comparisonDisplayRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          displayBucketSeconds: 3600,
+          metricKey: 'otherFailure',
+        }),
+        color: readChartColorVar('--warning', 'hsl(38 92% 50%)'),
+        comparisonColor: backdropColors.yesterday,
+      },
+      unknown: {
+        ...buildPeriodBackdropSeries({
+          hourlyRequestWindow,
+          currentValueRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: summaryWindowValues.today_end,
+          },
+          currentDisplayRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: todayPeriodEnd,
+          },
+          comparisonValueRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          comparisonDisplayRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          displayBucketSeconds: 3600,
+          metricKey: 'unknown',
+        }),
+        color: readChartColorVar('--muted-foreground', 'hsl(215 16% 47%)'),
+        comparisonColor: backdropColors.yesterday,
+      },
+      upstreamExhausted: {
+        ...buildPeriodBackdropSeries({
+          hourlyRequestWindow,
+          currentValueRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: summaryWindowValues.today_end,
+          },
+          currentDisplayRange: {
+            rangeStart: summaryWindowValues.today_start,
+            rangeEnd: todayPeriodEnd,
+          },
+          comparisonValueRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          comparisonDisplayRange: {
+            rangeStart: comparisonRangeStart,
+            rangeEnd: comparisonRangeEnd,
+          },
+          displayBucketSeconds: 3600,
+          metricKey: 'upstreamExhausted',
+        }),
+        color: readChartColorVar('--info', 'hsl(199 89% 48%)'),
+        comparisonColor: backdropColors.yesterday,
+      },
+    }
+  ), [
+    backdropColors.today,
+    backdropColors.yesterday,
+    comparisonRangeEnd,
+    comparisonRangeStart,
+    hourlyRequestWindow,
+    todayBackdrop,
+  ])
+  const monthBackdrop = useMemo(
+    () => {
+      const backdrop = buildMonthSeriesBackdropSeries(monthSeriesValue, 'total')
+      return {
+        ...backdrop,
+        baseline: 0,
+      }
+    },
+    [monthSeriesValue],
+  )
+  const monthCardBackdrops = useMemo<DashboardCardBackdropMap>(() => {
+    const buildMonthCardBackdrop = (
+      metricKey: DashboardBackdropMetricKey,
+      color = backdropColors.month,
+    ): DashboardCardBackdropSeries => {
+      const backdrop = buildMonthSeriesBackdropSeries(monthSeriesValue, metricKey)
+      return {
+        ...backdrop,
+        baseline: 0,
+        color,
+        comparisonColor: backdropColors.yesterday,
+      }
+    }
+    return {
+      total: {
+        ...monthBackdrop,
+        color: backdropColors.month,
+        comparisonColor: backdropColors.yesterday,
+      },
+      valuableSuccess: buildMonthCardBackdrop('valuableSuccess'),
+      valuableFailure: buildMonthCardBackdrop('valuableFailure', readChartColorVar('--destructive', 'hsl(0 84% 60%)')),
+      otherSuccess: buildMonthCardBackdrop('otherSuccess', readChartColorVar('--success', 'hsl(160 84% 39%)')),
+      otherFailure: buildMonthCardBackdrop('otherFailure', readChartColorVar('--warning', 'hsl(38 92% 50%)')),
+      unknown: buildMonthCardBackdrop('unknown', readChartColorVar('--muted-foreground', 'hsl(215 16% 47%)')),
+      upstreamExhausted: buildMonthCardBackdrop('upstreamExhausted', readChartColorVar('--info', 'hsl(199 89% 48%)')),
+    }
+  }, [
+    backdropColors.month,
+    backdropColors.yesterday,
+    monthBackdrop,
+    monthSeriesValue,
+  ])
+  const monthComparisonNotice = monthBackdrop.hasVisibleComparison ? null : strings.monthComparisonEmpty
 
   return (
     <div className="dashboard-overview-stack">
-      <section className="surface panel dashboard-hero-panel">
-        <div className="panel-header">
-          <div>
-            <h2>{strings.title}</h2>
-            <p className="panel-description">{strings.description}</p>
-          </div>
-          <button type="button" className="btn btn-outline" onClick={() => onOpenModule('tokens')}>
-            {strings.openModule}
-          </button>
-        </div>
-      </section>
-
       <section className="dashboard-summary-panel">
         {!overviewReady ? (
           <div className="surface panel dashboard-summary-fallback">
@@ -237,67 +904,72 @@ export default function DashboardOverview({
           <div className="dashboard-summary-layout">
             <div className="dashboard-summary-top-row">
               <article className="dashboard-summary-block dashboard-summary-block-primary">
-                <header className="dashboard-summary-header">
-                  <div>
-                    <h2>{strings.todayTitle}</h2>
-                    <p className="panel-description">{strings.todayDescription}</p>
-                  </div>
-                </header>
-                {hasTodaySummary ? (
-                  <>
-                    <div className="dashboard-summary-metrics dashboard-summary-metrics-primary dashboard-today-grid">
-                      {todayMetrics.map((metric) => (
-                        <TodayMetricCard key={metric.id} metric={metric} />
-                      ))}
+                <div className="dashboard-summary-block-content">
+                  <header className="dashboard-summary-header">
+                    <div>
+                      <h2>{strings.todayTitle}</h2>
+                      <p className="panel-description">{strings.todayDescription}</p>
                     </div>
-                    <div className="dashboard-today-comparisons">
-                      {todayMetrics.map((metric) => {
-                        const deltaTone = metric.comparison?.tone ?? (
-                          metric.comparison?.direction === 'flat'
-                            ? 'neutral'
-                            : metric.comparison?.direction === 'up'
-                              ? 'positive'
-                              : 'negative'
-                        )
-
-                        return (
-                          <div key={`${metric.id}-comparison`} className="dashboard-today-comparison-row">
-                            <div className="dashboard-today-comparison-copy">
-                              <div className="dashboard-today-comparison-label">{metric.label}</div>
-                              {metric.subtitle ? <div className="dashboard-today-comparison-subtitle">{metric.subtitle}</div> : null}
-                            </div>
-                            {metric.comparison ? (
-                              <div className={`metric-delta metric-delta-${deltaTone}`}>
-                                <span className="metric-delta-label">{metric.comparison.label}</span>
-                                <span className="metric-delta-value">{metric.comparison.value}</span>
-                              </div>
-                            ) : null}
-                          </div>
-                        )
-                      })}
+                  </header>
+                  {hasTodaySummary ? (
+                    <div className="dashboard-summary-section-stack">
+                      {todayTotalMetric ? (
+                        <SummaryMetricCard
+                          metric={todayTotalMetric}
+                          backdrop={todayCardBackdrops[getBackdropMetricKey(todayTotalMetric.id) ?? 'total']}
+                        />
+                      ) : null}
+                      {todayQuotaCharge ? <QuotaChargeCard card={todayQuotaCharge} backdrop={todayCardBackdrops.total} /> : null}
+                      <div className="dashboard-summary-metrics dashboard-summary-metrics-primary dashboard-today-grid">
+                        {todayDetailMetrics.map((metric) => (
+                          <SummaryMetricCard
+                            key={metric.id}
+                            metric={metric}
+                            backdrop={todayCardBackdrops[getBackdropMetricKey(metric.id) ?? 'total']}
+                          />
+                        ))}
+                      </div>
                     </div>
-                  </>
-                ) : (
-                  <div className="empty-state alert dashboard-summary-empty">{strings.summaryUnavailable}</div>
-                )}
+                  ) : (
+                    <div className="empty-state alert dashboard-summary-empty">{strings.summaryUnavailable}</div>
+                  )}
+                </div>
               </article>
 
               <article className="dashboard-summary-block dashboard-summary-block-secondary">
-                <header className="dashboard-summary-header">
-                  <div>
-                    <h2>{strings.monthTitle}</h2>
-                    <p className="panel-description">{strings.monthDescription}</p>
-                  </div>
-                </header>
-                {hasMonthSummary ? (
-                  <div className="dashboard-summary-metrics dashboard-summary-metrics-compact dashboard-summary-metrics-month">
-                    {monthMetrics.map((metric) => (
-                      <SummaryMetricCard key={metric.id} metric={metric} compact />
-                    ))}
-                  </div>
-                ) : (
-                  <div className="empty-state alert dashboard-summary-empty">{strings.summaryUnavailable}</div>
-                )}
+                <div className="dashboard-summary-block-content">
+                  <header className="dashboard-summary-header">
+                    <div>
+                      <h2>{strings.monthTitle}</h2>
+                      <p className="panel-description">{strings.monthDescription}</p>
+                    </div>
+                  </header>
+                  {hasMonthSummary ? (
+                    <div className="dashboard-summary-section-stack">
+                      {monthTotalMetric ? (
+                        <SummaryMetricCard
+                          metric={monthTotalMetric}
+                          backdrop={monthCardBackdrops[getBackdropMetricKey(monthTotalMetric.id) ?? 'total']}
+                          backdropNotice={monthComparisonNotice}
+                        />
+                      ) : null}
+                      {monthQuotaCharge ? <QuotaChargeCard card={monthQuotaCharge} backdrop={monthCardBackdrops.total} /> : null}
+                      <div className="dashboard-summary-metrics dashboard-summary-metrics-compact dashboard-summary-metrics-month">
+                        {monthDetailMetrics.map((metric) => (
+                          <SummaryMetricCard
+                            key={metric.id}
+                            metric={metric}
+                            compact
+                            backdrop={monthCardBackdrops[getBackdropMetricKey(metric.id) ?? 'total']}
+                            backdropNotice={monthComparisonNotice}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="empty-state alert dashboard-summary-empty">{strings.summaryUnavailable}</div>
+                  )}
+                </div>
               </article>
             </div>
 
@@ -324,49 +996,170 @@ export default function DashboardOverview({
         )}
       </section>
 
-      <section className="surface panel dashboard-trend-panel">
-        <div className="panel-header">
-          <div>
-            <h2>{strings.trendsTitle}</h2>
-            <p className="panel-description">{strings.trendsDescription}</p>
-          </div>
-        </div>
-        <div className="dashboard-trend-grid">
-          <article className="dashboard-trend-card">
-            <header>{strings.requestTrend}</header>
-            <Sparkline values={trend.request} />
-          </article>
-          <article className="dashboard-trend-card">
-            <header>{strings.errorTrend}</header>
-            <Sparkline values={trend.error} />
-          </article>
-        </div>
-      </section>
+      <DashboardTrendPanel
+        strings={strings}
+        overviewReady={overviewReady}
+        hourlyRequestWindow={hourlyRequestWindow}
+        rollupIntegrity={rollupIntegrity}
+        initialChartMode={initialChartMode}
+        initialVisibleResultSeries={initialVisibleResultSeries}
+        initialVisibleTypeSeries={initialVisibleTypeSeries}
+        initialVisibleCreditSeries={initialVisibleCreditSeries}
+        chartPersistenceKey={chartPersistenceKey}
+        chartLabelTimeZone={chartLabelTimeZone}
+      />
 
       <section className="surface panel">
         <div className="panel-header">
           <div>
-            <h2>{strings.riskTitle}</h2>
-            <p className="panel-description">{strings.riskDescription}</p>
+            <h2>{strings.recentAlertsTitle}</h2>
+            <p className="panel-description">{strings.recentAlertsDescription}</p>
           </div>
+          <button type="button" className="btn btn-outline" onClick={onOpenRecentAlerts}>
+            {strings.recentAlertsOpen}
+          </button>
         </div>
         {!overviewReady ? (
           <div className="empty-state alert">{strings.loading}</div>
-        ) : riskItems.length === 0 ? (
-          <div className="empty-state alert">{strings.riskEmpty}</div>
+        ) : recentAlerts.totalEvents === 0 ? (
+          <div className="empty-state alert">{strings.recentAlertsEmpty}</div>
         ) : (
-          <ul className="dashboard-risk-list">
-            {riskItems.map((item) => (
-              <li key={item.id}>
-                <span>{item.label}</span>
-                {item.action && (
-                  <button type="button" className="btn btn-ghost btn-sm" onClick={item.action}>
-                    {strings.openModule}
-                  </button>
-                )}
-              </li>
-            ))}
-          </ul>
+          <div className="dashboard-alerts-summary">
+            <div className="dashboard-alerts-summary__overview">
+              <div className="dashboard-alerts-summary__overview-copy">
+                <strong>{strings.recentAlertsOverviewTitle}</strong>
+                <p>{strings.recentAlertsOverviewSummary}</p>
+              </div>
+              <div className="dashboard-alerts-summary__metrics">
+                {recentAlerts.groupedCountWindows.map((item) => (
+                  <article
+                    className="dashboard-alerts-summary__metric-chip"
+                    data-current-window={item.windowHours === recentAlerts.windowHours ? 'true' : undefined}
+                    key={item.windowHours}
+                  >
+                    <span>{compactWindowCountLabel(strings, item.windowHours)}</span>
+                    <strong>{item.groupedCount}</strong>
+                    {item.windowHours === recentAlerts.windowHours ? (
+                      <small>{strings.recentAlertsCurrentWindow}</small>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            </div>
+            <div className="dashboard-alerts-summary__groups" role="table" aria-label={strings.recentAlertsTitle}>
+              <div className="dashboard-alerts-summary__table-head-shell" role="rowgroup">
+                <div className="dashboard-alerts-summary__table-head" role="row">
+                  <span id={recentAlertsAlertHeaderId} role="columnheader">{strings.recentAlertsColumns.alert}</span>
+                  <span id={recentAlertsWindowHeaderId} role="columnheader">{strings.recentAlertsColumns.timeRange}</span>
+                  <span id={recentAlertsReviewHeaderId} role="columnheader">{strings.recentAlertsColumns.review}</span>
+                </div>
+              </div>
+              <div className="dashboard-alerts-summary__table-body" role="rowgroup">
+                {recentAlerts.topGroups.map((group, index) => {
+                  const typeLabel = strings.recentAlertsTypeLabels[group.type]
+                  const reasonBadgeLabel = getRecentAlertReasonBadgeLabel(group, typeLabel)
+                  const rowBaseId = `${recentAlertsTableId}-row-${index}`
+                  const subjectId = `${rowBaseId}-subject`
+                  const summaryId = `${rowBaseId}-summary`
+                  const windowId = `${rowBaseId}-window`
+                  const actionHintId = `${rowBaseId}-action-hint`
+                  const openGroupAriaLabel = `${strings.recentAlertsOpenGroup}: ${group.subjectLabel}`
+                  const userSubjectId = group.subjectKind === 'user' ? group.user?.userId : null
+                  const subjectLabel = group.subjectLabel.trim() || '—'
+
+                  return (
+                    <article key={group.id} className="dashboard-alerts-summary__row" role="row">
+                      <div
+                        className="dashboard-alerts-summary__identity"
+                        role="cell"
+                        aria-labelledby={`${recentAlertsAlertHeaderId} ${subjectId}`}
+                        aria-describedby={summaryId}
+                      >
+                        <span className="dashboard-alerts-summary__field-label" aria-hidden="true">{strings.recentAlertsColumns.alert}</span>
+                        <div className="dashboard-alerts-summary__identity-head">
+                          {userSubjectId && onOpenUser ? (
+                            <button
+                              type="button"
+                              id={subjectId}
+                              className="dashboard-alerts-summary__subject-button"
+                              onClick={() => onOpenUser(userSubjectId)}
+                              aria-label={`${strings.recentAlertsOpenUser}: ${subjectLabel}`}
+                            >
+                              {subjectLabel}
+                            </button>
+                          ) : (
+                            <strong id={subjectId}>{subjectLabel}</strong>
+                          )}
+                          <div className="dashboard-alerts-summary__identity-flags">
+                            <StatusBadge
+                              tone={alertSummaryTone(group.type)}
+                              className="dashboard-alerts-summary__type-badge"
+                            >
+                              {reasonBadgeLabel}
+                            </StatusBadge>
+                            <StatusBadge
+                              tone={alertSummaryTone(group.type)}
+                              className="dashboard-alerts-summary__count-badge"
+                              title={`${group.count} ${strings.recentAlertsColumns.hits}`}
+                            >
+                              <strong>{group.count}</strong>
+                              <span>{strings.recentAlertsColumns.hits}</span>
+                            </StatusBadge>
+                          </div>
+                        </div>
+                        {group.requestKind ? (
+                          <div className="dashboard-alerts-summary__identity-meta">
+                            <span className="dashboard-alerts-summary__meta-item">
+                              <span className="dashboard-alerts-summary__meta-label">
+                                {strings.recentAlertsColumns.requestKind}
+                              </span>
+                              <span className="dashboard-alerts-summary__meta-value">
+                                {group.requestKind.label}
+                              </span>
+                            </span>
+                          </div>
+                        ) : null}
+                        <div className="dashboard-alerts-summary__identity-copy" id={summaryId}>
+                          <span>{group.latestEvent.summary}</span>
+                        </div>
+                      </div>
+                      <div
+                        className="dashboard-alerts-summary__window"
+                        role="cell"
+                        aria-labelledby={`${recentAlertsWindowHeaderId} ${windowId}`}
+                      >
+                        <span className="dashboard-alerts-summary__field-label" aria-hidden="true">{strings.recentAlertsColumns.timeRange}</span>
+                        <strong id={windowId} className="dashboard-alerts-summary__window-range">
+                          <time dateTime={formatAlertDateTimeIso(group.firstSeen)}>{formatAlertRange(group.firstSeen)}</time>
+                          <span className="dashboard-alerts-summary__window-separator" aria-hidden="true">→</span>
+                          <time dateTime={formatAlertDateTimeIso(group.lastSeen)}>{formatAlertRange(group.lastSeen)}</time>
+                        </strong>
+                      </div>
+                      <div
+                        className="dashboard-alerts-summary__action"
+                        role="cell"
+                        aria-labelledby={recentAlertsReviewHeaderId}
+                      >
+                        <span className="dashboard-alerts-summary__field-label" aria-hidden="true">{strings.recentAlertsColumns.review}</span>
+                        <span id={actionHintId} className="sr-only">
+                          {group.subjectLabel} · {formatAlertRange(group.firstSeen)} → {formatAlertRange(group.lastSeen)}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm dashboard-alerts-summary__action-button"
+                          onClick={() => openRecentAlertGroup(group)}
+                          aria-label={openGroupAriaLabel}
+                          aria-describedby={actionHintId}
+                        >
+                          {strings.recentAlertsOpenGroup}
+                        </button>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+            </div>
+          </div>
         )}
       </section>
 

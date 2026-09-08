@@ -1,20 +1,61 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test'
 
 import {
+  archiveAnnouncement,
+  buildPublicEventsUrl,
   bindAdminUserTag,
+  createAnnouncement,
+  createBrowserTodayWindow,
+  createAdminUserEntitlement,
+  createAdminUserToken,
+  deleteAdminUserToken,
   fetchAdminRegistrationSettings,
+  fetchAdminUserRankings,
   fetchAdminUnboundTokenUsage,
+  fetchAdminUserUsageSeries,
   fetchAdminUsers,
   fetchAdminUserTags,
+  fetchAlertCatalog,
+  fetchAlertEvents,
+  fetchAlertGroups,
+  fetchAnnouncements,
   fetchApiKeys,
+  fetchDashboardOverview,
+  fetchForwardProxySettings,
   fetchJobs,
+  fetchKeyLogsCatalog,
   fetchKeyLogDetails,
+  fetchKeyLogsList,
+  fetchPublicMetrics,
+  fetchPublicLogs,
   fetchRequestLogs,
+  fetchRequestLogsCatalog,
   fetchRequestLogDetails,
+  fetchRequestLogsList,
+  fetchSystemSettings,
+  fetchSystemStatus,
+  fetchTokenLogsCatalog,
+  fetchTokenMetrics,
   fetchTokenLogDetails,
+  fetchTokenLogsList,
+  fetchUserAnnouncementHistory,
+  fetchUserAnnouncements,
+  fetchUserBillingSummary,
+  fetchUserDashboard,
+  fetchUserDashboardOverview,
+  postUserLogout,
+  fetchUserTokenDetail,
+  fetchUserTokenLogs,
+  fetchUserTokens,
+  millisecondsUntilNextBrowserDayBoundary,
+  parseUserDashboardOverviewEventSnapshot,
+  parseUserTokenEventSnapshot,
+  publishAnnouncement,
+  triggerJob,
   updateForwardProxySettingsWithProgress,
   updateAdminRegistrationSettings,
-  updateAdminUserQuota,
+  updateAnnouncement,
+  updateSystemSettings,
   validateForwardProxyCandidateWithProgress,
 } from './api'
 
@@ -43,6 +84,744 @@ function createSseResponse(chunks: string[]): Response {
 }
 
 describe('admin user tag api helpers', () => {
+  it('routes announcement lifecycle requests through dedicated endpoints', async () => {
+    const announcement = {
+      id: 'ann/id 1',
+      content: '# Launch notice\n\nMaintenance window',
+      displayKind: 'modal',
+      status: 'published',
+      createdAt: 1,
+      updatedAt: 2,
+      publishedAt: 2,
+      archivedAt: null,
+    }
+    const fetchMock = mock((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(JSON.stringify({ items: [announcement], ...announcement }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const createPayload = {
+      content: '# Launch notice\n\nMaintenance window',
+      displayKind: 'modal' as const,
+    }
+    const updatePayload = {
+      content: 'Updated ticker copy only',
+      displayKind: 'ticker' as const,
+    }
+
+    await fetchAnnouncements()
+    await createAnnouncement(createPayload)
+    await updateAnnouncement('ann/id 1', updatePayload)
+    await publishAnnouncement('ann/id 1')
+    await archiveAnnouncement('ann/id 1')
+    await fetchUserAnnouncements()
+    await fetchUserAnnouncementHistory()
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/announcements')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/announcements')
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(createPayload),
+    })
+    expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/announcements/ann%2Fid%201')
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updatePayload),
+    })
+    expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/announcements/ann%2Fid%201/publish')
+    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({ method: 'POST' })
+    expect(fetchMock.mock.calls[4]?.[0]).toBe('/api/announcements/ann%2Fid%201/archive')
+    expect(fetchMock.mock.calls[4]?.[1]).toMatchObject({ method: 'POST' })
+    expect(fetchMock.mock.calls[5]?.[0]).toBe('/api/user/announcements')
+    expect(fetchMock.mock.calls[6]?.[0]).toBe('/api/user/announcements/history')
+  })
+
+  it('formats browser today windows with explicit ISO8601 offsets', () => {
+    const localNoon = new Date()
+    localNoon.setFullYear(2026, 2, 8)
+    localNoon.setHours(12, 34, 56, 0)
+    const windowRange = createBrowserTodayWindow(localNoon)
+
+    expect(windowRange.todayStart).toMatch(/^2026-03-08T00:00:00[+-]\d{2}:\d{2}$/)
+    expect(windowRange.todayEnd).toMatch(/^2026-03-09T00:00:00[+-]\d{2}:\d{2}$/)
+  })
+
+  it('computes the next browser-day refresh delay from the local clock', () => {
+    const nearMidnight = new Date()
+    nearMidnight.setHours(23, 59, 30, 0)
+    const delay = millisecondsUntilNextBrowserDayBoundary(nearMidnight)
+
+    expect(delay).toBe(30_000)
+  })
+
+  it('appends explicit today windows to user-facing metric endpoints', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({ monthlySuccess: 1, dailySuccess: 2 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const todayWindow = {
+      todayStart: '2026-04-03T00:00:00+08:00',
+      todayEnd: '2026-04-04T00:00:00+08:00',
+    }
+
+    await fetchPublicMetrics(todayWindow)
+    await fetchTokenMetrics('th-a1b2-secretsecret', todayWindow)
+    await fetchUserDashboard(todayWindow)
+    await fetchUserDashboardOverview(todayWindow)
+    await fetchUserBillingSummary()
+    await fetchUserTokens(todayWindow)
+    await fetchUserTokenDetail('a1b2', todayWindow)
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe(
+      '/api/public/metrics?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[1] as [string])[0]).toBe(
+      '/api/token/metrics?token=th-a1b2-secretsecret&today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[2] as [string])[0]).toBe(
+      '/api/user/dashboard?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[3] as [string])[0]).toBe(
+      '/api/user/dashboard/overview?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[4] as [string])[0]).toBe(
+      '/api/user/billing/summary',
+    )
+    expect((fetchMock.mock.calls[5] as [string])[0]).toBe(
+      '/api/user/tokens?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+    expect((fetchMock.mock.calls[6] as [string])[0]).toBe(
+      '/api/user/tokens/a1b2?today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+  })
+
+  it('keeps charged credits on user token logs and snapshots only', async () => {
+    const payload = [{
+      id: 1,
+      method: 'POST',
+      path: '/mcp',
+      query: null,
+      httpStatus: 200,
+      mcpStatus: 200,
+      businessCredits: 7,
+      resultStatus: 'success',
+      errorMessage: null,
+      createdAt: 1_776_000_000,
+    }]
+    const fetchMock = mock(() => {
+      return Promise.resolve(new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const userLogs = await fetchUserTokenLogs('a1b2')
+    const publicLogs = await fetchPublicLogs('th-a1b2-secret')
+    const snapshot = parseUserTokenEventSnapshot(JSON.stringify({
+      token: { id: 'a1b2', enabled: true },
+      logs: payload,
+    }))
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/user/tokens/a1b2/logs?limit=50')
+    expect((fetchMock.mock.calls[1] as [string])[0]).toBe('/api/public/logs?token=th-a1b2-secret&limit=20')
+    expect(userLogs[0]?.business_credits).toBe(7)
+    expect(snapshot.logs[0]?.business_credits).toBe(7)
+    expect(publicLogs[0]?.business_credits).toBeUndefined()
+  })
+
+  it('parses user dashboard overview snapshots with nullable future slots', () => {
+    const snapshot = parseUserDashboardOverviewEventSnapshot(JSON.stringify({
+      summary: {
+        debugInfoShared: true,
+        requestRate: { used: 6, limit: 60, windowMinutes: 5, scope: 'user' },
+        hourlyAnyUsed: 6,
+        hourlyAnyLimit: 60,
+        quotaHourlyUsed: 12,
+        quotaHourlyLimit: 100,
+        quotaDailyUsed: 42,
+        quotaDailyLimit: 500,
+        quotaMonthlyUsed: 420,
+        quotaMonthlyLimit: 5000,
+        dailySuccess: 33,
+        dailyFailure: 1,
+        monthlySuccess: 512,
+        lastActivity: null,
+        recharge: {
+          currentMonthStart: 1_776_000_000,
+          currentEntitlementCredits: 1000,
+          effectiveUntilMonthStart: null,
+        },
+      },
+      progress: {
+        requestRate: {
+          used: 6,
+          limit: 60,
+          points: [
+            { bucketStart: 1, value: 2, limitValue: 60 },
+            { bucketStart: 2, value: 6, limitValue: 60 },
+          ],
+        },
+        quotaHourly: {
+          used: 12,
+          limit: 100,
+          points: [
+            { bucketStart: 1, value: 4, limitValue: 100 },
+            { bucketStart: 2, value: null, limitValue: 100 },
+          ],
+        },
+        quotaDaily: { used: 42, limit: 500, points: [] },
+        quotaMonthly: { used: 420, limit: 5000, points: [] },
+      },
+    }))
+
+    expect(snapshot.summary.debugInfoShared).toBe(true)
+    expect(snapshot.progress.requestRate.points[1]).toMatchObject({
+      bucketStart: 2,
+      value: 6,
+      limitValue: 60,
+    })
+    expect(snapshot.progress.businessCalls1h.points[1]?.value).toBeNull()
+  })
+
+  it('treats user logout 204 and 401 as successful sign-out responses', async () => {
+    let status = 204
+    const fetchMock = mock((_input: RequestInfo | URL) => {
+      const response = new Response(null, { status })
+      status = 401
+      return Promise.resolve(response)
+    })
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(postUserLogout()).resolves.toBeUndefined()
+    await expect(postUserLogout()).resolves.toBeUndefined()
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/user/logout')
+    expect((fetchMock.mock.calls[1] as [string])[0]).toBe('/api/user/logout')
+  })
+
+  it('surfaces logout request failures for the caller to render', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response('upstream unavailable', { status: 503 })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(postUserLogout()).rejects.toMatchObject({
+      message: 'upstream unavailable',
+      status: 503,
+    })
+  })
+
+  it('loads the dashboard overview from the dedicated aggregate endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            summary: {
+              total_requests: 1,
+              success_count: 1,
+              error_count: 0,
+              quota_exhausted_count: 0,
+              active_keys: 1,
+              exhausted_keys: 0,
+              quarantined_keys: 0,
+              temporary_isolated_keys: 0,
+              last_activity: null,
+              total_quota_limit: 10,
+              total_quota_remaining: 9,
+            },
+            summaryWindows: {
+              today: { total_requests: 1, success_count: 1, error_count: 0, quota_exhausted_count: 0, valuable_success_count: 0, valuable_failure_count: 0, other_success_count: 0, other_failure_count: 0, unknown_count: 0, upstream_exhausted_key_count: 0, new_keys: 0, new_quarantines: 0 },
+              yesterday: { total_requests: 0, success_count: 0, error_count: 0, quota_exhausted_count: 0, valuable_success_count: 0, valuable_failure_count: 0, other_success_count: 0, other_failure_count: 0, unknown_count: 0, upstream_exhausted_key_count: 0, new_keys: 0, new_quarantines: 0 },
+              month: { total_requests: 1, success_count: 1, error_count: 0, quota_exhausted_count: 0, valuable_success_count: 0, valuable_failure_count: 0, other_success_count: 0, other_failure_count: 0, unknown_count: 0, upstream_exhausted_key_count: 0, new_keys: 0, new_quarantines: 0 },
+              today_start: 1_776_000_000,
+              today_end: 1_776_003_601,
+              yesterday_start: 1_775_913_600,
+              yesterday_end: 1_776_000_000,
+              month_start: 1_775_481_600,
+              month_end: 1_776_003_601,
+            },
+            siteStatus: {
+              remainingQuota: 9,
+              totalQuotaLimit: 10,
+              activeKeys: 1,
+              quarantinedKeys: 0,
+              temporaryIsolatedKeys: 0,
+              exhaustedKeys: 0,
+              availableProxyNodes: 1,
+              totalProxyNodes: 1,
+            },
+            forwardProxy: { availableNodes: 1, totalNodes: 1 },
+            hourlyRequestWindow: {
+              bucketSeconds: 300,
+              visibleBuckets: 73,
+              retainedBuckets: 589,
+              unverifiedBucketStarts: [],
+              buckets: Array.from({ length: 589 }, (_, index) => ({
+                bucketStart: 1_775_534_400 + index * 300,
+                secondarySuccess: 0,
+                primarySuccess: index === 588 ? 1 : 0,
+                secondaryFailure: 0,
+                primaryFailure429: 0,
+                primaryFailureOther: 0,
+                unknown: 0,
+                mcpNonBillable: 0,
+                mcpBillable: 0,
+                apiNonBillable: 0,
+                apiBillable: index === 588 ? 1 : 0,
+              })),
+            },
+            rollupIntegrity: {
+              state: 'healthy',
+              lastVerifiedAt: 1_775_711_100,
+              nextAttemptAt: 1_775_711_115,
+              unverifiedBucketCount: 0,
+            },
+            monthSeries: {
+              current: Array.from({ length: 31 }, (_, index) => ({
+                bucketStart: 1_775_481_600 + index * 86_400,
+                displayBucketStart: 1_775_481_600 + index * 86_400,
+                total: index < 7 ? (index + 1) * 100 : null,
+                valuableSuccess: index < 7 ? (index + 1) * 67 : null,
+                valuableFailure: index < 7 ? (index + 1) * 12 : null,
+                otherSuccess: index < 7 ? (index + 1) * 14 : null,
+                otherFailure: index < 7 ? (index + 1) * 4 : null,
+                unknown: index < 7 ? (index + 1) * 3 : null,
+                upstreamExhausted: index < 7 ? Math.floor(index / 3) : null,
+                newKeys: index < 7 ? Math.floor(index / 2) : null,
+                newQuarantines: index < 7 ? Math.floor(index / 6) : null,
+              })),
+              comparison: Array.from({ length: 31 }, (_, index) => ({
+                bucketStart: 1_772_803_200 + index * 86_400,
+                displayBucketStart: 1_775_481_600 + index * 86_400,
+                total: (index + 1) * 90,
+                valuableSuccess: (index + 1) * 61,
+                valuableFailure: (index + 1) * 10,
+                otherSuccess: (index + 1) * 13,
+                otherFailure: (index + 1) * 4,
+                unknown: (index + 1) * 2,
+                upstreamExhausted: Math.floor(index / 4),
+                newKeys: Math.floor(index / 5),
+                newQuarantines: Math.floor(index / 8),
+              })),
+            },
+            trend: { request: [1, 0, 0, 0, 0, 0, 0, 0], error: [0, 0, 0, 0, 0, 0, 0, 0] },
+            exhaustedKeys: [],
+            recentLogs: [],
+            recentJobs: [],
+            recentAlerts: {
+              windowHours: 24,
+              totalEvents: 3,
+              groupedCount: 2,
+              groupedCountWindows: [
+                { windowHours: 1, groupedCount: 1 },
+                { windowHours: 24, groupedCount: 2 },
+                { windowHours: 168, groupedCount: 4 },
+              ],
+              countsByType: [
+                { type: 'upstream_rate_limited_429', count: 1 },
+                { type: 'upstream_usage_limit_432', count: 2 },
+              ],
+              topGroups: [
+                {
+                  id: 'group-1',
+                  type: 'upstream_usage_limit_432',
+                  subjectKind: 'user',
+                  subjectId: 'usr_001',
+                  subjectLabel: 'Alice Wang',
+                  user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                  token: { id: 'tok_001', label: 'tok_001' },
+                  key: null,
+                  requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: null },
+                  count: 2,
+                  firstSeen: 1_775_534_400,
+                  lastSeen: 1_775_535_400,
+                  latestEvent: {
+                    id: 'alert_evt_001',
+                    type: 'upstream_usage_limit_432',
+                    title: 'Tavily usage limit 432',
+                    summary: 'Alice Wang hit the upstream Tavily usage limit.',
+                    occurredAt: 1_775_535_400,
+                    subjectKind: 'user',
+                    subjectId: 'usr_001',
+                    subjectLabel: 'Alice Wang',
+                    user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                    token: { id: 'tok_001', label: 'tok_001' },
+                    key: { id: 'key_001', label: 'key_001' },
+                    request: { id: 91, method: 'POST', path: '/api/tavily/search', query: null },
+                    requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: null },
+                    failureKind: null,
+                    resultStatus: 'quota_exhausted',
+                    errorMessage: 'This request exceeds your plan\'s set usage limit.',
+                    reasonCode: null,
+                    reasonSummary: null,
+                    reasonDetail: null,
+                    source: { kind: 'auth_token_log', id: 'log_91' },
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const overview = await fetchDashboardOverview()
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/dashboard/overview')
+    expect(overview.siteStatus.activeKeys).toBe(1)
+    expect(overview.trend.request).toHaveLength(8)
+    expect(overview.hourlyRequestWindow.buckets).toHaveLength(589)
+    expect(overview.monthSeries.current).toHaveLength(31)
+    expect(overview.monthSeries.current[7]?.total).toBeNull()
+    expect(overview.monthSeries.comparison[0]?.total).toBe(90)
+    expect(overview.recentAlerts.totalEvents).toBe(3)
+    expect(overview.recentAlerts.groupedCountWindows.map((item) => item.windowHours)).toEqual([1, 24, 168])
+    expect(overview.recentAlerts.topGroups[0]?.latestEvent.request?.id).toBe(91)
+  })
+
+  it('loads the admin user rankings snapshot from the dedicated endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({
+        generatedAt: 1_781_763_600,
+        refreshIntervalSecs: 10,
+        stale: false,
+        last24h: { primarySuccessTop: [], businessCreditsTop: [], uniqueIpTop: [] },
+        last7d: { primarySuccessTop: [], businessCreditsTop: [], uniqueIpTop: [] },
+        last30d: { primarySuccessTop: [], businessCreditsTop: [], uniqueIpTop: [] },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const snapshot = await fetchAdminUserRankings()
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/users/rankings')
+    expect(snapshot.refreshIntervalSecs).toBe(10)
+    expect(snapshot.stale).toBe(false)
+    expect(snapshot.last24h.primarySuccessTop).toEqual([])
+    expect(snapshot.last24h.uniqueIpTop).toEqual([])
+  })
+
+  it('formats the admin user usage series URL with the selected series key', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({ kind: 'quotaLike', limit: 100, points: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchAdminUserUsageSeries('user/abc', 'quotaMonth')
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/users/user%2Fabc/usage-series?series=quotaMonth')
+  })
+
+  it('creates and deletes user-scoped admin tokens through user endpoints', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({ token: 'th-a1b2-secret' }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      })),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await createAdminUserToken('user/abc')
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    let [input, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(input).toBe('/api/users/user%2Fabc/tokens')
+    expect(init.method).toBe('POST')
+
+    fetchMock.mockImplementation(() => Promise.resolve(new Response(null, { status: 204 })))
+    await deleteAdminUserToken('user/abc', 'tok/1')
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    ;[input, init] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(input).toBe('/api/users/user%2Fabc/tokens/tok%2F1')
+    expect(init.method).toBe('DELETE')
+  })
+
+  it('fetches the alert catalog from the dedicated endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            retentionDays: 30,
+            types: [{ value: 'upstream_rate_limited_429', count: 2 }],
+            requestKindOptions: [
+              {
+                key: 'tavily_search',
+                label: 'Tavily Search',
+                protocol_group: 'api',
+                billing_group: 'billable',
+                count: 2,
+              },
+            ],
+            users: [{ value: 'usr_001', label: 'Alice Wang', count: 2 }],
+            tokens: [{ value: 'tok_001', label: 'tok_001', count: 2 }],
+            keys: [{ value: 'key_001', label: 'key_001', count: 1 }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const catalog = await fetchAlertCatalog()
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('/api/alerts/catalog')
+    expect(catalog.types[0]).toEqual({ value: 'upstream_rate_limited_429', count: 2 })
+    expect(catalog.requestKindOptions[0]?.key).toBe('tavily_search')
+    expect(catalog.users[0]?.label).toBe('Alice Wang')
+  })
+
+  it('builds repeated alert query params and normalizes event payloads', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 'alert_evt_001',
+                type: 'upstream_rate_limited_429',
+                title: 'Upstream 429',
+                summary: 'The upstream returned 429.',
+                occurredAt: 1_775_535_400,
+                subjectKind: 'user',
+                subjectId: 'usr_001',
+                subjectLabel: 'Alice Wang',
+                user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                token: { id: 'tok_001', label: 'tok_001' },
+                key: { id: 'key_001', label: 'key_001' },
+                request: { id: 91, method: 'POST', path: '/api/tavily/search', query: null },
+                requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: 'POST /api/tavily/search' },
+                failureKind: 'upstream_rate_limited_429',
+                resultStatus: 'error',
+                errorMessage: 'HTTP 429',
+                reasonCode: null,
+                reasonSummary: null,
+                reasonDetail: null,
+                source: { kind: 'auth_token_log', id: 'log_91' },
+              },
+            ],
+            total: 1,
+            page: 2,
+            per_page: 50,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const page = await fetchAlertEvents({
+      page: 2,
+      perPage: 50,
+      type: 'upstream_rate_limited_429',
+      since: '2026-04-18T00:00:00+08:00',
+      until: '2026-04-18T12:00:00+08:00',
+      userId: 'usr_001',
+      tokenId: 'tok_001',
+      keyId: 'key_001',
+      requestKinds: ['tavily_search', 'mcp_search'],
+    })
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe(
+      '/api/alerts/events?page=2&per_page=50&type=upstream_rate_limited_429&since=2026-04-18T00%3A00%3A00%2B08%3A00&until=2026-04-18T12%3A00%3A00%2B08%3A00&user_id=usr_001&token_id=tok_001&key_id=key_001&request_kind=tavily_search&request_kind=mcp_search',
+    )
+    expect(page.perPage).toBe(50)
+    expect(page.items[0]?.requestKind?.label).toBe('Tavily Search')
+    expect(page.items[0]?.source.kind).toBe('auth_token_log')
+  })
+
+  it('normalizes grouped alert payloads from the groups endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 'group-1',
+                type: 'user_request_rate_limited',
+                subjectKind: 'user',
+                subjectId: 'usr_001',
+                subjectLabel: 'Alice Wang',
+                user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                token: { id: 'tok_001', label: 'tok_001' },
+                key: null,
+                requestKind: null,
+                count: 4,
+                firstSeen: 1_775_534_400,
+                lastSeen: 1_775_535_400,
+                grouping_kind: 'mother',
+                semantic_window_kind: 'request_rate',
+                semantic_window_minutes: 5,
+                semantic_window_start: 1_775_534_100,
+                semantic_window_end: 1_775_535_400,
+                child_count: 2,
+                event_count: 4,
+                children: [
+                  {
+                    id: 'group-1:child:0',
+                    type: 'user_request_rate_limited',
+                    subjectKind: 'user',
+                    subjectId: 'usr_001',
+                    subjectLabel: 'Alice Wang',
+                    user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                    token: { id: 'tok_001', label: 'tok_001' },
+                    key: null,
+                    requestKind: null,
+                    count: 2,
+                    firstSeen: 1_775_534_400,
+                    lastSeen: 1_775_534_500,
+                    grouping_kind: 'child',
+                    semantic_window_kind: 'request_rate',
+                    semantic_window_minutes: 5,
+                    semantic_window_start: 1_775_534_100,
+                    semantic_window_end: 1_775_534_500,
+                    semantic_window_key: 'request_rate:test:0',
+                    child_count: 0,
+                    event_count: 2,
+                    children: [],
+                    child_events: [
+                      {
+                        id: 'alert_evt_003',
+                        type: 'user_request_rate_limited',
+                        title: 'User request rate limited',
+                        summary: 'Token tok_001 was rate limited by the local rolling 5m request-rate window for MCP tools/list.',
+                        occurredAt: 1_775_534_500,
+                        subjectKind: 'user',
+                        subjectId: 'usr_001',
+                        subjectLabel: 'Alice Wang',
+                        user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                        token: { id: 'tok_001', label: 'tok_001' },
+                        key: null,
+                        request: { id: 91, method: 'POST', path: '/mcp', query: null },
+                        requestKind: { key: 'mcp_tools_list', label: 'MCP tools/list', detail: 'tools/list' },
+                        failureKind: null,
+                        resultStatus: 'quota_exhausted',
+                        errorMessage: 'user request rate limit exceeded on rolling 5m window (limit 25, used 25)',
+                        reasonCode: null,
+                        reasonSummary: null,
+                        reasonDetail: null,
+                        source: { kind: 'auth_token_log', id: 'log_91' },
+                        semantic_window: {
+                          kind: 'request_rate',
+                          window_minutes: 5,
+                          window_start: 1_775_534_200,
+                          window_end: 1_775_534_500,
+                          window_key: 'request_rate:test:0',
+                        },
+                      },
+                    ],
+                    latestEvent: {
+                      id: 'alert_evt_003',
+                      type: 'user_request_rate_limited',
+                      title: 'User request rate limited',
+                      summary: 'Token tok_001 was rate limited by the local rolling 5m request-rate window for MCP tools/list.',
+                      occurredAt: 1_775_534_500,
+                      subjectKind: 'user',
+                      subjectId: 'usr_001',
+                      subjectLabel: 'Alice Wang',
+                      user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                      token: { id: 'tok_001', label: 'tok_001' },
+                      key: null,
+                      request: { id: 91, method: 'POST', path: '/mcp', query: null },
+                      requestKind: { key: 'mcp_tools_list', label: 'MCP tools/list', detail: 'tools/list' },
+                      failureKind: null,
+                      resultStatus: 'quota_exhausted',
+                      errorMessage: 'user request rate limit exceeded on rolling 5m window (limit 25, used 25)',
+                      reasonCode: null,
+                      reasonSummary: null,
+                      reasonDetail: null,
+                      source: { kind: 'auth_token_log', id: 'log_91' },
+                      semantic_window: {
+                        kind: 'request_rate',
+                        window_minutes: 5,
+                        window_start: 1_775_534_200,
+                        window_end: 1_775_534_500,
+                        window_key: 'request_rate:test:0',
+                      },
+                    },
+                  },
+                ],
+                latestEvent: {
+                  id: 'alert_evt_004',
+                  type: 'user_request_rate_limited',
+                  title: 'User request rate limited',
+                  summary: 'Token tok_001 was rate limited by the local rolling 5m request-rate window for MCP resources/list.',
+                  occurredAt: 1_775_535_400,
+                  subjectKind: 'user',
+                  subjectId: 'usr_001',
+                  subjectLabel: 'Alice Wang',
+                  user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+                  token: { id: 'tok_001', label: 'tok_001' },
+                  key: null,
+                  request: { id: 92, method: 'POST', path: '/mcp', query: null },
+                  requestKind: { key: 'mcp_resources_list', label: 'MCP resources/list', detail: 'resources/list' },
+                  failureKind: null,
+                  resultStatus: 'quota_exhausted',
+                  errorMessage: 'user request rate limit exceeded on rolling 5m window (limit 25, used 25)',
+                  reasonCode: null,
+                  reasonSummary: null,
+                  reasonDetail: null,
+                  source: { kind: 'auth_token_log', id: 'log_92' },
+                },
+              },
+            ],
+            total: 1,
+            page: 1,
+            perPage: 20,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const page = await fetchAlertGroups({
+      page: 1,
+      perPage: 20,
+      requestKinds: ['mcp_search'],
+    })
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe(
+      '/api/alerts/groups?page=1&per_page=20&request_kind=mcp_search',
+    )
+    expect(page.items[0]?.groupingKind).toBe('mother')
+    expect(page.items[0]?.semanticWindowKind).toBe('request_rate')
+    expect(page.items[0]?.childCount).toBe(2)
+    expect(page.items[0]?.children?.[0]?.groupingKind).toBe('child')
+    expect(page.items[0]?.children?.[0]?.childEvents?.[0]?.semanticWindow?.kind).toBe('request_rate')
+    expect(page.items[0]?.latestEvent.requestKind?.key).toBe('mcp_resources_list')
+  })
+
+  it('builds the public SSE url with token and explicit today windows', () => {
+    expect(buildPublicEventsUrl('th-a1b2-secretsecret', {
+      todayStart: '2026-04-03T00:00:00+08:00',
+      todayEnd: '2026-04-04T00:00:00+08:00',
+    })).toBe(
+      '/api/public/events?token=th-a1b2-secretsecret&today_start=2026-04-03T00%3A00%3A00%2B08%3A00&today_end=2026-04-04T00%3A00%3A00%2B08%3A00',
+    )
+  })
+
   it('streams forward proxy validation progress events before returning the final payload', async () => {
     const events: string[] = []
     const fetchMock = mock(() =>
@@ -239,11 +1018,11 @@ describe('admin user tag api helpers', () => {
     )
     globalThis.fetch = fetchMock as typeof fetch
 
-    await fetchAdminUsers(1, 20, 'L2', 'linuxdo_l2', 'monthlySuccessRate', 'asc')
+    await fetchAdminUsers(1, 20, 'L2', 'linuxdo_l2', 'all', 'monthlySuccessRate', 'asc')
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [input] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(input).toBe('/api/users?page=1&per_page=20&q=L2&tagId=linuxdo_l2&sort=monthlySuccessRate&order=asc')
+    expect(input).toBe('/api/users?page=1&per_page=20&q=L2&tagId=linuxdo_l2&activityScope=all&sort=monthlySuccessRate&order=asc')
   })
 
   it('sends exact search and sort params when listing unbound token usage', async () => {
@@ -282,7 +1061,7 @@ describe('admin user tag api helpers', () => {
             perPage: 50,
             facets: {
               groups: [{ value: 'ops', count: 3 }],
-              statuses: [{ value: 'quarantined', count: 2 }],
+              statuses: [{ value: 'quarantined', count: 2 }, { value: 'temporary_isolated', count: 1 }],
               regions: [{ value: 'US', count: 1 }],
             },
           }),
@@ -294,7 +1073,7 @@ describe('admin user tag api helpers', () => {
 
     const result = await fetchApiKeys(2, 50, {
       groups: ['ops', ''],
-      statuses: ['Quarantined', 'disabled'],
+      statuses: ['Quarantined', 'disabled', 'Temporary_Isolated'],
       registrationIp: '8.8.8.8',
       regions: ['US', 'US Westfield (MA)'],
     })
@@ -302,7 +1081,7 @@ describe('admin user tag api helpers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [input] = fetchMock.mock.calls[0] as [string, RequestInit]
     expect(input).toBe(
-      '/api/keys?page=2&per_page=50&group=ops&group=&status=quarantined&status=disabled&registration_ip=8.8.8.8&region=US&region=US+Westfield+%28MA%29',
+      '/api/keys?page=2&per_page=50&group=ops&group=&status=quarantined&status=disabled&status=temporary_isolated&registration_ip=8.8.8.8&region=US&region=US+Westfield+%28MA%29',
     )
     expect(result.page).toBe(2)
     expect(result.perPage).toBe(50)
@@ -310,29 +1089,52 @@ describe('admin user tag api helpers', () => {
     expect(result.facets.regions[0]).toEqual({ value: 'US', count: 1 })
   })
 
-  it('patches base quota through the existing user quota endpoint', async () => {
-    const fetchMock = mock(() => Promise.resolve(new Response(null, { status: 204 })))
+  it('creates base quota changes through the account entitlement ledger endpoint', async () => {
+    const created = {
+      id: 12,
+      userId: 'usr_alice',
+      scopeKind: 'base',
+      monthStart: 0,
+      businessCalls1hDelta: 10,
+      dailyCreditsDelta: 20,
+      monthlyCreditsDelta: 30,
+      backendNote: '',
+      frontendNote: 'baseline correction',
+      sourceKind: 'admin',
+      sourceId: 'admin:test',
+      actorUserId: null,
+      actorDisplayName: 'Admin',
+      createdAt: 1710000000,
+    }
+    const fetchMock = mock(() => Promise.resolve(Response.json(created, { status: 201 })))
     globalThis.fetch = fetchMock as typeof fetch
 
-    await updateAdminUserQuota('usr_alice', {
-      hourlyAnyLimit: 1200,
-      hourlyLimit: 1000,
-      dailyLimit: 24000,
-      monthlyLimit: 600000,
+    const result = await createAdminUserEntitlement('usr_alice', {
+      scopeKind: 'base',
+      monthStart: null,
+      businessCalls1hDelta: 10,
+      dailyCreditsDelta: 20,
+      monthlyCreditsDelta: 30,
+      backendNote: '',
+      frontendNote: 'baseline correction',
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [input, init] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(input).toBe('/api/users/usr_alice/quota')
-    expect(init.method).toBe('PATCH')
+    expect(input).toBe('/api/users/usr_alice/entitlements')
+    expect(init.method).toBe('POST')
     expect(init.body).toBe(
       JSON.stringify({
-        hourlyAnyLimit: 1200,
-        hourlyLimit: 1000,
-        dailyLimit: 24000,
-        monthlyLimit: 600000,
+        scopeKind: 'base',
+        monthStart: null,
+        businessCalls1hDelta: 10,
+        dailyCreditsDelta: 20,
+        monthlyCreditsDelta: 30,
+        backendNote: '',
+        frontendNote: 'baseline correction',
       }),
     )
+    expect(result.scopeKind).toBe('base')
   })
 
   it('reads admin registration settings from the dedicated endpoint', async () => {
@@ -383,11 +1185,13 @@ describe('admin user tag api helpers', () => {
               {
                 id: 37696,
                 jobType: 'quota_sync',
+                triggerSource: 'manual',
                 keyId: '7QZ5',
                 keyGroup: 'ops',
                 status: 'error',
                 attempt: 1,
                 message: 'usage_http 401',
+                queuedAt: 1_773_344_450,
                 startedAt: 1_773_344_460,
                 finishedAt: 1_773_344_470,
               },
@@ -395,6 +1199,15 @@ describe('admin user tag api helpers', () => {
             total: 1,
             page: 1,
             perPage: 10,
+            groupCounts: {
+              all: 4,
+              quota: 1,
+              usage: 1,
+              logs: 1,
+              db: 1,
+              geo: 0,
+              linuxdo: 1,
+            },
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         ),
@@ -406,14 +1219,25 @@ describe('admin user tag api helpers', () => {
 
     expect(jobs.page).toBe(1)
     expect(jobs.perPage).toBe(10)
+    expect(jobs.groupCounts).toEqual({
+      all: 4,
+      quota: 1,
+      usage: 1,
+      logs: 1,
+      db: 1,
+      geo: 0,
+      linuxdo: 1,
+    })
     expect(jobs.items[0]).toEqual({
       id: 37696,
       job_type: 'quota_sync',
+      trigger_source: 'manual',
       key_id: '7QZ5',
       key_group: 'ops',
       status: 'error',
       attempt: 1,
       message: 'usage_http 401',
+      queued_at: 1_773_344_450,
       started_at: 1_773_344_460,
       finished_at: 1_773_344_470,
     })
@@ -428,6 +1252,15 @@ describe('admin user tag api helpers', () => {
             total: 0,
             page: 1,
             perPage: 10,
+            groupCounts: {
+              all: 0,
+              quota: 0,
+              usage: 0,
+              logs: 0,
+              db: 0,
+              geo: 0,
+              linuxdo: 0,
+            },
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         ),
@@ -439,6 +1272,40 @@ describe('admin user tag api helpers', () => {
 
     const [input] = fetchMock.mock.calls[0] as [string]
     expect(input).toBe('/api/jobs?page=1&per_page=10&group=geo')
+  })
+
+  it('normalizes manual trigger queue semantics for the jobs UI', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            jobId: 37701,
+            jobType: 'db_compaction',
+            triggerSource: 'manual',
+            status: 'running',
+            coalesced: true,
+            promoted: true,
+          }),
+          { status: 202, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    const response = await triggerJob('db_compaction')
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [input, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(input).toBe('/api/jobs/trigger')
+    expect(init.method).toBe('POST')
+    expect(response).toEqual({
+      job_id: 37701,
+      job_type: 'db_compaction',
+      trigger_source: 'manual',
+      status: 'running',
+      coalesced: true,
+      promoted: true,
+    })
   })
 
   it('passes the operational class filter through to the admin logs API', async () => {
@@ -517,5 +1384,414 @@ describe('admin user tag api helpers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/tokens/ZjvC/logs/73/details')
     expect(detail).toEqual({ request_body: '{"tool":"search"}', response_body: null })
+  })
+
+  it('builds cursor-based admin request log list URLs', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            pageSize: 20,
+            nextCursor: '300:3',
+            prevCursor: null,
+            hasOlder: true,
+            hasNewer: false,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchRequestLogsList({
+      limit: 20,
+      cursor: '400:4',
+      direction: 'older',
+      requestKinds: ['api:search', 'mcp:search'],
+      result: 'error',
+      keyId: 'K001',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/logs/list?limit=20&cursor=400%3A4&direction=older&request_kind=api%3Asearch&request_kind=mcp%3Asearch&result=error&key_id=K001',
+    )
+  })
+
+  it('builds admin request log catalog URLs across scopes', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            retentionDays: 32,
+            requestKindOptions: [],
+            facets: {
+              results: [],
+              keyEffects: [],
+              bindingEffects: [{ value: 'http_project_affinity_bound', count: 1 }],
+              selectionEffects: [{ value: 'http_project_affinity_pressure_avoided', count: 2 }],
+              tokens: [],
+              keys: [],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchRequestLogsCatalog({
+      requestKinds: ['api:search'],
+      result: 'error',
+      keyId: 'K001',
+    })
+    await fetchKeyLogsCatalog('K001', {
+      since: 0,
+      requestKinds: ['mcp:search'],
+      bindingEffect: 'http_project_affinity_reused',
+      tokenId: 'T001',
+    })
+    await fetchTokenLogsCatalog('T001', {
+      sinceIso: '2026-04-01T00:00:00+08:00',
+      untilIso: '2026-04-02T00:00:00+08:00',
+      requestKinds: ['api:extract'],
+      result: 'quota_exhausted',
+      keyId: 'K001',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/logs/catalog?request_kind=api%3Asearch&result=error&key_id=K001',
+    )
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/keys/K001/logs/catalog?request_kind=mcp%3Asearch&binding_effect=http_project_affinity_reused&auth_token_id=T001&since=0',
+    )
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      '/api/tokens/T001/logs/catalog?request_kind=api%3Aextract&result=quota_exhausted&key_id=K001&since=2026-04-01T00%3A00%3A00%2B08%3A00&until=2026-04-02T00%3A00%3A00%2B08%3A00',
+    )
+    const catalog = await fetchRequestLogsCatalog()
+    expect(catalog.facets.bindingEffects).toEqual([{ value: 'http_project_affinity_bound', count: 1 }])
+    expect(catalog.facets.selectionEffects).toEqual([
+      { value: 'http_project_affinity_pressure_avoided', count: 2 },
+    ])
+  })
+
+  it('builds cursor-based scoped request log list URLs', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            items: [],
+            pageSize: 10,
+            nextCursor: null,
+            prevCursor: '200:2',
+            hasOlder: false,
+            hasNewer: true,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await fetchKeyLogsList('K001', {
+      limit: 10,
+      direction: 'newer',
+      cursor: '150:1',
+      since: 100,
+      requestKinds: ['api:extract'],
+    })
+    await fetchTokenLogsList('T001', {
+      limit: 10,
+      direction: 'older',
+      sinceIso: '2026-04-01T00:00:00+08:00',
+      untilIso: '2026-04-02T00:00:00+08:00',
+      keyId: 'K001',
+      selectionEffect: 'mcp_session_init_pressure_avoided',
+      operationalClass: 'neutral',
+    })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/keys/K001/logs/list?limit=10&cursor=150%3A1&direction=newer&request_kind=api%3Aextract&since=100',
+    )
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/tokens/T001/logs/list?limit=10&direction=older&selection_effect=mcp_session_init_pressure_avoided&operational_class=neutral&key_id=K001&since=2026-04-01T00%3A00%3A00%2B08%3A00&until=2026-04-02T00%3A00%3A00%2B08%3A00',
+    )
+  })
+
+  it('loads system settings including the request-rate threshold', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            systemSettings: {
+              requestRateLimit: 72,
+              authTokenLogRetentionDays: 92,
+              mcpSessionAffinityKeyCount: 3,
+              rebalanceMcpEnabled: true,
+              rebalanceMcpSessionPercent: 100,
+              apiRebalanceEnabled: false,
+              apiRebalancePercent: 0,
+              upstreamProjectIdMode: 'accessToken',
+              upstreamProjectIdFixedValue: '',
+              upstreamMcpUserAgent: '',
+              rechargeFeatureEnabled: false,
+              rechargeUserEnabled: false,
+              adminDefaultActiveUsersOnly: true,
+              userBlockedKeyBaseLimit: 8,
+              globalIpLimit: 5,
+              trustedProxyCidrs: ['127.0.0.0/8', '::1/128'],
+              trustedClientIpHeaders: ['cf-connecting-ip', 'x-forwarded-for'],
+              requestLogRetention: {
+                maxLogRetentionDays: 32,
+                heavyUsageThresholdPercent: 80,
+                global: { businessBodyDays: 7, nonBusinessBodyDays: 0, nonSuccessBodyDays: 3 },
+                heavyUsage: { businessBodyDays: 3, nonBusinessBodyDays: 0, nonSuccessBodyDays: 1 },
+                debugShared: { businessBodyDays: 14, nonBusinessBodyDays: 1, nonSuccessBodyDays: 7 },
+              },
+            },
+            adminUserListStats: {
+              activeUsers90d: 12,
+              totalUsers: 30,
+              windowDays: 90,
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(fetchSystemSettings()).resolves.toEqual({
+      requestRateLimit: 72,
+      authTokenLogRetentionDays: 92,
+      mcpSessionAffinityKeyCount: 3,
+      rebalanceMcpEnabled: true,
+      rebalanceMcpSessionPercent: 100,
+      apiRebalanceEnabled: false,
+      apiRebalancePercent: 0,
+      upstreamProjectIdMode: 'accessToken',
+      upstreamProjectIdFixedValue: '',
+      upstreamMcpUserAgent: '',
+      rechargeFeatureEnabled: false,
+      rechargeUserEnabled: false,
+      adminDefaultActiveUsersOnly: true,
+      userBlockedKeyBaseLimit: 8,
+      globalIpLimit: 5,
+      trustedProxyCidrs: ['127.0.0.0/8', '::1/128'],
+      trustedClientIpHeaders: ['cf-connecting-ip', 'x-forwarded-for'],
+      requestLogRetention: {
+        maxLogRetentionDays: 32,
+        heavyUsageThresholdPercent: 80,
+        global: { businessBodyDays: 7, nonBusinessBodyDays: 0, nonSuccessBodyDays: 3 },
+        heavyUsage: { businessBodyDays: 3, nonBusinessBodyDays: 0, nonSuccessBodyDays: 1 },
+        debugShared: { businessBodyDays: 14, nonBusinessBodyDays: 1, nonSuccessBodyDays: 7 },
+      },
+    })
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/settings')
+  })
+
+  it('loads the system status from the dedicated endpoint', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            phase: 'pending',
+            configuredProjectIdMode: 'accessToken',
+            effectiveProjectIdMode: 'accessToken',
+            fixedProjectIdConfigured: false,
+            configuredMcpUserAgent: '',
+            effectiveMcpUserAgent: null,
+            httpAllowedHeaders: ['accept'],
+            controlMcpAllowedHeaders: ['mcp-protocol-version'],
+            gates: [{ key: 'accessTokenMode', ready: true, detail: 'AccessToken' }],
+            completedGates: 1,
+            totalGates: 4,
+            activeUpstreamMcpSessions: 2,
+            currentPeriodCode: '2026-07-14/S2',
+            currentPeriodEndsAt: 1_783_994_400,
+            nextEpochAt: 1_783_994_400,
+            pendingResearch: 1,
+            queuedSettlements: 2,
+            degradedSettlements: 0,
+            degradedSettlementsCapped: false,
+            lastReconciliationRunAt: 1_783_958_250,
+            lastShadowAdjustmentAt: 1_783_958_100,
+            lastReconciliationEnqueueErrorAt: 1_783_957_900,
+            retryBuckets: {
+              upstream429: 1,
+              localUsageRateLimit: 2,
+              other: 0,
+            },
+            currentPeriodBoundUsersByKey: [{ keyIdHint: 'key-primary', count: 7 }],
+            currentPeriodPendingProjectIdsByKey: [{ keyIdHint: 'key-primary', count: 21 }],
+            recentAdjustments: [],
+            generatedAt: 1_783_958_400,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(fetchSystemStatus()).resolves.toMatchObject({
+      phase: 'pending',
+      configuredProjectIdMode: 'accessToken',
+      currentPeriodCode: '2026-07-14/S2',
+      activeUpstreamMcpSessions: 2,
+      retryBuckets: {
+        upstream429: 1,
+        localUsageRateLimit: 2,
+        other: 0,
+      },
+      currentPeriodBoundUsersByKey: [{ keyIdHint: 'key-primary', count: 7 }],
+      currentPeriodPendingProjectIdsByKey: [{ keyIdHint: 'key-primary', count: 21 }],
+    })
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/settings/system/status')
+  })
+
+  it('fetches forward proxy settings from the dedicated endpoint', async () => {
+    const payload = {
+      proxyUrls: ['https://example.com/sub.txt'],
+      subscriptionServerSideEnabled: true,
+      sourceSubscriptionUrl: 'https://example.com/sub.txt',
+      validationSummary: null,
+      validationNodes: [],
+      runtime: null,
+    }
+    const fetchMock = mock(() =>
+      Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(fetchForwardProxySettings()).resolves.toEqual(payload)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/settings/forward-proxy')
+  })
+
+  it('updates system settings with requestRateLimit in the payload body', async () => {
+    const fetchMock = mock((_input: RequestInfo | URL, init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            requestRateLimit: 75,
+            authTokenLogRetentionDays: 92,
+            mcpSessionAffinityKeyCount: 4,
+            rebalanceMcpEnabled: false,
+            rebalanceMcpSessionPercent: 100,
+            apiRebalanceEnabled: true,
+            apiRebalancePercent: 100,
+            upstreamProjectIdMode: 'accessToken',
+            upstreamProjectIdFixedValue: '',
+            upstreamMcpUserAgent: '',
+            rechargeFeatureEnabled: false,
+            rechargeUserEnabled: false,
+            adminDefaultActiveUsersOnly: true,
+            userBlockedKeyBaseLimit: 5,
+            globalIpLimit: 6,
+            trustedProxyCidrs: ['127.0.0.0/8', '::1/128'],
+            trustedClientIpHeaders: ['cf-connecting-ip', 'x-forwarded-for'],
+            requestLogRetention: {
+              maxLogRetentionDays: 32,
+              heavyUsageThresholdPercent: 80,
+              global: { businessBodyDays: 7, nonBusinessBodyDays: 0, nonSuccessBodyDays: 3 },
+              heavyUsage: { businessBodyDays: 3, nonBusinessBodyDays: 0, nonSuccessBodyDays: 1 },
+              debugShared: { businessBodyDays: 14, nonBusinessBodyDays: 1, nonSuccessBodyDays: 7 },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    )
+    globalThis.fetch = fetchMock as typeof fetch
+
+    await expect(
+      updateSystemSettings({
+        requestRateLimit: 75,
+        authTokenLogRetentionDays: 92,
+        mcpSessionAffinityKeyCount: 4,
+        rebalanceMcpEnabled: false,
+        rebalanceMcpSessionPercent: 100,
+        apiRebalanceEnabled: true,
+        apiRebalancePercent: 100,
+        upstreamProjectIdMode: 'accessToken',
+        upstreamProjectIdFixedValue: '',
+        upstreamMcpUserAgent: '',
+        rechargeFeatureEnabled: false,
+        rechargeUserEnabled: false,
+        adminDefaultActiveUsersOnly: true,
+        userBlockedKeyBaseLimit: 5,
+        globalIpLimit: 6,
+        trustedProxyCidrs: ['127.0.0.0/8', '::1/128'],
+        trustedClientIpHeaders: ['cf-connecting-ip', 'x-forwarded-for'],
+        requestLogRetention: {
+          maxLogRetentionDays: 32,
+          heavyUsageThresholdPercent: 80,
+          global: { businessBodyDays: 7, nonBusinessBodyDays: 0, nonSuccessBodyDays: 3 },
+          heavyUsage: { businessBodyDays: 3, nonBusinessBodyDays: 0, nonSuccessBodyDays: 1 },
+          debugShared: { businessBodyDays: 14, nonBusinessBodyDays: 1, nonSuccessBodyDays: 7 },
+        },
+      }),
+    ).resolves.toEqual({
+      requestRateLimit: 75,
+      authTokenLogRetentionDays: 92,
+      mcpSessionAffinityKeyCount: 4,
+      rebalanceMcpEnabled: false,
+        rebalanceMcpSessionPercent: 100,
+        apiRebalanceEnabled: true,
+        apiRebalancePercent: 100,
+        upstreamProjectIdMode: 'accessToken',
+        upstreamProjectIdFixedValue: '',
+        upstreamMcpUserAgent: '',
+        rechargeFeatureEnabled: false,
+        rechargeUserEnabled: false,
+        adminDefaultActiveUsersOnly: true,
+        userBlockedKeyBaseLimit: 5,
+        globalIpLimit: 6,
+        trustedProxyCidrs: ['127.0.0.0/8', '::1/128'],
+        trustedClientIpHeaders: ['cf-connecting-ip', 'x-forwarded-for'],
+        requestLogRetention: {
+          maxLogRetentionDays: 32,
+          heavyUsageThresholdPercent: 80,
+          global: { businessBodyDays: 7, nonBusinessBodyDays: 0, nonSuccessBodyDays: 3 },
+          heavyUsage: { businessBodyDays: 3, nonBusinessBodyDays: 0, nonSuccessBodyDays: 1 },
+          debugShared: { businessBodyDays: 14, nonBusinessBodyDays: 1, nonSuccessBodyDays: 7 },
+        },
+      })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/settings/system')
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requestRateLimit: 75,
+        authTokenLogRetentionDays: 92,
+        mcpSessionAffinityKeyCount: 4,
+        rebalanceMcpEnabled: false,
+        rebalanceMcpSessionPercent: 100,
+        apiRebalanceEnabled: true,
+        apiRebalancePercent: 100,
+        upstreamProjectIdMode: 'accessToken',
+        upstreamProjectIdFixedValue: '',
+        upstreamMcpUserAgent: '',
+        rechargeFeatureEnabled: false,
+        rechargeUserEnabled: false,
+        adminDefaultActiveUsersOnly: true,
+        userBlockedKeyBaseLimit: 5,
+        globalIpLimit: 6,
+        trustedProxyCidrs: ['127.0.0.0/8', '::1/128'],
+        trustedClientIpHeaders: ['cf-connecting-ip', 'x-forwarded-for'],
+        requestLogRetention: {
+          maxLogRetentionDays: 32,
+          heavyUsageThresholdPercent: 80,
+          global: { businessBodyDays: 7, nonBusinessBodyDays: 0, nonSuccessBodyDays: 3 },
+          heavyUsage: { businessBodyDays: 3, nonBusinessBodyDays: 0, nonSuccessBodyDays: 1 },
+          debugShared: { businessBodyDays: 14, nonBusinessBodyDays: 1, nonSuccessBodyDays: 7 },
+        },
+      }),
+    })
   })
 })

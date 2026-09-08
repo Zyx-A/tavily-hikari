@@ -1,0 +1,1832 @@
+impl TavilyProxy {
+    fn oauth_profile_log_context(profile: &OAuthAccountProfile) -> String {
+        let provider_user_id_hash = Self::sha256_hex(&profile.provider_user_id);
+        format!(
+            "provider={}, provider_user_id_sha256={}",
+            profile.provider,
+            &provider_user_id_hash[..16]
+        )
+    }
+
+    // ----- Public auth token management API -----
+
+    /// Validate an access token in format `th-<id>-<secret>` and record usage.
+    /// Returns true if valid and enabled.
+    pub async fn validate_access_token(&self, token: &str) -> Result<bool, ProxyError> {
+        self.key_store.validate_access_token(token).await
+    }
+
+    pub async fn admin_passkey_enabled(&self, scope: &AdminPasskeyScope) -> Result<bool, ProxyError> {
+        self.key_store.admin_passkey_enabled(scope).await
+    }
+
+    pub async fn ensure_admin_passkey_scope(
+        &self,
+        scope: &AdminPasskeyScope,
+    ) -> Result<(), ProxyError> {
+        self.key_store.ensure_admin_passkey_scope(scope).await
+    }
+
+    pub async fn admin_passkey_scope_status(
+        &self,
+        scope: &AdminPasskeyScope,
+    ) -> Result<AdminPasskeyScopeStatus, ProxyError> {
+        self.key_store.admin_passkey_scope_status(scope).await
+    }
+
+    pub async fn create_admin_passkey_reset_token(
+        &self,
+        scope: &AdminPasskeyScope,
+        ttl_secs: i64,
+    ) -> Result<AdminPasskeyResetTokenRecord, ProxyError> {
+        self.key_store
+            .create_admin_passkey_reset_token(scope, ttl_secs)
+            .await
+    }
+
+    pub async fn get_active_admin_passkey_reset_token(
+        &self,
+        scope: &AdminPasskeyScope,
+        token: &str,
+    ) -> Result<Option<AdminPasskeyResetTokenRecord>, ProxyError> {
+        self.key_store
+            .get_active_admin_passkey_reset_token(scope, token)
+            .await
+    }
+
+    pub async fn consume_admin_passkey_reset_token_hash(
+        &self,
+        scope: &AdminPasskeyScope,
+        token_hash: &str,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .consume_admin_passkey_reset_token_hash(scope, token_hash)
+            .await
+    }
+
+    pub async fn complete_admin_passkey_reset_registration(
+        &self,
+        scope: &AdminPasskeyScope,
+        token_hash: &str,
+        credential_id: &str,
+        passkey_json: &str,
+        label: Option<&str>,
+        revoke_credential_ids: &[String],
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .complete_admin_passkey_reset_registration(
+                scope,
+                token_hash,
+                credential_id,
+                passkey_json,
+                label,
+                revoke_credential_ids,
+            )
+            .await
+    }
+
+    pub async fn get_admin_password_settings(
+        &self,
+    ) -> Result<Option<AdminPasswordSettingsRecord>, ProxyError> {
+        self.key_store.get_admin_password_settings().await
+    }
+
+    pub async fn set_admin_password_hash(
+        &self,
+        password_hash: &str,
+    ) -> Result<AdminPasswordSettingsRecord, ProxyError> {
+        self.key_store.set_admin_password_hash(password_hash).await
+    }
+
+    pub async fn disable_admin_password_preserving_login(
+        &self,
+        external_admin_login_available: bool,
+        runtime_passkey_login_available: bool,
+    ) -> Result<AdminPasswordSettingsRecord, ProxyError> {
+        self.key_store
+            .disable_admin_password_preserving_login(
+                external_admin_login_available,
+                runtime_passkey_login_available,
+                None,
+            )
+            .await
+    }
+
+    pub async fn disable_admin_password_preserving_login_for_scope(
+        &self,
+        external_admin_login_available: bool,
+        runtime_passkey_login_available: bool,
+        passkey_scope: Option<&AdminPasskeyScope>,
+    ) -> Result<AdminPasswordSettingsRecord, ProxyError> {
+        self.key_store
+            .disable_admin_password_preserving_login(
+                external_admin_login_available,
+                runtime_passkey_login_available,
+                passkey_scope,
+            )
+            .await
+    }
+
+    pub async fn set_admin_login_totp_required(
+        &self,
+        required: bool,
+    ) -> Result<AdminPasswordSettingsRecord, ProxyError> {
+        self.key_store.set_admin_login_totp_required(required, None).await
+    }
+
+    pub async fn set_admin_login_totp_required_for_scope(
+        &self,
+        required: bool,
+        passkey_scope: Option<&AdminPasskeyScope>,
+    ) -> Result<AdminPasswordSettingsRecord, ProxyError> {
+        self.key_store
+            .set_admin_login_totp_required(required, passkey_scope)
+            .await
+    }
+
+    pub async fn clear_admin_totp_secret_record_and_login_requirement(
+        &self,
+    ) -> Result<AdminPasswordSettingsRecord, ProxyError> {
+        self.key_store
+            .clear_admin_totp_secret_record_and_login_requirement()
+            .await
+    }
+
+    pub async fn list_active_admin_passkey_credentials(
+        &self,
+        scope: &AdminPasskeyScope,
+    ) -> Result<Vec<AdminPasskeyCredentialRecord>, ProxyError> {
+        self.key_store.list_active_admin_passkey_credentials(scope).await
+    }
+
+    pub async fn upsert_admin_passkey_credential(
+        &self,
+        scope: &AdminPasskeyScope,
+        credential_id: &str,
+        passkey_json: &str,
+        label: Option<&str>,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .upsert_admin_passkey_credential(scope, credential_id, passkey_json, label)
+            .await
+    }
+
+    pub async fn update_admin_passkey_credential_after_auth(
+        &self,
+        scope: &AdminPasskeyScope,
+        credential_id: &str,
+        passkey_json: &str,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .update_admin_passkey_credential_after_auth(scope, credential_id, passkey_json)
+            .await
+    }
+
+    pub async fn update_admin_passkey_credential_label(
+        &self,
+        scope: &AdminPasskeyScope,
+        credential_id: &str,
+        label: Option<&str>,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .update_admin_passkey_credential_label(scope, credential_id, label)
+            .await
+    }
+
+    pub async fn revoke_admin_passkey_credential_preserving_login(
+        &self,
+        scope: &AdminPasskeyScope,
+        credential_id: &str,
+        external_admin_login_available: bool,
+        runtime_password_available: bool,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .revoke_admin_passkey_credential_preserving_login(
+                scope,
+                credential_id,
+                external_admin_login_available,
+                runtime_password_available,
+            )
+            .await
+    }
+
+    pub async fn insert_admin_passkey_challenge(
+        &self,
+        scope: &AdminPasskeyScope,
+        kind: AdminPasskeyChallengeKind,
+        reset_token: Option<&str>,
+        state_json: &str,
+        ttl_secs: i64,
+    ) -> Result<AdminPasskeyChallengeRecord, ProxyError> {
+        self.key_store
+            .insert_admin_passkey_challenge(scope, kind, reset_token, state_json, ttl_secs)
+            .await
+    }
+
+    pub async fn consume_admin_passkey_challenge(
+        &self,
+        scope: &AdminPasskeyScope,
+        id: &str,
+        kind: AdminPasskeyChallengeKind,
+    ) -> Result<Option<AdminPasskeyChallengeRecord>, ProxyError> {
+        self.key_store
+            .consume_admin_passkey_challenge(scope, id, kind)
+            .await
+    }
+
+    pub async fn create_admin_passkey_session(
+        &self,
+        scope: &AdminPasskeyScope,
+        credential_id: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<AdminPasskeySessionRecord, ProxyError> {
+        self.key_store
+            .create_admin_passkey_session(scope, credential_id, ttl_secs)
+            .await
+    }
+
+    pub async fn get_active_admin_passkey_session(
+        &self,
+        scope: &AdminPasskeyScope,
+        token: &str,
+    ) -> Result<Option<AdminPasskeySessionRecord>, ProxyError> {
+        self.key_store.get_active_admin_passkey_session(scope, token).await
+    }
+
+    pub async fn revoke_admin_passkey_session(
+        &self,
+        scope: &AdminPasskeyScope,
+        token: &str,
+    ) -> Result<(), ProxyError> {
+        self.key_store.revoke_admin_passkey_session(scope, token).await
+    }
+
+    pub async fn revoke_admin_passkey_sessions_for_credential(
+        &self,
+        scope: &AdminPasskeyScope,
+        credential_id: &str,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .revoke_admin_passkey_sessions_for_credential(scope, credential_id)
+            .await
+    }
+
+    pub async fn revoke_all_admin_passkey_sessions(
+        &self,
+        scope: &AdminPasskeyScope,
+    ) -> Result<(), ProxyError> {
+        self.key_store.revoke_all_admin_passkey_sessions(scope).await
+    }
+
+    /// Admin: create a new access token with optional note.
+    pub async fn create_access_token(
+        &self,
+        note: Option<&str>,
+    ) -> Result<AuthTokenSecret, ProxyError> {
+        self.key_store.create_access_token(note).await
+    }
+
+    /// Admin: create a new access token and bind it to the specified user.
+    pub async fn create_user_bound_access_token(
+        &self,
+        user_id: &str,
+        note: Option<&str>,
+    ) -> Result<AuthTokenSecret, ProxyError> {
+        self.key_store
+            .create_user_bound_access_token(user_id, note)
+            .await
+    }
+
+    /// Admin: batch create access tokens with required group name.
+    pub async fn create_access_tokens_batch(
+        &self,
+        group: &str,
+        count: usize,
+        note: Option<&str>,
+    ) -> Result<Vec<AuthTokenSecret>, ProxyError> {
+        self.key_store
+            .create_access_tokens_batch(group, count, note)
+            .await
+    }
+
+    /// Admin: list tokens for management.
+    pub async fn list_access_tokens(&self) -> Result<Vec<AuthToken>, ProxyError> {
+        let mut tokens = self.key_store.list_access_tokens().await?;
+        self.populate_token_quota(&mut tokens).await?;
+        Ok(tokens)
+    }
+
+    pub async fn list_dashboard_disabled_tokens(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AuthToken>, ProxyError> {
+        let mut tokens = self.key_store.list_disabled_access_tokens(limit).await?;
+        self.populate_token_quota(&mut tokens).await?;
+        Ok(tokens)
+    }
+
+    pub async fn list_dashboard_disabled_token_ids(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, ProxyError> {
+        self.key_store.list_disabled_access_token_ids(limit).await
+    }
+
+    /// Admin: list tokens paginated.
+    pub async fn list_access_tokens_paged(
+        &self,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<AuthToken>, i64), ProxyError> {
+        self.list_access_tokens_filtered_paged(page, per_page, AdminTokenListFilters::default())
+            .await
+    }
+
+    pub async fn list_access_tokens_filtered_paged(
+        &self,
+        page: i64,
+        per_page: i64,
+        filters: AdminTokenListFilters,
+    ) -> Result<(Vec<AuthToken>, i64), ProxyError> {
+        if filters.quota_state.is_some() {
+            let mut tokens = self.key_store.list_access_tokens_for_filters(&filters).await?;
+            self.populate_token_quota(&mut tokens).await?;
+            let quota_state = filters.quota_state.as_deref().unwrap_or("normal");
+            tokens.retain(|token| {
+                token
+                    .quota
+                    .as_ref()
+                    .map(|quota| quota.state_key())
+                    .unwrap_or("normal")
+                    == quota_state
+            });
+            let total = tokens.len() as i64;
+            let page = page.max(1);
+            let per_page = per_page.clamp(1, 200);
+            let start = ((page - 1) * per_page).max(0) as usize;
+            let end = start.saturating_add(per_page as usize).min(tokens.len());
+            let items = if start >= tokens.len() {
+                Vec::new()
+            } else {
+                tokens[start..end].to_vec()
+            };
+            return Ok((items, total));
+        }
+
+        let (mut tokens, total) = self
+            .key_store
+            .list_access_tokens_filtered_paged(page, per_page, &filters)
+            .await?;
+        self.populate_token_quota(&mut tokens).await?;
+        Ok((tokens, total))
+    }
+
+    pub async fn set_access_tokens_enabled(
+        &self,
+        ids: &[String],
+        enabled: bool,
+    ) -> Result<AdminTokenBatchMutationResult, ProxyError> {
+        self.key_store.set_access_tokens_enabled(ids, enabled).await
+    }
+
+    pub async fn delete_access_tokens(
+        &self,
+        ids: &[String],
+    ) -> Result<AdminTokenBatchMutationResult, ProxyError> {
+        self.key_store.delete_access_tokens(ids).await
+    }
+
+    pub(crate) async fn populate_token_quota(
+        &self,
+        tokens: &mut [AuthToken],
+    ) -> Result<(), ProxyError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = tokens.iter().map(|t| t.id.clone()).collect();
+        let verdicts = self.token_quota.snapshot_many(&ids).await?;
+        let token_bindings = self.key_store.list_user_bindings_for_tokens(&ids).await?;
+        let now = self.backend_time.now_utc();
+        let now_ts = now.timestamp();
+        let minute_bucket = now_ts - (now_ts % 60);
+        let local_now = now.with_timezone(&Local);
+        let hour_window_start = minute_bucket - 59 * 60;
+        let day_window_start = start_of_local_day_utc_ts(local_now);
+        let day_window_end = next_local_day_start_utc_ts(day_window_start);
+        let token_hourly_oldest = self
+            .key_store
+            .earliest_usage_bucket_since_bulk(&ids, GRANULARITY_MINUTE, hour_window_start)
+            .await?;
+        let mut user_ids: Vec<String> = token_bindings.values().cloned().collect();
+        user_ids.sort_unstable();
+        user_ids.dedup();
+        let account_hourly_oldest = self
+            .key_store
+            .earliest_account_usage_bucket_since_bulk(
+                &user_ids,
+                GRANULARITY_MINUTE,
+                hour_window_start,
+            )
+            .await?;
+        let month_start = start_of_month(now);
+        let next_month_reset = start_of_next_month(month_start).timestamp();
+        for token in tokens.iter_mut() {
+            if let Some(verdict) = verdicts.get(&token.id) {
+                let hourly_oldest = if let Some(user_id) = token_bindings.get(&token.id) {
+                    account_hourly_oldest.get(user_id).copied()
+                } else {
+                    token_hourly_oldest.get(&token.id).copied()
+                };
+                token.quota_hourly_reset_at = if verdict.hourly_used > 0 {
+                    hourly_oldest.map(|bucket| bucket + SECS_PER_HOUR)
+                } else {
+                    None
+                };
+                token.quota_daily_reset_at = if verdict.daily_used > 0 {
+                    Some(day_window_end)
+                } else {
+                    None
+                };
+                token.quota_monthly_reset_at = if verdict.monthly_used > 0 {
+                    Some(next_month_reset)
+                } else {
+                    None
+                };
+                token.quota = Some(verdict.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Admin: delete a token by id code.
+    pub async fn delete_access_token(&self, id: &str) -> Result<(), ProxyError> {
+        self.key_store.delete_access_token(id).await
+    }
+
+    /// Admin: delete a token only when it belongs to a user and is not their last token.
+    pub async fn delete_user_bound_access_token(
+        &self,
+        user_id: &str,
+        token_id: &str,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .delete_user_bound_access_token(user_id, token_id)
+            .await
+    }
+
+    /// Admin: set token enabled/disabled.
+    pub async fn set_access_token_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), ProxyError> {
+        self.key_store.set_access_token_enabled(id, enabled).await
+    }
+
+    /// Admin: update token note.
+    pub async fn update_access_token_note(&self, id: &str, note: &str) -> Result<(), ProxyError> {
+        self.key_store.update_access_token_note(id, note).await
+    }
+
+    /// Admin: get full token string for copy.
+    pub async fn get_access_token_secret(
+        &self,
+        id: &str,
+    ) -> Result<Option<AuthTokenSecret>, ProxyError> {
+        self.key_store.get_access_token_secret(id).await
+    }
+
+    /// Admin: rotate token secret while keeping the same token id.
+    /// Returns the new full token string (th-<id>-<secret>).
+    pub async fn rotate_access_token_secret(
+        &self,
+        id: &str,
+    ) -> Result<AuthTokenSecret, ProxyError> {
+        self.key_store.rotate_access_token_secret(id).await
+    }
+
+    /// Create a one-time OAuth login state with TTL for CSRF/replay protection.
+    pub async fn create_oauth_login_state(
+        &self,
+        provider: &str,
+        redirect_to: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<String, ProxyError> {
+        self.create_oauth_login_state_with_binding_and_token(
+            provider,
+            redirect_to,
+            ttl_secs,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Create a one-time OAuth login state bound to optional browser context hash.
+    pub async fn create_oauth_login_state_with_binding(
+        &self,
+        provider: &str,
+        redirect_to: Option<&str>,
+        ttl_secs: i64,
+        binding_hash: Option<&str>,
+    ) -> Result<String, ProxyError> {
+        self.create_oauth_login_state_with_binding_and_token(
+            provider,
+            redirect_to,
+            ttl_secs,
+            binding_hash,
+            None,
+        )
+        .await
+    }
+
+    /// Create a one-time OAuth login state bound to optional browser context hash and token id.
+    pub async fn create_oauth_login_state_with_binding_and_token(
+        &self,
+        provider: &str,
+        redirect_to: Option<&str>,
+        ttl_secs: i64,
+        binding_hash: Option<&str>,
+        bind_token_id: Option<&str>,
+    ) -> Result<String, ProxyError> {
+        self.key_store
+            .insert_oauth_login_state(provider, redirect_to, ttl_secs, binding_hash, bind_token_id)
+            .await
+    }
+
+    /// Consume and invalidate an OAuth login state. Returns redirect target when valid.
+    pub async fn consume_oauth_login_state(
+        &self,
+        provider: &str,
+        state: &str,
+    ) -> Result<Option<Option<String>>, ProxyError> {
+        Ok(self
+            .consume_oauth_login_state_with_binding_and_token(provider, state, None)
+            .await?
+            .map(|payload| payload.redirect_to))
+    }
+
+    /// Consume and invalidate an OAuth login state bound to optional browser context hash.
+    pub async fn consume_oauth_login_state_with_binding(
+        &self,
+        provider: &str,
+        state: &str,
+        binding_hash: Option<&str>,
+    ) -> Result<Option<Option<String>>, ProxyError> {
+        Ok(self
+            .consume_oauth_login_state_with_binding_and_token(provider, state, binding_hash)
+            .await?
+            .map(|payload| payload.redirect_to))
+    }
+
+    /// Consume and invalidate an OAuth login state and return all payload fields.
+    pub async fn consume_oauth_login_state_with_binding_and_token(
+        &self,
+        provider: &str,
+        state: &str,
+        binding_hash: Option<&str>,
+    ) -> Result<Option<OAuthLoginStatePayload>, ProxyError> {
+        self.key_store
+            .consume_oauth_login_state(provider, state, binding_hash)
+            .await
+    }
+
+    /// Upsert local user identity from third-party OAuth profile.
+    pub async fn upsert_oauth_account(
+        &self,
+        profile: &OAuthAccountProfile,
+    ) -> Result<UserIdentity, ProxyError> {
+        let deadline = self.backend_time.deadline_after(Duration::from_secs(5));
+        let mut attempt = 0usize;
+        let operation_started = Instant::now();
+        let context = Self::oauth_profile_log_context(profile);
+        loop {
+            match self.key_store.upsert_oauth_account(profile).await {
+                Ok(identity) => {
+                    log_slow_db_operation(
+                        "oauth account upsert",
+                        operation_started.elapsed(),
+                        Some(context.as_str()),
+                    );
+                    return Ok(identity);
+                }
+                Err(err) => {
+                    if sleep_before_sqlite_transient_write_retry(
+                        &self.backend_time,
+                        "oauth account upsert",
+                        attempt,
+                        deadline,
+                        &err,
+                    )
+                    .await
+                    {
+                        attempt += 1;
+                        continue;
+                    }
+                    log_db_operation_error(
+                        "oauth account upsert",
+                        operation_started.elapsed(),
+                        Some(context.as_str()),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Refresh third-party OAuth profile without mutating the user's real last_login_at timestamp.
+    pub async fn refresh_oauth_account_profile(
+        &self,
+        profile: &OAuthAccountProfile,
+    ) -> Result<UserIdentity, ProxyError> {
+        let deadline = self.backend_time.deadline_after(Duration::from_secs(5));
+        let mut attempt = 0usize;
+        let operation_started = Instant::now();
+        let context = Self::oauth_profile_log_context(profile);
+        loop {
+            match self.key_store.refresh_oauth_account_profile(profile).await {
+                Ok(identity) => {
+                    log_slow_db_operation(
+                        "oauth account profile refresh",
+                        operation_started.elapsed(),
+                        Some(context.as_str()),
+                    );
+                    return Ok(identity);
+                }
+                Err(err) => {
+                    if sleep_before_sqlite_transient_write_retry(
+                        &self.backend_time,
+                        "oauth account profile refresh",
+                        attempt,
+                        deadline,
+                        &err,
+                    )
+                    .await
+                    {
+                        attempt += 1;
+                        continue;
+                    }
+                    log_db_operation_error(
+                        "oauth account profile refresh",
+                        operation_started.elapsed(),
+                        Some(context.as_str()),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Refresh third-party OAuth profile and atomically rotate the persisted refresh token.
+    pub async fn refresh_oauth_account_profile_with_refresh_token(
+        &self,
+        profile: &OAuthAccountProfile,
+        refresh_token_ciphertext: &str,
+        refresh_token_nonce: &str,
+    ) -> Result<UserIdentity, ProxyError> {
+        let deadline = self.backend_time.deadline_after(Duration::from_secs(5));
+        let mut attempt = 0usize;
+        let operation_started = Instant::now();
+        let context = Self::oauth_profile_log_context(profile);
+        loop {
+            match self
+                .key_store
+                .refresh_oauth_account_profile_with_refresh_token(
+                    profile,
+                    refresh_token_ciphertext,
+                    refresh_token_nonce,
+                )
+                .await
+            {
+                Ok(identity) => {
+                    log_slow_db_operation(
+                        "oauth account profile refresh token update",
+                        operation_started.elapsed(),
+                        Some(context.as_str()),
+                    );
+                    return Ok(identity);
+                }
+                Err(err) => {
+                    if sleep_before_sqlite_transient_write_retry(
+                        &self.backend_time,
+                        "oauth account profile refresh token update",
+                        attempt,
+                        deadline,
+                        &err,
+                    )
+                    .await
+                    {
+                        attempt += 1;
+                        continue;
+                    }
+                    log_db_operation_error(
+                        "oauth account profile refresh token update",
+                        operation_started.elapsed(),
+                        Some(context.as_str()),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Check whether a third-party account already exists locally.
+    pub async fn oauth_account_exists(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .oauth_account_exists(provider, provider_user_id)
+            .await
+    }
+
+    /// Persist encrypted refresh token material for an OAuth account.
+    pub async fn set_oauth_account_refresh_token(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+        refresh_token_ciphertext: &str,
+        refresh_token_nonce: &str,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .set_oauth_account_refresh_token(
+                provider,
+                provider_user_id,
+                refresh_token_ciphertext,
+                refresh_token_nonce,
+            )
+            .await
+    }
+
+    /// Update whether a local user can authenticate.
+    pub async fn set_user_active_status(
+        &self,
+        user_id: &str,
+        active: bool,
+    ) -> Result<(), ProxyError> {
+        self.key_store.set_user_active_status(user_id, active).await
+    }
+
+    /// List OAuth accounts that can be refreshed offline.
+    pub async fn list_oauth_accounts_with_refresh_token(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<OAuthAccountRefreshTokenRecord>, ProxyError> {
+        self.key_store
+            .list_oauth_accounts_with_refresh_token(provider)
+            .await
+    }
+
+    /// Record a successful profile sync attempt for an OAuth account.
+    pub async fn record_oauth_account_profile_sync_success(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+        attempted_at: i64,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .record_oauth_account_profile_sync_success(provider, provider_user_id, attempted_at)
+            .await
+    }
+
+    /// Record a failed profile sync attempt for an OAuth account.
+    pub async fn record_oauth_account_profile_sync_failure(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+        attempted_at: i64,
+        error: &str,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .record_oauth_account_profile_sync_failure(
+                provider,
+                provider_user_id,
+                attempted_at,
+                error,
+            )
+            .await
+    }
+
+    /// Read whether first-time third-party registration is enabled.
+    pub async fn allow_registration(&self) -> Result<bool, ProxyError> {
+        self.key_store.allow_registration().await
+    }
+
+    /// Persist whether first-time third-party registration is enabled.
+    pub async fn set_allow_registration(&self, allow: bool) -> Result<bool, ProxyError> {
+        self.key_store.set_allow_registration(allow).await
+    }
+
+    /// Ensure one-to-one user token binding exists, creating a token only when missing.
+    pub async fn ensure_user_token_binding(
+        &self,
+        user_id: &str,
+        note: Option<&str>,
+    ) -> Result<AuthTokenSecret, ProxyError> {
+        self.key_store
+            .ensure_user_token_binding(user_id, note)
+            .await
+    }
+
+    /// Ensure binding with an optional preferred token id. Falls back to default behavior.
+    pub async fn ensure_user_token_binding_with_preferred(
+        &self,
+        user_id: &str,
+        note: Option<&str>,
+        preferred_token_id: Option<&str>,
+    ) -> Result<AuthTokenSecret, ProxyError> {
+        self.key_store
+            .ensure_user_token_binding_with_preferred(user_id, note, preferred_token_id)
+            .await
+    }
+
+    /// Fetch current user token by user_id. Does not auto-recreate when unavailable.
+    pub async fn get_user_token(&self, user_id: &str) -> Result<UserTokenLookup, ProxyError> {
+        self.key_store.get_user_token(user_id).await
+    }
+
+    /// List tokens bound to the specified user.
+    pub async fn list_user_tokens(&self, user_id: &str) -> Result<Vec<AuthToken>, ProxyError> {
+        let mut tokens = self.key_store.list_user_tokens(user_id).await?;
+        self.populate_token_quota(&mut tokens).await?;
+        Ok(tokens)
+    }
+
+    /// Verify whether a token belongs to the specified user.
+    pub async fn is_user_token_bound(
+        &self,
+        user_id: &str,
+        token_id: &str,
+    ) -> Result<bool, ProxyError> {
+        self.key_store.is_user_token_bound(user_id, token_id).await
+    }
+
+    /// Get a token secret only when the token belongs to the specified user.
+    pub async fn get_user_token_secret(
+        &self,
+        user_id: &str,
+        token_id: &str,
+    ) -> Result<Option<AuthTokenSecret>, ProxyError> {
+        self.key_store
+            .get_user_token_secret(user_id, token_id)
+            .await
+    }
+
+    /// User-level quota and usage summary for dashboard.
+    pub async fn user_dashboard_summary(
+        &self,
+        user_id: &str,
+        daily_window: Option<TimeRangeUtc>,
+    ) -> Result<UserDashboardSummary, ProxyError> {
+        let mut summaries = self
+            .user_dashboard_summaries_for_users(&[user_id.to_string()], daily_window)
+            .await?;
+        Ok(summaries.remove(user_id).unwrap_or(UserDashboardSummary {
+            debug_info_shared: false,
+            request_rate: self.default_request_rate_view(RequestRateScope::User),
+            business_calls_1h: BusinessCalls1hSummary {
+                window_minutes: 60,
+                ..BusinessCalls1hSummary::default()
+            },
+            daily_credits_used: 0,
+            daily_credits_limit: 0,
+            monthly_credits_used: 0,
+            monthly_credits_limit: 0,
+            daily_success: 0,
+            daily_failure: 0,
+            monthly_success: 0,
+            monthly_failure: 0,
+            last_activity: None,
+            recharge: LinuxDoCreditRechargeSummary::default(),
+        }))
+    }
+
+    /// Admin: resolve dashboard summaries for many users without N+1 queries.
+    pub async fn user_dashboard_summaries_for_users(
+        &self,
+        user_ids: &[String],
+        daily_window: Option<TimeRangeUtc>,
+    ) -> Result<HashMap<String, UserDashboardSummary>, ProxyError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let now = self.backend_time.now_utc();
+        let month_start = start_of_month(now).timestamp();
+        let server_daily_window = server_local_day_window_utc(now.with_timezone(&Local));
+        let resolved_daily_window = daily_window.unwrap_or(server_daily_window);
+
+        let mut deduped_user_ids = user_ids.to_vec();
+        deduped_user_ids.sort_unstable();
+        deduped_user_ids.dedup();
+
+        let account_limits = self
+            .key_store
+            .resolve_account_quota_limits_bulk(&deduped_user_ids)
+            .await?;
+        let request_rate_totals = self
+            .token_request_limit
+            .snapshot_for_users(&deduped_user_ids)
+            .await?;
+        let business_calls_1h = self
+            .user_business_calls_1h_window
+            .snapshot_for_users(&deduped_user_ids)
+            .await;
+        let daily_totals = self
+            .key_store
+            .sum_account_usage_buckets_bulk(
+                &deduped_user_ids,
+                GRANULARITY_DAY,
+                server_daily_window.start,
+            )
+            .await?;
+        let legacy_daily_totals = self
+            .key_store
+            .sum_account_usage_buckets_bulk_between(
+                &deduped_user_ids,
+                GRANULARITY_HOUR,
+                server_daily_window.start,
+                server_daily_window.end,
+            )
+            .await?;
+        let monthly_totals = self
+            .key_store
+            .fetch_account_monthly_counts(&deduped_user_ids, month_start)
+            .await?;
+        let local_month_start = start_of_local_month_utc_ts(now.with_timezone(&Local));
+        let recharge_delta = self
+            .key_store
+            .sum_linuxdo_credit_recharge_entitlements_for_users(
+                &deduped_user_ids,
+                local_month_start,
+            )
+            .await?;
+        let log_metrics = self
+            .key_store
+            .fetch_user_log_metrics_bulk(
+                &deduped_user_ids,
+                resolved_daily_window.start,
+                resolved_daily_window.end,
+            )
+            .await?;
+        let debug_info_shared = self
+            .key_store
+            .user_debug_info_shared_bulk(&deduped_user_ids)
+            .await?;
+        let default_limits = AccountQuotaLimits::zero_base();
+
+        Ok(deduped_user_ids
+            .into_iter()
+            .map(|user_id| {
+                let limits = account_limits
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| default_limits.clone());
+                let recharge_delta = recharge_delta.get(&user_id).copied().unwrap_or_default();
+                let metrics = log_metrics.get(&user_id).cloned().unwrap_or_default();
+                let request_rate =
+                    request_rate_totals
+                        .get(&user_id)
+                        .cloned()
+                        .unwrap_or_else(|| self.default_request_rate_verdict(RequestRateScope::User));
+                (
+                    user_id.clone(),
+                    UserDashboardSummary {
+                        debug_info_shared: debug_info_shared.get(&user_id).copied().unwrap_or(false),
+                        request_rate: request_rate.request_rate(),
+                        business_calls_1h: {
+                            let mut summary = business_calls_1h.get(&user_id).cloned().unwrap_or(
+                                BusinessCalls1hSummary {
+                                    window_minutes: 60,
+                                    ..BusinessCalls1hSummary::default()
+                                },
+                            );
+                            summary.limit = limits.business_calls_1h_limit;
+                            summary
+                        },
+                        daily_credits_used: daily_totals.get(&user_id).copied().unwrap_or(0)
+                            + legacy_daily_totals.get(&user_id).copied().unwrap_or(0),
+                        daily_credits_limit: limits.daily_credits_limit,
+                        monthly_credits_used: monthly_totals.get(&user_id).copied().unwrap_or(0),
+                        monthly_credits_limit: limits.monthly_credits_limit,
+                        daily_success: metrics.daily_success,
+                        daily_failure: metrics.daily_failure,
+                        monthly_success: metrics.monthly_success,
+                        monthly_failure: metrics.monthly_failure,
+                        last_activity: metrics.last_activity,
+                        recharge: LinuxDoCreditRechargeSummary {
+                            current_month_start: local_month_start,
+                            current_month_entitlement_credits: recharge_delta.monthly_delta,
+                            current_month_entitlement_hourly_delta: recharge_delta.hourly_delta,
+                            current_month_entitlement_daily_delta: recharge_delta.daily_delta,
+                            current_month_entitlement_monthly_delta: recharge_delta.monthly_delta,
+                            effective_until_month_start: None,
+                        },
+                    },
+                )
+            })
+            .collect())
+    }
+
+    pub async fn token_log_metrics_for_tokens(
+        &self,
+        token_ids: &[String],
+    ) -> Result<HashMap<String, TokenLogMetricsSummary>, ProxyError> {
+        let daily_window = server_local_day_window_utc(self.backend_time.local_now());
+        self.key_store
+            .fetch_token_log_metrics_bulk(token_ids, daily_window.start, daily_window.end)
+            .await
+    }
+
+    pub async fn list_api_key_binding_counts_for_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, i64>, ProxyError> {
+        self.key_store
+            .list_api_key_binding_counts_for_users(user_ids)
+            .await
+    }
+
+    async fn backfill_current_month_broken_key_subjects(&self) -> Result<(), ProxyError> {
+        self.key_store
+            .backfill_current_month_auto_subject_breakages()
+            .await
+    }
+
+    pub async fn fetch_account_monthly_broken_limit(
+        &self,
+        user_id: &str,
+    ) -> Result<i64, ProxyError> {
+        self.key_store
+            .fetch_account_monthly_broken_limit(user_id)
+            .await
+    }
+
+    pub async fn fetch_account_monthly_broken_limits_bulk(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, i64>, ProxyError> {
+        self.key_store
+            .fetch_account_monthly_broken_limits_bulk(user_ids)
+            .await
+    }
+
+    pub async fn update_account_monthly_broken_limit(
+        &self,
+        user_id: &str,
+        monthly_broken_limit: i64,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .update_account_monthly_broken_limit(user_id, monthly_broken_limit)
+            .await
+    }
+
+    pub async fn fetch_monthly_broken_counts_for_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, i64>, ProxyError> {
+        self.backfill_current_month_broken_key_subjects().await?;
+        self.key_store
+            .fetch_monthly_broken_counts_for_users(
+                user_ids,
+                start_of_month(self.backend_time.now_utc()).timestamp(),
+            )
+            .await
+    }
+
+    pub async fn fetch_monthly_broken_counts_for_tokens(
+        &self,
+        token_ids: &[String],
+    ) -> Result<HashMap<String, i64>, ProxyError> {
+        self.backfill_current_month_broken_key_subjects().await?;
+        self.key_store
+            .fetch_monthly_broken_counts_for_tokens(
+                token_ids,
+                start_of_month(self.backend_time.now_utc()).timestamp(),
+            )
+            .await
+    }
+
+    pub async fn list_monthly_broken_subjects_for_tokens(
+        &self,
+        token_ids: &[String],
+    ) -> Result<HashSet<String>, ProxyError> {
+        self.backfill_current_month_broken_key_subjects().await?;
+        self.key_store
+            .list_monthly_broken_subjects_for_tokens(
+                token_ids,
+                start_of_month(self.backend_time.now_utc()).timestamp(),
+            )
+            .await
+    }
+
+    pub async fn fetch_user_monthly_broken_keys(
+        &self,
+        user_id: &str,
+        page: i64,
+        per_page: i64,
+    ) -> Result<PaginatedMonthlyBrokenKeys, ProxyError> {
+        self.backfill_current_month_broken_key_subjects().await?;
+        self.key_store
+            .fetch_monthly_broken_keys_page(
+                BROKEN_KEY_SUBJECT_USER,
+                user_id,
+                page,
+                per_page,
+                start_of_month(self.backend_time.now_utc()).timestamp(),
+            )
+            .await
+    }
+
+    pub async fn fetch_token_monthly_broken_keys(
+        &self,
+        token_id: &str,
+        page: i64,
+        per_page: i64,
+    ) -> Result<PaginatedMonthlyBrokenKeys, ProxyError> {
+        self.backfill_current_month_broken_key_subjects().await?;
+        self.key_store
+            .fetch_monthly_broken_keys_page(
+                BROKEN_KEY_SUBJECT_TOKEN,
+                token_id,
+                page,
+                per_page,
+                start_of_month(self.backend_time.now_utc()).timestamp(),
+            )
+            .await
+    }
+
+    /// Admin: list users with pagination and optional fuzzy query.
+    pub async fn list_admin_users_paged(
+        &self,
+        page: i64,
+        per_page: i64,
+        query: Option<&str>,
+        tag_id: Option<&str>,
+        activity_scope: AdminUserActivityScope,
+    ) -> Result<(Vec<AdminUserIdentity>, i64), ProxyError> {
+        self.key_store
+            .list_admin_users_paged(page, per_page, query, tag_id, activity_scope)
+            .await
+    }
+
+    /// Admin: list users with pagination pushed below expensive usage hydration.
+    pub async fn list_admin_users_sorted_paged(
+        &self,
+        request: AdminUserSortedPageRequest<'_>,
+    ) -> Result<(Vec<AdminUserIdentity>, i64), ProxyError> {
+        let now = self.backend_time.now_utc();
+        let month_start = start_of_month(now).timestamp();
+        let server_daily_window = server_local_day_window_utc(now.with_timezone(&Local));
+        let minute_bucket = now.timestamp() - (now.timestamp() % SECS_PER_MINUTE);
+        self.key_store
+            .list_admin_users_sorted_paged(
+                request.page,
+                request.per_page,
+                request.query,
+                request.tag_id,
+                request.activity_scope,
+                request.sort,
+                request.direction,
+                minute_bucket - 59 * SECS_PER_MINUTE,
+                server_daily_window.start,
+                server_daily_window.end,
+                month_start,
+                now.timestamp() - 7 * SECS_PER_DAY,
+            )
+            .await
+    }
+
+    /// Admin: list the full filtered user set prior to sorting and pagination.
+    pub async fn list_admin_users_filtered(
+        &self,
+        query: Option<&str>,
+        tag_id: Option<&str>,
+        activity_scope: AdminUserActivityScope,
+    ) -> Result<Vec<AdminUserIdentity>, ProxyError> {
+        self.key_store
+            .list_admin_users_filtered(query, tag_id, activity_scope)
+            .await
+    }
+
+    pub async fn get_admin_user_list_stats(&self) -> Result<AdminUserListStats, ProxyError> {
+        self.key_store.get_admin_user_list_stats().await
+    }
+
+    /// Admin: get a single user identity by id.
+    pub async fn get_admin_user_identity(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<AdminUserIdentity>, ProxyError> {
+        self.key_store.get_admin_user_identity(user_id).await
+    }
+
+    pub async fn get_admin_user_identities(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, AdminUserIdentity>, ProxyError> {
+        self.key_store.get_admin_user_identities(user_ids).await
+    }
+
+    /// Admin: resolve token owners in bulk for management views.
+    pub async fn get_admin_token_owners(
+        &self,
+        token_ids: &[String],
+    ) -> Result<HashMap<String, AdminUserIdentity>, ProxyError> {
+        if token_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let token_bindings = self
+            .key_store
+            .list_user_bindings_for_tokens(token_ids)
+            .await?;
+        if token_bindings.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut user_ids: Vec<String> = token_bindings.values().cloned().collect();
+        user_ids.sort_unstable();
+        user_ids.dedup();
+
+        let user_map = self.key_store.get_admin_user_identities(&user_ids).await?;
+        let mut owners = HashMap::with_capacity(token_bindings.len());
+        for (token_id, user_id) in token_bindings {
+            if let Some(identity) = user_map.get(&user_id) {
+                owners.insert(token_id, identity.clone());
+            }
+        }
+        Ok(owners)
+    }
+
+    /// Admin: upsert account quota limits for a user.
+    pub async fn update_account_quota_limits(
+        &self,
+        user_id: &str,
+        business_calls_1h_limit: i64,
+        daily_credits_limit: i64,
+        monthly_credits_limit: i64,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .update_account_quota_limits(
+                user_id,
+                business_calls_1h_limit,
+                daily_credits_limit,
+                monthly_credits_limit,
+            )
+            .await
+    }
+
+    /// Admin: update only business quota limits and preserve deprecated raw request fields.
+    pub async fn update_account_business_quota_limits(
+        &self,
+        user_id: &str,
+        business_calls_1h_limit: i64,
+        daily_credits_limit: i64,
+        monthly_credits_limit: i64,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .update_account_business_quota_limits(
+                user_id,
+                business_calls_1h_limit,
+                daily_credits_limit,
+                monthly_credits_limit,
+            )
+            .await
+    }
+
+    /// Admin: list all user tag definitions.
+    pub async fn list_user_tags(&self) -> Result<Vec<AdminUserTag>, ProxyError> {
+        Ok(self
+            .key_store
+            .list_user_tags()
+            .await?
+            .into_iter()
+            .map(|tag| to_admin_user_tag(&tag))
+            .collect())
+    }
+
+    /// Admin: create a custom user tag.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_user_tag(
+        &self,
+        name: &str,
+        display_name: &str,
+        icon: Option<&str>,
+        effect_kind: &str,
+        business_calls_1h_delta: i64,
+        daily_credits_delta: i64,
+        monthly_credits_delta: i64,
+    ) -> Result<AdminUserTag, ProxyError> {
+        self.key_store
+            .create_user_tag(
+                name,
+                display_name,
+                icon,
+                effect_kind,
+                business_calls_1h_delta,
+                daily_credits_delta,
+                monthly_credits_delta,
+            )
+            .await
+            .map(|tag| to_admin_user_tag(&tag))
+    }
+
+    /// Admin: update an existing user tag definition.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_user_tag(
+        &self,
+        tag_id: &str,
+        name: &str,
+        display_name: &str,
+        icon: Option<&str>,
+        effect_kind: &str,
+        business_calls_1h_delta: i64,
+        daily_credits_delta: i64,
+        monthly_credits_delta: i64,
+    ) -> Result<Option<AdminUserTag>, ProxyError> {
+        self.key_store
+            .update_user_tag(
+                tag_id,
+                name,
+                display_name,
+                icon,
+                effect_kind,
+                business_calls_1h_delta,
+                daily_credits_delta,
+                monthly_credits_delta,
+            )
+            .await
+            .map(|tag| tag.map(|it| to_admin_user_tag(&it)))
+    }
+
+    /// Admin: delete a custom user tag definition.
+    pub async fn delete_user_tag(&self, tag_id: &str) -> Result<bool, ProxyError> {
+        self.key_store.delete_user_tag(tag_id).await
+    }
+
+    /// Admin: bind a custom tag to a user.
+    pub async fn bind_user_tag_to_user(
+        &self,
+        user_id: &str,
+        tag_id: &str,
+    ) -> Result<bool, ProxyError> {
+        self.key_store.bind_user_tag_to_user(user_id, tag_id).await
+    }
+
+    /// Admin: unbind a tag from a user.
+    pub async fn unbind_user_tag_from_user(
+        &self,
+        user_id: &str,
+        tag_id: &str,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .unbind_user_tag_from_user(user_id, tag_id)
+            .await
+    }
+
+    /// Admin: list tag bindings for a set of users.
+    pub async fn list_user_tag_bindings_for_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, Vec<AdminUserTagBinding>>, ProxyError> {
+        let bindings = self
+            .key_store
+            .list_user_tag_bindings_for_users(user_ids)
+            .await?;
+        Ok(bindings
+            .into_iter()
+            .map(|(user_id, items)| {
+                (
+                    user_id,
+                    items
+                        .into_iter()
+                        .map(|binding| to_admin_user_tag_binding(&binding))
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// Admin: resolve base/effective quota and breakdown for a user.
+    pub async fn get_admin_user_quota_details(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<AdminUserQuotaDetails>, ProxyError> {
+        let Some(_) = self.key_store.get_admin_user_identity(user_id).await? else {
+            return Ok(None);
+        };
+        let resolution = self
+            .key_store
+            .resolve_account_quota_resolution(user_id)
+            .await?;
+        Ok(Some(AdminUserQuotaDetails {
+            base: to_admin_quota_limit_set(&resolution.base),
+            effective: to_admin_quota_limit_set(&resolution.effective),
+            breakdown: resolution
+                .breakdown
+                .iter()
+                .map(to_admin_quota_breakdown_entry)
+                .collect(),
+            tags: resolution
+                .tags
+                .iter()
+                .map(to_admin_user_tag_binding)
+                .collect(),
+            }))
+    }
+
+    pub async fn resolve_user_quota_details(
+        &self,
+        user_id: &str,
+    ) -> Result<AdminUserQuotaDetails, ProxyError> {
+        let resolution = self
+            .key_store
+            .resolve_account_quota_resolution(user_id)
+            .await?;
+        Ok(AdminUserQuotaDetails {
+            base: to_admin_quota_limit_set(&resolution.base),
+            effective: to_admin_quota_limit_set(&resolution.effective),
+            breakdown: resolution
+                .breakdown
+                .iter()
+                .map(to_admin_quota_breakdown_entry)
+                .collect(),
+            tags: resolution
+                .tags
+                .iter()
+                .map(to_admin_user_tag_binding)
+                .collect(),
+        })
+    }
+
+    pub async fn linuxdo_credit_recharge_summary(
+        &self,
+        user_id: &str,
+    ) -> Result<LinuxDoCreditRechargeSummary, ProxyError> {
+        self.key_store
+            .linuxdo_credit_recharge_summary_for_user(
+                user_id,
+                start_of_local_month_utc_ts(self.backend_time.local_now()),
+            )
+            .await
+    }
+
+    pub async fn linuxdo_credit_recharge_admin_audit(
+        &self,
+        user_id: &str,
+    ) -> Result<LinuxDoCreditRechargeAdminAudit, ProxyError> {
+        self.key_store
+            .linuxdo_credit_recharge_admin_audit(
+                user_id,
+                start_of_local_month_utc_ts(self.backend_time.local_now()),
+            )
+            .await
+    }
+
+    pub async fn account_entitlement_summary(
+        &self,
+        user_id: &str,
+    ) -> Result<AccountEntitlementSummary, ProxyError> {
+        self.key_store
+            .account_entitlement_summary_for_user(
+                user_id,
+                start_of_local_month_utc_ts(self.backend_time.local_now()),
+            )
+            .await
+    }
+
+    pub async fn list_user_billing_month_summaries(
+        &self,
+        user_id: &str,
+        start_month: i64,
+        end_month: i64,
+    ) -> Result<Vec<UserBillingMonthSummary>, ProxyError> {
+        self.key_store
+            .list_user_billing_month_summaries_for_user(user_id, start_month, end_month)
+            .await
+    }
+
+    pub async fn list_account_entitlements(
+        &self,
+        user_id: &str,
+        scope_kind: Option<&str>,
+        start_month: Option<i64>,
+        end_month_before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<AccountEntitlementRecord>, ProxyError> {
+        self.key_store
+            .list_account_entitlements_for_user(
+                user_id,
+                scope_kind,
+                start_month,
+                end_month_before,
+                limit,
+            )
+            .await
+    }
+
+    pub async fn create_account_entitlement(
+        &self,
+        record: &AccountEntitlementRecord,
+    ) -> Result<AccountEntitlementRecord, ProxyError> {
+        self.key_store.create_account_entitlement(record).await
+    }
+
+    pub async fn has_linuxdo_credit_recharge_orders(&self) -> Result<bool, ProxyError> {
+        self.key_store.has_linuxdo_credit_recharge_orders().await
+    }
+
+    pub async fn count_admin_linuxdo_credit_recharge_orders(
+        &self,
+        query: &LinuxDoCreditRechargeAdminListQuery,
+    ) -> Result<i64, ProxyError> {
+        self.key_store
+            .count_admin_linuxdo_credit_recharge_orders(query)
+            .await
+    }
+
+    pub async fn count_admin_linuxdo_credit_recharge_user_groups(
+        &self,
+        query: &LinuxDoCreditRechargeAdminListQuery,
+    ) -> Result<i64, ProxyError> {
+        self.key_store
+            .count_admin_linuxdo_credit_recharge_user_groups(query)
+            .await
+    }
+
+    pub async fn list_admin_linuxdo_credit_recharge_orders(
+        &self,
+        query: &LinuxDoCreditRechargeAdminListQuery,
+    ) -> Result<Vec<LinuxDoCreditRechargeAdminOrder>, ProxyError> {
+        self.key_store
+            .list_admin_linuxdo_credit_recharge_orders(query)
+            .await
+    }
+
+    pub async fn list_admin_linuxdo_credit_recharge_user_groups(
+        &self,
+        query: &LinuxDoCreditRechargeAdminListQuery,
+    ) -> Result<Vec<LinuxDoCreditRechargeAdminUserGroup>, ProxyError> {
+        self.key_store
+            .list_admin_linuxdo_credit_recharge_user_groups(query)
+            .await
+    }
+
+    pub async fn create_linuxdo_credit_recharge_order(
+        &self,
+        order: &LinuxDoCreditRechargeOrder,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .create_linuxdo_credit_recharge_order(order)
+            .await
+    }
+
+    pub async fn set_linuxdo_credit_recharge_payment_url(
+        &self,
+        out_trade_no: &str,
+        payment_url: &str,
+        updated_at: i64,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .update_linuxdo_credit_recharge_order_payment_url(
+                out_trade_no,
+                payment_url,
+                updated_at,
+            )
+            .await
+    }
+
+    pub async fn fail_linuxdo_credit_recharge_order(
+        &self,
+        out_trade_no: &str,
+        message: &str,
+        updated_at: i64,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .mark_linuxdo_credit_recharge_order_failed(out_trade_no, message, updated_at)
+            .await
+    }
+
+    pub async fn get_linuxdo_credit_recharge_order(
+        &self,
+        out_trade_no: &str,
+    ) -> Result<Option<LinuxDoCreditRechargeOrder>, ProxyError> {
+        self.key_store
+            .fetch_linuxdo_credit_recharge_order(out_trade_no)
+            .await
+    }
+
+    pub async fn list_linuxdo_credit_recharge_orders(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<LinuxDoCreditRechargeOrder>, ProxyError> {
+        self.key_store
+            .list_linuxdo_credit_recharge_orders_for_user(user_id, limit)
+            .await
+    }
+
+    pub async fn expire_due_linuxdo_credit_recharge_orders(
+        &self,
+        expired_at: i64,
+        limit: i64,
+    ) -> Result<i64, ProxyError> {
+        self.key_store
+            .expire_due_linuxdo_credit_recharge_orders(expired_at, limit)
+            .await
+    }
+
+    pub async fn cancel_due_linuxdo_credit_recharge_orders(
+        &self,
+        cancelled_at: i64,
+        limit: i64,
+    ) -> Result<i64, ProxyError> {
+        self.key_store
+            .cancel_due_linuxdo_credit_recharge_orders(cancelled_at, limit)
+            .await
+    }
+
+    pub async fn linuxdo_credit_recharge_lifecycle_due(
+        &self,
+        now: i64,
+    ) -> Result<bool, ProxyError> {
+        self.key_store
+            .linuxdo_credit_recharge_lifecycle_due(now)
+            .await
+    }
+
+    pub async fn list_linuxdo_credit_recharge_system_refund_candidates(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<LinuxDoCreditRechargeOrder>, ProxyError> {
+        self.key_store
+            .list_linuxdo_credit_recharge_system_refund_candidates(now, limit)
+            .await
+    }
+
+    pub async fn apply_linuxdo_credit_recharge_payment(
+        &self,
+        out_trade_no: &str,
+        trade_no: &str,
+        notify_payload: &str,
+        paid_at: i64,
+    ) -> Result<LinuxDoCreditRechargeOrder, ProxyError> {
+        self.key_store
+            .apply_linuxdo_credit_recharge_payment(
+                out_trade_no,
+                trade_no,
+                notify_payload,
+                paid_at,
+            )
+            .await
+    }
+
+    pub async fn refund_linuxdo_credit_recharge_order(
+        &self,
+        out_trade_no: &str,
+        next_status: &str,
+        refund_actor: &str,
+        refund_payload: &str,
+        refunded_at: i64,
+        revoke_entitlements: bool,
+    ) -> Result<LinuxDoCreditRechargeOrder, ProxyError> {
+        self.key_store
+            .refund_linuxdo_credit_recharge_order(
+                out_trade_no,
+                next_status,
+                refund_actor,
+                refund_payload,
+                refunded_at,
+                revoke_entitlements,
+            )
+            .await
+    }
+
+    pub async fn reserve_linuxdo_credit_recharge_order_refund(
+        &self,
+        out_trade_no: &str,
+        reserved_at: i64,
+    ) -> Result<LinuxDoCreditRechargeOrder, ProxyError> {
+        self.key_store
+            .reserve_linuxdo_credit_recharge_order_refund(out_trade_no, reserved_at)
+            .await
+    }
+
+    pub async fn mark_linuxdo_credit_recharge_order_refund_external_succeeded(
+        &self,
+        out_trade_no: &str,
+        refund_actor: &str,
+        refund_payload: &str,
+        updated_at: i64,
+    ) -> Result<LinuxDoCreditRechargeOrder, ProxyError> {
+        self.key_store
+            .mark_linuxdo_credit_recharge_order_refund_external_succeeded(
+                out_trade_no,
+                refund_actor,
+                refund_payload,
+                updated_at,
+            )
+            .await
+    }
+
+    pub async fn mark_linuxdo_credit_recharge_order_system_refund_failure(
+        &self,
+        out_trade_no: &str,
+        attempts: i64,
+        retry_after_at: i64,
+        message: &str,
+        updated_at: i64,
+    ) -> Result<LinuxDoCreditRechargeOrder, ProxyError> {
+        self.key_store
+            .mark_linuxdo_credit_recharge_order_system_refund_failure(
+                out_trade_no,
+                attempts,
+                retry_after_at,
+                message,
+                updated_at,
+            )
+            .await
+    }
+
+    pub async fn release_linuxdo_credit_recharge_order_refund_reservation(
+        &self,
+        out_trade_no: &str,
+        message: &str,
+        updated_at: i64,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .release_linuxdo_credit_recharge_order_refund_reservation(
+                out_trade_no,
+                message,
+                updated_at,
+            )
+            .await
+    }
+
+    pub async fn get_admin_totp_secret_record(
+        &self,
+    ) -> Result<Option<(String, String, i64)>, ProxyError> {
+        self.key_store.get_admin_totp_secret_record().await
+    }
+
+    pub async fn set_admin_totp_secret_record(
+        &self,
+        ciphertext: &str,
+        nonce: &str,
+        enabled_at: i64,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .set_admin_totp_secret_record(ciphertext, nonce, enabled_at)
+            .await
+    }
+
+    pub async fn clear_admin_totp_secret_record(&self) -> Result<(), ProxyError> {
+        self.key_store.clear_admin_totp_secret_record().await
+    }
+
+    pub async fn get_admin_totp_failure_state(&self) -> Result<(i64, i64), ProxyError> {
+        self.key_store.get_admin_totp_failure_state().await
+    }
+
+    pub async fn set_admin_totp_failure_state(
+        &self,
+        count: i64,
+        locked_until: i64,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .set_admin_totp_failure_state(count, locked_until)
+            .await
+    }
+
+    pub async fn clear_admin_totp_failures(&self) -> Result<(), ProxyError> {
+        self.key_store.clear_admin_totp_failures().await
+    }
+
+    /// Create persisted user session.
+    pub async fn create_user_session(
+        &self,
+        user: &UserIdentity,
+        session_max_age_secs: i64,
+    ) -> Result<UserSession, ProxyError> {
+        self.key_store
+            .create_user_session(user, session_max_age_secs)
+            .await
+    }
+
+    /// Lookup valid user session from cookie token.
+    pub async fn get_user_session(&self, token: &str) -> Result<Option<UserSession>, ProxyError> {
+        self.key_store.get_user_session(token).await
+    }
+
+    /// Revoke persisted user session token.
+    pub async fn revoke_user_session(&self, token: &str) -> Result<(), ProxyError> {
+        self.key_store.revoke_user_session(token).await
+    }
+
+}

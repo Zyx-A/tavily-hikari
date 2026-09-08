@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "prd/**"
   pull_request:
     branches:
       - main
@@ -17,15 +18,129 @@ permissions:
   contents: read
 
 jobs:
-  lint:
-    name: Lint & Checks
-    runs-on: ubuntu-latest
+  worktree-bootstrap-smoke:
+    name: Worktree Bootstrap Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run linked worktree bootstrap smoke
+        run: bash scripts/test-worktree-bootstrap.sh
+
+  web-assets:
+    name: Web Assets
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          bun-version-file: .bun-version
+
+      - name: Install PWA asset dependencies
+        run: python3 -m pip install --user Pillow
+
+      - name: Build frontend assets
+        working-directory: web
+        env:
+          VITE_APP_VERSION: ci-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Verify web asset contract
+        run: python3 scripts/ci_backend_tests.py verify-web-assets --root web/dist
+
+      - name: Upload web assets artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  version-layer-reuse:
+    name: Version Layer Reuse
+    runs-on: ubuntu-24.04
+    needs: [backend-tests]
+    if: ${{ always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install PWA asset dependencies
+        run: python3 -m pip install --user Pillow
+
+      - name: Build and verify version layers
+        env:
+          IMAGE_B_ARCHIVE: ${{ runner.temp }}/version-layer-image-b.tar.gz
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          cd web
+          bun install --frozen-lockfile
+          cd ..
+          bash scripts/check-version-layer-reuse.sh
+
+      - name: Upload version layer B image
+        uses: actions/upload-artifact@v7
+        with:
+          name: version-layer-image-b
+          path: ${{ runner.temp }}/version-layer-image-b.tar.gz
+          if-no-files-found: error
+
+  brand-assets:
+    name: Brand Assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install brand asset dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y librsvg2-bin potrace
+          python3 -m pip install --user Pillow fonttools numpy
+
+      - name: Regenerate and verify branded lockups
+        run: |
+          set -euo pipefail
+          python3 web/scripts/vectorize_relay_mesh_lockups.py
+          python3 web/scripts/generate_relay_mesh_brand_assets.py
+          python3 web/scripts/vectorize_relay_mesh_lockups.py
+          python3 web/scripts/generate_relay_mesh_brand_assets.py
+          python3 web/scripts/verify_relay_mesh_lockup_geometry.py
+          python3 web/scripts/verify_relay_mesh_icon_geometry.py
+          git diff --exit-code
+
+  lint:
+    name: Lint & Checks
+    runs-on: ubuntu-24.04
+    needs: [web-assets, backend-tests]
+    if: ${{ always() && needs.web-assets.result == 'success' }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download web assets artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
@@ -39,7 +154,7 @@ jobs:
         run: rustup component add rustfmt clippy
 
       - name: Cache cargo directories
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -57,26 +172,36 @@ jobs:
       - name: Cargo check
         run: cargo check --locked --all-targets --all-features
 
-  unit-tests:
-    name: Backend Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+  backend-shard-plan:
+    name: Backend Shard Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      lane-matrix: ${{ steps.matrix.outputs.lane-matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Cache prepared backend test bundle
+        id: backend-test-bundle-cache
+        uses: actions/cache@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: /tmp/backend-test-artifacts
+          key: ${{ runner.os }}-backend-test-bundle-v1-rust-1.91.0-ci-test-mold-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tests/**', 'scripts/ci_backend_tests.py', 'scripts/ci_backend_test_manifest.json') }}
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
+        if: ${{ steps.backend-test-bundle-cache.outputs.cache-hit != 'true' }}
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Set up Rust toolchain
+        if: ${{ steps.backend-test-bundle-cache.outputs.cache-hit != 'true' }}
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.91.0
 
       - name: Cache cargo directories
-        uses: actions/cache@v4
+        if: ${{ steps.backend-test-bundle-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -85,13 +210,120 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run cargo test
-        run: cargo test --locked --all-features
+      - name: Cache backend test compilation
+        if: ${{ steps.backend-test-bundle-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v5
+        with:
+          path: target/ci-test
+          key: ${{ runner.os }}-backend-test-target-rust-1.91.0-ci-test-mold-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tests/**', 'scripts/ci_backend_tests.py') }}
+          restore-keys: |
+            ${{ runner.os }}-backend-test-target-rust-1.91.0-ci-test-mold-
+
+      - name: Prepare backend test artifacts
+        if: ${{ steps.backend-test-bundle-cache.outputs.cache-hit != 'true' }}
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          python3 scripts/ci_backend_tests.py prepare-artifacts \
+            --output-dir /tmp/backend-test-artifacts \
+            --cargo-profile ci-test \
+            --cargo-jobs 4 \
+            --web-assets minimal
+
+      - name: Verify backend shard coverage
+        run: python3 scripts/ci_backend_tests.py verify --prebuilt-root /tmp/backend-test-artifacts
+
+      - name: Test backend shard runner contract
+        run: python3 scripts/test_ci_backend_tests.py
+
+      - name: Upload backend test artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-test-artifacts
+          path: /tmp/backend-test-artifacts
+          compression-level: 1
+          if-no-files-found: error
+
+      - name: Export balanced backend lane matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          echo "lane-matrix=$(python3 scripts/ci_backend_tests.py lane-matrix --lane-count 16)" >> "${GITHUB_OUTPUT}"
+
+  backend-test-lanes:
+    name: Backend Test Lane (${{ matrix.lane.name }})
+    runs-on: ubuntu-24.04
+    needs: [backend-shard-plan]
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJson(needs.backend-shard-plan.outputs.lane-matrix) }}
+    steps:
+      - name: Checkout source tree
+        uses: actions/checkout@v7
+
+      - name: Download backend test artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: backend-test-artifacts
+          path: /tmp/backend-test-artifacts
+
+      - name: Run backend lane
+        run: |
+          python3 /tmp/backend-test-artifacts/scripts/ci_backend_tests.py run-lane \
+            --id "${{ matrix.lane.id }}" \
+            --lane-count 16 \
+            --prebuilt-root /tmp/backend-test-artifacts \
+            --filtered-process-workers 4 \
+            --filtered-test-threads 2
+
+  backend-tests:
+    name: Backend Tests
+    runs-on: ubuntu-24.04
+    needs: [backend-test-lanes]
+    if: ${{ always() }}
+    timeout-minutes: 5
+    steps:
+      - name: Validate backend shards
+        env:
+          BACKEND_LANES_RESULT: ${{ needs.backend-test-lanes.result }}
+        run: |
+          set -euo pipefail
+          if [ "${BACKEND_LANES_RESULT}" != "success" ]; then
+            echo "backend lanes did not succeed (result=${BACKEND_LANES_RESULT})"
+            exit 1
+          fi
+
+  frontend-checks:
+    name: Frontend Checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Enforce frontend source budgets
+        working-directory: web
+        run: bun run test:source-budgets
+
+      - name: Run frontend tests
+        working-directory: web
+        run: bun test
 
   compose-smoke-forwardauth-caddy:
     name: Compose Smoke (ForwardAuth + Caddy)
-    runs-on: ubuntu-latest
-    needs: [lint, unit-tests]
+    runs-on: ubuntu-24.04
+    needs: [web-assets, version-layer-reuse]
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     timeout-minutes: 20
     env:
@@ -99,17 +331,16 @@ jobs:
       COMPOSE_FILE: examples/forwardauth-caddy/docker-compose.yml
       BASIC_AUTH_USER: admin
       BASIC_AUTH_PASS: password
-      IMAGE_TAG: tavily-hikari:ci
+      IMAGE_TAG: tavily-hikari-version-layer-${{ github.run_id }}-b
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        uses: actions/checkout@v6
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Download version layer B image
+        uses: actions/download-artifact@v8
         with:
-          bun-version-file: .bun-version
+          name: version-layer-image-b
+          path: ${{ runner.temp }}/version-layer-image-b
 
       - name: Install system dependencies
         shell: bash
@@ -120,23 +351,12 @@ jobs:
           docker --version
           docker compose version || (sudo apt-get install -y docker-compose-plugin && docker compose version)
 
-      - name: Build web assets (required for Dockerfile)
-        working-directory: web
-        env:
-          VITE_APP_VERSION: ci-${{ github.sha }}
-        run: |
-          set -euo pipefail
-          bun install --frozen-lockfile
-          bun run build
-
-      - name: Build local Docker image (PR checkout)
+      - name: Load version layer B image
         shell: bash
         run: |
           set -euo pipefail
-          docker build \
-            --build-arg "APP_EFFECTIVE_VERSION=ci-${GITHUB_SHA}" \
-            -t "${IMAGE_TAG}" \
-            .
+          gzip -dc "${RUNNER_TEMP}/version-layer-image-b/version-layer-image-b.tar.gz" | docker load
+          docker image inspect "${IMAGE_TAG}" >/dev/null
 
       - name: Start compose stack
         shell: bash
@@ -202,6 +422,14 @@ jobs:
             exit 1
           fi
 
+      - name: Verify release version endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="ci-layer-b"
+          curl -sS -u "${BASIC_AUTH_USER}:${BASIC_AUTH_PASS}" "${BASE_URL}/api/version" | jq -e --arg expected "${expected}" \
+            '.backend == $expected and .frontend == $expected'
+
       - name: Dump compose logs (on failure)
         if: failure()
         shell: bash
@@ -219,15 +447,19 @@ jobs:
 
   build:
     name: Build (Release)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    needs: [lint, unit-tests]
+    runs-on: ubuntu-24.04
+    if: ${{ always() && github.event_name == 'pull_request' && needs.web-assets.result == 'success' }}
+    needs: [web-assets, backend-tests]
     timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Download web assets artifact
+        uses: actions/download-artifact@v8
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          name: web-dist
+          path: web/dist
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
@@ -238,7 +470,7 @@ jobs:
           toolchain: 1.91.0
 
       - name: Cache cargo directories
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry

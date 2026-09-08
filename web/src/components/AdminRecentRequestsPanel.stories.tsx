@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { useCallback, useLayoutEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react'
 
 import type { RequestLog, RequestLogBodies } from '../api'
 import { useLanguage, useTranslate } from '../i18n'
@@ -9,7 +9,7 @@ import AdminRecentRequestsPanel from './AdminRecentRequestsPanel'
 const storyLogs: RequestLog[] = [
   {
     id: 7001,
-    key_id: 'K001',
+    key_id: 'LKoZ',
     auth_token_id: 'T001',
     method: 'POST',
     path: '/api/tavily/search',
@@ -25,10 +25,22 @@ const storyLogs: RequestLog[] = [
     error_message: null,
     key_effect_code: 'none',
     key_effect_summary: null,
+    binding_effect_code: 'api_rebalance_route_bound',
+    binding_effect_summary: 'API rebalance created a new route key binding',
+    selection_effect_code: 'api_rebalance_pressure_avoided',
+    selection_effect_summary: 'API rebalance skipped a hotter key',
     request_body: null,
     response_body: null,
     forwarded_headers: ['x-request-id', 'x-forwarded-for'],
     dropped_headers: ['authorization'],
+    remote_addr: '127.0.0.1:49321',
+    client_ip: '203.0.113.7',
+    client_ip_source: 'cf-connecting-ip',
+    client_ip_trusted: true,
+    ip_headers: [
+      { name: 'cf-connecting-ip', value: '203.0.113.7' },
+      { name: 'x-forwarded-for', value: '198.51.100.10, 10.0.0.4' },
+    ],
     operationalClass: 'success',
     requestKindProtocolGroup: 'api',
     requestKindBillingGroup: 'billable',
@@ -49,8 +61,18 @@ const storyLogs: RequestLog[] = [
     result_status: 'success',
     created_at: 1_774_693_580,
     error_message: null,
-    key_effect_code: 'none',
-    key_effect_summary: null,
+    key_effect_code: 'mcp_session_init_backoff_set',
+    key_effect_summary: 'The system armed a temporary backoff for MCP session initialization',
+    binding_effect_code: 'none',
+    binding_effect_summary: null,
+    selection_effect_code: 'mcp_session_init_pressure_avoided',
+    selection_effect_summary: 'Initialization avoided a key under higher recent pressure',
+    gateway_mode: 'rebalance_http',
+    experiment_variant: 'rebalance',
+    proxy_session_id: 'rebalance-session-7002',
+    routing_subject_hash: '9f2ab31c0d44e912',
+    upstream_operation: 'mcp',
+    fallback_reason: null,
     request_body: null,
     response_body: null,
     forwarded_headers: ['x-request-id'],
@@ -77,6 +99,16 @@ const storyLogs: RequestLog[] = [
     error_message: null,
     key_effect_code: 'restored_active',
     key_effect_summary: 'The system automatically restored this key to active',
+    binding_effect_code: 'none',
+    binding_effect_summary: null,
+    selection_effect_code: 'none',
+    selection_effect_summary: null,
+    gateway_mode: 'rebalance_http',
+    experiment_variant: 'rebalance',
+    proxy_session_id: 'rebalance-session-7004',
+    routing_subject_hash: '9f2ab31c0d44e912',
+    upstream_operation: 'http_search',
+    fallback_reason: 'upstream_http_error',
     request_body: null,
     response_body: null,
     forwarded_headers: ['x-request-id'],
@@ -104,6 +136,10 @@ const storyLogs: RequestLog[] = [
     failure_kind: 'upstream_account_deactivated_401',
     key_effect_code: 'quarantined',
     key_effect_summary: 'Automatically quarantined this key',
+    binding_effect_code: 'none',
+    binding_effect_summary: null,
+    selection_effect_code: 'none',
+    selection_effect_summary: null,
     request_body: null,
     response_body: null,
     forwarded_headers: ['x-request-id'],
@@ -130,6 +166,10 @@ const storyLogs: RequestLog[] = [
     error_message: null,
     key_effect_code: 'none',
     key_effect_summary: null,
+    binding_effect_code: 'http_project_affinity_reused',
+    binding_effect_summary: 'The system reused the current upstream key binding for this project',
+    selection_effect_code: 'none',
+    selection_effect_summary: null,
     request_body: null,
     response_body: null,
     forwarded_headers: ['x-request-id'],
@@ -137,6 +177,21 @@ const storyLogs: RequestLog[] = [
     operationalClass: 'success',
     requestKindProtocolGroup: 'api',
     requestKindBillingGroup: 'billable',
+  },
+]
+
+const rebalanceMarkerStoryLogs: RequestLog[] = [
+  storyLogs[0],
+  storyLogs[1],
+  {
+    ...storyLogs[4],
+    id: 8203,
+    key_id: 'pK9x',
+    auth_token_id: 'plainT1',
+    binding_effect_code: 'none',
+    binding_effect_summary: null,
+    selection_effect_code: 'none',
+    selection_effect_summary: null,
   },
 ]
 
@@ -207,6 +262,8 @@ function LazyDetailsStateGallery(): JSX.Element {
     () => ({
       results: buildFacetOptions(storyLogs.map((log) => log.result_status)),
       keyEffects: buildFacetOptions(storyLogs.map((log) => log.key_effect_code ?? 'none')),
+      bindingEffects: buildFacetOptions(storyLogs.map((log) => log.binding_effect_code ?? 'none')),
+      selectionEffects: buildFacetOptions(storyLogs.map((log) => log.selection_effect_code ?? 'none')),
       tokens: buildFacetOptions(storyLogs.map((log) => log.auth_token_id)),
       keys: buildFacetOptions(storyLogs.map((log) => log.key_id)),
     }),
@@ -249,23 +306,548 @@ function LazyDetailsStateGallery(): JSX.Element {
         outcomeFilter={null}
         resultOptions={facets.results}
         keyEffectOptions={facets.keyEffects}
+        bindingEffectOptions={facets.bindingEffects}
+        selectionEffectOptions={facets.selectionEffects}
         onOutcomeFilterChange={() => undefined}
         keyOptions={facets.keys}
         selectedKeyId={null}
         onKeyFilterChange={() => undefined}
         showKeyColumn
         showTokenColumn
-        page={1}
         perPage={20}
-        total={storyLogs.length}
-        onPreviousPage={() => undefined}
-        onNextPage={() => undefined}
+        hasOlder
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summaryWithRetention.replace('{days}', '32')}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
         onPerPageChange={() => undefined}
         formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
         formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
         onOpenKey={() => undefined}
         onOpenToken={() => undefined}
         loadLogBodies={loadLogBodies}
+      />
+    </div>
+  )
+}
+
+const alignmentStoryLogs: RequestLog[] = [
+  {
+    id: 8101,
+    key_id: 'bab3',
+    auth_token_id: 'cBtp',
+    method: 'POST',
+    path: '/mcp',
+    query: null,
+    http_status: 200,
+    mcp_status: 429,
+    business_credits: null,
+    request_kind_key: 'mcp:extract',
+    request_kind_label: 'MCP | extract',
+    request_kind_detail: null,
+    result_status: 'error',
+    created_at: 1_775_438_268,
+    error_message: 'Quota exhausted',
+    key_effect_code: 'none',
+    key_effect_summary: null,
+    request_body: null,
+    response_body: null,
+    forwarded_headers: ['x-request-id'],
+    dropped_headers: [],
+    operationalClass: 'upstream_error',
+    requestKindProtocolGroup: 'mcp',
+    requestKindBillingGroup: 'billable',
+  },
+  {
+    id: 8102,
+    key_id: 'EGsl',
+    auth_token_id: 'ZjvC',
+    method: 'POST',
+    path: '/mcp',
+    query: null,
+    http_status: 200,
+    mcp_status: 429,
+    business_credits: null,
+    request_kind_key: 'mcp:search',
+    request_kind_label: 'MCP | search',
+    request_kind_detail: null,
+    result_status: 'error',
+    created_at: 1_775_438_146,
+    error_message: 'Quota exhausted',
+    key_effect_code: 'none',
+    key_effect_summary: null,
+    request_body: null,
+    response_body: null,
+    forwarded_headers: ['x-request-id'],
+    dropped_headers: [],
+    operationalClass: 'upstream_error',
+    requestKindProtocolGroup: 'mcp',
+    requestKindBillingGroup: 'billable',
+  },
+]
+
+function IdentifierAlignmentShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  const facets = useMemo(
+    () => ({
+      results: buildFacetOptions(alignmentStoryLogs.map((log) => log.result_status)),
+      keyEffects: buildFacetOptions(alignmentStoryLogs.map((log) => log.key_effect_code ?? 'none')),
+      bindingEffects: buildFacetOptions(alignmentStoryLogs.map((log) => log.binding_effect_code ?? 'none')),
+      selectionEffects: buildFacetOptions(alignmentStoryLogs.map((log) => log.selection_effect_code ?? 'none')),
+      tokens: buildFacetOptions(alignmentStoryLogs.map((log) => log.auth_token_id)),
+      keys: buildFacetOptions(alignmentStoryLogs.map((log) => log.key_id)),
+    }),
+    [],
+  )
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title="Identifier Alignment"
+        description="Stable desktop canvas for validating token and key identifiers sit visually centered within the row."
+        emptyLabel="No logs."
+        loadState="ready"
+        loadingLabel="Loading…"
+        logs={alignmentStoryLogs}
+        requestKindOptions={[
+          { key: 'mcp:extract', label: 'MCP | extract', protocol_group: 'mcp', billing_group: 'billable', count: 1 },
+          { key: 'mcp:search', label: 'MCP | search', protocol_group: 'mcp', billing_group: 'billable', count: 1 },
+        ]}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={{ kind: 'result', value: 'error' }}
+        resultOptions={facets.results}
+        keyEffectOptions={facets.keyEffects}
+        bindingEffectOptions={facets.bindingEffects}
+        selectionEffectOptions={facets.selectionEffects}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={facets.keys}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder
+        hasNewer
+        paginationSummary={admin.logs.pagination.summary}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function RebalanceMarkerShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  const facets = useMemo(
+    () => ({
+      results: buildFacetOptions(rebalanceMarkerStoryLogs.map((log) => log.result_status)),
+      keyEffects: buildFacetOptions(rebalanceMarkerStoryLogs.map((log) => log.key_effect_code ?? 'none')),
+      bindingEffects: buildFacetOptions(rebalanceMarkerStoryLogs.map((log) => log.binding_effect_code ?? 'none')),
+      selectionEffects: buildFacetOptions(rebalanceMarkerStoryLogs.map((log) => log.selection_effect_code ?? 'none')),
+      tokens: buildFacetOptions(rebalanceMarkerStoryLogs.map((log) => log.auth_token_id)),
+      keys: buildFacetOptions(rebalanceMarkerStoryLogs.map((log) => log.key_id)),
+    }),
+    [],
+  )
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title="Rebalance Markers"
+        description="API rebalance and MCP rebalance rows reuse the same key marker; ordinary API rows stay unmarked."
+        emptyLabel="No logs."
+        loadState="ready"
+        loadingLabel="Loading…"
+        logs={rebalanceMarkerStoryLogs}
+        requestKindOptions={requestKindOptions}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={null}
+        resultOptions={facets.results}
+        keyEffectOptions={facets.keyEffects}
+        bindingEffectOptions={facets.bindingEffects}
+        selectionEffectOptions={facets.selectionEffects}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={facets.keys}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder={false}
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summary}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function RequestKindDesktopExpandedShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+  const [requestKinds, setRequestKinds] = useState<string[]>([])
+  const [quickBilling, setQuickBilling] = useState<'all' | 'billable' | 'non_billable'>('all')
+  const [quickProtocol, setQuickProtocol] = useState<'all' | 'api' | 'mcp'>('all')
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const trigger = document.querySelector<HTMLButtonElement>(
+        '.recent-requests-filter-field--request-kind .recent-requests-filter-select-trigger',
+      )
+      trigger?.click()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [])
+
+  const facets = useMemo(
+    () => ({
+      results: buildFacetOptions(storyLogs.map((log) => log.result_status)),
+      keyEffects: buildFacetOptions(storyLogs.map((log) => log.key_effect_code ?? 'none')),
+      bindingEffects: buildFacetOptions(storyLogs.map((log) => log.binding_effect_code ?? 'none')),
+      selectionEffects: buildFacetOptions(storyLogs.map((log) => log.selection_effect_code ?? 'none')),
+      tokens: buildFacetOptions(storyLogs.map((log) => log.auth_token_id)),
+      keys: buildFacetOptions(storyLogs.map((log) => log.key_id)),
+    }),
+    [],
+  )
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title="Request Type Desktop 2x2"
+        description="Desktop proof for the shared request-type grid with quick filters on the first row and API/MCP columns below."
+        emptyLabel="No logs."
+        loadState="ready"
+        loadingLabel="Loading…"
+        logs={storyLogs}
+        requestKindOptions={[
+          ...requestKindOptions,
+          {
+            key: 'mcp:tools/list',
+            label: 'MCP | tools/list',
+            protocol_group: 'mcp',
+            billing_group: 'non_billable',
+            count: 19_349,
+          },
+          {
+            key: 'api:research-result',
+            label: 'API | research result',
+            protocol_group: 'api',
+            billing_group: 'non_billable',
+            count: 5,
+          },
+        ]}
+        requestKindQuickBilling={quickBilling}
+        requestKindQuickProtocol={quickProtocol}
+        selectedRequestKinds={requestKinds}
+        onRequestKindQuickFiltersChange={(billing, protocol) => {
+          setQuickBilling(billing)
+          setQuickProtocol(protocol)
+        }}
+        onToggleRequestKind={(key) =>
+          setRequestKinds((current) =>
+            current.includes(key) ? current.filter((value) => value !== key) : [...current, key],
+          )
+        }
+        onClearRequestKinds={() => {
+          setRequestKinds([])
+          setQuickBilling('all')
+          setQuickProtocol('all')
+        }}
+        outcomeFilter={null}
+        resultOptions={facets.results}
+        keyEffectOptions={facets.keyEffects}
+        bindingEffectOptions={facets.bindingEffects}
+        selectionEffectOptions={facets.selectionEffects}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={facets.keys}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summary}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function RequestKindMobileDrawerShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+  const [requestKinds, setRequestKinds] = useState<string[]>([])
+  const [quickBilling, setQuickBilling] = useState<'all' | 'billable' | 'non_billable'>('all')
+  const [quickProtocol, setQuickProtocol] = useState<'all' | 'api' | 'mcp'>('all')
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const trigger = document.querySelector<HTMLButtonElement>(
+        '.recent-requests-filter-field--request-kind .recent-requests-filter-select-trigger',
+      )
+      trigger?.click()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [])
+
+  const facets = useMemo(
+    () => ({
+      results: buildFacetOptions(storyLogs.map((log) => log.result_status)),
+      keyEffects: buildFacetOptions(storyLogs.map((log) => log.key_effect_code ?? 'none')),
+      bindingEffects: buildFacetOptions(storyLogs.map((log) => log.binding_effect_code ?? 'none')),
+      selectionEffects: buildFacetOptions(storyLogs.map((log) => log.selection_effect_code ?? 'none')),
+      tokens: buildFacetOptions(storyLogs.map((log) => log.auth_token_id)),
+      keys: buildFacetOptions(storyLogs.map((log) => log.key_id)),
+    }),
+    [],
+  )
+
+  return (
+    <div style={{ maxWidth: 420, margin: '0 auto', padding: 16 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title="Request Type Mobile Drawer"
+        description="Small-viewport proof for the shared request-type drawer ordering and touch targets."
+        emptyLabel="No logs."
+        loadState="ready"
+        loadingLabel="Loading…"
+        logs={storyLogs.slice(0, 3)}
+        requestKindOptions={requestKindOptions}
+        requestKindQuickBilling={quickBilling}
+        requestKindQuickProtocol={quickProtocol}
+        selectedRequestKinds={requestKinds}
+        onRequestKindQuickFiltersChange={(billing, protocol) => {
+          setQuickBilling(billing)
+          setQuickProtocol(protocol)
+        }}
+        onToggleRequestKind={(key) =>
+          setRequestKinds((current) =>
+            current.includes(key) ? current.filter((value) => value !== key) : [...current, key],
+          )
+        }
+        onClearRequestKinds={() => {
+          setRequestKinds([])
+          setQuickBilling('all')
+          setQuickProtocol('all')
+        }}
+        outcomeFilter={null}
+        resultOptions={facets.results}
+        keyEffectOptions={facets.keyEffects}
+        bindingEffectOptions={facets.bindingEffects}
+        selectionEffectOptions={facets.selectionEffects}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={facets.keys}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder={false}
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summary}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function CatalogLoadingShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title={admin.logs.title}
+        description={admin.logs.descriptionFallback}
+        emptyLabel={admin.logs.empty.none}
+        loadState="ready"
+        loadingLabel={admin.logs.empty.loading}
+        logs={storyLogs.slice(0, 3)}
+        requestKindOptions={[]}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={null}
+        resultOptions={[]}
+        keyEffectOptions={[]}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={[]}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summary}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function EmptyStateShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title={admin.logs.title}
+        description={admin.logs.descriptionWithRetention.replace('{days}', '32')}
+        emptyLabel={admin.logs.empty.none}
+        loadState="ready"
+        loadingLabel={admin.logs.empty.loading}
+        logs={[]}
+        requestKindOptions={requestKindOptions}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={null}
+        resultOptions={[]}
+        keyEffectOptions={[]}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={[]}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder={false}
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summaryWithRetention.replace('{days}', '32')}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
+      />
+    </div>
+  )
+}
+
+function ErrorStateShowcase(): JSX.Element {
+  const admin = useTranslate().admin
+  const { language } = useLanguage()
+
+  return (
+    <div style={{ maxWidth: 1480, margin: '0 auto', padding: 24 }}>
+      <AdminRecentRequestsPanel
+        variant="admin"
+        language={language}
+        strings={admin}
+        title={admin.logs.title}
+        description={admin.logs.descriptionWithRetention.replace('{days}', '32')}
+        emptyLabel={admin.logs.empty.none}
+        loadState="error"
+        loadingLabel={admin.logs.empty.loading}
+        errorLabel={language === 'zh' ? '加载近期请求失败。' : 'Failed to load recent requests.'}
+        logs={[]}
+        requestKindOptions={requestKindOptions}
+        requestKindQuickBilling="all"
+        requestKindQuickProtocol="all"
+        selectedRequestKinds={[]}
+        onRequestKindQuickFiltersChange={() => undefined}
+        onToggleRequestKind={() => undefined}
+        onClearRequestKinds={() => undefined}
+        outcomeFilter={null}
+        resultOptions={[]}
+        keyEffectOptions={[]}
+        onOutcomeFilterChange={() => undefined}
+        keyOptions={[]}
+        selectedKeyId={null}
+        onKeyFilterChange={() => undefined}
+        showKeyColumn
+        showTokenColumn
+        perPage={20}
+        hasOlder={false}
+        hasNewer={false}
+        paginationSummary={admin.logs.pagination.summaryWithRetention.replace('{days}', '32')}
+        onNewerPage={() => undefined}
+        onOlderPage={() => undefined}
+        onPerPageChange={() => undefined}
+        formatTime={(ts) => new Date((ts ?? 0) * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
+        formatTimeDetail={(ts) => new Date((ts ?? 0) * 1000).toISOString()}
+        onOpenKey={() => undefined}
+        onOpenToken={() => undefined}
+        loadLogBodies={() => Promise.resolve({ request_body: null, response_body: null })}
       />
     </div>
   )
@@ -307,10 +889,163 @@ export const LazyDetailsGallery: Story = {
       '加载请求详情失败。',
       '重试',
       'site reliability',
+      'IP 诊断',
+      '203.0.113.7',
     ]) {
       if (!text.includes(expected)) {
         throw new Error(`Expected lazy detail gallery to contain: ${expected}`)
       }
     }
+  },
+}
+
+export const IdentifierAlignment: Story = {
+  render: () => <IdentifierAlignmentShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: '用于稳定验收桌面表格中 Token / Key 标识链接的视觉垂直居中效果。',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 150))
+    const text = canvasElement.ownerDocument.body.textContent ?? ''
+    for (const expected of ['bab3', 'cBtp', 'EGsl', 'ZjvC']) {
+      if (!text.includes(expected)) {
+        throw new Error(`Expected identifier alignment canvas to contain: ${expected}`)
+      }
+    }
+  },
+}
+
+export const RebalanceMarkers: Story = {
+  render: () => <RebalanceMarkerShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: '稳定验收 API Rebalance、MCP Rebalance 与普通 API 行的 Key 标记差异，并覆盖带图标 Key 不省略。',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 150))
+    const text = canvasElement.ownerDocument.body.textContent ?? ''
+    for (const expected of ['LKoZ', 'API绑定', 'API避高压', 'API Rebalance 路由', 'pK9x']) {
+      if (!text.includes(expected)) {
+        throw new Error(`Expected rebalance marker canvas to contain: ${expected}`)
+      }
+    }
+  },
+}
+
+export const RequestKindDesktopExpanded: Story = {
+  render: () => <RequestKindDesktopExpandedShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: '桌面端 request type 浮层固定为 2x2：第一行计费/协议快捷筛选，第二行 API/MCP 分列列表。',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 260))
+    const text = canvasElement.ownerDocument.body.textContent ?? ''
+    for (const expected of ['请求类型', '清空', '计费', '协议', 'API', 'MCP', 'tools/list']) {
+      if (!text.includes(expected)) {
+        throw new Error(`Expected request kind desktop proof to contain: ${expected}`)
+      }
+    }
+  },
+}
+
+export const RequestKindMobileDrawer: Story = {
+  render: () => <RequestKindMobileDrawerShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: 'mobile1' },
+    docs: {
+      description: {
+        story: '小屏端 request type 同一触发入口打开 Drawer，内容顺序固定为标题/清空、计费、协议、API、MCP，且计费/协议保持按钮单选。',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 260))
+    const ownerDocument = canvasElement.ownerDocument
+    const text = ownerDocument.body.textContent ?? ''
+    for (const expected of ['Request Type Mobile Drawer', '清空', '计费', '协议', 'API', 'MCP']) {
+      if (!text.includes(expected)) {
+        throw new Error(`Expected request kind mobile proof to contain: ${expected}`)
+      }
+    }
+    const drawer = ownerDocument.querySelector('.token-request-kind-panel--drawer')
+    if (!drawer) {
+      throw new Error('Expected mobile drawer request-kind panel to be present.')
+    }
+    const billingGroup = drawer.querySelector('[aria-label="计费"]')
+    const protocolGroup = drawer.querySelector('[aria-label="协议"]')
+    if (!billingGroup || !protocolGroup) {
+      throw new Error('Expected mobile quick filters to render button groups.')
+    }
+    if (drawer.querySelector('[role="combobox"]')) {
+      throw new Error('Expected mobile quick filters to avoid combobox fallback.')
+    }
+  },
+}
+
+export const CatalogLoading: Story = {
+  render: () => <CatalogLoadingShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: '当 list 已经返回、catalog 尚未补齐时的安全兜底态，不展示保留天数数字。',
+      },
+    },
+  },
+}
+
+export const EmptyState: Story = {
+  render: () => <EmptyStateShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+  },
+}
+
+export const ErrorState: Story = {
+  render: () => <ErrorStateShowcase />,
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
   },
 }

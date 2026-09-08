@@ -1,80 +1,898 @@
-fn random_delay_secs() -> u64 {
+use tavily_hikari::{
+    ClaimedReconciliationRunOutcome,
+    ClaimedResearchDrainOutcome,
+    LinuxDoCreditRechargeOrder,
+    LINUXDO_CREDIT_RECHARGE_REFUND_EXTERNAL_SUCCEEDED_PHASE,
+    LINUXDO_CREDIT_RECHARGE_STATUS_REFUNDED,
+    LINUXDO_CREDIT_RECHARGE_SYSTEM_REFUND_ACTOR,
+    LinuxDoCreditRefundExternalSuccessMarker as SharedLinuxDoCreditRefundExternalSuccessMarker,
+    decode_linuxdo_credit_refund_external_success_marker,
+    format_ha_outbox_gc_report_message, format_linuxdo_credit_money,
+    HA_OUTBOX_GC_DEFERRED_CONTINUATION_DELAY_SECS,
+    HA_OUTBOX_GC_IDLE_DISCOVERY_SECS,
+    HA_OUTBOX_GC_RECOVERY_CONTINUATION_DELAY_SECS,
+    linuxdo_credit_recharge_system_refund_retry_delay_secs,
+    linuxdo_credit_refund_params as shared_linuxdo_credit_refund_params,
+    linuxdo_credit_refund_url as shared_linuxdo_credit_refund_url,
+};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering;
+use tokio::time::Instant;
+
+include!("schedulers_remote_attempt.rs");
+fn random_delay_secs(max_inclusive: u64) -> u64 {
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    rng.gen_range(0..=300)
+    rng.gen_range(0..=max_inclusive)
 }
 
 fn twenty_four_hours_secs() -> i64 {
     24 * 60 * 60
 }
 
+fn two_hours_secs() -> i64 {
+    2 * 60 * 60
+}
+
+fn fifteen_minutes_secs() -> i64 {
+    15 * 60
+}
+
 fn forward_proxy_geo_refresh_recheck_secs() -> i64 {
     60
 }
 
-fn spawn_quota_sync_scheduler(state: Arc<AppState>) {
+fn linuxdo_credit_recharge_lifecycle_recheck_secs() -> i64 {
+    30
+}
+
+fn scheduled_request_logs_gc_options() -> RequestLogsGcOptions {
+    RequestLogsGcOptions {
+        batch_size: 100,
+        max_batches: 5,
+        max_runtime_secs: 20,
+        inter_batch_sleep_ms: 0,
+    }
+}
+
+const LINUXDO_USER_STATUS_SYNC_JOB_TYPE: &str = "linuxdo_user_status_sync";
+const LINUXDO_USER_TAG_BINDING_REFRESH_JOB_TYPE: &str = "linuxdo_user_tag_binding_refresh";
+const LINUXDO_CREDIT_RECHARGE_LIFECYCLE_JOB_TYPE: &str = "linuxdo_credit_recharge_lifecycle";
+const TRIGGER_SOURCE_SCHEDULER: &str = "scheduler";
+const TRIGGER_SOURCE_MANUAL: &str = "manual";
+const TRIGGER_SOURCE_AUTO: &str = "auto";
+const REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS: i64 = 5 * 60;
+const HA_OUTBOX_GC_BASELINE_SECS: i64 = 60 * 60;
+const AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_JOB_TYPE: &str =
+    "auth_token_logs_alert_index_ensure";
+const DASHBOARD_ROLLUP_INTEGRITY_JOB_TYPE: &str = "dashboard_rollup_integrity";
+const DASHBOARD_ROLLUP_INTEGRITY_FAILURE_BACKOFF_SECS: i64 = 60;
+const DASHBOARD_ROLLUP_INTEGRITY_WATCHDOG_SECS: u64 = 60;
+const DASHBOARD_ALERT_PROJECTION_INTERVAL_SECS: u64 = 10;
+const DASHBOARD_ALERT_PROJECTION_IDLE_INTERVAL_SECS: u64 = 20;
+const DASHBOARD_ALERT_PROJECTION_IDLE_OBSERVATION_SECS: i64 = 60;
+// HA GC has a durable recovery deadline and cannot make progress once the
+// foreground load starts. The dashboard projection is derived state, so let
+// HA establish its first fair continuation before it competes for the sole
+// maintenance bulk permit after startup or a rolling restart.
+const DASHBOARD_ALERT_PROJECTION_INITIAL_DELAY_SECS: u64 = 30;
+const AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_RETRY_DELAY_SECS: i64 = 5 * 60;
+const SCHEDULED_JOB_WAIT_WARN_SECS: i64 = 5 * 60;
+const RECONCILIATION_REMOTE_TURN_WAIT_SECS: i64 = 120;
+const RECONCILIATION_RESEARCH_DRAIN_JOB_TYPE: &str =
+    "upstream_reconciliation_research_drain";
+const SCHEDULED_JOB_WAIT_WARN_SAMPLE_SECS: u64 = 5 * 60;
+static REQUEST_LOGS_GC_ZERO_PROGRESS_STREAK: AtomicU64 = AtomicU64::new(0);
+static SCHEDULED_JOB_QUEUE_WAIT_WARN_WINDOWS: OnceLock<StdMutex<HashMap<String, Instant>>> =
+    OnceLock::new();
+fn should_warn_scheduled_job_queue_wait(job_type: &str) -> bool {
+    let now = Instant::now();
+    let windows = SCHEDULED_JOB_QUEUE_WAIT_WARN_WINDOWS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut windows = windows
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match windows.get(job_type) {
+        Some(last_warning)
+            if now.duration_since(*last_warning)
+                < Duration::from_secs(SCHEDULED_JOB_WAIT_WARN_SAMPLE_SECS) =>
+        {
+            false
+        }
+        _ => {
+            windows.insert(job_type.to_string(), now);
+            true
+        }
+    }
+}
+
+struct ClaimedScheduledJob {
+    job_id: i64,
+    claim_generation: i64,
+    _job_execution_gate: Option<OwnedMutexGuard<()>>,
+}
+
+async fn enqueue_scheduled_job_result(
+    state: &AppState,
+    job_type: &str,
+    key_id: Option<&str>,
+    trigger_source: &str,
+) -> Result<tavily_hikari::ScheduledJobEnqueueResult, ProxyError> {
+    let result = if trigger_source == TRIGGER_SOURCE_MANUAL {
+        state
+            .proxy
+            .scheduled_job_enqueue_foreground(job_type, trigger_source, key_id, 1)
+            .await?
+    } else {
+        state
+            .proxy
+            .scheduled_job_enqueue(job_type, trigger_source, key_id, 1)
+            .await?
+    };
+    maintenance_worker_wake_for_state(state).notify_one();
+    Ok(result)
+}
+
+async fn enqueue_scheduled_job(
+    state: &AppState,
+    job_type: &str,
+    key_id: Option<&str>,
+    trigger_source: &str,
+) -> Result<i64, ProxyError> {
+    Ok(enqueue_scheduled_job_result(state, job_type, key_id, trigger_source)
+        .await?
+        .job_id)
+}
+
+async fn enqueue_scheduled_job_at(
+    state: &AppState,
+    job_type: &str,
+    key_id: Option<&str>,
+    trigger_source: &str,
+    available_at: i64,
+) -> Result<i64, ProxyError> {
+    let result = state
+        .proxy
+        .scheduled_job_enqueue_at(job_type, trigger_source, key_id, 1, available_at)
+        .await?;
+    maintenance_worker_wake_for_state(state).notify_one();
+    Ok(result.job_id)
+}
+
+async fn enqueue_scheduled_job_logged(
+    state: &AppState,
+    job_type: &str,
+    key_id: Option<&str>,
+    trigger_source: &str,
+    log_prefix: &str,
+) -> Option<i64> {
+    let started = Instant::now();
+    let context = format!(
+        "job_type={job_type}, trigger_source={trigger_source}, key_id={}",
+        key_id.unwrap_or("-")
+    );
+    match enqueue_scheduled_job_result(state, job_type, key_id, trigger_source).await {
+        Ok(result) => {
+            tavily_hikari::emit_db_operation_slow_log(
+                "scheduled job enqueue",
+                started.elapsed(),
+                Some(context.as_str()),
+            );
+            if job_type == "upstream_reconciliation" && !result.created {
+                tracing::debug!(
+                    component = "reconciliation",
+                    event = "enqueue_reused",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    job_type,
+                    reused_status = %result.status,
+                    trigger_source = %result.trigger_source,
+                );
+            }
+            Some(result.job_id)
+        }
+        Err(err) => {
+            let transient = tavily_hikari::is_transient_sqlite_write_error(&err);
+            if transient {
+                tracing::debug!(
+                    component = "scheduler",
+                    event = "job_enqueue_deferred",
+                    job_type,
+                    trigger_source,
+                    key_id = key_id.unwrap_or("-"),
+                    defer_reason = "sqlite_contention",
+                    retry_via = "durable_representative_or_stale_reaper",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    err = %err,
+                );
+            } else {
+                tavily_hikari::emit_db_operation_error_log(
+                    "scheduled job enqueue",
+                    started.elapsed(),
+                    Some(context.as_str()),
+                    &err,
+                );
+            }
+            if job_type == "upstream_reconciliation" {
+                let now = state.proxy.backend_time().now_ts();
+                if let Err(meta_err) = state
+                    .proxy
+                    .mark_upstream_reconciliation_enqueue_error_at(now)
+                    .await
+                {
+                    tracing::debug!(
+                        component = "reconciliation",
+                        event = "enqueue_error_meta_failed",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        job_type,
+                        err = %meta_err,
+                    );
+                }
+                if transient {
+                    tracing::debug!(
+                        component = "reconciliation",
+                        event = "enqueue_deferred",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        job_type,
+                        defer_reason = "sqlite_contention",
+                        err = %err,
+                    );
+                } else {
+                    tracing::warn!(
+                        component = "reconciliation",
+                        event = "enqueue_exhausted",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        job_type,
+                        err = %err,
+                    );
+                }
+            }
+            if !transient {
+                tracing::warn!(
+                    component = "scheduler",
+                    event = "job_enqueue_failed",
+                    job_type,
+                    trigger_source,
+                    key_id = key_id.unwrap_or("-"),
+                    err = %err,
+                    "{log_prefix}: enqueue job error: {err}"
+                );
+            }
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn claim_scheduled_job_with_gate(
+    state: &AppState,
+    job_type: &str,
+    key_id: Option<&str>,
+    trigger_source: &str,
+) -> Result<Option<ClaimedScheduledJob>, ProxyError> {
+    let job_execution_gate = acquire_db_job_execution_gate_for_state(state).await;
+    let _maintenance = acquire_db_maintenance_read_gate().await;
+    match state
+        .proxy
+        .scheduled_job_claim(job_type, trigger_source, key_id, 1)
+        .await
+    {
+        Ok(Some(job_id)) => Ok(Some(ClaimedScheduledJob {
+            job_id,
+            claim_generation: 1,
+            _job_execution_gate: Some(job_execution_gate),
+        })),
+        Ok(None) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn claim_scheduled_job(
+    state: &AppState,
+    job_type: &str,
+    key_id: Option<&str>,
+    trigger_source: &str,
+    log_prefix: &str,
+) -> Option<ClaimedScheduledJob> {
+    match claim_scheduled_job_with_gate(state, job_type, key_id, trigger_source).await {
+        Ok(Some(job)) => Some(job),
+        Ok(None) => {
+            tracing::info!(
+                component = "scheduler",
+                event = "job_trigger_skipped_already_running",
+                job_type,
+                trigger_source,
+                key_id = key_id.unwrap_or("-"),
+                "{log_prefix}: job already running; skip trigger"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                component = "scheduler",
+                event = "job_start_failed",
+                job_type,
+                trigger_source,
+                key_id = key_id.unwrap_or("-"),
+                err = %err,
+                "{log_prefix}: start job error: {err}"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn next_local_daily_run_after(now: DateTime<Local>, hour: u32, minute: u32) -> DateTime<Local> {
+    now + chrono::Duration::from_std(
+        tavily_hikari::duration_until_next_local_daily_run(now, hour, minute),
+    )
+    .unwrap_or_else(|_| ChronoDuration::zero())
+}
+
+#[cfg(test)]
+fn duration_until_next_local_daily_run(now: DateTime<Local>, hour: u32, minute: u32) -> Duration {
+    tavily_hikari::duration_until_next_local_daily_run(now, hour, minute)
+}
+
+const REMOTE_IO_SCHEDULED_JOB_TYPES: [&str; 8] = [
+    "quota_sync",
+    "quota_sync/manual",
+    "quota_sync/hot",
+    LINUXDO_USER_STATUS_SYNC_JOB_TYPE,
+    LINUXDO_CREDIT_RECHARGE_LIFECYCLE_JOB_TYPE,
+    "upstream_reconciliation",
+    RECONCILIATION_RESEARCH_DRAIN_JOB_TYPE,
+    "forward_proxy_geo_refresh",
+];
+
+async fn dequeue_next_scheduled_job(
+    state: &AppState,
+) -> Result<Option<(JobLog, Option<ReconciliationTurn>)>, ProxyError> {
+    let candidates = state.proxy.fetch_queued_scheduled_jobs(16).await?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let controller = remote_attempt_admission_for_state(state);
+    let mut selected = None;
+    let mut reconciliation_turn = None;
+
+    // A manual maintenance request retains its existing priority over the
+    // automatic reconciliation fairness turn. Neither branch reserves the
+    // outbound lease: local work can overlap until a real HTTP request starts.
+    if let Some(manual_remote) = candidates
+        .iter()
+        .find(|candidate| {
+            scheduled_job_uses_remote_io(&candidate.job_type)
+                && scheduled_job_is_manual_remote(candidate)
+        })
+        .cloned()
+    {
+        selected = Some(manual_remote);
+    }
+
+    if selected.is_none() {
+        let aged_main = state
+            .proxy
+            .fetch_aged_queued_scheduled_job_by_type(
+                "upstream_reconciliation",
+                RECONCILIATION_REMOTE_TURN_WAIT_SECS,
+            )
+            .await?;
+        let aged_research = state
+            .proxy
+            .fetch_aged_queued_scheduled_job_by_type(
+                RECONCILIATION_RESEARCH_DRAIN_JOB_TYPE,
+                RECONCILIATION_REMOTE_TURN_WAIT_SECS,
+            )
+            .await?;
+        // A claim-fenced `remote_lease` continuation retains its already-won
+        // aged turn. Resume it before running another automatic candidate;
+        // manual work still won the branch above.
+        let resumed_kind = controller.resumable_reconciliation_turn_kind();
+        let aged = match (resumed_kind, aged_main, aged_research) {
+            (Some(ReconciliationTurnKind::ResearchDrain), _, Some(research)) => {
+                Some((research, ReconciliationTurnKind::ResearchDrain))
+            }
+            (Some(ReconciliationTurnKind::Main), Some(main), _) => {
+                Some((main, ReconciliationTurnKind::Main))
+            }
+            (Some(_), _, _) => None,
+            (None, Some(main), Some(research))
+                if reconciliation_turn_eligible_since(&research)
+                    < reconciliation_turn_eligible_since(&main) =>
+            {
+                Some((research, ReconciliationTurnKind::ResearchDrain))
+            }
+            (None, Some(main), _) => Some((main, ReconciliationTurnKind::Main)),
+            (None, None, Some(research)) => {
+                Some((research, ReconciliationTurnKind::ResearchDrain))
+            }
+            (None, None, None) => None,
+        };
+        if let Some((aged_job, kind)) = aged {
+            let turn = match kind {
+                ReconciliationTurnKind::Main => controller.reserve_aged_reconciliation_turn(),
+                ReconciliationTurnKind::ResearchDrain => {
+                    controller.reserve_aged_research_drain_turn()
+                }
+            };
+            if let Some(turn) = turn {
+                reconciliation_turn = Some(turn);
+                selected = Some(aged_job);
+            }
+        }
+    }
+
+    for candidate in candidates {
+        if selected.is_some() {
+            break;
+        }
+        if scheduled_job_uses_remote_io(&candidate.job_type) {
+            if matches!(
+                candidate.job_type.as_str(),
+                "upstream_reconciliation" | RECONCILIATION_RESEARCH_DRAIN_JOB_TYPE
+            ) && controller.reconciliation_turn_required()
+            {
+                // The aged representative owns the next HTTP turn; other work may prepare locally.
+                continue;
+            }
+            selected = Some(candidate);
+            break;
+        }
+
+        selected = Some(candidate);
+        break;
+    }
+
+    if selected.is_none() {
+        // Do not let an arbitrarily long remote queue hide eligible local
+        // maintenance behind the first dequeue page while an aged
+        // reconciliation turn is already in progress.
+        selected = state
+            .proxy
+            .fetch_next_queued_scheduled_job_excluding_types(&REMOTE_IO_SCHEDULED_JOB_TYPES)
+            .await?;
+    }
+
+    let Some(candidate) = selected else {
+        return Ok(None);
+    };
+
+    let now = state.proxy.backend_time().now_ts();
+    let queue_age_secs = now.saturating_sub(candidate.queued_at);
+    let scheduled_delay_secs = candidate.available_at.saturating_sub(candidate.queued_at);
+    let eligible_wait_secs = now.saturating_sub(candidate.available_at);
+    tracing::debug!(
+        component = "scheduler",
+        event = "job_claim_attempt",
+        job_id = candidate.id,
+        job_type = %candidate.job_type,
+        trigger_source = %candidate.trigger_source,
+        queue_age_ms = queue_age_secs.saturating_mul(1_000),
+        scheduled_delay_ms = scheduled_delay_secs.saturating_mul(1_000),
+        eligible_wait_ms = eligible_wait_secs.saturating_mul(1_000),
+        effective_priority = candidate.effective_priority,
+        available_at = candidate.available_at,
+    );
+    if eligible_wait_secs >= SCHEDULED_JOB_WAIT_WARN_SECS
+        && should_warn_scheduled_job_queue_wait(&candidate.job_type)
+    {
+        tracing::warn!(
+            component = "scheduler",
+            event = "job_queue_wait_threshold_exceeded",
+            job_id = candidate.id,
+            job_type = %candidate.job_type,
+            queue_age_ms = queue_age_secs.saturating_mul(1_000),
+            scheduled_delay_ms = scheduled_delay_secs.saturating_mul(1_000),
+            eligible_wait_ms = eligible_wait_secs.saturating_mul(1_000),
+            effective_priority = candidate.effective_priority,
+            available_at = candidate.available_at,
+        );
+    }
+
+    match state.proxy.scheduled_job_mark_running(candidate.id).await? {
+        Some(job) => Ok(Some((job, reconciliation_turn))),
+        None => Ok(None),
+    }
+}
+
+async fn run_queued_scheduled_job(
+    state: Arc<AppState>,
+    job: JobLog,
+    reconciliation_turn: Option<ReconciliationTurn>,
+) {
+    let job_type = job.job_type.clone();
+    let key_id = job.key_id.clone();
+    let manual_remote_attempt = job.trigger_source == TRIGGER_SOURCE_MANUAL;
+    let claimed_job = ClaimedScheduledJob {
+        job_id: job.id,
+        claim_generation: job.claim_generation,
+        _job_execution_gate: None,
+    };
+    run_manual_claimed_job(
+        state.clone(),
+        job_type.clone(),
+        key_id.clone(),
+        claimed_job,
+        reconciliation_turn,
+        manual_remote_attempt,
+    )
+    .await;
+}
+
+fn spawn_dashboard_rollup_integrity_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            // Initial cycle runs immediately on startup
-            let keys = match state
+            // The unique-active-job constraint turns this into a cheap liveness
+            // check while recovering both startup and handoff enqueue failures.
+            let _ = enqueue_scheduled_job_logged(
+                state.as_ref(),
+                DASHBOARD_ROLLUP_INTEGRITY_JOB_TYPE,
+                None,
+                TRIGGER_SOURCE_SCHEDULER,
+                "dashboard-rollup-integrity",
+            )
+            .await;
+            state
                 .proxy
-                .list_keys_pending_quota_sync(twenty_four_hours_secs())
+                .backend_time()
+                .sleep(Duration::from_secs(
+                    DASHBOARD_ROLLUP_INTEGRITY_WATCHDOG_SECS,
+                ))
+                .await;
+        }
+    });
+}
+include!("schedulers_dashboard_alert_projection.rs");
+async fn finish_dashboard_rollup_integrity_and_enqueue(
+    state: &AppState,
+    job_id: i64,
+    claim_generation: i64,
+    message: &str,
+    available_at: i64,
+) -> bool {
+    match state
+        .proxy
+        .scheduled_job_finish_and_enqueue_auto_at(
+            job_id,
+            claim_generation,
+            DASHBOARD_ROLLUP_INTEGRITY_JOB_TYPE,
+            None,
+            1,
+            Some(message),
+            available_at,
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(err) => {
+            // The integrity slice already stopped at its short write budget. Use
+            // the scheduler's normal retry path only to avoid stranding a running
+            // job when a transient writer lock prevented the atomic handoff.
+            tracing::warn!(
+                component = "dashboard_rollup_integrity",
+                event = "scheduler_handoff_short_write_failed",
+                job_id,
+                err = %err,
+                "falling back to the durable scheduled-job handoff"
+            );
+            let fallback_message = format!("{message}; scheduler handoff fallback: {err}");
+            if let Err(finish_err) = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "error",
+                    Some(&fallback_message),
+                )
                 .await
             {
-                Ok(list) => list,
+                tracing::error!(
+                    component = "dashboard_rollup_integrity",
+                    event = "scheduler_handoff_fallback_failed",
+                    job_id,
+                    err = %finish_err,
+                    "dashboard integrity job could not be released for retry"
+                );
+                return false;
+            }
+            enqueue_scheduled_job_at(
+                state,
+                DASHBOARD_ROLLUP_INTEGRITY_JOB_TYPE,
+                None,
+                TRIGGER_SOURCE_AUTO,
+                available_at,
+            )
+            .await
+            .is_ok()
+        }
+    }
+}
+
+async fn run_dashboard_rollup_integrity_claimed_job(
+    state: Arc<AppState>,
+    claimed_job: ClaimedScheduledJob,
+) -> bool {
+    let ClaimedScheduledJob {
+        job_id,
+        claim_generation,
+        _job_execution_gate: existing_gate,
+    } = claimed_job;
+    drop(existing_gate);
+    let now = state.proxy.backend_time().now_ts();
+    let _bulk_admission = match state.proxy.admit_dashboard_rollup_integrity() {
+        tavily_hikari::SqliteAdmissionOutcome::Admitted(permit) => permit,
+        tavily_hikari::SqliteAdmissionOutcome::Deferred { reason } => {
+            return finish_dashboard_rollup_integrity_and_enqueue(
+                state.as_ref(),
+                job_id,
+                claim_generation,
+                &format!("state=deferred admission={reason}"),
+                now.saturating_add(30),
+            )
+            .await;
+        }
+    };
+    let (message, next_delay_secs) = match state.proxy.run_dashboard_rollup_integrity_slice().await {
+        Ok(result) => (format!("state={}", result.state), result.next_delay_secs),
+        Err(err) => {
+            let available_at = now.saturating_add(DASHBOARD_ROLLUP_INTEGRITY_FAILURE_BACKOFF_SECS);
+            let _ = state
+                .proxy
+                .mark_dashboard_rollup_integrity_failure(&err, available_at)
+                .await;
+            let degraded = state
+                .proxy
+                .dashboard_rollup_integrity_status()
+                .await
+                .map(|status| status.state == "degraded")
+                .unwrap_or(false);
+            let message = if degraded {
+                format!("state=degraded error={err}")
+            } else {
+                format!("state=deferred error={err}")
+            };
+            let handed_off = finish_dashboard_rollup_integrity_and_enqueue(
+                state.as_ref(),
+                job_id,
+                claim_generation,
+                &message,
+                available_at,
+            )
+            .await;
+            return handed_off && !degraded;
+        }
+    };
+    finish_dashboard_rollup_integrity_and_enqueue(
+        state.as_ref(),
+        job_id,
+        claim_generation,
+        &message,
+        now.saturating_add(next_delay_secs),
+    )
+    .await
+}
+
+fn spawn_maintenance_worker(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let wake = maintenance_worker_wake_for_state(state.as_ref());
+        loop {
+            match dequeue_next_scheduled_job(state.as_ref()).await {
+                Ok(Some((job, reconciliation_turn))) => {
+                    let remote_io_job = scheduled_job_uses_remote_io(&job.job_type);
+                    if remote_io_job || reconciliation_turn.is_some() {
+                        let run_state = state.clone();
+                        let run_wake = wake.clone();
+                        tokio::spawn(async move {
+                            run_queued_scheduled_job(run_state, job, reconciliation_turn).await;
+                            run_wake.notify_one();
+                        });
+                    } else {
+                        run_queued_scheduled_job(state.clone(), job, None).await;
+                    }
+                }
+                Ok(None) => {
+                    let now = state.proxy.backend_time().now_ts();
+                    let delay_secs = state
+                        .proxy
+                        .next_queued_scheduled_job_available_at()
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|available_at| available_at.saturating_sub(now).max(1) as u64)
+                        .unwrap_or(60 * 60);
+                    tokio::select! {
+                        _ = wake.notified() => {}
+                        _ = state.proxy.backend_time().sleep(Duration::from_secs(delay_secs)) => {}
+                    }
+                }
                 Err(err) => {
-                    eprintln!("quota-sync: list pending error: {err}");
-                    vec![]
+                    if tavily_hikari::is_transient_sqlite_write_error(&err) {
+                        tracing::debug!(
+                            component = "scheduler",
+                            event = "maintenance_dequeue_deferred",
+                            defer_reason = "sqlite_contention",
+                            retry_delay_secs = 30_u64,
+                            err = %err,
+                        );
+                        tokio::select! {
+                            _ = wake.notified() => {}
+                            _ = state.proxy.backend_time().sleep(Duration::from_secs(30)) => {}
+                        }
+                    } else {
+                        tracing::error!(
+                            component = "scheduler",
+                            event = "maintenance_dequeue_failed",
+                            err = %err,
+                        );
+                        state.proxy.backend_time().sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_scheduled_job_stale_reaper(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            state.proxy.backend_time().sleep(Duration::from_secs(30)).await;
+            match state.proxy.recover_stale_scheduled_jobs().await {
+                Ok(0) => {}
+                Ok(recovered) => {
+                    tracing::warn!(
+                        component = "scheduler",
+                        event = "stale_jobs_recovered",
+                        recovered,
+                        continuation_delay_secs = 30_i64,
+                    );
+                    maintenance_worker_wake_for_state(state.as_ref()).notify_one();
+                }
+                Err(err) if tavily_hikari::is_transient_sqlite_write_error(&err) => {
+                    tracing::debug!(
+                        component = "scheduler",
+                        event = "stale_job_reaper_deferred",
+                        defer_reason = "sqlite_contention",
+                        retry_delay_secs = 30_i64,
+                    );
+                }
+                Err(err) => tracing::error!(
+                    component = "scheduler",
+                    event = "stale_job_reaper_failed",
+                    err = %err,
+                ),
+            }
+            match state
+                .proxy
+                .ensure_upstream_reconciliation_representative_job()
+                .await
+            {
+                Ok(()) => maintenance_worker_wake_for_state(state.as_ref()).notify_one(),
+                Err(err) => tracing::debug!(
+                    component = "reconciliation",
+                    event = "resume_watcher_enqueue_failed",
+                    err = %err,
+                ),
+            }
+            match state
+                .proxy
+                .ensure_upstream_reconciliation_research_drain_job()
+                .await
+            {
+                Ok(()) => maintenance_worker_wake_for_state(state.as_ref()).notify_one(),
+                Err(err) => tracing::debug!(
+                    component = "reconciliation_research_drain",
+                    event = "resume_watcher_enqueue_failed",
+                    err = %err,
+                ),
+            }
+        }
+    });
+}
+
+fn spawn_quota_sync_scheduler(state: Arc<AppState>) {
+    let cold_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let keys = {
+                let _maintenance = acquire_db_maintenance_read_gate().await;
+                match cold_state
+                    .proxy
+                    .list_keys_pending_quota_sync(twenty_four_hours_secs())
+                    .await
+                {
+                    Ok(list) => list,
+                    Err(err) => {
+                        tracing::warn!(
+                            component = "quota_sync",
+                            event = "list_pending_failed",
+                            scope = "cold",
+                            err = %err,
+                        );
+                        vec![]
+                    }
                 }
             };
 
             for key_id in keys {
-                let delay = random_delay_secs();
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                let job_id = match state
+                let delay = random_delay_secs(300);
+                cold_state
                     .proxy
-                    .scheduled_job_start("quota_sync", Some(&key_id), 1)
-                    .await
-                {
-                    Ok(id) => id,
-                    Err(err) => {
-                        eprintln!("quota-sync: start job error: {err}");
-                        continue;
-                    }
+                    .backend_time()
+                    .sleep(Duration::from_secs(delay))
+                    .await;
+                let Some(_) = enqueue_scheduled_job_logged(
+                    cold_state.as_ref(),
+                    "quota_sync",
+                    Some(&key_id),
+                    TRIGGER_SOURCE_SCHEDULER,
+                    "quota-sync",
+                )
+                .await
+                else {
+                    continue;
                 };
-                match state.proxy.sync_key_quota(&key_id, &state.usage_base).await {
-                    Ok((limit, remaining)) => {
-                        let msg = format!("limit={limit} remaining={remaining}");
-                        let _ = state
-                            .proxy
-                            .scheduled_job_finish(job_id, "success", Some(&msg))
-                            .await;
-                    }
-                    Err(ProxyError::QuotaDataMissing { reason }) => {
-                        let msg = format!("quota_data_missing: {reason}");
-                        let _ = state
-                            .proxy
-                            .scheduled_job_finish(job_id, "error", Some(&msg))
-                            .await;
-                    }
-                    Err(ProxyError::UsageHttp { status, body }) => {
-                        let msg = format!("usage_http {status}: {body}");
-                        let _ = state
-                            .proxy
-                            .scheduled_job_finish(job_id, "error", Some(&msg))
-                            .await;
-                    }
-                    Err(err) => {
-                        let _ = state
-                            .proxy
-                            .scheduled_job_finish(job_id, "error", Some(&err.to_string()))
-                            .await;
-                    }
-                }
             }
 
-            // Sleep one hour before next cycle
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            cold_state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_secs(3600))
+                .await;
+        }
+    });
+
+    let hot_state = state;
+    tokio::spawn(async move {
+        loop {
+            let keys = {
+                let _maintenance = acquire_db_maintenance_read_gate().await;
+                match hot_state
+                    .proxy
+                    .list_keys_pending_hot_quota_sync(two_hours_secs(), fifteen_minutes_secs())
+                    .await
+                {
+                    Ok(list) => list,
+                    Err(err) => {
+                        tracing::warn!(
+                            component = "quota_sync",
+                            event = "list_pending_failed",
+                            scope = "hot",
+                            err = %err,
+                        );
+                        vec![]
+                    }
+                }
+            };
+
+            for key_id in keys {
+                let delay = random_delay_secs(60);
+                hot_state
+                    .proxy
+                    .backend_time()
+                    .sleep(Duration::from_secs(delay))
+                    .await;
+                let Some(_) = enqueue_scheduled_job_logged(
+                    hot_state.as_ref(),
+                    "quota_sync/hot",
+                    Some(&key_id),
+                    TRIGGER_SOURCE_SCHEDULER,
+                    "quota-sync-hot",
+                )
+                .await
+                else {
+                    continue;
+                };
+            }
+
+            hot_state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_secs(300))
+                .await;
         }
     });
 }
@@ -82,40 +900,21 @@ fn spawn_quota_sync_scheduler(state: Arc<AppState>) {
 fn spawn_token_usage_rollup_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            let job_id = match state
-                .proxy
-                .scheduled_job_start("token_usage_rollup", None, 1)
-                .await
-            {
-                Ok(id) => id,
-                Err(err) => {
-                    eprintln!("token-usage-rollup: start job error: {err}");
-                    tokio::time::sleep(Duration::from_secs(300)).await;
-                    continue;
-                }
+            let Some(_) = enqueue_scheduled_job_logged(
+                state.as_ref(),
+                "token_usage_rollup",
+                None,
+                TRIGGER_SOURCE_SCHEDULER,
+                "token-usage-rollup",
+            )
+            .await
+            else {
+                state.proxy.backend_time().sleep(Duration::from_secs(300)).await;
+                continue;
             };
 
-            match state.proxy.rollup_token_usage_stats().await {
-                Ok((rows, last_ts)) => {
-                    let msg = match last_ts {
-                        Some(ts) => format!("rows={rows} last_rollup_ts={ts}"),
-                        None => format!("rows={rows} last_rollup_ts=none"),
-                    };
-                    let _ = state
-                        .proxy
-                        .scheduled_job_finish(job_id, "success", Some(&msg))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = state
-                        .proxy
-                        .scheduled_job_finish(job_id, "error", Some(&err.to_string()))
-                        .await;
-                }
-            }
-
             // Run rollup every 5 minutes to keep charts reasonably fresh
-            tokio::time::sleep(Duration::from_secs(300)).await;
+            state.proxy.backend_time().sleep(Duration::from_secs(300)).await;
         }
     });
 }
@@ -123,37 +922,112 @@ fn spawn_token_usage_rollup_scheduler(state: Arc<AppState>) {
 fn spawn_auth_token_logs_gc_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            let job_id = match state
-                .proxy
-                .scheduled_job_start("auth_token_logs_gc", None, 1)
-                .await
-            {
-                Ok(id) => id,
-                Err(err) => {
-                    eprintln!("auth-token-logs-gc: start job error: {err}");
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                    continue;
+            let Some(_) = enqueue_scheduled_job_logged(
+                state.as_ref(),
+                "auth_token_logs_gc",
+                None,
+                TRIGGER_SOURCE_SCHEDULER,
+                "auth-token-logs-gc",
+            )
+            .await
+            else {
+                state.proxy.backend_time().sleep(Duration::from_secs(3600)).await;
+                continue;
+            };
+
+            // Run GC once per hour; retention window is enforced inside the proxy.
+            state.proxy.backend_time().sleep(Duration::from_secs(3600)).await;
+        }
+    });
+}
+
+fn spawn_ha_outbox_gc_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut next_baseline_at = state.proxy.backend_time().now_ts();
+        loop {
+            let now = state.proxy.backend_time().now_ts();
+            let baseline_due = now >= next_baseline_at;
+            let watchdog_needed = if baseline_due {
+                false
+            } else {
+                match state.proxy.ha_outbox_gc_watchdog_needed().await {
+                    Ok(needed) => needed,
+                    Err(err) => {
+                        tracing::debug!(
+                            component = "ha_outbox_gc",
+                            event = "watchdog_state_unavailable",
+                            err = %err,
+                            "HA outbox GC watchdog could not read durable debt state"
+                        );
+                        false
+                    }
                 }
             };
 
-            match state.proxy.gc_auth_token_logs().await {
-                Ok(deleted) => {
-                    let msg = format!("deleted_rows={deleted}");
-                    let _ = state
-                        .proxy
-                        .scheduled_job_finish(job_id, "success", Some(&msg))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = state
-                        .proxy
-                        .scheduled_job_finish(job_id, "error", Some(&err.to_string()))
-                        .await;
+            if baseline_due || watchdog_needed {
+                let enqueued = enqueue_scheduled_job_logged(
+                    state.as_ref(),
+                    "ha_outbox_gc",
+                    None,
+                    TRIGGER_SOURCE_SCHEDULER,
+                    "ha-outbox-gc",
+                )
+                .await;
+                if baseline_due && enqueued.is_some() {
+                    next_baseline_at = now.saturating_add(HA_OUTBOX_GC_BASELINE_SECS);
                 }
             }
 
-            // Run GC once per hour; retention window is enforced inside the proxy.
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            // The hourly baseline discovers newly expired records. Between sweeps,
+            // the controller either restores pending debt or rechecks an expired
+            // state observation before admitting another indexed channel slice.
+            state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_secs(HA_OUTBOX_GC_IDLE_DISCOVERY_SECS as u64))
+                .await;
+        }
+    });
+}
+
+fn spawn_mcp_sessions_gc_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(_) = enqueue_scheduled_job_logged(
+                state.as_ref(),
+                "mcp_sessions_gc",
+                None,
+                TRIGGER_SOURCE_SCHEDULER,
+                "mcp-sessions-gc",
+            )
+            .await
+            else {
+                state.proxy.backend_time().sleep(Duration::from_secs(3600)).await;
+                continue;
+            };
+
+            state.proxy.backend_time().sleep(Duration::from_secs(3600)).await;
+        }
+    });
+}
+
+fn spawn_mcp_session_init_backoffs_gc_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(_) = enqueue_scheduled_job_logged(
+                state.as_ref(),
+                "mcp_session_init_backoffs_gc",
+                None,
+                TRIGGER_SOURCE_SCHEDULER,
+                "mcp-session-init-backoffs-gc",
+            )
+            .await
+            else {
+                state.proxy.backend_time().sleep(Duration::from_secs(3600)).await;
+                continue;
+            };
+
+            state.proxy.backend_time().sleep(Duration::from_secs(3600)).await;
         }
     });
 }
@@ -163,149 +1037,2084 @@ fn spawn_request_logs_gc_scheduler(state: Arc<AppState>) {
         // Schedule: daily at configured local time.
         loop {
             let (hour, minute) = effective_request_logs_gc_at();
+            state
+                .proxy
+                .backend_time()
+                .sleep(state.proxy.backend_time().sleep_until_local_daily_run(hour, minute))
+                .await;
 
-            let now = Local::now();
-            let today = now.date_naive();
-            let scheduled_naive = today
-                .and_hms_opt(hour, minute, 0)
-                .unwrap_or_else(|| today.and_hms_opt(7, 0, 0).expect("valid default time"));
-            let scheduled_today = match Local.from_local_datetime(&scheduled_naive) {
-                chrono::LocalResult::Single(dt) => dt,
-                chrono::LocalResult::Ambiguous(dt, _) => dt,
-                chrono::LocalResult::None => now,
-            };
-            let scheduled_next = if scheduled_today > now {
-                scheduled_today
-            } else {
-                // Next day at the configured time.
-                let tomorrow = today.succ_opt().unwrap_or_else(|| {
-                    today
-                        .checked_add_days(chrono::Days::new(1))
-                        .unwrap_or(today)
-                });
-                let next_naive = tomorrow
-                    .and_hms_opt(hour, minute, 0)
-                    .unwrap_or_else(|| tomorrow.and_hms_opt(7, 0, 0).expect("valid default time"));
-                match Local.from_local_datetime(&next_naive) {
-                    chrono::LocalResult::Single(dt) => dt,
-                    chrono::LocalResult::Ambiguous(dt, _) => dt,
-                    chrono::LocalResult::None => now + ChronoDuration::hours(24),
-                }
-            };
-
-            let sleep_for = (scheduled_next - now)
-                .to_std()
-                .unwrap_or_else(|_| Duration::from_secs(0));
-            tokio::time::sleep(sleep_for).await;
-
-            // After we reach the scheduled time, keep retrying until we either run the job
-            // successfully or record an error for this run window.
-            loop {
-                let retention_days = effective_request_logs_retention_days();
-                let job_id = match state
-                    .proxy
-                    .scheduled_job_start("request_logs_gc", None, 1)
-                    .await
-                {
-                    Ok(id) => id,
-                    Err(err) => {
-                        eprintln!("request-logs-gc: start job error: {err}");
-                        tokio::time::sleep(Duration::from_secs(300)).await;
-                        continue;
-                    }
-                };
-
-                match state.proxy.gc_request_logs().await {
-                    Ok(deleted) => {
-                        let msg = format!("deleted_rows={deleted} retention_days={retention_days}");
-                        let _ = state
-                            .proxy
-                            .scheduled_job_finish(job_id, "success", Some(&msg))
-                            .await;
-                        break;
-                    }
-                    Err(err) => {
-                        let _ = state
-                            .proxy
-                            .scheduled_job_finish(job_id, "error", Some(&err.to_string()))
-                            .await;
-                        break;
-                    }
-                }
-            }
+            let _ = enqueue_scheduled_job_logged(
+                state.as_ref(),
+                "request_logs_gc",
+                None,
+                TRIGGER_SOURCE_SCHEDULER,
+                "request-logs-gc",
+            )
+            .await;
         }
     });
 }
 
-async fn run_forward_proxy_geo_refresh_job(state: Arc<AppState>) {
-    let job_id = match state
-        .proxy
-        .scheduled_job_start("forward_proxy_geo_refresh", None, 1)
-        .await
-    {
-        Ok(id) => id,
-        Err(err) => {
-            eprintln!("forward-proxy-geo-refresh: start job error: {err}");
-            return;
+fn spawn_auth_token_logs_alert_index_ensure_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let _ = enqueue_scheduled_job_logged(
+            state.as_ref(),
+            AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_JOB_TYPE,
+            None,
+            TRIGGER_SOURCE_SCHEDULER,
+            "auth-token-logs-alert-index",
+        )
+        .await;
+    });
+}
+
+async fn run_request_logs_gc_catchup_claimed_job(
+    state: Arc<AppState>,
+    claimed_job: ClaimedScheduledJob,
+) -> bool {
+    let ClaimedScheduledJob {
+        job_id,
+        claim_generation,
+        _job_execution_gate,
+    } = claimed_job;
+    drop(_job_execution_gate);
+    let _bulk_admission = match state.proxy.admit_request_logs_gc() {
+        tavily_hikari::SqliteAdmissionOutcome::Admitted(permit) => permit,
+        tavily_hikari::SqliteAdmissionOutcome::Deferred { reason } => {
+            let msg = format!("deferred={reason}");
+            tracing::debug!(
+                component = "request_logs_gc",
+                event = "deferred",
+                job_id,
+                defer_reason = reason,
+                continuation_delay_secs = REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS,
+                "request-log GC deferred before SQLite connection acquisition"
+            );
+            return finish_request_logs_gc_with_continuation(
+                &state,
+                job_id,
+                claim_generation,
+                "success",
+                msg,
+            )
+            .await;
         }
     };
+    let result = state
+        .proxy
+        .gc_request_logs_with_options(scheduled_request_logs_gc_options())
+        .await;
+    drop(_bulk_admission);
 
+    match result {
+        Ok(report) => {
+            let msg = format_request_logs_gc_report_message(&report, 1);
+            let zero_progress = report.progress_status == "incomplete_zero_progress";
+            let zero_progress_streak = if zero_progress {
+                REQUEST_LOGS_GC_ZERO_PROGRESS_STREAK.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                REQUEST_LOGS_GC_ZERO_PROGRESS_STREAK.store(0, Ordering::Relaxed);
+                0
+            };
+            tracing::debug!(
+                component = "request_logs_gc",
+                event = "pass_completed",
+                progress_status = %report.progress_status,
+                scanned_body_candidates = report.scanned_body_candidates,
+                unique_retention_users = report.unique_retention_users,
+                retention_context_cache_hits = report.retention_context_cache_hits,
+                candidate_query_ms = report.body_candidate_query_elapsed_ms,
+                decision_ms = report.body_retention_decision_elapsed_ms,
+                write_ms = report.body_write_elapsed_ms,
+            );
+            if zero_progress_streak == 3
+                || (zero_progress_streak > 0 && zero_progress_streak % 12 == 0)
+            {
+                tracing::warn!(
+                    component = "request_logs_gc",
+                    event = "consecutive_zero_progress",
+                    zero_progress_streak,
+                    continuation_delay_secs = REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS,
+                    "request-log GC is incomplete without progress"
+                );
+            }
+            if report.completed {
+                match state
+                    .proxy
+                    .scheduled_job_finish_claimed(job_id, claim_generation, "success", Some(&msg))
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(err) if err.is_stale_claim() => true,
+                    Err(err) => {
+                        tracing::warn!(
+                            component = "request_logs_gc",
+                            event = "completion_persist_deferred",
+                            job_id,
+                            claim_generation,
+                            stale_reaper_after_secs = 120_u64,
+                            err = %err,
+                            "request-log GC completion remains running for stale-reaper recovery"
+                        );
+                        false
+                    }
+                }
+            } else {
+                finish_request_logs_gc_with_continuation(
+                    &state,
+                    job_id,
+                    claim_generation,
+                    "success",
+                    msg,
+                )
+                .await
+            }
+        }
+        Err(err) => {
+            finish_request_logs_gc_with_continuation(
+                &state,
+                job_id,
+                claim_generation,
+                "error",
+                format!("error={err}"),
+            )
+            .await
+        }
+    }
+}
+
+async fn finish_request_logs_gc_with_continuation(
+    state: &Arc<AppState>,
+    job_id: i64,
+    claim_generation: i64,
+    status: &str,
+    message: String,
+) -> bool {
+    let available_at = state
+        .proxy
+        .backend_time()
+        .now_ts()
+        .saturating_add(REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS);
     match state
         .proxy
-        .refresh_forward_proxy_geo_metadata(&state.api_key_ip_geo_origin, true)
+        .scheduled_job_finish_and_enqueue_auto_at_with_status(
+            job_id,
+            claim_generation,
+            status,
+            "request_logs_gc",
+            None,
+            1,
+            Some(&message),
+            available_at,
+        )
         .await
     {
-        Ok(refreshed) => {
-            let msg = format!("refreshed_candidates={refreshed}");
+        Ok(continuation) => {
+            tracing::debug!(
+                component = "request_logs_gc",
+                event = "continuation_queued",
+                job_id,
+                continuation_job_id = continuation.job_id,
+                continuation_created = continuation.created,
+                continuation_delay_secs = REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS,
+                available_at,
+            );
+            true
+        }
+        Err(err) if err.is_stale_claim() => true,
+        Err(err) => {
+            tracing::warn!(
+                component = "request_logs_gc",
+                event = "continuation_persist_deferred",
+                job_id,
+                claim_generation,
+                continuation_delay_secs = REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS,
+                stale_reaper_after_secs = 120_u64,
+                err = %err,
+                "request-log GC continuation remains running for stale-reaper recovery"
+            );
+            false
+        }
+    }
+}
+
+async fn finish_ha_gc_with_continuation(
+    state: &Arc<AppState>,
+    job_id: i64,
+    claim_generation: i64,
+    message: String,
+    continuation_delay_secs: i64,
+) -> bool {
+    let available_at = state
+        .proxy
+        .backend_time()
+        .now_ts()
+        .saturating_add(continuation_delay_secs);
+    let result = state
+        .proxy
+        .scheduled_job_finish_and_enqueue_auto_at(
+            job_id,
+            claim_generation,
+            "ha_outbox_gc",
+            None,
+            1,
+            Some(&message),
+            available_at,
+        )
+        .await;
+    match result {
+        Ok(result) => {
+            tracing::debug!(
+                component = "ha_outbox_gc",
+                event = "continuation_queued",
+                job_id,
+                continuation_job_id = result.job_id,
+                continuation_created = result.created,
+                continuation_delay_secs,
+                available_at,
+            );
+        }
+        Err(err) if err.is_stale_claim() => {
+            tracing::debug!(
+                component = "ha_outbox_gc",
+                event = "stale_claim_ignored",
+                job_id,
+                claim_generation,
+                "stale GC claim cannot finish or enqueue a continuation"
+            );
+            return true;
+        }
+        Err(err) if tavily_hikari::is_transient_sqlite_write_error(&err) => {
+            tracing::warn!(
+                component = "ha_outbox_gc",
+                event = "continuation_persist_deferred",
+                job_id,
+                claim_generation,
+                continuation_delay_secs,
+                stale_reaper_after_secs = 120_u64,
+                err = %err,
+                "HA outbox GC continuation hit a transient SQLite conflict; retaining the running claim for stale recovery"
+            );
+            return true;
+        }
+        Err(err) => {
+            tracing::error!(
+                component = "ha_outbox_gc",
+                event = "continuation_transaction_failed",
+                job_id,
+                continuation_delay_secs,
+                err = %err,
+                "HA outbox GC could not persist its deferred continuation"
+            );
+            if let Err(finish_err) = state
+                .proxy
+                .scheduled_job_finish_claimed(job_id, claim_generation, "error", Some(&message))
+                .await
+            {
+                tracing::error!(
+                    component = "ha_outbox_gc",
+                    event = "deferred_job_finish_failed",
+                    job_id,
+                    err = %finish_err,
+                    "HA outbox GC deferred job remains running for stale-reaper recovery"
+                );
+            }
+            return false;
+        }
+    }
+    true
+}
+
+async fn run_ha_outbox_gc_claimed_job(
+    state: Arc<AppState>,
+    claimed_job: ClaimedScheduledJob,
+) -> bool {
+    let ClaimedScheduledJob {
+        job_id,
+        claim_generation,
+        _job_execution_gate,
+    } = claimed_job;
+    drop(_job_execution_gate);
+
+    let foreground_rps = state.proxy.foreground_activity_rps();
+    let _bulk_admission = match state.proxy.admit_ha_outbox_gc() {
+        tavily_hikari::SqliteAdmissionOutcome::Admitted(permit) => permit,
+        tavily_hikari::SqliteAdmissionOutcome::Deferred { reason } => {
+        tracing::debug!(
+            component = "ha_outbox_gc",
+            event = "deferred",
+            job_id,
+            claim_generation,
+            defer_reason = reason,
+            continuation_delay_secs = HA_OUTBOX_GC_DEFERRED_CONTINUATION_DELAY_SECS,
+        );
+        return finish_ha_gc_with_continuation(
+            &state,
+            job_id,
+            claim_generation,
+            format!("deferred={reason}"),
+            HA_OUTBOX_GC_DEFERRED_CONTINUATION_DELAY_SECS,
+        )
+        .await;
+        }
+    };
+    let proxy = state.proxy.clone();
+    let result = state
+        .proxy
+        .gc_ha_outbox_online_with_foreground_activity(
+            foreground_rps,
+            state.proxy.foreground_activity_low_pressure_since_floor(),
+            move || proxy.foreground_activity_rps(),
+        )
+        .await;
+
+    match result {
+        Ok(report) => {
+            // The durable controller has already selected the next fair channel
+            // and its wake. The scheduler only persists that typed wake; it must
+            // not turn a defer for one channel into a global delay.
+            let continuation_delay_secs = report.continuation_delay_secs;
+            if report.max_batch_elapsed_ms > tavily_hikari::HA_OUTBOX_GC_ACTIVE_BUDGET_MS {
+                tracing::warn!(
+                    component = "ha_outbox_gc",
+                    event = "slow_slice",
+                    job_id,
+                    claim_generation,
+                    max_batch_elapsed_ms = report.max_batch_elapsed_ms as u64,
+                    active_elapsed_ms = report.active_elapsed_ms as u64,
+                    elapsed_ms = report.elapsed_ms as u64,
+                    "HA outbox GC slice exceeded its SQL budget"
+                );
+            }
+            for channel in &report.channels {
+                let sampling =
+                    tavily_hikari::sample_ha_perf_event_windowed("gc_aggregate", channel.channel);
+                if sampling.emit_info {
+                    tracing::info!(
+                        component = "ha_outbox_gc",
+                        event = "aggregate",
+                        job_id,
+                        claim_generation,
+                        channel = channel.channel.as_str(),
+                        deleted_rows = channel.deleted_rows,
+                        retention_deleted_rows = channel.retention_deleted_rows,
+                        invalid_legacy_deleted_rows = channel.invalid_legacy_deleted_rows,
+                        oldest_deletable_age_secs = channel.oldest_deletable_age_secs,
+                        deleted_rows_per_minute = channel.deleted_rows_per_minute,
+                        foreground_rps = channel.foreground_rps,
+                        debt_mode = channel.debt_mode.as_str(),
+                        slo_state = channel.slo_state.as_str(),
+                        has_more = channel.has_more,
+                        controller_wake_delay_secs = continuation_delay_secs,
+                        elapsed_ms = report.elapsed_ms as u64,
+                    );
+                }
+                if let Some(transition) = channel.slo_state_transition.as_deref() {
+                    match transition {
+                        "breached" => tracing::warn!(
+                            component = "ha_outbox_gc",
+                            event = "slo_breached",
+                            job_id,
+                            channel = channel.channel.as_str(),
+                            oldest_deletable_age_secs = channel.oldest_deletable_age_secs,
+                            deleted_rows_per_minute = channel.deleted_rows_per_minute,
+                            recovery_deadline_at = channel.recovery_deadline_at,
+                            "HA outbox GC recovery SLO breached"
+                        ),
+                        "recovered" => tracing::info!(
+                            component = "ha_outbox_gc",
+                            event = "slo_recovered",
+                            job_id,
+                            channel = channel.channel.as_str(),
+                            oldest_deletable_age_secs = channel.oldest_deletable_age_secs,
+                            deleted_rows_per_minute = channel.deleted_rows_per_minute,
+                            "HA outbox GC recovery SLO recovered"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(continuation_delay_secs) = continuation_delay_secs {
+                tracing::debug!(
+                    component = "ha_outbox_gc",
+                    event = "deferred",
+                    job_id,
+                    claim_generation,
+                    defer_reason = "controller_wake",
+                    deleted_rows = report.deleted_rows,
+                    active_elapsed_ms = report.active_elapsed_ms as u64,
+                    max_batch_elapsed_ms = report.max_batch_elapsed_ms as u64,
+                    elapsed_ms = report.elapsed_ms as u64,
+                    continuation_delay_secs,
+                );
+                return finish_ha_gc_with_continuation(
+                    &state,
+                    job_id,
+                    claim_generation,
+                    format!(
+                        "controller_wake_delay_secs={continuation_delay_secs} {}",
+                        format_ha_outbox_gc_report_message(&report, 1)
+                    ),
+                    continuation_delay_secs,
+                )
+                .await;
+            } else {
+                let message = format_ha_outbox_gc_report_message(&report, 1);
+                if let Err(err) = state
+                    .proxy
+                    .scheduled_job_finish_claimed(
+                        job_id,
+                        claim_generation,
+                        "success",
+                        Some(&message),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        component = "ha_outbox_gc",
+                        event = "deferred",
+                        job_id,
+                        claim_generation,
+                        defer_reason = "job_finish_failed",
+                        err = %err,
+                        "HA outbox GC completion could not be persisted; retaining a durable continuation"
+                    );
+                    return finish_ha_gc_with_continuation(
+                        &state,
+                        job_id,
+                        claim_generation,
+                        format!("deferred=job_finish_failed error={err}"),
+                        HA_OUTBOX_GC_DEFERRED_CONTINUATION_DELAY_SECS,
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(err) if tavily_hikari::is_transient_sqlite_write_error(&err) => {
+            tracing::debug!(
+                component = "ha_outbox_gc",
+                event = "deferred",
+                job_id,
+                claim_generation,
+                defer_reason = "sqlite_busy",
+                err = %err,
+            );
+            return finish_ha_gc_with_continuation(
+                &state,
+                job_id,
+                claim_generation,
+                format!("deferred=sqlite_busy error={err}"),
+                HA_OUTBOX_GC_RECOVERY_CONTINUATION_DELAY_SECS,
+            )
+            .await;
+        }
+        Err(err) => {
+            let message = err.to_string();
             let _ = state
                 .proxy
-                .scheduled_job_finish(job_id, "success", Some(&msg))
+                .scheduled_job_finish_claimed(job_id, claim_generation, "error", Some(&message))
+                .await;
+        }
+    }
+    true
+}
+
+async fn record_linuxdo_user_sync_failure(
+    state: &AppState,
+    provider_user_id: &str,
+    attempted_at: i64,
+    error: &str,
+) {
+    let _job_execution_gate = acquire_db_job_execution_gate_for_state(state).await;
+    let _maintenance = acquire_db_maintenance_read_gate().await;
+    record_linuxdo_user_sync_failure_in_db_window(state, provider_user_id, attempted_at, error)
+        .await;
+}
+
+async fn record_linuxdo_user_sync_failure_in_db_window(
+    state: &AppState,
+    provider_user_id: &str,
+    attempted_at: i64,
+    error: &str,
+) {
+    if let Err(mark_err) = state
+        .proxy
+        .record_oauth_account_profile_sync_failure(
+            "linuxdo",
+            provider_user_id,
+            attempted_at,
+            error,
+        )
+        .await
+    {
+        tracing::warn!(
+            component = "linuxdo_user_sync",
+            event = "record_failure_metadata_failed",
+            provider_user_id,
+            err = %mark_err,
+        );
+    }
+}
+
+async fn finish_scheduled_job_with_db_gate(
+    state: &AppState,
+    job_id: i64,
+    claim_generation: i64,
+    status: &str,
+    message: &str,
+) {
+    let _job_execution_gate = acquire_db_job_execution_gate_for_state(state).await;
+    let _maintenance = acquire_db_maintenance_read_gate().await;
+    let _ = state
+        .proxy
+        .scheduled_job_finish_claimed(job_id, claim_generation, status, Some(message))
+        .await;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_linuxdo_user_status_sync_job(state: Arc<AppState>) {
+    run_linuxdo_user_status_sync_job_with_source(state, TRIGGER_SOURCE_SCHEDULER).await;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_linuxdo_user_status_sync_job_with_source(
+    state: Arc<AppState>,
+    trigger_source: &'static str,
+) {
+    let Some(claimed_job) = claim_scheduled_job(
+        state.as_ref(),
+        LINUXDO_USER_STATUS_SYNC_JOB_TYPE,
+        None,
+        trigger_source,
+        "linuxdo-user-sync",
+    )
+    .await
+    else {
+        return;
+    };
+
+    run_linuxdo_user_status_sync_claimed_job(
+        state,
+        claimed_job,
+        trigger_source == TRIGGER_SOURCE_MANUAL,
+    )
+    .await;
+}
+
+async fn run_linuxdo_user_status_sync_claimed_job(
+    state: Arc<AppState>,
+    mut claimed_job: ClaimedScheduledJob,
+    manual_remote_attempt: bool,
+) -> bool {
+    if claimed_job._job_execution_gate.is_none() {
+        claimed_job._job_execution_gate =
+            Some(acquire_db_job_execution_gate_for_state(state.as_ref()).await);
+    }
+
+    let job_id = claimed_job.job_id;
+    let claim_generation = claimed_job.claim_generation;
+    let cfg = &state.linuxdo_oauth;
+
+    let records = {
+        let _job_execution_gate = claimed_job
+            ._job_execution_gate
+            .take()
+            .expect("claimed linuxdo job has execution gate");
+        let _maintenance = acquire_db_maintenance_read_gate().await;
+        if !cfg.is_enabled_and_configured() {
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "success",
+                    Some("attempted=0 success=0 skipped=0 failure=0 reason=linuxdo_oauth_not_configured"),
+                )
+                .await;
+            return true;
+        }
+        if !cfg.has_refresh_token_crypt_key() {
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "success",
+                    Some("attempted=0 success=0 skipped=0 failure=0 reason=missing_refresh_token_crypt_key"),
+                )
+                .await;
+            return true;
+        }
+
+        let records = match state
+            .proxy
+            .list_oauth_accounts_with_refresh_token("linuxdo")
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => {
+                let _ = state
+                    .proxy
+                    .scheduled_job_finish_claimed(
+                        job_id,
+                        claim_generation,
+                        "error",
+                        Some(&err.to_string()),
+                    )
+                    .await;
+                return false;
+            }
+        };
+
+        if records.is_empty() {
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "success",
+                    Some("attempted=0 success=0 skipped=0 failure=0 reason=no_eligible_accounts"),
+                )
+                .await;
+            return true;
+        }
+
+        records
+    };
+
+    let client = reqwest::Client::new();
+    let attempted = records.len();
+    let mut success = 0usize;
+    let skipped = 0usize;
+    let mut failure = 0usize;
+    let mut first_failure: Option<String> = None;
+
+    for record in records {
+        let attempted_at = state.proxy.backend_time().now_ts();
+        let record_label = record
+            .username
+            .as_deref()
+            .or(record.name.as_deref())
+            .unwrap_or(record.provider_user_id.as_str())
+            .to_string();
+        let refresh_token = match decrypt_linuxdo_refresh_token(
+            cfg,
+            &record.refresh_token_ciphertext,
+            &record.refresh_token_nonce,
+        ) {
+            Ok(refresh_token) => refresh_token,
+            Err(err) => {
+                let message = err.to_string();
+                failure += 1;
+                first_failure
+                    .get_or_insert_with(|| format!("{record_label}: {message}"));
+                record_linuxdo_user_sync_failure(
+                    state.as_ref(),
+                    &record.provider_user_id,
+                    attempted_at,
+                    &message,
+                )
+                .await;
+                continue;
+            }
+        };
+        let profile_result = fetch_linuxdo_profile_from_refresh_token_with_remote_attempt_admission(
+            &client,
+            cfg,
+            &refresh_token,
+            &remote_attempt_admission_for_state(state.as_ref()),
+            manual_remote_attempt,
+        )
+        .await;
+        let (profile, token_payload) =
+            match profile_result {
+                Ok(result) => result,
+                Err(err) => {
+                    let message = err.to_string();
+                    failure += 1;
+                    first_failure
+                        .get_or_insert_with(|| format!("{record_label}: {message}"));
+                    record_linuxdo_user_sync_failure(
+                        state.as_ref(),
+                        &record.provider_user_id,
+                        attempted_at,
+                        &message,
+                    )
+                    .await;
+                    continue;
+                }
+            };
+
+        if profile.provider_user_id != record.provider_user_id {
+            let message = LinuxDoSyncError::ProviderUserIdMismatch {
+                expected: record.provider_user_id.clone(),
+                actual: profile.provider_user_id.clone(),
+            }
+            .to_string();
+            failure += 1;
+            first_failure.get_or_insert_with(|| format!("{record_label}: {message}"));
+            record_linuxdo_user_sync_failure(
+                state.as_ref(),
+                &record.provider_user_id,
+                attempted_at,
+                &message,
+            )
+            .await;
+            continue;
+        }
+
+        let mut upsert_failure_message = None;
+        {
+            let _job_execution_gate = acquire_db_job_execution_gate_for_state(state.as_ref()).await;
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            let upsert_result = if let Some(rotated_refresh_token) = token_payload
+                .refresh_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                match encrypt_linuxdo_refresh_token(cfg, rotated_refresh_token) {
+                    Ok(Some((refresh_token_ciphertext, refresh_token_nonce))) => {
+                        state
+                            .proxy
+                            .refresh_oauth_account_profile_with_refresh_token(
+                                &profile,
+                                &refresh_token_ciphertext,
+                                &refresh_token_nonce,
+                            )
+                            .await
+                    }
+                    Ok(None) => state.proxy.refresh_oauth_account_profile(&profile).await,
+                    Err(err) => {
+                        let message = format!("encrypt rotated refresh token error: {err}");
+                        failure += 1;
+                        first_failure.get_or_insert_with(|| format!("{record_label}: {message}"));
+                        record_linuxdo_user_sync_failure_in_db_window(
+                            state.as_ref(),
+                            &record.provider_user_id,
+                            attempted_at,
+                            &message,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            } else {
+                state.proxy.refresh_oauth_account_profile(&profile).await
+            };
+
+            if let Err(err) = upsert_result {
+                let mut message = format!("upsert oauth account error: {err}");
+                if !profile.active
+                    && let Err(deactivate_err) = state
+                        .proxy
+                        .set_user_active_status(&record.user_id, false)
+                        .await
+                {
+                    message.push_str(&format!(
+                        "; deactivate local user error: {deactivate_err}"
+                    ));
+                }
+                record_linuxdo_user_sync_failure_in_db_window(
+                    state.as_ref(),
+                    &record.provider_user_id,
+                    attempted_at,
+                    &message,
+                )
+                .await;
+                upsert_failure_message = Some(message);
+            }
+        }
+
+        if let Some(message) = upsert_failure_message {
+            failure += 1;
+            first_failure.get_or_insert_with(|| format!("{record_label}: {message}"));
+            continue;
+        }
+
+        {
+            let _job_execution_gate = acquire_db_job_execution_gate_for_state(state.as_ref()).await;
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            if let Err(err) = state
+                .proxy
+                .record_oauth_account_profile_sync_success(
+                    "linuxdo",
+                    &record.provider_user_id,
+                    attempted_at,
+                )
+                .await
+            {
+                tracing::warn!(
+                    component = "linuxdo_user_sync",
+                    event = "record_success_metadata_failed",
+                    provider_user_id = %record.provider_user_id,
+                    user_id = record.user_id,
+                    err = %err,
+                );
+            }
+        }
+
+        success += 1;
+    }
+
+    let mut message =
+        format!("attempted={attempted} success={success} skipped={skipped} failure={failure}");
+    if let Some(first_failure) = first_failure {
+        message.push_str(&format!(" first_failure={first_failure}"));
+    }
+    let final_status = if failure > 0 { "error" } else { "success" };
+    finish_scheduled_job_with_db_gate(
+        state.as_ref(),
+        job_id,
+        claim_generation,
+        final_status,
+        &message,
+    )
+    .await;
+    final_status == "success"
+}
+
+fn spawn_linuxdo_user_status_sync_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let (hour, minute) = state.linuxdo_oauth.user_sync_time();
+            state
+                .proxy
+                .backend_time()
+                .sleep(state.proxy.backend_time().sleep_until_local_daily_run(hour, minute))
+                .await;
+            let _ = enqueue_scheduled_job_logged(
+                state.as_ref(),
+                LINUXDO_USER_STATUS_SYNC_JOB_TYPE,
+                None,
+                TRIGGER_SOURCE_SCHEDULER,
+                "linuxdo-user-sync",
+            )
+            .await;
+        }
+    });
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_linuxdo_user_tag_binding_refresh_job(state: Arc<AppState>) {
+    run_linuxdo_user_tag_binding_refresh_job_with_source(state, TRIGGER_SOURCE_SCHEDULER).await;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_linuxdo_user_tag_binding_refresh_job_with_source(
+    state: Arc<AppState>,
+    trigger_source: &'static str,
+) {
+    let Some(ClaimedScheduledJob {
+        job_id,
+        claim_generation,
+        _job_execution_gate,
+    }) = claim_scheduled_job(
+        state.as_ref(),
+        LINUXDO_USER_TAG_BINDING_REFRESH_JOB_TYPE,
+        None,
+        trigger_source,
+        "linuxdo-tag-binding-refresh",
+    )
+    .await
+    else {
+        return;
+    };
+
+    let _maintenance = acquire_db_maintenance_read_gate().await;
+    match state.proxy.refresh_linuxdo_user_tag_bindings().await {
+        Ok(refreshed) => {
+            let msg = format!("refreshed={refreshed}");
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(job_id, claim_generation, "success", Some(&msg))
                 .await;
         }
         Err(err) => {
             let _ = state
                 .proxy
-                .scheduled_job_finish(job_id, "error", Some(&err.to_string()))
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "error",
+                    Some(&err.to_string()),
+                )
                 .await;
         }
     }
 }
 
-fn spawn_forward_proxy_geo_refresh_scheduler(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+fn spawn_linuxdo_user_tag_binding_refresh_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            let wait_secs = state
-                .proxy
-                .forward_proxy_geo_refresh_wait_secs(twenty_four_hours_secs())
-                .await;
-            if wait_secs <= 0 {
-                if state
+            let wait_secs = {
+                let _maintenance = acquire_db_maintenance_read_gate().await;
+                state
                     .proxy
-                    .forward_proxy_geo_refresh_due(twenty_four_hours_secs())
+                    .linuxdo_user_tag_binding_refresh_wait_secs(twenty_four_hours_secs())
                     .await
-                {
-                    run_forward_proxy_geo_refresh_job(state.clone()).await;
+            };
+            if wait_secs <= 0 {
+                let due = {
+                    let _maintenance = acquire_db_maintenance_read_gate().await;
+                    state
+                        .proxy
+                        .linuxdo_user_tag_binding_refresh_due(twenty_four_hours_secs())
+                        .await
+                };
+                if due {
+                    let _ = enqueue_scheduled_job_logged(
+                        state.as_ref(),
+                        LINUXDO_USER_TAG_BINDING_REFRESH_JOB_TYPE,
+                        None,
+                        TRIGGER_SOURCE_SCHEDULER,
+                        "linuxdo-tag-binding-refresh",
+                    )
+                    .await;
                 }
-                tokio::time::sleep(Duration::from_secs(
-                    forward_proxy_geo_refresh_recheck_secs() as u64,
-                ))
-                .await;
+                state
+                    .proxy
+                    .backend_time()
+                    .sleep(Duration::from_secs(fifteen_minutes_secs() as u64))
+                    .await;
                 continue;
             }
 
-            let sleep_secs = wait_secs.min(forward_proxy_geo_refresh_recheck_secs()) as u64;
-            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+            let sleep_secs = wait_secs.min(fifteen_minutes_secs()) as u64;
+            state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_secs(sleep_secs))
+                .await;
+        }
+    });
+}
+
+fn spawn_linuxdo_credit_recharge_lifecycle_scheduler(
+    state: Arc<AppState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let due = {
+                let _maintenance = acquire_db_maintenance_read_gate().await;
+                match state
+                    .proxy
+                    .linuxdo_credit_recharge_lifecycle_due(state.proxy.backend_time().now_ts())
+                    .await
+                {
+                    Ok(due) => due,
+                    Err(err) => {
+                        tracing::warn!(
+                            component = "linuxdo_credit_recharge",
+                            event = "lifecycle_due_check_failed",
+                            err = %err,
+                        );
+                        false
+                    }
+                }
+            };
+            if due {
+                let _ = enqueue_scheduled_job_logged(
+                    state.as_ref(),
+                    LINUXDO_CREDIT_RECHARGE_LIFECYCLE_JOB_TYPE,
+                    None,
+                    TRIGGER_SOURCE_SCHEDULER,
+                    "linuxdo-credit-recharge-lifecycle",
+                )
+                .await;
+            }
+            state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_secs(
+                    linuxdo_credit_recharge_lifecycle_recheck_secs() as u64,
+                ))
+                .await;
         }
     })
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinuxDoCreditSystemRefundResponse {
+    code: i64,
+    msg: Option<String>,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_linuxdo_credit_recharge_lifecycle_job(state: Arc<AppState>) {
+    run_linuxdo_credit_recharge_lifecycle_job_with_source(state, TRIGGER_SOURCE_SCHEDULER).await;
+}
+
+#[cfg(test)]
+async fn run_linuxdo_credit_recharge_lifecycle_job_with_source(
+    state: Arc<AppState>,
+    trigger_source: &'static str,
+) {
+    let Some(claimed_job) = claim_scheduled_job(
+        state.as_ref(),
+        LINUXDO_CREDIT_RECHARGE_LIFECYCLE_JOB_TYPE,
+        None,
+        trigger_source,
+        "linuxdo-credit-recharge-lifecycle",
+    )
+    .await
+    else {
+        return;
+    };
+
+    run_linuxdo_credit_recharge_lifecycle_claimed_job(state, claimed_job).await;
+}
+
+async fn post_linuxdo_credit_system_full_refund(
+    state: &AppState,
+    order: &LinuxDoCreditRechargeOrder,
+    trade_no: &str,
+) -> Result<String, String> {
+    let client_id = state
+        .linuxdo_credit
+        .client_id
+        .as_deref()
+        .ok_or_else(|| "Linux.do Credit client id missing".to_string())?;
+    let client_secret = state
+        .linuxdo_credit
+        .client_secret
+        .as_deref()
+        .ok_or_else(|| "Linux.do Credit client secret missing".to_string())?;
+    let endpoint =
+        shared_linuxdo_credit_refund_url(&state.linuxdo_credit.submit_url)
+            .map_err(|err| err.to_string())?;
+    let money = format_linuxdo_credit_money(order.final_money_cents);
+    let params = shared_linuxdo_credit_refund_params(
+        client_id,
+        client_secret,
+        trade_no,
+        &order.out_trade_no,
+        &money,
+    );
+    let remote_attempt = remote_attempt_admission_for_state(state)
+        .acquire_attempt()
+        .await
+        .map_err(str::to_string)?;
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|err| err.to_string())?;
+    drop(remote_attempt);
+    if !status.is_success() {
+        return Err(format!("refund endpoint returned {status}: {text}"));
+    }
+    let parsed: LinuxDoCreditSystemRefundResponse =
+        serde_json::from_str(&text).map_err(|err| format!("invalid refund response: {err}"))?;
+    if parsed.code != 1 {
+        return Err(parsed.msg.unwrap_or_else(|| "refund failed".to_string()));
+    }
+    Ok(text)
+}
+
+async fn persist_linuxdo_credit_system_refund_success_marker_with_retry(
+    state: &AppState,
+    out_trade_no: &str,
+    marker: &SharedLinuxDoCreditRefundExternalSuccessMarker,
+) -> Result<(), String> {
+    let marker_payload =
+        serde_json::to_string(marker).map_err(|err| format!("encode refund marker: {err}"))?;
+    let mut last_error = None;
+    for delay_ms in [0, 50, 200] {
+        if delay_ms > 0 {
+            state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_millis(delay_ms))
+                .await;
+        }
+        match state
+            .proxy
+            .mark_linuxdo_credit_recharge_order_refund_external_succeeded(
+                out_trade_no,
+                LINUXDO_CREDIT_RECHARGE_SYSTEM_REFUND_ACTOR,
+                &marker_payload,
+                state.proxy.backend_time().now_ts(),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(format!(
+        "external refund succeeded but local success marker failed: {}",
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+async fn finalize_linuxdo_credit_system_refund_from_external_success(
+    state: Arc<AppState>,
+    order: &LinuxDoCreditRechargeOrder,
+    marker: &SharedLinuxDoCreditRefundExternalSuccessMarker,
+) -> Result<(), String> {
+    if marker.phase != LINUXDO_CREDIT_RECHARGE_REFUND_EXTERNAL_SUCCEEDED_PHASE
+        || marker.next_status != LINUXDO_CREDIT_RECHARGE_STATUS_REFUNDED
+        || marker.revoke_entitlements
+        || marker.refund_actor != LINUXDO_CREDIT_RECHARGE_SYSTEM_REFUND_ACTOR
+    {
+        return Err("system auto refund marker intent mismatch".to_string());
+    }
+    state
+        .proxy
+        .refund_linuxdo_credit_recharge_order(
+            &order.out_trade_no,
+            LINUXDO_CREDIT_RECHARGE_STATUS_REFUNDED,
+            LINUXDO_CREDIT_RECHARGE_SYSTEM_REFUND_ACTOR,
+            &marker.response,
+            state.proxy.backend_time().now_ts(),
+            false,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("external refund succeeded; local finalize pending: {err}"))
+}
+
+async fn finalize_linuxdo_credit_system_refund_from_external_success_with_retry(
+    state: Arc<AppState>,
+    order: &LinuxDoCreditRechargeOrder,
+    marker: &SharedLinuxDoCreditRefundExternalSuccessMarker,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for delay_ms in [0, 50, 200] {
+        if delay_ms > 0 {
+            state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_millis(delay_ms))
+                .await;
+        }
+        match finalize_linuxdo_credit_system_refund_from_external_success(
+            state.clone(),
+            order,
+            marker,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        "external refund succeeded; local finalize pending".to_string()
+    }))
+}
+
+async fn run_linuxdo_credit_recharge_lifecycle_claimed_job(
+    state: Arc<AppState>,
+    claimed_job: ClaimedScheduledJob,
+) -> bool {
+    let ClaimedScheduledJob {
+        job_id,
+        claim_generation,
+        _job_execution_gate,
+    } = claimed_job;
+    drop(_job_execution_gate);
+
+    let now = state.proxy.backend_time().now_ts();
+    let expired = match state
+        .proxy
+        .expire_due_linuxdo_credit_recharge_orders(now, 64)
+        .await
+    {
+        Ok(changed) => changed,
+        Err(err) => {
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "error",
+                    Some(&err.to_string()),
+                )
+                .await;
+            return false;
+        }
+    };
+    let cancelled = match state
+        .proxy
+        .cancel_due_linuxdo_credit_recharge_orders(now, 64)
+        .await
+    {
+        Ok(changed) => changed,
+        Err(err) => {
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "error",
+                    Some(&err.to_string()),
+                )
+                .await;
+            return false;
+        }
+    };
+    let candidates = match state
+        .proxy
+        .list_linuxdo_credit_recharge_system_refund_candidates(now, 24)
+        .await
+    {
+        Ok(candidates) => candidates,
+        Err(err) => {
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "error",
+                    Some(&err.to_string()),
+                )
+                .await;
+            return false;
+        }
+    };
+    let refund_candidates = candidates.len() as i64;
+    let mut refund_success = 0_i64;
+    let mut refund_failure = 0_i64;
+    let mut first_failure = None::<String>;
+
+    for order in candidates {
+        let order_label = order.out_trade_no.clone();
+        if let Some(marker) =
+            decode_linuxdo_credit_refund_external_success_marker(order.refund_payload.as_deref())
+        {
+            match finalize_linuxdo_credit_system_refund_from_external_success_with_retry(
+                state.clone(),
+                &order,
+                &marker,
+            )
+            .await
+            {
+                Ok(()) => {
+                    refund_success += 1;
+                }
+                Err(err) => {
+                    refund_failure += 1;
+                    first_failure.get_or_insert_with(|| format!("{order_label}: {err}"));
+                }
+            }
+            continue;
+        }
+
+        let Some(trade_no) = order
+            .trade_no
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            refund_failure += 1;
+            first_failure.get_or_insert_with(|| {
+                format!("{order_label}: system auto refund requires trade_no")
+            });
+            continue;
+        };
+
+        match post_linuxdo_credit_system_full_refund(state.as_ref(), &order, trade_no).await {
+            Ok(response) => {
+                let marker = SharedLinuxDoCreditRefundExternalSuccessMarker {
+                    phase: LINUXDO_CREDIT_RECHARGE_REFUND_EXTERNAL_SUCCEEDED_PHASE.to_string(),
+                    next_status: LINUXDO_CREDIT_RECHARGE_STATUS_REFUNDED.to_string(),
+                    revoke_entitlements: false,
+                    refund_actor: LINUXDO_CREDIT_RECHARGE_SYSTEM_REFUND_ACTOR.to_string(),
+                    response,
+                };
+                let marker_result = persist_linuxdo_credit_system_refund_success_marker_with_retry(
+                    state.as_ref(),
+                    &order.out_trade_no,
+                    &marker,
+                )
+                .await;
+                let finalize_result =
+                    finalize_linuxdo_credit_system_refund_from_external_success_with_retry(
+                        state.clone(),
+                        &order,
+                        &marker,
+                    )
+                    .await;
+                match (marker_result, finalize_result) {
+                    (_, Ok(())) => {
+                        refund_success += 1;
+                    }
+                    (Ok(()), Err(err)) => {
+                        refund_failure += 1;
+                        first_failure.get_or_insert_with(|| format!("{order_label}: {err}"));
+                    }
+                    (Err(marker_err), Err(finalize_err)) => {
+                        refund_failure += 1;
+                        first_failure.get_or_insert_with(|| {
+                            format!(
+                                "{order_label}: {finalize_err}; success marker also failed: {marker_err}"
+                            )
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                let next_attempts = order.refund_attempts.saturating_add(1);
+                let retry_after_at = state.proxy.backend_time().now_ts().saturating_add(
+                    linuxdo_credit_recharge_system_refund_retry_delay_secs(order.refund_attempts),
+                );
+                let failure_message = format!(
+                    "system auto refund attempt {next_attempts} failed: {err}"
+                );
+                let persisted = state
+                    .proxy
+                    .mark_linuxdo_credit_recharge_order_system_refund_failure(
+                        &order.out_trade_no,
+                        next_attempts,
+                        retry_after_at,
+                        &failure_message,
+                        state.proxy.backend_time().now_ts(),
+                    )
+                    .await;
+                refund_failure += 1;
+                match persisted {
+                    Ok(_) => {
+                        first_failure
+                            .get_or_insert_with(|| format!("{order_label}: {failure_message}"));
+                    }
+                    Err(persist_err) => {
+                        first_failure.get_or_insert_with(|| {
+                            format!(
+                                "{order_label}: {failure_message}; retry state persist failed: {persist_err}"
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut message = format!(
+        "expired={expired} cancelled={cancelled} refund_candidates={refund_candidates} refund_success={refund_success} refund_failure={refund_failure}"
+    );
+    if let Some(first_failure) = first_failure {
+        message.push_str(&format!(" first_failure={first_failure}"));
+    }
+    let final_status = if refund_failure > 0 { "error" } else { "success" };
+    let _ = state
+        .proxy
+        .scheduled_job_finish_claimed(job_id, claim_generation, final_status, Some(&message))
+        .await;
+    final_status == "success"
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_forward_proxy_geo_refresh_job(state: Arc<AppState>) {
+    run_forward_proxy_geo_refresh_job_with_source(state, TRIGGER_SOURCE_SCHEDULER).await;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_forward_proxy_geo_refresh_job_with_source(
+    state: Arc<AppState>,
+    trigger_source: &'static str,
+) {
+    let Some(claimed_job) = claim_scheduled_job(
+        state.as_ref(),
+        "forward_proxy_geo_refresh",
+        None,
+        trigger_source,
+        "forward-proxy-geo-refresh",
+    )
+    .await
+    else {
+        return;
+    };
+
+    run_forward_proxy_geo_refresh_claimed_job(
+        state,
+        claimed_job,
+        trigger_source == TRIGGER_SOURCE_MANUAL,
+    )
+    .await;
+}
+
+async fn run_forward_proxy_geo_refresh_claimed_job(
+    state: Arc<AppState>,
+    claimed_job: ClaimedScheduledJob,
+    manual_remote_attempt: bool,
+) -> bool {
+    let ClaimedScheduledJob {
+        job_id,
+        claim_generation,
+        _job_execution_gate,
+    } = claimed_job;
+    drop(_job_execution_gate);
+
+    let candidates_result = state
+        .proxy
+        .resolve_forward_proxy_geo_refresh_candidates_with_remote_attempt_admission(
+            &state.api_key_ip_geo_origin,
+            true,
+            Some(remote_attempt_admission_for_state(state.as_ref())),
+            manual_remote_attempt,
+        )
+        .await;
+    let candidates = match candidates_result {
+        Ok(candidates) => candidates,
+        Err(err) => {
+            let _ = state
+                .proxy
+                .scheduled_job_finish_claimed(
+                    job_id,
+                    claim_generation,
+                    "error",
+                    Some(&err.to_string()),
+                )
+                .await;
+            return false;
+        }
+    };
+
+    let refreshed = candidates.len();
+    let _job_execution_gate = acquire_db_job_execution_gate_for_state(state.as_ref()).await;
+    let _maintenance = acquire_db_maintenance_read_gate().await;
+    if !candidates.is_empty()
+        && let Err(err) = state.proxy.persist_forward_proxy_geo_candidates(&candidates).await
+    {
+        let _ = state
+            .proxy
+            .scheduled_job_finish_claimed(
+                job_id,
+                claim_generation,
+                "error",
+                Some(&err.to_string()),
+            )
+            .await;
+        return false;
+    }
+
+    let msg = format!("refreshed_candidates={refreshed}");
+    let _ = state
+        .proxy
+        .scheduled_job_finish_claimed(job_id, claim_generation, "success", Some(&msg))
+        .await;
+    true
+}
+
+async fn run_manual_claimed_job(
+    state: Arc<AppState>,
+    job_type: String,
+    key_id: Option<String>,
+    mut claimed_job: ClaimedScheduledJob,
+    reconciliation_turn: Option<ReconciliationTurn>,
+    manual_remote_attempt: bool,
+) -> bool {
+    if job_type == "ha_outbox_gc" {
+        return run_ha_outbox_gc_claimed_job(state, claimed_job).await;
+    }
+    if job_type == "request_logs_gc" {
+        return run_request_logs_gc_catchup_claimed_job(state, claimed_job).await;
+    }
+    if job_type == AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_JOB_TYPE {
+        let ClaimedScheduledJob {
+            job_id,
+            claim_generation,
+            _job_execution_gate,
+        } = claimed_job;
+        drop(_job_execution_gate);
+        let _maintenance = acquire_db_maintenance_write_gate().await;
+        let result = state.proxy.ensure_auth_token_logs_alert_time_index().await;
+        return match result {
+            Ok(()) => {
+                let _ = state
+                    .proxy
+                    .scheduled_job_finish_claimed(
+                        job_id,
+                        claim_generation,
+                        "success",
+                        Some("partial_index_ready"),
+                    )
+                    .await;
+                true
+            }
+            Err(err) => {
+                let _ = state
+                    .proxy
+                    .scheduled_job_finish_claimed(
+                        job_id,
+                        claim_generation,
+                        "error",
+                        Some(&err.to_string()),
+                    )
+                    .await;
+                let available_at = state.proxy.backend_time().now_ts().saturating_add(
+                    AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_RETRY_DELAY_SECS,
+                );
+                match enqueue_scheduled_job_at(
+                    state.as_ref(),
+                    AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_JOB_TYPE,
+                    None,
+                    TRIGGER_SOURCE_AUTO,
+                    available_at,
+                )
+                .await
+                {
+                    Ok(retry_job_id) => tracing::warn!(
+                        component = "dashboard_alerts",
+                        event = "alert_index_retry_queued",
+                        failed_job_id = job_id,
+                        retry_job_id,
+                        retry_delay_secs = AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_RETRY_DELAY_SECS,
+                        available_at,
+                        err = %err,
+                    ),
+                    Err(retry_err) => tracing::warn!(
+                        component = "dashboard_alerts",
+                        event = "alert_index_retry_enqueue_failed",
+                        failed_job_id = job_id,
+                        retry_delay_secs = AUTH_TOKEN_LOGS_ALERT_INDEX_ENSURE_RETRY_DELAY_SECS,
+                        err = %err,
+                        retry_err = %retry_err,
+                    ),
+                }
+                false
+            }
+        };
+    }
+    if job_type == LINUXDO_USER_STATUS_SYNC_JOB_TYPE {
+        return run_linuxdo_user_status_sync_claimed_job(
+            state,
+            claimed_job,
+            manual_remote_attempt,
+        )
+        .await;
+    }
+    if job_type == DASHBOARD_ROLLUP_INTEGRITY_JOB_TYPE {
+        return run_dashboard_rollup_integrity_claimed_job(state, claimed_job).await;
+    }
+
+    if claimed_job._job_execution_gate.is_none()
+        && scheduled_job_uses_db_execution_gate(&job_type)
+    {
+        claimed_job._job_execution_gate =
+            Some(acquire_db_job_execution_gate_for_state(state.as_ref()).await);
+    }
+
+    let ClaimedScheduledJob {
+        job_id,
+        claim_generation,
+        _job_execution_gate,
+    } = claimed_job;
+    let finish = |state: Arc<AppState>, status: &'static str, message: String| async move {
+        let succeeded = status == "success";
+        let _ = state
+            .proxy
+            .scheduled_job_finish_claimed(job_id, claim_generation, status, Some(&message))
+            .await;
+        succeeded
+    };
+
+    match job_type.as_str() {
+        "quota_sync" | "quota_sync/manual" | "quota_sync/hot" => {
+            let Some(key_id) = key_id else {
+                return finish(state, "error", "missing key_id".to_string()).await;
+            };
+            drop(_job_execution_gate);
+            let source = if job_type == "quota_sync/hot" {
+                "quota_sync/hot"
+            } else {
+                "quota_sync/manual"
+            };
+            match sync_key_quota_with_db_job_gate(
+                state.as_ref(),
+                &key_id,
+                source,
+                manual_remote_attempt,
+            )
+            .await
+            {
+                Ok((limit, remaining)) => {
+                    finish(state, "success", format!("limit={limit} remaining={remaining}")).await
+                }
+                Err(ProxyError::QuotaDataMissing { reason }) => {
+                    finish(state, "error", format!("quota_data_missing: {reason}")).await
+                }
+                Err(ProxyError::UsageHttp { status, body }) => {
+                    finish(state, "error", format!("usage_http {status}: {body}")).await
+                }
+                Err(err) => {
+                    finish(state, "error", err.to_string()).await
+                }
+            }
+        }
+        "token_usage_rollup" | "usage_aggregation" => {
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            match state.proxy.rollup_token_usage_stats().await {
+                Ok((rows, last_ts)) => {
+                    let msg = match last_ts {
+                        Some(ts) => format!("rows={rows} last_rollup_ts={ts}"),
+                        None => format!("rows={rows} last_rollup_ts=none"),
+                    };
+                    finish(state, "success", msg).await
+                }
+                Err(err) => finish(state, "error", err.to_string()).await,
+            }
+        }
+        "upstream_reconciliation" => {
+            drop(_job_execution_gate);
+            let remote_attempt_admission = remote_attempt_admission_for_state(state.as_ref());
+            let foreground_rps = state.proxy.foreground_activity_rps();
+            if foreground_rps > tavily_hikari::HA_OUTBOX_GC_LOW_PRESSURE_RPS {
+                let deferred = defer_reconciliation_for_sqlite_admission(
+                    &state,
+                    job_id,
+                    claim_generation,
+                    "foreground_pressure",
+                    state.proxy.backend_time().now_ts().saturating_add(30),
+                )
+                .await;
+                return deferred;
+            }
+            match state
+                .proxy
+                .clear_upstream_reconciliation_local_backoff_claimed(job_id, claim_generation)
+                .await
+            {
+                Ok(()) => {}
+                Err(ProxyError::StaleClaim { .. }) => {
+                    return false;
+                }
+                Err(error) if tavily_hikari::is_transient_sqlite_write_error(&error) => {
+                    tracing::debug!(
+                        component = "reconciliation",
+                        event = "low_pressure_recovery_deferred",
+                        job_id,
+                        claim_generation,
+                        err = %error,
+                        "reconciliation retained its claim while low-pressure recovery could not start"
+                    );
+                    let deferred = defer_reconciliation_for_sqlite_admission(
+                        &state,
+                        job_id,
+                        claim_generation,
+                        "local_pressure",
+                        state.proxy.backend_time().now_ts().saturating_add(30),
+                    )
+                    .await;
+                    return deferred;
+                }
+                Err(error) => {
+                    let finished = finish(state, "error", error.to_string()).await;
+                    return finished;
+                }
+            }
+            let run_result = state
+                .proxy
+                .run_upstream_reconciliation_once_claimed_outcome_with_remote_attempt_turn(
+                    &state.usage_base,
+                    job_id,
+                    claim_generation,
+                    Some(remote_attempt_admission.clone()),
+                    reconciliation_turn,
+                    manual_remote_attempt,
+                )
+                .await;
+            persist_claimed_reconciliation_run(state, job_id, claim_generation, run_result).await
+        }
+        RECONCILIATION_RESEARCH_DRAIN_JOB_TYPE => {
+            drop(_job_execution_gate);
+            run_reconciliation_research_drain_claimed_job(
+                state,
+                job_id,
+                claim_generation,
+                reconciliation_turn,
+            )
+            .await
+        }
+        "auth_token_logs_gc" => {
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            match state.proxy.gc_auth_token_logs().await {
+                Ok(deleted) => finish(state, "success", format!("deleted_rows={deleted}")).await,
+                Err(err) => finish(state, "error", err.to_string()).await,
+            }
+        }
+        "mcp_sessions_gc" => {
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            match state.proxy.gc_mcp_sessions().await {
+                Ok(deleted) => finish(state, "success", format!("deleted_rows={deleted}")).await,
+                Err(err) => finish(state, "error", err.to_string()).await,
+            }
+        }
+        "mcp_session_init_backoffs_gc" => {
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            match state.proxy.gc_mcp_session_init_backoffs().await {
+                Ok(deleted) => finish(state, "success", format!("deleted_rows={deleted}")).await,
+                Err(err) => finish(state, "error", err.to_string()).await,
+            }
+        },
+        "request_logs_gc" => unreachable!("request_logs_gc handled above"),
+        "linuxdo_user_status_sync" => unreachable!("linuxdo_user_status_sync handled above"),
+        "linuxdo_user_tag_binding_refresh" => {
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            match state.proxy.refresh_linuxdo_user_tag_bindings().await {
+                Ok(refreshed) => finish(state, "success", format!("refreshed={refreshed}")).await,
+                Err(err) => finish(state, "error", err.to_string()).await,
+            }
+        }
+        LINUXDO_CREDIT_RECHARGE_LIFECYCLE_JOB_TYPE => {
+            drop(_job_execution_gate);
+            run_linuxdo_credit_recharge_lifecycle_claimed_job(
+                state,
+                ClaimedScheduledJob {
+                    job_id,
+                    claim_generation,
+                    _job_execution_gate: None,
+                },
+            )
+            .await
+        }
+        "forward_proxy_geo_refresh" => {
+            drop(_job_execution_gate);
+            run_forward_proxy_geo_refresh_claimed_job(
+                state,
+                ClaimedScheduledJob {
+                    job_id,
+                    claim_generation,
+                    _job_execution_gate: None,
+                },
+                manual_remote_attempt,
+            )
+            .await
+        },
+        "db_compaction" => {
+            run_db_compaction_claimed_job(state, job_id, claim_generation).await
+        }
+        _ => finish(state, "error", format!("unsupported manual job type: {job_type}")).await,
+    }
+}
+
+async fn persist_claimed_reconciliation_run(
+    state: Arc<AppState>,
+    job_id: i64,
+    claim_generation: i64,
+    run_result: Result<ClaimedReconciliationRunOutcome, ProxyError>,
+) -> bool {
+    let finish = |state: Arc<AppState>, status: &'static str, message: String| async move {
+        let succeeded = status == "success";
+        let _ = state
+            .proxy
+            .scheduled_job_finish_claimed(job_id, claim_generation, status, Some(&message))
+            .await;
+        succeeded
+    };
+
+    match run_result {
+        Ok(ClaimedReconciliationRunOutcome::Completed {
+            settled,
+            no_adjustment,
+            observed,
+        }) => {
+            if let Err(error) = state
+                .proxy
+                .ensure_upstream_reconciliation_research_drain_job()
+                .await
+            {
+                tracing::debug!(
+                    component = "reconciliation_research_drain",
+                    event = "main_completion_drain_enqueue_deferred",
+                    err = %error,
+                    retry_via = "startup_or_stale_reaper_watchdog",
+                );
+            }
+            match state.proxy.upstream_reconciliation_representative_available_at().await {
+                Ok(Some(available_at)) => state
+                    .proxy
+                    .scheduled_job_finish_and_enqueue_auto_at(
+                        job_id,
+                        claim_generation,
+                        "upstream_reconciliation",
+                        None,
+                        1,
+                        Some(&format!(
+                            "settled={settled} no_adjustment={no_adjustment} observed={observed} continuation_at={available_at}"
+                        )),
+                        available_at,
+                    )
+                    .await
+                    .is_ok(),
+                Ok(None) => finish(
+                    state,
+                    "success",
+                    format!(
+                        "settled={settled} no_adjustment={no_adjustment} observed={observed}"
+                    ),
+                )
+                .await,
+                Err(err) if tavily_hikari::is_transient_sqlite_write_error(&err) => {
+                    tracing::warn!(
+                        component = "reconciliation",
+                        event = "completed_claim_deferred",
+                        job_id,
+                        claim_generation,
+                        defer_reason = "local_pressure",
+                        "reconciliation completion bookkeeping deferred under local pressure"
+                    );
+                    defer_reconciliation_for_sqlite_admission(
+                        &state,
+                        job_id,
+                        claim_generation,
+                        "local_pressure",
+                        state.proxy.backend_time().now_ts().saturating_add(30),
+                    )
+                    .await
+                }
+                Err(err) => finish(state, "error", err.to_string()).await,
+            }
+        }
+        Ok(ClaimedReconciliationRunOutcome::Deferred { reason, retry_at }) => {
+            defer_reconciliation_for_sqlite_admission(
+                &state,
+                job_id,
+                claim_generation,
+                reason,
+                retry_at,
+            )
+            .await
+        }
+        Ok(ClaimedReconciliationRunOutcome::StaleClaim) => false,
+        Err(err) if tavily_hikari::is_transient_sqlite_write_error(&err) => {
+            tracing::warn!(
+                component = "reconciliation",
+                event = "claimed_run_deferred",
+                job_id,
+                claim_generation,
+                defer_reason = "local_pressure",
+                error_kind = "unclassified",
+                "reconciliation run did not reach a typed terminal outcome"
+            );
+            defer_reconciliation_for_sqlite_admission(
+                &state,
+                job_id,
+                claim_generation,
+                "local_pressure",
+                state.proxy.backend_time().now_ts().saturating_add(30),
+            )
+            .await
+        }
+        Err(err) => finish(state, "error", err.to_string()).await,
+    }
+}
+
+include!("schedulers_reconciliation_research_drain.rs");
+
+async fn defer_reconciliation_for_sqlite_admission(
+    state: &Arc<AppState>,
+    job_id: i64,
+    claim_generation: i64,
+    defer_reason: &'static str,
+    retry_at: i64,
+) -> bool {
+    let available_at = retry_at.max(state.proxy.backend_time().now_ts());
+    tracing::debug!(
+        component = "reconciliation",
+        event = "local_preparation_deferred",
+        job_id,
+        claim_generation,
+        defer_reason,
+        available_at,
+        "reconciliation retained its representative after SQLite admission defer"
+    );
+    state
+        .proxy
+        .finalize_deferred_upstream_reconciliation_claim(
+            job_id,
+            claim_generation,
+            defer_reason,
+            available_at,
+        )
+        .await
+        .is_ok()
+}
+
+async fn finish_db_compaction_claimed_job(
+    state: Arc<AppState>,
+    job_id: i64,
+    claim_generation: i64,
+) -> bool {
+    let finish = |state: Arc<AppState>, status: &'static str, message: String| async move {
+        let succeeded = status == "success";
+        let _ = state
+            .proxy
+            .scheduled_job_finish_claimed(job_id, claim_generation, status, Some(&message))
+            .await;
+        succeeded
+    };
+
+    match run_db_compaction_once(state.proxy.sqlite_database_path(), false).await {
+        Ok(report) => {
+            let message = if report.skipped {
+                format!(
+                    "skipped=true forced={} reason={} database_bytes_before={} database_bytes_after={} wal_bytes_before={} wal_bytes_after={} reclaimable_bytes_before={} reclaimable_bytes_after={} freelist_before={} freelist_after={}",
+                    report.forced,
+                    report.reason.unwrap_or_else(|| "unknown".to_string()),
+                    report.before.database_bytes,
+                    report.after.database_bytes,
+                    report.before.wal_bytes,
+                    report.after.wal_bytes,
+                    report.before.reclaimable_bytes,
+                    report.after.reclaimable_bytes,
+                    report.before.freelist_count,
+                    report.after.freelist_count
+                )
+            } else {
+                format!(
+                    "skipped=false forced={} database_bytes_before={} database_bytes_after={} wal_bytes_before={} wal_bytes_after={} reclaimable_bytes_before={} reclaimable_bytes_after={} freelist_before={} freelist_after={}",
+                    report.forced,
+                    report.before.database_bytes,
+                    report.after.database_bytes,
+                    report.before.wal_bytes,
+                    report.after.wal_bytes,
+                    report.before.reclaimable_bytes,
+                    report.after.reclaimable_bytes,
+                    report.before.freelist_count,
+                    report.after.freelist_count
+                )
+            };
+            finish(state, "success", message).await
+        }
+        Err(err) => finish(state, "error", err.to_string()).await,
+    }
+}
+
+async fn run_db_compaction_claimed_job(
+    state: Arc<AppState>,
+    job_id: i64,
+    claim_generation: i64,
+) -> bool {
+    let _maintenance = acquire_db_maintenance_write_gate().await;
+    finish_db_compaction_claimed_job(state, job_id, claim_generation).await
+}
+
+fn spawn_db_compaction_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut next_allowed_at = state.proxy.backend_time().instant_now();
+        loop {
+            state.proxy.backend_time().sleep(Duration::from_secs(3600)).await;
+            if state.proxy.backend_time().instant_now() < next_allowed_at {
+                continue;
+            }
+            let _job_execution_gate = acquire_db_job_execution_gate_for_state(state.as_ref()).await;
+            let _maintenance = acquire_db_maintenance_write_gate().await;
+            let stats = match state.proxy.sqlite_db_stats().await {
+                Ok(stats) => stats,
+                Err(err) => {
+                    tracing::warn!(
+                        component = "db_compaction",
+                        event = "stats_read_failed",
+                        err = %err,
+                    );
+                    continue;
+                }
+            };
+            if stats.reclaimable_bytes < DB_COMPACTION_MIN_RECLAIMABLE_BYTES
+                || stats.reclaimable_ratio < DB_COMPACTION_MIN_RECLAIMABLE_RATIO
+            {
+                continue;
+            }
+            if let Err(err) = enqueue_scheduled_job(
+                state.as_ref(),
+                "db_compaction",
+                None,
+                TRIGGER_SOURCE_AUTO,
+            )
+            .await
+            {
+                tracing::warn!(
+                    component = "db_compaction",
+                    event = "enqueue_failed",
+                    err = %err,
+                );
+                continue;
+            }
+            next_allowed_at = state.proxy.backend_time().deadline_after(Duration::from_secs(
+                DB_COMPACTION_COOLDOWN_SECS,
+            ));
+        }
+    });
+}
+
+fn spawn_forward_proxy_geo_refresh_scheduler(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let wait_secs = {
+                let _maintenance = acquire_db_maintenance_read_gate().await;
+                state
+                    .proxy
+                    .forward_proxy_geo_refresh_wait_secs(twenty_four_hours_secs())
+                    .await
+            };
+            if wait_secs <= 0 {
+                let due = {
+                    let _maintenance = acquire_db_maintenance_read_gate().await;
+                    state
+                        .proxy
+                        .forward_proxy_geo_refresh_due(twenty_four_hours_secs())
+                        .await
+                };
+                if due {
+                    let _ = enqueue_scheduled_job_logged(
+                        state.as_ref(),
+                        "forward_proxy_geo_refresh",
+                        None,
+                        TRIGGER_SOURCE_SCHEDULER,
+                        "forward-proxy-geo-refresh",
+                    )
+                    .await;
+                }
+                state
+                    .proxy
+                    .backend_time()
+                    .sleep(Duration::from_secs(
+                        forward_proxy_geo_refresh_recheck_secs() as u64,
+                    ))
+                    .await;
+                continue;
+            }
+            let sleep_secs = wait_secs.min(forward_proxy_geo_refresh_recheck_secs()) as u64;
+            state
+                .proxy
+                .backend_time()
+                .sleep(Duration::from_secs(sleep_secs))
+                .await;
+        }
+    })
+}
 fn spawn_forward_proxy_maintenance_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            if let Err(err) = state.proxy.maybe_run_forward_proxy_maintenance().await {
-                eprintln!("forward-proxy-maintenance: {err}");
+            {
+                let _maintenance = acquire_db_maintenance_read_gate().await;
+                if state.ha.status().await.allows_basic_business
+                    && let Err(err) = state.proxy.maybe_run_forward_proxy_maintenance().await
+                {
+                    tracing::warn!(
+                        component = "forward_proxy_maintenance",
+                        event = "maintenance_failed",
+                        err = %err,
+                    );
+                }
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            state.proxy.backend_time().sleep(Duration::from_secs(30)).await;
         }
     });
 }

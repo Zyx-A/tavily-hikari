@@ -8,63 +8,214 @@ pub async fn serve(
     dev_open_admin: bool,
     usage_base: String,
     api_key_ip_geo_origin: String,
+    ha_config: tavily_hikari::HaConfig,
     linuxdo_oauth: LinuxDoOAuthOptions,
+    linuxdo_credit: LinuxDoCreditOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve_with_shutdown(
+        addr,
+        proxy,
+        static_dir,
+        forward_auth,
+        admin_auth,
+        dev_open_admin,
+        usage_base,
+        api_key_ip_geo_origin,
+        ha_config,
+        linuxdo_oauth,
+        linuxdo_credit,
+        shutdown_signal(),
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_with_shutdown(
+    addr: SocketAddr,
+    proxy: TavilyProxy,
+    static_dir: Option<PathBuf>,
+    forward_auth: ForwardAuthConfig,
+    admin_auth: AdminAuthOptions,
+    dev_open_admin: bool,
+    usage_base: String,
+    api_key_ip_geo_origin: String,
+    ha_config: tavily_hikari::HaConfig,
+    linuxdo_oauth: LinuxDoOAuthOptions,
+    linuxdo_credit: LinuxDoCreditOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ready: Option<tokio::sync::oneshot::Sender<Arc<AppState>>>,
+    #[cfg(test)] prewarm_gate: Option<(
+        tokio::sync::oneshot::Sender<Arc<AppState>>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let AdminAuthOptions {
         forward_auth_enabled,
         builtin_auth_enabled,
         builtin_auth_password,
         builtin_auth_password_hash,
+        passkey_auth_enabled,
+        passkey_rp_id,
+        passkey_rp_origin,
+        passkey_challenge_ttl_secs,
+        passkey_session_max_age_secs,
     } = admin_auth;
     let builtin_admin = BuiltinAdminAuth::new(
         builtin_auth_enabled,
         builtin_auth_password,
         builtin_auth_password_hash,
     );
+    match proxy.get_admin_password_settings().await {
+        Ok(settings) => builtin_admin.apply_persisted_settings(settings),
+        Err(err) => tracing::warn!(
+            component = "startup",
+            event = "admin_password_settings_load_failed",
+            err = %err,
+            "admin password settings load failed; using startup configuration"
+        ),
+    }
+    let admin_passkey_scope = match (&passkey_rp_id, &passkey_rp_origin) {
+        (Some(rp_id), Some(rp_origin)) => Some(
+            tavily_hikari::AdminPasskeyScope::new(&ha_config.node_id, rp_id, rp_origin)
+                .map_err(|err| format!("invalid admin passkey scope: {err}"))?,
+        ),
+        _ => None,
+    };
+    let admin_passkey = AdminPasskeyOptions {
+        enabled: passkey_auth_enabled,
+        rp_id: passkey_rp_id,
+        rp_origin: passkey_rp_origin,
+        scope: admin_passkey_scope,
+        challenge_ttl_secs: passkey_challenge_ttl_secs.max(60),
+        session_max_age_secs: passkey_session_max_age_secs.max(60),
+    };
+    if let Some(scope) = admin_passkey.scope.as_ref() {
+        proxy.ensure_admin_passkey_scope(scope).await?;
+    }
+    let ha = tavily_hikari::HaRuntime::new(ha_config);
+    let startup_ha_status = initialize_ha_startup_state(&proxy, &ha).await;
+    if let Err(err) = sync_forward_proxy_runtime_for_status(proxy.clone(), &startup_ha_status).await {
+        tracing::warn!(
+            component = "forward_proxy",
+            event = "startup_runtime_role_sync_failed",
+            role = startup_ha_status.role.as_str(),
+            err = %err,
+            "forward-proxy startup runtime role sync failed"
+        );
+    }
     let state = Arc::new(AppState {
         proxy,
         static_dir: static_dir.clone(),
         forward_auth,
         forward_auth_enabled,
         builtin_admin,
+        admin_passkey,
         linuxdo_oauth,
+        linuxdo_credit,
+        ha,
         dev_open_admin,
         usage_base: usage_base.clone(),
         api_key_ip_geo_origin,
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
     });
-
-    println!(
-        "Admin auth modes: forward_enabled={} builtin_enabled={} dev_open_admin={}",
-        state.forward_auth_enabled,
-        state.builtin_admin.is_enabled(),
-        state.dev_open_admin
+    match state.proxy.abandon_active_scheduled_jobs().await {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                component = "scheduler",
+                event = "stale_jobs_abandoned",
+                count,
+                "scheduled-jobs: abandoned stale queued/running jobs from previous process"
+            )
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            component = "scheduler",
+            event = "stale_jobs_cleanup_failed",
+            err = %err,
+            "scheduled-jobs: stale queued/running cleanup warning"
+        ),
+    }
+    tracing::info!(
+        component = "startup",
+        event = "admin_auth_modes",
+        forward_enabled = state.forward_auth_enabled,
+        builtin_enabled = state.builtin_admin.is_enabled(),
+        passkey_enabled = state.admin_passkey.enabled,
+        passkey_configured = state.admin_passkey.is_configured(),
+        dev_open_admin = state.dev_open_admin,
+        "configured admin auth modes"
     );
 
     if !state.forward_auth_enabled {
-        println!("Forward-Auth: disabled (ADMIN_AUTH_FORWARD_ENABLED=false)");
+        tracing::info!(
+            component = "startup",
+            event = "forward_auth_configuration",
+            enabled = false,
+            reason = "ADMIN_AUTH_FORWARD_ENABLED=false",
+            "forward auth disabled"
+        );
     } else if let Some(h) = state.forward_auth.user_header() {
-        println!(
-            "Forward-Auth: header='{}' admin_value='{}'",
-            h,
-            state.forward_auth.admin_value().unwrap_or("<none>")
+        tracing::info!(
+            component = "startup",
+            event = "forward_auth_configuration",
+            enabled = true,
+            header = %h,
+            admin_value_present = state.forward_auth.admin_value().is_some(),
+            "forward auth enabled"
         );
     } else {
-        println!(
-            "Forward-Auth: disabled (no user header), admin_override={} dev_open_admin={}",
-            state.forward_auth.admin_override_name().unwrap_or("<none>"),
-            state.dev_open_admin
+        tracing::warn!(
+            component = "startup",
+            event = "forward_auth_configuration",
+            enabled = false,
+            reason = "missing_user_header",
+            admin_override_present = state.forward_auth.admin_override_name().is_some(),
+            dev_open_admin = state.dev_open_admin,
+            "forward auth disabled because no user header is configured"
         );
     }
 
-    println!(
-        "LinuxDo OAuth: enabled={} configured={} redirect={}",
-        state.linuxdo_oauth.enabled,
-        state.linuxdo_oauth.is_enabled_and_configured(),
-        state
-            .linuxdo_oauth
-            .redirect_url
-            .as_deref()
-            .unwrap_or("<none>")
+    tracing::info!(
+        component = "startup",
+        event = "linuxdo_oauth_configuration",
+        enabled = state.linuxdo_oauth.enabled,
+        configured = state.linuxdo_oauth.is_enabled_and_configured(),
+        redirect_configured = state.linuxdo_oauth.redirect_url.is_some(),
+        "linuxdo oauth configuration loaded"
+    );
+    let (linuxdo_user_sync_hour, linuxdo_user_sync_minute) = state.linuxdo_oauth.user_sync_time();
+    tracing::info!(
+        component = "startup",
+        event = "linuxdo_user_sync_configuration",
+        scheduler_enabled = state.linuxdo_oauth.is_user_sync_scheduler_enabled(),
+        oauth_ready = state.linuxdo_oauth.is_enabled_and_configured(),
+        refresh_token_key = state.linuxdo_oauth.has_refresh_token_crypt_key(),
+        sync_hour = linuxdo_user_sync_hour,
+        sync_minute = linuxdo_user_sync_minute,
+        "linuxdo user sync configuration loaded"
+    );
+    tracing::info!(
+        component = "startup",
+        event = "linuxdo_credit_configuration",
+        enabled = state.linuxdo_credit.enabled,
+        configured = state.linuxdo_credit.is_enabled_and_configured(),
+        submit_url = %state.linuxdo_credit.submit_url,
+        "linuxdo credit configuration loaded"
+    );
+    let ha_status = state.ha.status().await;
+    tracing::info!(
+        component = "ha",
+        event = "startup_status",
+        mode = ?ha_status.mode,
+        node_id = %ha_status.node_id,
+        role = ?ha_status.role,
+        origin = ?ha_status.edgeone_origin,
+        edgeone_domain = ?ha_status.edgeone_domain,
+        "ha startup status loaded"
     );
 
     let mut router = Router::new()
@@ -76,18 +227,59 @@ pub async fn serve(
         .route("/api/public/events", get(sse_public))
         .route("/api/public/logs", get(get_public_logs))
         .route("/api/token/metrics", get(get_token_metrics_public))
+        .route("/api/ha/status", get(get_public_ha_status))
+        .route("/api/internal/ha/status", get(get_internal_ha_status))
+        .route("/api/internal/ha/leader", post(post_internal_ha_leader))
+        .route(
+            "/api/internal/ha/mcp-sessions/:proxy_session_id",
+            get(get_internal_ha_mcp_session),
+        )
+        .route(
+            "/api/internal/ha/research-requests/:request_id",
+            get(get_internal_ha_research_request),
+        )
         .route("/api/events", get(sse_dashboard))
         .route("/api/version", get(get_versions))
         .route("/api/profile", get(get_profile))
+        .route("/api/dashboard/overview", get(get_dashboard_overview))
         .route("/auth/linuxdo", get(get_linuxdo_auth).post(post_linuxdo_auth))
         .route("/auth/linuxdo/callback", get(get_linuxdo_callback))
+        .route("/auth/linuxdo/finalize", post(post_linuxdo_finalize))
         .route("/api/user/logout", post(post_user_logout))
         .route("/api/user/token", get(get_user_token))
         .route("/api/user/dashboard", get(get_user_dashboard))
+        .route("/api/user/dashboard/overview", get(get_user_dashboard_overview))
+        .route("/api/user/dashboard/events", get(sse_user_dashboard))
+        .route("/api/user/billing/summary", get(get_user_billing_summary))
+        .route(
+            "/api/user/debug-info-sharing",
+            put(put_user_debug_info_sharing),
+        )
+        .route("/api/user/announcements", get(get_user_announcements))
+        .route(
+            "/api/user/announcements/history",
+            get(get_user_announcement_history),
+        )
+        .route("/api/user/recharge/config", get(get_user_recharge_config))
+        .route("/api/user/recharge/quote", post(post_user_recharge_quote))
+        .route(
+            "/api/user/recharge/orders",
+            get(get_user_recharge_orders).post(post_user_recharge_order),
+        )
+        .route(
+            "/api/user/recharge/orders/:out_trade_no",
+            get(get_user_recharge_order),
+        )
+        .route("/api/linuxdo-credit/notify", get(get_linuxdo_credit_notify))
         .route("/api/user/tokens", get(get_user_tokens))
         .route("/api/user/tokens/:id", get(get_user_token_detail))
         .route("/api/user/tokens/:id/secret", get(get_user_token_secret))
+        .route(
+            "/api/user/tokens/:id/secret/rotate",
+            post(rotate_user_token_secret),
+        )
         .route("/api/user/tokens/:id/logs", get(get_user_token_logs))
+        .route("/api/user/tokens/:id/events", get(sse_user_token))
         .route("/api/admin/registration", get(get_admin_registration_settings))
         .route(
             "/api/admin/registration",
@@ -95,6 +287,66 @@ pub async fn serve(
         )
         .route("/api/admin/login", post(post_admin_login))
         .route("/api/admin/logout", post(post_admin_logout))
+        .route(
+            "/api/admin/password",
+            get(get_admin_password)
+                .put(put_admin_password)
+                .patch(patch_admin_password)
+                .delete(delete_admin_password),
+        )
+        .route(
+            "/api/admin/passkey/authentication/start",
+            post(post_admin_passkey_authentication_start),
+        )
+        .route(
+            "/api/admin/passkey/authentication/finish",
+            post(post_admin_passkey_authentication_finish),
+        )
+        .route(
+            "/api/admin/passkey/reset/:token/registration/start",
+            post(post_admin_passkey_reset_registration_start),
+        )
+        .route(
+            "/api/admin/passkey/reset/:token/registration/finish",
+            post(post_admin_passkey_reset_registration_finish),
+        )
+        .route("/api/admin/passkeys", get(get_admin_passkeys))
+        .route(
+            "/api/admin/passkeys/:credential_id",
+            patch(patch_admin_passkey).delete(delete_admin_passkey),
+        )
+        .route(
+            "/api/admin/passkeys/registration/start",
+            post(post_admin_passkey_registration_start),
+        )
+        .route(
+            "/api/admin/passkeys/registration/finish",
+            post(post_admin_passkey_registration_finish),
+        )
+        .route("/api/admin/ha/status", get(get_admin_ha_status))
+        .route("/api/admin/ha/source", put(put_admin_ha_source_settings))
+        .route(
+            "/api/admin/ha/snapshot",
+            get(get_admin_ha_snapshot)
+                .put(put_admin_ha_snapshot)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route("/api/admin/ha/baseline", get(get_admin_ha_baseline))
+        .route("/api/admin/ha/events", get(get_admin_ha_events))
+        .route("/api/admin/ha/events/ack", post(post_admin_ha_events_ack))
+        .route("/api/admin/ha/timeline", get(get_admin_ha_timeline))
+        .route("/api/admin/ha/nodes/:node_id", get(get_admin_ha_node_detail))
+        .route("/api/admin/ha/promote", post(post_admin_ha_promote))
+        .route(
+            "/api/admin/ha/planned-cutover",
+            post(post_admin_ha_planned_cutover),
+        )
+        .route("/api/admin/ha/finalize", post(post_admin_ha_finalize))
+        .route("/api/internal/ha/finalize", post(post_internal_ha_finalize))
+        .route(
+            "/api/admin/ha/recovery/import",
+            post(post_admin_ha_recovery_import),
+        )
         .route("/api/tavily/search", post(tavily_http_search))
         .route("/api/tavily/extract", post(tavily_http_extract))
         .route("/api/tavily/crawl", post(tavily_http_crawl))
@@ -107,8 +359,53 @@ pub async fn serve(
         .route("/api/tavily/usage", get(tavily_http_usage))
         .route("/api/summary", get(fetch_summary))
         .route("/api/summary/windows", get(fetch_summary_windows))
+        .route("/api/analysis/pressure", get(get_analysis_pressure_snapshot))
+        .route("/api/users/rankings", get(get_user_rankings))
+        .route("/api/users/rankings/events", get(sse_user_rankings))
         .route("/api/settings", get(get_settings))
-        .route("/api/settings/forward-proxy", put(put_forward_proxy_settings))
+        .route("/api/settings/system", put(put_system_settings))
+        .route(
+            "/api/settings/system/status",
+            get(get_upstream_privacy_status),
+        )
+        .route(
+            "/api/settings/system/privacy-status",
+            get(get_upstream_privacy_status),
+        )
+        .route(
+            "/api/settings/system/mcp-session-bindings",
+            get(get_admin_mcp_session_bindings),
+        )
+        .route(
+            "/api/settings/system/mcp-session-bindings/revoke-selected",
+            post(post_revoke_selected_admin_mcp_session_bindings),
+        )
+        .route(
+            "/api/settings/system/mcp-session-bindings/revoke-filtered",
+            post(post_revoke_filtered_admin_mcp_session_bindings),
+        )
+        .route("/api/admin/recharges", get(get_admin_recharges))
+        .route(
+            "/api/admin/recharges/:out_trade_no/refund",
+            post(post_admin_recharge_refund),
+        )
+        .route(
+            "/api/admin/recharges/:out_trade_no/refund-only",
+            post(post_admin_recharge_refund_only),
+        )
+        .route("/api/admin/totp", get(get_admin_totp_status))
+        .route("/api/admin/totp/setup", post(post_admin_totp_setup))
+        .route("/api/admin/totp/confirm", post(post_admin_totp_confirm))
+        .route("/api/admin/totp/reset", post(post_admin_totp_reset))
+        .route("/api/admin/totp/disable", post(post_admin_totp_disable))
+        .route(
+            "/api/settings/client-ip/observed-headers",
+            get(get_observed_client_ip_requests),
+        )
+        .route(
+            "/api/settings/forward-proxy",
+            get(get_forward_proxy_settings).put(put_forward_proxy_settings),
+        )
         .route(
             "/api/settings/forward-proxy/validate",
             post(post_forward_proxy_candidate_validation),
@@ -118,8 +415,16 @@ pub async fn serve(
             post(post_forward_proxy_revalidate),
         )
         .route(
+            "/api/settings/forward-proxy/nodes/state",
+            post(post_forward_proxy_node_state),
+        )
+        .route(
             "/api/stats/forward-proxy/summary",
             get(get_forward_proxy_dashboard_summary),
+        )
+        .route(
+            "/api/stats/forward-proxy/errors",
+            get(get_forward_proxy_error_stats),
         )
         .route("/api/stats/forward-proxy", get(get_forward_proxy_live_stats))
         .route("/api/public/metrics", get(get_public_metrics))
@@ -127,6 +432,7 @@ pub async fn serve(
         .route("/api/keys", post(create_api_key))
         .route("/api/keys/validate", post(post_validate_api_keys))
         .route("/api/keys/batch", post(create_api_keys_batch))
+        .route("/api/keys/bulk-actions", post(post_api_key_bulk_actions))
         .route("/api/keys/:id", get(get_api_key_detail))
         .route("/api/keys/:id/quarantine", delete(delete_api_key_quarantine))
         .route("/api/keys/:id/sync-usage", post(post_sync_key_usage))
@@ -134,15 +440,38 @@ pub async fn serve(
         .route("/api/keys/:id", delete(delete_api_key))
         .route("/api/keys/:id/status", patch(update_api_key_status))
         .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs/trigger", post(post_trigger_job))
         .route("/api/logs", get(list_logs))
+        .route("/api/logs/list", get(list_logs_cursor))
+        .route("/api/logs/catalog", get(get_logs_catalog))
         .route("/api/logs/:log_id/details", get(get_log_details))
+        .route("/api/announcements", get(get_announcements))
+        .route("/api/announcements", post(create_announcement))
+        .route("/api/announcements/:id", patch(update_announcement))
+        .route(
+            "/api/announcements/:id/publish",
+            post(publish_announcement),
+        )
+        .route(
+            "/api/announcements/:id/archive",
+            post(archive_announcement),
+        )
+        .route("/api/alerts/catalog", get(get_alert_catalog))
+        .route("/api/alerts/events", get(get_alert_events))
+        .route("/api/alerts/groups", get(get_alert_groups))
         .route("/api/user-tags", get(list_user_tags))
         .route("/api/user-tags", post(create_user_tag))
         .route("/api/user-tags/:tag_id", patch(update_user_tag))
         .route("/api/user-tags/:tag_id", delete(delete_user_tag))
         .route("/api/users", get(list_users))
         .route("/api/users/:id", get(get_user_detail))
-        .route("/api/users/:id/quota", patch(update_user_quota))
+        .route(
+            "/api/users/:id/entitlements",
+            get(list_user_entitlements).post(create_user_entitlement),
+        )
+        .route("/api/users/:id/usage-series", get(get_user_usage_series))
+        .route("/api/users/:id/tokens", post(create_user_token))
+        .route("/api/users/:id/tokens/:token_id", delete(delete_user_token))
         .route(
             "/api/users/:id/broken-key-limit",
             patch(update_user_broken_key_limit),
@@ -153,6 +482,8 @@ pub async fn serve(
         // Key details
         .route("/api/keys/:id/metrics", get(get_key_metrics))
         .route("/api/keys/:id/logs", get(get_key_logs))
+        .route("/api/keys/:id/logs/list", get(get_key_logs_list))
+        .route("/api/keys/:id/logs/catalog", get(get_key_logs_catalog))
         .route("/api/keys/:id/logs/page", get(get_key_logs_page))
         .route("/api/keys/:id/logs/:log_id/details", get(get_key_log_details))
         .route("/api/keys/:id/sticky-users", get(get_key_sticky_users))
@@ -171,6 +502,8 @@ pub async fn serve(
         .route("/api/tokens/leaderboard", get(get_token_leaderboard))
         .route("/api/tokens/unbound-usage", get(list_unbound_token_usage))
         .route("/api/tokens/:id/logs", get(get_token_logs))
+        .route("/api/tokens/:id/logs/list", get(get_token_logs_list))
+        .route("/api/tokens/:id/logs/catalog", get(get_token_logs_catalog))
         .route("/api/tokens/:id/logs/page", get(get_token_logs_page))
         .route("/api/tokens/:id/logs/:log_id/details", get(get_token_log_details))
         .route("/api/tokens/:id/broken-keys", get(get_token_monthly_broken_keys))
@@ -180,55 +513,47 @@ pub async fn serve(
         .route("/api/tokens", post(create_token))
         .route("/api/tokens/groups", get(list_token_groups))
         .route("/api/tokens/batch", post(create_tokens_batch))
+        .route("/api/tokens/batch/status", patch(update_tokens_status_batch))
+        .route("/api/tokens/batch", delete(delete_tokens_batch))
         .route("/api/tokens/:id", delete(delete_token))
         .route("/api/tokens/:id/status", patch(update_token_status))
         .route("/api/tokens/:id/note", patch(update_token_note))
         .route("/api/tokens/:id/secret", get(get_token_secret))
-        .route("/api/tokens/:id/secret/rotate", post(rotate_token_secret));
-
-    if let Some(dir) = static_dir.as_ref() {
-        if dir.is_dir() {
-            let index_file = dir.join("index.html");
-            if index_file.exists() {
-                router = router.nest_service("/assets", ServeDir::new(dir.join("assets")));
-                router = router.route("/", get(serve_index));
-                router = router.route("/admin", get(serve_admin_index));
-                router = router.route("/admin/", get(serve_admin_index));
-                router = router.route("/console", get(serve_console_index));
-                router = router.route("/console/", get(serve_console_index));
-                router = router.route("/console.html", get(serve_console_index));
-                router = router.route("/admin/*path", get(serve_admin_index));
-                router = router.route("/login", get(serve_login));
-                router = router.route("/login/", get(serve_login));
-                router = router.route("/login.html", get(serve_login));
-                router = router.route(
-                    "/registration-paused",
-                    get(serve_registration_paused_index),
-                );
-                router = router.route(
-                    "/registration-paused/",
-                    get(serve_registration_paused_index),
-                );
-                router = router.route(
-                    "/registration-paused.html",
-                    get(serve_registration_paused_index),
-                );
-                router =
-                    router.route_service("/favicon.svg", ServeFile::new(dir.join("favicon.svg")));
-                router = router.route_service(
-                    "/linuxdo-logo.svg",
-                    ServeFile::new(dir.join("linuxdo-logo.svg")),
-                );
-            } else {
-                eprintln!(
-                    "static index.html not found at {} — skip serving SPA",
-                    index_file.display()
-                );
-            }
-        } else {
-            eprintln!("static dir '{}' is not a directory", dir.display());
-        }
-    }
+        .route("/api/tokens/:id/secret/rotate", post(rotate_token_secret))
+        .route("/", get(serve_index))
+        .route("/index.html", get(serve_public_index_shell))
+        .route("/admin", get(serve_admin_index))
+        .route("/admin/", get(serve_admin_index))
+        .route("/admin.html", get(serve_admin_shell))
+        .route("/admin/*path", get(serve_admin_index))
+        .route("/console", get(serve_console_index))
+        .route("/console/", get(serve_console_index))
+        .route("/console.html", get(serve_console_shell))
+        .route("/console/*path", get(serve_console_shell))
+        .route("/login", get(serve_login))
+        .route("/login/", get(serve_login))
+        .route("/login.html", get(serve_login_shell))
+        .route(
+            "/registration-paused",
+            get(serve_registration_paused_index),
+        )
+        .route(
+            "/registration-paused/",
+            get(serve_registration_paused_index),
+        )
+        .route(
+            "/registration-paused.html",
+            get(serve_registration_paused_shell),
+        )
+        .route("/favicon.svg", get(serve_favicon))
+        .route("/version.json", get(serve_version_json))
+        .route("/manifest.webmanifest", get(serve_public_manifest))
+        .route("/manifest-admin.webmanifest", get(serve_admin_manifest))
+        .route("/sw-public.js", get(serve_public_sw))
+        .route("/sw-admin.js", get(serve_admin_sw))
+        .route("/pwa/*path", get(serve_pwa_asset))
+        .route("/assets", get(serve_assets_root))
+        .route("/assets/*path", get(serve_asset));
 
     router = router
         .route("/mcp", any(proxy_handler))
@@ -274,35 +599,1417 @@ pub async fn serve(
         }
     });
 
+    // Reuse the same bounded singleflight that serves cold dashboard reads so
+    // the first external clients after a rolling restart inherit its head
+    // start instead of racing a one-second cold build.
+    prewarm_dashboard_overview_snapshot(&state).await;
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound_addr = listener.local_addr()?;
-    println!("Tavily proxy listening on http://{bound_addr}");
+    tracing::info!(
+        component = "startup",
+        event = "server_listening",
+        bind_addr = %bound_addr,
+        "tavily proxy listening"
+    );
 
-    // Spawn background schedulers
-    spawn_quota_sync_scheduler(state.clone());
-    spawn_token_usage_rollup_scheduler(state.clone());
-    spawn_auth_token_logs_gc_scheduler(state.clone());
-    spawn_request_logs_gc_scheduler(state.clone());
-    let _forward_proxy_geo_refresh_scheduler = spawn_forward_proxy_geo_refresh_scheduler(state.clone());
-    spawn_forward_proxy_maintenance_scheduler(state.clone());
+    #[cfg(test)]
+    if let Some((prewarm_blocked, prewarm_gate)) = prewarm_gate {
+        let _ = prewarm_blocked.send(state.clone());
+        let _ = prewarm_gate.await;
+    }
 
+    // Privacy status is an owner-facing derived read model. It must populate
+    // last-good after readiness without delaying the listener or competing
+    // with foreground work; requests only ever copy the immutable result.
+    prewarm_owner_read_models_after_ready(state.clone()).await;
+    if let Some(ready) = ready {
+        let _ = ready.send(state.clone());
+    }
+
+    // Always-on HA tasks must stay available on standby/recovery so health, role
+    // refresh, and pull-sync keep working even while business traffic is fenced.
+    // Start them after the dashboard singleflight prewarm: a cold restart must
+    // not let HA observation work consume the small SQLite pool ahead of the
+    // first administrative snapshot.
+    spawn_ha_standby_sync_task(state.clone());
+    spawn_ha_peer_observation_task(state.clone());
+    spawn_ha_edgeone_authority_task(state.clone());
+    spawn_ha_control_plane_gc_task(state.clone());
+    spawn_background_tasks_for_current_role(state.clone()).await;
+    let _ = spawn_post_ready_serving_tasks_for_status(state.clone(), &startup_ha_status);
+
+    let shutdown_proxy = state.proxy.clone();
+    let shutdown_state = state.clone();
+    let post_shutdown_state = state.clone();
     axum::serve(
         listener,
         router
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                db_maintenance_http_gate,
+            ))
             .with_state(state)
             .into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+        fence_admin_privacy_status_refresh(shutdown_state.as_ref()).await;
+        shutdown_proxy.begin_sqlite_maintenance_run_shutdown();
+        shutdown_proxy.nudge_request_stats_flush().await;
+    })
     .await?;
-    println!("Server shut down gracefully.");
+    shutdown_admin_privacy_status_refresh(post_shutdown_state.as_ref()).await;
+    if let Err(err) = post_shutdown_state
+        .proxy
+        .shutdown_request_stats_coalescer(Duration::from_secs(20))
+        .await
+    {
+        tracing::warn!(
+            component = "shutdown",
+            event = "request_stats_drain_timeout",
+            err = %err,
+            "request stats coalescer did not drain before shutdown grace period"
+        );
+    }
+    if !post_shutdown_state
+        .proxy
+        .shutdown_sqlite_maintenance_bulk(Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!(
+            component = "shutdown",
+            event = "sqlite_maintenance_drain_timeout",
+            "SQLite maintenance did not reach a safe boundary before shutdown"
+        );
+    }
+    tracing::info!(
+        component = "shutdown",
+        event = "server_shutdown_complete",
+        "server shut down gracefully"
+    );
     Ok(())
+}
+
+async fn reconcile_ha_startup_role(
+    proxy: &TavilyProxy,
+    ha: &tavily_hikari::HaRuntime,
+    previous_ha_role: Option<tavily_hikari::HaNodeRole>,
+) -> tavily_hikari::HaStatusView {
+    let startup_role_checked = match ha.refresh_startup_role().await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                component = "ha",
+                event = "startup_role_check_failed",
+                err = %err,
+                "HA startup role check warning"
+            );
+            false
+        }
+    };
+    if ha.dual_active_enabled() {
+        let leader = proxy.get_ha_full_master_node_id().await.unwrap_or_else(|err| {
+            tracing::warn!(
+                component = "ha",
+                event = "leader_key_lookup_failed",
+                err = %err,
+                "HA leader key lookup warning"
+            );
+            None
+        });
+        let persisted_role = previous_ha_role.unwrap_or(tavily_hikari::HaNodeRole::Standby);
+        if leader.is_none()
+            && persisted_role == tavily_hikari::HaNodeRole::FullMaster
+            && let Err(err) = proxy
+                .set_ha_full_master_node_id(&ha.status().await.node_id)
+                .await
+        {
+            tracing::warn!(
+                component = "ha",
+                event = "leader_key_seed_failed",
+                err = %err,
+                "HA leader key seed warning"
+            );
+        }
+        let leader = proxy.get_ha_full_master_node_id().await.unwrap_or(None);
+        if let Err(err) = ha.apply_dual_active_leader(leader).await {
+            tracing::warn!(
+                component = "ha",
+                event = "dual_active_leader_apply_failed",
+                err = %err,
+                "HA dual-active leader apply warning"
+            );
+        }
+    }
+    if previous_ha_role == Some(tavily_hikari::HaNodeRole::Recovery) {
+        return ha
+            .enter_recovery("previous recovery role persisted; recovery import required".to_string())
+            .await;
+    }
+    let mut status = ha.status().await;
+    if startup_role_checked
+        && status.edgeone_api_configured
+        && !status.dual_active_enabled
+        && matches!(
+            previous_ha_role,
+            Some(
+                tavily_hikari::HaNodeRole::FullMaster
+                    | tavily_hikari::HaNodeRole::ProvisionalMaster
+            )
+        )
+        && status.role == tavily_hikari::HaNodeRole::Standby
+    {
+        status = ha
+            .enter_recovery(
+                "previous active node restarted after EdgeOne origin moved; recovery import required"
+                    .to_string(),
+            )
+            .await;
+    }
+    status
+}
+
+async fn initialize_ha_startup_state(
+    proxy: &TavilyProxy,
+    ha: &tavily_hikari::HaRuntime,
+) -> tavily_hikari::HaStatusView {
+    let previous_ha_role = proxy.get_persisted_ha_node_role().await.unwrap_or_else(|err| {
+        tracing::warn!(
+            component = "ha",
+            event = "persisted_role_lookup_failed",
+            err = %err,
+            "HA persisted role lookup warning"
+        );
+        None
+    });
+    let persisted_ha_source_settings = proxy.get_ha_source_settings().await.unwrap_or_else(|err| {
+        tracing::warn!(
+            component = "ha",
+            event = "source_settings_lookup_failed",
+            err = %err,
+            "HA source settings lookup warning"
+        );
+        None
+    });
+    if let Some(settings) = persisted_ha_source_settings
+        && let Err(err) = ha.set_local_source_settings(Some(settings)).await
+    {
+        tracing::warn!(
+            component = "ha",
+            event = "source_settings_restore_failed",
+            err = %err,
+            "HA source settings restore warning"
+        );
+    }
+    // Startup role evaluation must compare against the restored node-local HA source settings.
+    let startup_ha_status = reconcile_ha_startup_role(proxy, ha, previous_ha_role).await;
+    if let Err(err) = async {
+        proxy
+            .persist_ha_node_state(
+                &startup_ha_status.node_id,
+                startup_ha_status.role,
+                startup_ha_status.edgeone_origin.as_deref(),
+                startup_ha_status.ha_source_effective.as_ref(),
+                startup_ha_status.message.as_deref(),
+            )
+            .await?;
+        proxy.flush_ha_state_writes().await
+    }
+    .await
+    {
+        tracing::warn!(
+            component = "ha",
+            event = "startup_node_state_persist_failed",
+            err = %err,
+            "HA startup node state persist warning"
+        );
+    }
+    startup_ha_status
+}
+
+async fn sync_forward_proxy_runtime_for_status(
+    proxy: TavilyProxy,
+    status: &tavily_hikari::HaStatusView,
+) -> Result<(), ProxyError> {
+    let allows_basic_business = status.allows_basic_business;
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            if allows_basic_business {
+                proxy.ensure_forward_proxy_runtime_started().await
+            } else {
+                proxy.shutdown_forward_proxy_runtime().await
+            }
+        })
+    })
+    .await
+    .map_err(|err| ProxyError::Other(format!("forward-proxy runtime role sync join failed: {err}")))?
+}
+
+fn spawn_ha_standby_sync_task(state: Arc<AppState>) {
+    if state.ha.dual_active_enabled() {
+        spawn_ha_peer_sync_task(state);
+        return;
+    }
+    let Some(source_url) = state.ha.sync_source_url() else {
+        return;
+    };
+    let Some(internal_token) = state.ha.internal_token() else {
+        tracing::warn!(
+            component = "ha",
+            event = "standby_sync_disabled",
+            reason = "missing_internal_token",
+            source_url = source_url,
+            "HA standby sync disabled because HA_INTERNAL_TOKEN is required when HA_SYNC_SOURCE_URL is set"
+        );
+        return;
+    };
+    let interval = std::time::Duration::from_secs(state.ha.sync_interval_secs().max(1));
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        loop {
+            if state.ha.role().await == tavily_hikari::HaNodeRole::Standby
+                && let Err(err) =
+                    run_ha_standby_sync_once(&state, &client, &source_url, &internal_token).await
+            {
+                tracing::warn!(
+                    component = "ha",
+                    event = "standby_sync_failed",
+                    source_url = source_url,
+                    err = %err,
+                    "HA standby sync failed"
+                );
+            }
+            state.proxy.backend_time().sleep(interval).await;
+        }
+    });
+}
+
+fn spawn_ha_peer_sync_task(state: Arc<AppState>) {
+    let peer_count = state
+        .ha
+        .peer_nodes()
+        .into_iter()
+        .filter(|peer| peer.node_id != state.ha.node_id())
+        .count();
+    if peer_count == 0 {
+        tracing::warn!(
+            component = "ha",
+            event = "peer_sync_disabled",
+            peer_count,
+            sync_disabled_reason = "no_configured_peers",
+            "HA peer sync disabled because no peers are configured"
+        );
+        return;
+    }
+    let Some(internal_token) = state.ha.internal_token() else {
+        tracing::warn!(
+            component = "ha",
+            event = "peer_sync_disabled",
+            reason = "missing_internal_token",
+            "HA peer sync disabled because HA_INTERNAL_TOKEN is required in dual-active mode"
+        );
+        return;
+    };
+    let interval = std::time::Duration::from_secs(state.ha.sync_interval_secs().max(1));
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        loop {
+            let status = state.ha.status().await;
+            if ha_peer_sync_should_run(&status)
+                && let Err(err) = run_ha_peer_sync_once(&state, &client, &internal_token).await
+            {
+                tracing::warn!(
+                    component = "ha",
+                    event = "peer_sync_failed",
+                    err = %err,
+                    "HA peer sync failed"
+                );
+            }
+            state.proxy.backend_time().sleep(interval).await;
+        }
+    });
+}
+
+fn ha_peer_sync_should_run(status: &tavily_hikari::HaStatusView) -> bool {
+    matches!(
+        status.role,
+        tavily_hikari::HaNodeRole::FullMaster | tavily_hikari::HaNodeRole::Standby
+    )
+}
+
+struct HaSyncPerfEvent<'a> {
+    event: &'static str,
+    elapsed: Duration,
+    channel: tavily_hikari::HaSyncChannel,
+    row_count: usize,
+    payload_bytes: usize,
+    source_url: Option<&'a str>,
+    peer_node_id: Option<&'a str>,
+    high_watermark: Option<i64>,
+    after_seq: Option<i64>,
+    next_seq: Option<i64>,
+    detail: Option<&'a str>,
+}
+
+async fn emit_ha_sync_perf_event(
+    state: &AppState,
+    perf: HaSyncPerfEvent<'_>,
+) {
+    let sampling = tavily_hikari::sample_ha_perf_event(perf.event, perf.channel, perf.elapsed);
+    let outbox = if sampling.capture_heavy_stats {
+        match state
+            .proxy
+            .ha_channel_outbox_stats(perf.channel, perf.peer_node_id)
+            .await
+        {
+            Ok(stats) => Some(stats),
+            Err(_) => {
+                // Sync state has already been applied. Its sampled diagnostic
+                // must not turn a completed replication step into a retry.
+                tracing::debug!(
+                    component = "ha",
+                    event = perf.event,
+                    channel = perf.channel.as_str(),
+                    outcome = "outbox_stats_unavailable",
+                    "HA sync diagnostic sample unavailable"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if sampling.emit_info || sampling.capture_heavy_stats {
+        let memory = sampling
+            .capture_heavy_stats
+            .then(tavily_hikari::capture_runtime_memory_snapshot);
+        tracing::info!(
+            component = "ha",
+            event = perf.event,
+            elapsed_ms = perf.elapsed.as_millis() as u64,
+            source_url = perf.source_url.unwrap_or(""),
+            peer_node_id = perf.peer_node_id.unwrap_or(""),
+            channel = perf.channel.as_str(),
+            row_count = perf.row_count as u64,
+            payload_bytes = perf.payload_bytes as u64,
+            high_watermark = perf.high_watermark,
+            after_seq = perf.after_seq,
+            next_seq = perf.next_seq,
+            detail = perf.detail.unwrap_or(""),
+            outbox_sampled = outbox.is_some(),
+            outbox_sequence_span_estimate = outbox
+                .as_ref()
+                .map(|value| value.sequence_span_estimate)
+                .unwrap_or_default(),
+            outbox_high_watermark = outbox.as_ref().map(|value| value.high_watermark).unwrap_or_default(),
+            outbox_oldest_age_secs = outbox.as_ref().map(|value| value.oldest_age_secs),
+            outbox_ack_lag = outbox.as_ref().and_then(|value| value.ack_lag),
+            memory_sampled = memory.is_some(),
+            memory_current_bytes = memory.and_then(|value| value.memory_current_bytes),
+            memory_limit_bytes = memory.and_then(|value| value.memory_limit_bytes),
+            headroom_bytes = memory.and_then(|value| value.headroom_bytes),
+            process_rss_bytes = memory.and_then(|value| value.process_rss_bytes),
+            child_process_rss_bytes = memory.and_then(|value| value.child_process_rss_bytes),
+            process_group_rss_bytes = memory.and_then(|value| value.process_group_rss_bytes),
+            process_hwm_bytes = memory.and_then(|value| value.process_hwm_bytes),
+            process_swap_bytes = memory.and_then(|value| value.process_swap_bytes),
+            "ha perf"
+        );
+    } else {
+        tracing::debug!(
+            component = "ha",
+            event = perf.event,
+            elapsed_ms = perf.elapsed.as_millis() as u64,
+            source_url = perf.source_url.unwrap_or(""),
+            peer_node_id = perf.peer_node_id.unwrap_or(""),
+            channel = perf.channel.as_str(),
+            row_count = perf.row_count as u64,
+            payload_bytes = perf.payload_bytes as u64,
+            high_watermark = perf.high_watermark,
+            after_seq = perf.after_seq,
+            next_seq = perf.next_seq,
+            detail = perf.detail.unwrap_or(""),
+            "ha perf"
+        );
+    }
+}
+
+fn is_ha_retryable_foreign_key_gap(
+    err: &(dyn std::error::Error + 'static),
+) -> bool {
+    let mut current = Some(err);
+    while let Some(source) = current {
+        if let Some(ProxyError::Database(sqlx::Error::Database(db_err))) =
+            source.downcast_ref::<ProxyError>()
+        {
+            if db_err
+                .code()
+                .as_deref()
+                .is_some_and(|code| code == "787" || code == "SQLITE_CONSTRAINT_FOREIGNKEY")
+            {
+                return true;
+            }
+            if db_err
+                .message()
+                .to_ascii_lowercase()
+                .contains("foreign key constraint failed")
+            {
+                return true;
+            }
+        }
+        current = source.source();
+    }
+    false
+}
+
+async fn run_ha_standby_sync_once(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    source_url: &str,
+    internal_token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let local_node_id = state.ha.status().await.node_id;
+    for channel in [
+        tavily_hikari::HaSyncChannel::Control,
+        tavily_hikari::HaSyncChannel::Billing,
+        tavily_hikari::HaSyncChannel::Runtime,
+    ] {
+        let seq_key = format!("standby_{}_applied_seq", channel.as_str());
+        let baseline_key = format!("standby_{}_baseline_applied", channel.as_str());
+        let baseline_report_key = format!("standby_{}_baseline", channel.as_str());
+        let applied_seq = state
+            .proxy
+            .get_ha_sync_watermark(&seq_key)
+            .await?
+            .unwrap_or(0);
+        let baseline_applied = state
+            .proxy
+            .get_ha_sync_watermark(&baseline_key)
+            .await?
+            .unwrap_or(0)
+            > 0;
+        let mut next_seq = applied_seq;
+
+        if !baseline_applied {
+            let baseline_started = Instant::now();
+            let target = format!(
+                "{}/api/admin/ha/baseline?channel={}",
+                source_url.trim_end_matches('/'),
+                channel.as_str()
+            );
+            let response = client
+                .get(target)
+                .header("x-ha-internal-token", internal_token)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "baseline request failed for {} with {}",
+                    channel.as_str(),
+                    response.status()
+                )
+                .into());
+            }
+            let result = {
+                let _maintenance = acquire_db_maintenance_read_gate().await;
+                let result = apply_ha_baseline_response_stream(
+                    state.as_ref(),
+                    channel,
+                    response,
+                    tavily_hikari::HaBaselineApplyMode::Replace,
+                    None,
+                )
+                .await?;
+                state
+                    .proxy
+                    .persist_ha_sync_watermark(
+                        &baseline_report_key,
+                        Some(source_url),
+                        Some(&local_node_id),
+                        result.high_watermark,
+                        Some(&format!("rows={}", result.row_count)),
+                    )
+                    .await?;
+                state
+                    .proxy
+                    .persist_ha_sync_watermark(
+                        &seq_key,
+                        Some(source_url),
+                        Some(&local_node_id),
+                        result.high_watermark,
+                        Some("baseline"),
+                    )
+                    .await?;
+                state
+                    .proxy
+                    .persist_ha_sync_watermark(
+                        &baseline_key,
+                        Some(source_url),
+                        Some(&local_node_id),
+                        1,
+                        Some("baseline applied"),
+                    )
+                    .await?;
+                state.proxy.flush_ha_state_writes().await?;
+                result
+            };
+            next_seq = result.high_watermark;
+            emit_ha_sync_perf_event(
+                state.as_ref(),
+                HaSyncPerfEvent {
+                    event: "standby_sync_baseline_completed",
+                    elapsed: baseline_started.elapsed(),
+                    channel,
+                    row_count: result.row_count,
+                    payload_bytes: result.payload_bytes,
+                    source_url: Some(source_url),
+                    peer_node_id: Some(&local_node_id),
+                    high_watermark: Some(result.high_watermark),
+                    after_seq: None,
+                    next_seq: Some(next_seq),
+                    detail: Some("baseline_applied"),
+                },
+            )
+            .await;
+        }
+
+        let target = format!(
+            "{}/api/admin/ha/events?channel={}&after={}&limit=1000",
+            source_url.trim_end_matches('/'),
+            channel.as_str(),
+            next_seq
+        );
+        let events_started = Instant::now();
+        let response = client
+            .get(target)
+            .header("x-ha-internal-token", internal_token)
+            .send()
+            .await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::GONE | reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        ) {
+            let reset_detail = if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+                "events batch too large; baseline required"
+            } else {
+                "retention window missed; baseline required"
+            };
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &seq_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    0,
+                    Some(reset_detail),
+                )
+                .await?;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &baseline_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    0,
+                    Some(reset_detail),
+                )
+                .await?;
+            state.proxy.flush_ha_state_writes().await?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "events request failed for {} with {}",
+                channel.as_str(),
+                response.status()
+            )
+            .into());
+        }
+        let _maintenance = acquire_db_maintenance_read_gate().await;
+        let result =
+            match apply_ha_events_response_stream(state.as_ref(), channel, response, None).await {
+            Ok(result) => result,
+            Err(err) if is_ha_retryable_foreign_key_gap(&*err) => {
+                let reset_detail =
+                    "foreign key gap during events apply; baseline required";
+                state
+                    .proxy
+                    .persist_ha_sync_watermark(
+                        &seq_key,
+                        Some(source_url),
+                        Some(&local_node_id),
+                        0,
+                        Some(reset_detail),
+                    )
+                    .await?;
+                state
+                    .proxy
+                    .persist_ha_sync_watermark(
+                        &baseline_key,
+                        Some(source_url),
+                        Some(&local_node_id),
+                        0,
+                        Some(reset_detail),
+                    )
+                    .await?;
+                state.proxy.flush_ha_state_writes().await?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if result.high_watermark > next_seq {
+            next_seq = result.high_watermark;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &seq_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    next_seq,
+                    Some(&format!("events={}", result.row_count)),
+                )
+                .await?;
+            state.proxy.flush_ha_state_writes().await?;
+        }
+        drop(_maintenance);
+        emit_ha_sync_perf_event(
+            state.as_ref(),
+            HaSyncPerfEvent {
+                event: "standby_sync_events_completed",
+                elapsed: events_started.elapsed(),
+                channel,
+                row_count: result.row_count,
+                payload_bytes: result.payload_bytes,
+                source_url: Some(source_url),
+                peer_node_id: Some(&local_node_id),
+                high_watermark: Some(result.high_watermark),
+                after_seq: Some(applied_seq),
+                next_seq: Some(next_seq),
+                detail: None,
+            },
+        )
+        .await;
+        let ack_target = format!("{}/api/admin/ha/events/ack", source_url.trim_end_matches('/'));
+        let _ = client
+            .post(ack_target)
+            .header("x-ha-internal-token", internal_token)
+            .json(&serde_json::json!({
+                "channel": channel,
+                "peerNodeId": local_node_id,
+                "ackedSeq": next_seq
+            }))
+            .send()
+            .await?;
+    }
+    state.ha.mark_sync_success().await;
+    {
+        let _maintenance = acquire_db_maintenance_read_gate().await;
+        state.proxy.flush_ha_state_writes().await?;
+    }
+    Ok(())
+}
+
+async fn run_ha_peer_sync_once(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    internal_token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let status = state.ha.status().await;
+    let local_node_id = status.node_id.clone();
+    let mut peer_views = Vec::new();
+    let mut control_source_node_id: Option<String> = None;
+    let peer_configs = state
+        .ha
+        .peer_nodes()
+        .into_iter()
+        .filter(|peer| peer.node_id != local_node_id)
+        .collect::<Vec<_>>();
+    if peer_configs.is_empty() {
+        return Err("HA peer sync has no configured peers".into());
+    }
+    for peer in peer_configs {
+        match fetch_internal_ha_status(client, &peer, internal_token, &local_node_id).await {
+            Ok(peer_status) => {
+                if peer_status.allows_full_writes && control_source_node_id.is_none() {
+                    control_source_node_id = Some(peer.node_id.clone());
+                }
+                peer_views.push((peer, peer_status));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    component = "ha",
+                    event = "peer_status_discovery_failed",
+                    peer_node_id = peer.node_id,
+                    err = %err,
+                    "HA peer status discovery failed"
+                );
+            }
+        }
+    }
+    if peer_views.is_empty() {
+        return Err("HA peer sync reached no peers".into());
+    }
+    for (peer, peer_status) in peer_views {
+        let is_control_source =
+            control_source_node_id.as_deref() == Some(peer.node_id.as_str())
+                || peer_status.allows_full_writes;
+        let channels = if is_control_source {
+            vec![
+                tavily_hikari::HaSyncChannel::Control,
+                tavily_hikari::HaSyncChannel::Billing,
+                tavily_hikari::HaSyncChannel::Runtime,
+            ]
+        } else {
+            vec![
+                tavily_hikari::HaSyncChannel::Billing,
+                tavily_hikari::HaSyncChannel::Runtime,
+            ]
+        };
+        run_ha_sync_once_for_peer(
+            state,
+            client,
+            &peer.admin_base_url,
+            &peer.node_id,
+            internal_token,
+            &channels,
+        )
+        .await?;
+    }
+    state.ha.mark_sync_success().await;
+    {
+        let _maintenance = acquire_db_maintenance_read_gate().await;
+        state.proxy.flush_ha_state_writes().await?;
+    }
+    Ok(())
+}
+
+async fn run_ha_sync_once_for_peer(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    source_url: &str,
+    peer_node_id: &str,
+    internal_token: &str,
+    channels: &[tavily_hikari::HaSyncChannel],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let local_node_id = state.ha.status().await.node_id;
+    for &channel in channels {
+        let seq_key = format!("peer_{peer_node_id}_{}_applied_seq", channel.as_str());
+        let baseline_key = format!("peer_{peer_node_id}_{}_baseline_applied", channel.as_str());
+        let baseline_report_key = format!("peer_{peer_node_id}_{}_baseline", channel.as_str());
+        let applied_seq = state
+            .proxy
+            .get_ha_sync_watermark(&seq_key)
+            .await?
+            .unwrap_or(0);
+        let baseline_applied = state
+            .proxy
+            .get_ha_sync_watermark(&baseline_key)
+            .await?
+            .unwrap_or(0)
+            > 0;
+        let mut next_seq = applied_seq;
+
+        if !baseline_applied {
+            let target = format!(
+                "{}/api/admin/ha/baseline?channel={}",
+                source_url.trim_end_matches('/'),
+                channel.as_str()
+            );
+            let response = client
+                .get(target)
+                .header("x-ha-internal-token", internal_token)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "peer baseline request failed for {} from {} with {}",
+                    channel.as_str(),
+                    peer_node_id,
+                    response.status()
+                )
+                .into());
+            }
+            let baseline_mode = if state.ha.dual_active_enabled()
+                && channel != tavily_hikari::HaSyncChannel::Control
+            {
+                tavily_hikari::HaBaselineApplyMode::Upsert
+            } else {
+                tavily_hikari::HaBaselineApplyMode::Replace
+            };
+            let peer_import_node_id = if state.ha.dual_active_enabled()
+                && matches!(
+                    channel,
+                    tavily_hikari::HaSyncChannel::Billing | tavily_hikari::HaSyncChannel::Runtime
+                )
+            {
+                Some(peer_node_id)
+            } else {
+                None
+            };
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            let result = apply_ha_baseline_response_stream(
+                state.as_ref(),
+                channel,
+                response,
+                baseline_mode,
+                peer_import_node_id,
+            )
+            .await?;
+            next_seq = result.high_watermark;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &baseline_report_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    result.high_watermark,
+                    Some(&format!("rows={}", result.row_count)),
+                )
+                .await?;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &seq_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    result.high_watermark,
+                    Some("baseline"),
+                )
+                .await?;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &baseline_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    1,
+                    Some("baseline applied"),
+                )
+                .await?;
+            state.proxy.flush_ha_state_writes().await?;
+        }
+
+        let target = format!(
+            "{}/api/admin/ha/events?channel={}&after={}&limit=1000",
+            source_url.trim_end_matches('/'),
+            channel.as_str(),
+            next_seq
+        );
+        let response = client
+            .get(target)
+            .header("x-ha-internal-token", internal_token)
+            .send()
+            .await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::GONE | reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        ) {
+            let reset_detail = if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+                "events batch too large; baseline required"
+            } else {
+                "retention window missed; baseline required"
+            };
+            let _maintenance = acquire_db_maintenance_read_gate().await;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &seq_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    0,
+                    Some(reset_detail),
+                )
+                .await?;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &baseline_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    0,
+                    Some(reset_detail),
+                )
+                .await?;
+            state.proxy.flush_ha_state_writes().await?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "peer events request failed for {} from {} with {}",
+                channel.as_str(),
+                peer_node_id,
+                response.status()
+            )
+            .into());
+        }
+        let peer_import_node_id = if state.ha.dual_active_enabled()
+            && matches!(
+                channel,
+                tavily_hikari::HaSyncChannel::Billing | tavily_hikari::HaSyncChannel::Runtime
+            )
+        {
+            Some(peer_node_id)
+        } else {
+            None
+        };
+        let _maintenance = acquire_db_maintenance_read_gate().await;
+        let result = match apply_ha_events_response_stream(
+            state.as_ref(),
+            channel,
+            response,
+            peer_import_node_id,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) if is_ha_retryable_foreign_key_gap(&*err) => {
+                let reset_detail = "foreign key gap during events apply; baseline required";
+                state
+                    .proxy
+                    .persist_ha_sync_watermark(
+                        &seq_key,
+                        Some(source_url),
+                        Some(&local_node_id),
+                        0,
+                        Some(reset_detail),
+                    )
+                    .await?;
+                state
+                    .proxy
+                    .persist_ha_sync_watermark(
+                        &baseline_key,
+                        Some(source_url),
+                        Some(&local_node_id),
+                        0,
+                        Some(reset_detail),
+                    )
+                    .await?;
+                state.proxy.flush_ha_state_writes().await?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if result.high_watermark > next_seq {
+            next_seq = result.high_watermark;
+            state
+                .proxy
+                .persist_ha_sync_watermark(
+                    &seq_key,
+                    Some(source_url),
+                    Some(&local_node_id),
+                    next_seq,
+                    Some(&format!("events={}", result.row_count)),
+                )
+                .await?;
+            state.proxy.flush_ha_state_writes().await?;
+        }
+        drop(_maintenance);
+        let ack_target = format!("{}/api/admin/ha/events/ack", source_url.trim_end_matches('/'));
+        let _ = client
+            .post(ack_target)
+            .header("x-ha-internal-token", internal_token)
+            .json(&serde_json::json!({
+                "channel": channel,
+                "peerNodeId": local_node_id,
+                "ackedSeq": next_seq
+            }))
+            .send()
+            .await?;
+    }
+    Ok(())
+}
+
+fn spawn_business_background_tasks(state: Arc<AppState>) {
+    spawn_maintenance_worker(state.clone());
+    spawn_upstream_reconciliation_startup_resume(state.clone());
+    spawn_scheduled_job_stale_reaper(state.clone());
+    spawn_quota_sync_scheduler(state.clone());
+    spawn_token_usage_rollup_scheduler(state.clone());
+    spawn_auth_token_logs_gc_scheduler(state.clone());
+    spawn_ha_outbox_gc_scheduler(state.clone());
+    spawn_mcp_sessions_gc_scheduler(state.clone());
+    spawn_mcp_session_init_backoffs_gc_scheduler(state.clone());
+    spawn_request_logs_gc_scheduler(state.clone());
+    spawn_dashboard_rollup_integrity_scheduler(state.clone());
+    spawn_dashboard_alert_projection_scheduler(state.clone());
+    spawn_auth_token_logs_alert_index_ensure_scheduler(state.clone());
+    if state.linuxdo_oauth.is_user_sync_scheduler_enabled() {
+        spawn_linuxdo_user_status_sync_scheduler(state.clone());
+    }
+    spawn_linuxdo_user_tag_binding_refresh_scheduler(state.clone());
+    let _linuxdo_credit_recharge_lifecycle_scheduler =
+        spawn_linuxdo_credit_recharge_lifecycle_scheduler(state.clone());
+    let _forward_proxy_geo_refresh_scheduler = spawn_forward_proxy_geo_refresh_scheduler(state.clone());
+    spawn_forward_proxy_maintenance_scheduler(state.clone());
+    spawn_db_compaction_scheduler(state);
+}
+
+fn background_tasks_disabled_via_env() -> bool {
+    std::env::var("TAVILY_DISABLE_BACKGROUND_TASKS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn spawn_background_tasks_for_current_role(state: Arc<AppState>) -> bool {
+    if !state.ha.allows_full_writes().await {
+        return false;
+    }
+    if background_tasks_disabled_via_env() {
+        tracing::info!(
+            component = "startup",
+            event = "background_tasks_disabled_via_env",
+            "background tasks disabled via TAVILY_DISABLE_BACKGROUND_TASKS"
+        );
+        return false;
+    }
+    spawn_business_background_tasks(state);
+    true
+}
+
+fn spawn_post_ready_serving_tasks_for_status(
+    state: Arc<AppState>,
+    status: &tavily_hikari::HaStatusView,
+) -> bool {
+    if !status.allows_full_writes {
+        state
+            .proxy
+            .reset_post_ready_serving_tasks_for_writable_tenure();
+        return false;
+    }
+    if background_tasks_disabled_via_env() {
+        tracing::info!(
+            component = "startup",
+            event = "post_ready_tasks_disabled_via_env",
+            "post-ready non-core tasks disabled via TAVILY_DISABLE_BACKGROUND_TASKS"
+        );
+        return false;
+    }
+    match state
+        .proxy
+        .claim_post_ready_serving_tasks_for_writable_tenure()
+    {
+        tavily_hikari::PostReadyServingTasksClaim::Start => {}
+        tavily_hikari::PostReadyServingTasksClaim::Suppressed { should_log } => {
+            if should_log {
+                tracing::info!(
+                    component = "startup",
+                    event = "post_ready_tasks_suppressed",
+                    role = status.role.as_str(),
+                    node_id = %status.node_id,
+                    pressure_spawned = false,
+                    business_calls_spawned = false,
+                    reason = "already_started_for_writable_tenure",
+                    "post-ready non-core tasks already started for current writable tenure"
+                );
+            }
+            return false;
+        }
+    }
+    let pressure = state.proxy.spawn_server_pressure_buckets_rebuild_once();
+    let business_calls = state.proxy.spawn_user_business_calls_1h_backfill_once();
+    tracing::info!(
+        component = "startup",
+        event = "post_ready_tasks_started",
+        role = status.role.as_str(),
+        node_id = %status.node_id,
+        pressure_spawned = pressure,
+        business_calls_spawned = business_calls,
+        reason = "writable_tenure_entered",
+        "post-ready non-core tasks started for writable tenure"
+    );
+    pressure || business_calls
+}
+
+async fn refresh_admin_password_state_after_ha_apply(
+    state: &AppState,
+    channel: tavily_hikari::HaSyncChannel,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if channel != tavily_hikari::HaSyncChannel::Control {
+        return Ok(());
+    }
+    let settings = state.proxy.get_admin_password_settings().await?;
+    let login_totp_became_required = !state.builtin_admin.login_totp_required()
+        && settings
+            .as_ref()
+            .is_some_and(|settings| settings.login_totp_required);
+    state.builtin_admin.apply_persisted_settings(settings);
+    if login_totp_became_required
+        && let Some(scope) = state.admin_passkey.scope.as_ref()
+    {
+        state.proxy.revoke_all_admin_passkey_sessions(scope).await?;
+    }
+    Ok(())
+}
+
+async fn apply_ha_baseline_response_stream(
+    state: &AppState,
+    channel: tavily_hikari::HaSyncChannel,
+    response: reqwest::Response,
+    mode: tavily_hikari::HaBaselineApplyMode,
+    peer_import_node_id: Option<&str>,
+) -> Result<tavily_hikari::HaApplyResult, Box<dyn std::error::Error + Send + Sync>> {
+    let started = Instant::now();
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    let reader = StreamReader::new(stream);
+    let decoder = ZstdDecoder::new(BufReader::new(reader));
+    let mut lines = BufReader::new(decoder).lines();
+    let mut session = state
+        .proxy
+        .begin_ha_baseline_apply_with_mode(channel, mode)
+        .await?;
+    loop {
+        let next_line = match lines.next_line().await {
+            Ok(next_line) => next_line,
+            Err(err) => {
+                let _ = session.abort().await;
+                return Err(err.into());
+            }
+        };
+        let Some(line) = next_line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let apply_result = if let Some(peer_node_id) = peer_import_node_id {
+            session.apply_line_with_peer_import(trimmed, peer_node_id).await
+        } else {
+            session.apply_line(trimmed).await
+        };
+        if let Err(err) = apply_result {
+            let _ = session.abort().await;
+            return Err(err.into());
+        }
+    }
+    let result = session
+        .finish()
+        .await
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+    if channel == tavily_hikari::HaSyncChannel::Runtime {
+        state.proxy.ensure_upstream_reconciliation_representative_job().await?;
+    }
+    refresh_admin_password_state_after_ha_apply(state, channel).await?;
+    let detail = match mode {
+        tavily_hikari::HaBaselineApplyMode::Replace => "replace",
+        tavily_hikari::HaBaselineApplyMode::Upsert => "upsert",
+    };
+    emit_ha_sync_perf_event(
+        state,
+        HaSyncPerfEvent {
+            event: "baseline_import_completed",
+            elapsed: started.elapsed(),
+            channel,
+            row_count: result.row_count,
+            payload_bytes: result.payload_bytes,
+            source_url: None,
+            peer_node_id: peer_import_node_id,
+            high_watermark: Some(result.high_watermark),
+            after_seq: None,
+            next_seq: None,
+            detail: Some(detail),
+        },
+    )
+    .await;
+    Ok(result)
+}
+
+async fn apply_ha_events_response_stream(
+    state: &AppState,
+    channel: tavily_hikari::HaSyncChannel,
+    response: reqwest::Response,
+    peer_import_node_id: Option<&str>,
+) -> Result<tavily_hikari::HaApplyResult, Box<dyn std::error::Error + Send + Sync>> {
+    let started = Instant::now();
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    let reader = StreamReader::new(stream);
+    let decoder = ZstdDecoder::new(BufReader::new(reader));
+    let mut lines = BufReader::new(decoder).lines();
+    let mut session = state.proxy.begin_ha_events_apply(channel).await?;
+    loop {
+        let next_line = match lines.next_line().await {
+            Ok(next_line) => next_line,
+            Err(err) => {
+                let _ = session.abort().await;
+                return Err(err.into());
+            }
+        };
+        let Some(line) = next_line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let apply_result = if let Some(peer_node_id) = peer_import_node_id {
+            session.apply_line_with_peer_import(trimmed, peer_node_id).await
+        } else {
+            session.apply_line(trimmed).await
+        };
+        if let Err(err) = apply_result {
+            let _ = session.abort().await;
+            return Err(err.into());
+        }
+    }
+    let result = session.finish().await.map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+    refresh_admin_password_state_after_ha_apply(state, channel).await?;
+    emit_ha_sync_perf_event(
+        state,
+        HaSyncPerfEvent {
+            event: "events_import_completed",
+            elapsed: started.elapsed(),
+            channel,
+            row_count: result.row_count,
+            payload_bytes: result.payload_bytes,
+            source_url: None,
+            peer_node_id: peer_import_node_id,
+            high_watermark: Some(result.high_watermark),
+            after_seq: None,
+            next_seq: None,
+            detail: None,
+        },
+    )
+    .await;
+    Ok(result)
+}
+
+fn spawn_ha_edgeone_authority_task(state: Arc<AppState>) {
+    if !state.ha.edgeone_authority_enabled() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            state
+                .proxy
+                .backend_time()
+                .sleep(std::time::Duration::from_secs(5))
+                .await;
+            match state.ha.refresh_authoritative_role().await {
+                Ok(mut status) => {
+                    if state.ha.dual_active_enabled() {
+                        let leader = state.proxy.get_ha_full_master_node_id().await.unwrap_or_else(|err| {
+                            tracing::warn!(
+                                component = "ha",
+                                event = "leader_key_lookup_failed",
+                                err = %err,
+                                "HA leader key lookup warning"
+                            );
+                            None
+                        });
+                        if let Err(err) = state.ha.apply_dual_active_leader(leader).await {
+                            tracing::warn!(
+                                component = "ha",
+                                event = "dual_active_leader_apply_failed",
+                                err = %err,
+                                "HA dual-active leader apply warning"
+                            );
+                        }
+                        status = state.ha.status().await;
+                    }
+                    if !status.allows_full_writes {
+                        state
+                            .proxy
+                            .reset_post_ready_serving_tasks_for_writable_tenure();
+                    }
+                    if let Err(err) =
+                        sync_forward_proxy_runtime_for_status(state.proxy.clone(), &status).await
+                    {
+                        tracing::warn!(
+                            component = "forward_proxy",
+                            event = "authority_runtime_role_sync_failed",
+                            role = status.role.as_str(),
+                            err = %err,
+                            "forward-proxy authority runtime role sync failed"
+                        );
+                    } else {
+                        let _ = spawn_post_ready_serving_tasks_for_status(state.clone(), &status);
+                    }
+                    let node_id = status.node_id.clone();
+                    let edgeone_origin = status.edgeone_origin.clone();
+                    let source_effective = status.ha_source_effective.clone();
+                    let message = status.message.clone();
+                    if let Err(err) = state
+                        .proxy
+                        .persist_ha_node_state(
+                            &node_id,
+                            status.role,
+                            edgeone_origin.as_deref(),
+                            source_effective.as_ref(),
+                            message.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            component = "ha",
+                            event = "authority_state_persist_failed",
+                            err = %err,
+                            "HA authority state persist failed"
+                        );
+                    } else if let Err(err) = state.proxy.flush_ha_state_writes().await {
+                        tracing::warn!(
+                            component = "ha",
+                            event = "authority_state_persist_failed",
+                            err = %err,
+                            "HA authority state persist failed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        component = "ha",
+                        event = "authority_refresh_failed",
+                        err = %err,
+                        "HA authority refresh failed"
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn spawn_ha_control_plane_gc_task(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            state
+                .proxy
+                .backend_time()
+                .sleep(std::time::Duration::from_secs(60 * 60))
+                .await;
+            if let Err(err) = state.proxy.gc_ha_control_plane_events().await {
+                tracing::warn!(
+                    component = "ha",
+                    event = "control_plane_gc_failed",
+                    err = %err,
+                    "HA control-plane event GC failed"
+                );
+            }
+        }
+    });
 }
 
 async fn wait_for_ctrl_c() -> &'static str {
     match signal::ctrl_c().await {
         Ok(()) => "ctrl_c",
         Err(err) => {
-            eprintln!("Failed to listen for Ctrl+C: {err}");
+            tracing::error!(
+                component = "shutdown",
+                event = "ctrl_c_listener_failed",
+                err = %err,
+                "Failed to listen for Ctrl+C"
+            );
             "ctrl_c_error"
         }
     }
@@ -316,7 +2023,12 @@ async fn wait_for_sigterm() -> &'static str {
             "sigterm"
         }
         Err(err) => {
-            eprintln!("Failed to listen for SIGTERM: {err}");
+            tracing::error!(
+                component = "shutdown",
+                event = "sigterm_listener_failed",
+                err = %err,
+                "Failed to listen for SIGTERM"
+            );
             wait_for_ctrl_c().await
         }
     }
@@ -338,8 +2050,580 @@ async fn shutdown_signal() {
         }
     };
 
-    println!("Shutdown signal ({signal}) received, waiting for in-flight requests to finish...");
+    tracing::info!(
+        component = "shutdown",
+        event = "shutdown_signal_received",
+        signal,
+        "shutdown signal received, waiting for in-flight requests to finish"
+    );
+}
+
+async fn prewarm_owner_read_models_after_ready(state: Arc<AppState>) {
+    prewarm_admin_privacy_status(state.clone()).await;
+    prewarm_admin_alerts(state).await;
 }
 
 const BODY_LIMIT: usize = 16 * 1024 * 1024; // 16 MiB 默认限制
 const DEFAULT_LOG_LIMIT: usize = 200;
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+    use tavily_hikari::DEFAULT_UPSTREAM;
+
+    #[tokio::test]
+    async fn listener_ready_hook_schedules_privacy_status_prewarm() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("privacy-status-ready-hook.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-privacy-status-ready-hook".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (prewarm_blocked_tx, prewarm_blocked_rx) = tokio::sync::oneshot::channel();
+        let (prewarm_gate_tx, prewarm_gate_rx) = tokio::sync::oneshot::channel();
+        let server = serve_with_shutdown(
+            "127.0.0.1:0".parse().expect("test socket address"),
+            proxy,
+            None,
+            ForwardAuthConfig::new(None, None, None, None),
+            AdminAuthOptions {
+                forward_auth_enabled: false,
+                builtin_auth_enabled: false,
+                builtin_auth_password: None,
+                builtin_auth_password_hash: None,
+                passkey_auth_enabled: false,
+                passkey_rp_id: None,
+                passkey_rp_origin: None,
+                passkey_challenge_ttl_secs: 300,
+                passkey_session_max_age_secs: 60 * 60,
+            },
+            false,
+            "http://127.0.0.1:58088".to_string(),
+            "https://api.country.is".to_string(),
+            tavily_hikari::HaConfig::default(),
+            LinuxDoOAuthOptions::disabled(),
+            LinuxDoCreditOptions::disabled(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Some(ready_tx),
+            Some((prewarm_blocked_tx, prewarm_gate_rx)),
+        );
+        tokio::pin!(server);
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                blocked = prewarm_blocked_rx => blocked.expect("server reached prewarm gate"),
+                result = &mut server => panic!("server exited before listener-ready prewarm gate: {result:?}"),
+            }
+        })
+        .await
+        .expect("server reached listener-ready prewarm gate");
+        for _ in 0..6 {
+            state.proxy.record_foreground_activity();
+        }
+        assert!(
+            state.proxy.foreground_activity_rps() > 5,
+            "test must establish foreground pressure before startup prewarm"
+        );
+        let prewarm_deferred = admin_privacy_status_prewarm_deferred_signal_for_test(
+            state.as_ref(),
+        )
+        .await
+        .notified_owned();
+        let last_good_published =
+            admin_privacy_status_last_good_published_signal_for_test(state.as_ref())
+                .await
+                .notified_owned();
+        prewarm_gate_tx.send(()).expect("release listener-ready prewarm");
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                ready = ready_rx => ready.expect("server reported ready state"),
+                result = &mut server => panic!("server exited before listener-ready hook: {result:?}"),
+            }
+        })
+            .await
+            .expect("server reached listener-ready hook");
+
+        tokio::time::timeout(Duration::from_secs(1), prewarm_deferred)
+            .await
+            .expect("startup prewarm observed foreground pressure");
+        assert!(
+            admin_privacy_status_cached(state.as_ref()).await.is_none(),
+            "startup prewarm must defer while foreground pressure is active"
+        );
+        tokio::time::timeout(Duration::from_secs(7), last_good_published)
+            .await
+            .expect("deferred listener-ready prewarm published privacy-status last-good data");
+        assert!(
+            admin_privacy_status_cached(state.as_ref()).await.is_some(),
+            "deferred listener-ready prewarm must publish privacy-status last-good data"
+        );
+        shutdown_tx.send(()).expect("signal server shutdown");
+        tokio::time::timeout(Duration::from_secs(2), &mut server)
+            .await
+            .expect("server shuts down")
+            .expect("server exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn ha_control_apply_refreshes_in_memory_admin_password_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("admin-password-ha-refresh.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-ha-admin-password-refresh".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let passkey_scope = tavily_hikari::AdminPasskeyScope::new(
+            "node-ha-refresh",
+            "admin.example.com",
+            "https://admin.example.com",
+        )
+        .expect("passkey scope");
+        proxy
+            .upsert_admin_passkey_credential(
+                &passkey_scope,
+                "credential-ha-refresh",
+                r#"{\"credential\":1}"#,
+                None,
+            )
+            .await
+            .expect("create passkey credential");
+        let passkey_session = proxy
+            .create_admin_passkey_session(
+                &passkey_scope,
+                Some("credential-ha-refresh"),
+                120,
+            )
+            .await
+            .expect("create passkey session");
+        let builtin_admin = BuiltinAdminAuth::new(true, Some("env-password".to_string()), None);
+        let state = AppState {
+            proxy: proxy.clone(),
+            static_dir: None,
+            forward_auth: ForwardAuthConfig::new(None, None, None, None),
+            forward_auth_enabled: false,
+            builtin_admin,
+            admin_passkey: AdminPasskeyOptions {
+                enabled: true,
+                rp_id: Some("admin.example.com".to_string()),
+                rp_origin: Some("https://admin.example.com".to_string()),
+                scope: Some(passkey_scope.clone()),
+                challenge_ttl_secs: 300,
+                session_max_age_secs: 120,
+            },
+            linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+            dev_open_admin: false,
+            usage_base: "http://127.0.0.1:58088".to_string(),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+        };
+
+        let session_token = state
+            .builtin_admin
+            .login("env-password")
+            .expect("env password login should succeed");
+        state.builtin_admin.remember_session(session_token.clone());
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("{BUILTIN_ADMIN_COOKIE_NAME}={session_token}"))
+                .expect("cookie header should be valid"),
+        );
+        assert!(state.builtin_admin.is_admin(&session_headers));
+
+        proxy
+            .set_admin_login_totp_required(true)
+            .await
+            .expect("enable login TOTP requirement in store");
+        refresh_admin_password_state_after_ha_apply(
+            &state,
+            tavily_hikari::HaSyncChannel::Control,
+        )
+        .await
+        .expect("refresh login TOTP state");
+        assert!(state.builtin_admin.login_totp_required());
+        assert!(!state.builtin_admin.is_admin(&session_headers));
+        assert!(state.builtin_admin.login("env-password").is_some());
+        assert!(proxy
+            .get_active_admin_passkey_session(&passkey_scope, &passkey_session.token)
+            .await
+            .expect("read revoked passkey session")
+            .is_none());
+
+        proxy
+            .disable_admin_password_preserving_login(true, false)
+            .await
+            .expect("disable password in store");
+        refresh_admin_password_state_after_ha_apply(
+            &state,
+            tavily_hikari::HaSyncChannel::Control,
+        )
+        .await
+        .expect("refresh disabled password state");
+        assert!(!state.builtin_admin.is_enabled());
+        assert!(state.builtin_admin.login("env-password").is_none());
+
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{db_str}"))
+            .await
+            .expect("connect test db");
+        sqlx::query("DELETE FROM admin_password_settings")
+            .execute(&pool)
+            .await
+            .expect("delete persisted password settings");
+        pool.close().await;
+        refresh_admin_password_state_after_ha_apply(
+            &state,
+            tavily_hikari::HaSyncChannel::Control,
+        )
+        .await
+        .expect("refresh missing password state");
+        assert!(state.builtin_admin.is_enabled());
+        assert!(state.builtin_admin.login("env-password").is_some());
+    }
+
+    #[tokio::test]
+    async fn passkey_admin_session_sets_maintenance_actor() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("passkey-maintenance-actor.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-passkey-maintenance-actor".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let passkey_scope = tavily_hikari::AdminPasskeyScope::new(
+            "node-passkey-actor",
+            "example.com",
+            "https://example.com",
+        )
+        .expect("test passkey scope");
+        proxy
+            .upsert_admin_passkey_credential(
+                &passkey_scope,
+                "credential-actor-1234567890",
+                r#"{"credential":1}"#,
+                None,
+            )
+            .await
+            .expect("insert passkey credential");
+        let session = proxy
+            .create_admin_passkey_session(&passkey_scope, Some("credential-actor-1234567890"), 120)
+            .await
+            .expect("create passkey session");
+        let state = AppState {
+            proxy,
+            static_dir: None,
+            forward_auth: ForwardAuthConfig::new(None, None, None, None),
+            forward_auth_enabled: false,
+            builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions {
+                enabled: true,
+                rp_id: Some("example.com".to_string()),
+                rp_origin: Some("https://example.com".to_string()),
+                scope: Some(passkey_scope),
+                challenge_ttl_secs: 300,
+                session_max_age_secs: 120,
+            },
+            linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+            dev_open_admin: false,
+            usage_base: "http://127.0.0.1:58088".to_string(),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("{ADMIN_PASSKEY_COOKIE_NAME}={}", session.token))
+                .expect("cookie header should be valid"),
+        );
+
+        assert!(is_admin_request(&state, &headers).await);
+        let actor = admin_maintenance_actor(&state, &headers, None).await;
+
+        assert_eq!(
+            actor.actor_display_name.as_deref(),
+            Some("admin-passkey:credential-actor")
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_auth_pressure_returns_a_bounded_privacy_status_retry() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("passkey-privacy-status-pressure.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-passkey-privacy-status-pressure".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let scope = tavily_hikari::AdminPasskeyScope::new(
+            "node-passkey-privacy-status-pressure",
+            "admin.example.com",
+            "https://admin.example.com",
+        )
+        .expect("passkey scope");
+        let session = proxy
+            .create_admin_passkey_session(&scope, None, 120)
+            .await
+            .expect("create passkey session");
+        let state = Arc::new(AppState {
+            proxy,
+            static_dir: None,
+            forward_auth: ForwardAuthConfig::new(None, None, None, None),
+            forward_auth_enabled: false,
+            builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions {
+                enabled: true,
+                rp_id: Some("admin.example.com".to_string()),
+                rp_origin: Some("https://admin.example.com".to_string()),
+                scope: Some(scope),
+                challenge_ttl_secs: 300,
+                session_max_age_secs: 120,
+            },
+            linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+            dev_open_admin: false,
+            usage_base: "http://127.0.0.1:58088".to_string(),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("{ADMIN_PASSKEY_COOKIE_NAME}={}", session.token))
+                .expect("cookie header should be valid"),
+        );
+        assert!(
+            try_is_admin_request(state.as_ref(), &headers)
+                .await
+                .expect("session is valid before pressure")
+        );
+        prime_admin_privacy_status_for_test(state.clone()).await;
+        assert!(
+            admin_privacy_status_cached(state.as_ref()).await.is_some(),
+            "the pressure path must prove a populated immutable last-good cannot leak"
+        );
+
+        let release_pool = Arc::new(tokio::sync::Notify::new());
+        let (pool_held_tx, pool_held_rx) = tokio::sync::oneshot::channel();
+        let pool_holder = {
+            let proxy = state.proxy.clone();
+            let release_pool = release_pool.clone();
+            tokio::spawn(async move { proxy.hold_sqlite_pool_until_for_test(pool_held_tx, release_pool).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), pool_held_rx)
+            .await
+            .expect("the app SQLite pool should be exhausted")
+            .expect("the pool holder should signal readiness");
+
+        let started = std::time::Instant::now();
+        let response = get_upstream_privacy_status(State(state), headers)
+            .await
+            .expect_err("passkey auth pressure must return a retry response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(
+            response.headers().get(CONTENT_TYPE).is_none(),
+            "a retry before authentication must not expose the cached status representation"
+        );
+        let retry_body = body::to_bytes(response.into_body(), BODY_LIMIT)
+            .await
+            .expect("read bounded retry body");
+        assert!(
+            retry_body.is_empty(),
+            "a retry before authentication must not expose cached privacy-status JSON"
+        );
+        release_pool.notify_one();
+        pool_holder
+            .await
+            .expect("pool holder joins")
+            .expect("pool holder releases cleanly");
+    }
+
+    #[tokio::test]
+    async fn cache_aware_admin_auth_records_only_passkey_sqlite_lookups() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("cache-aware-passkey-auth.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            vec!["tvly-cache-aware-passkey-auth".to_string()],
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let scope = tavily_hikari::AdminPasskeyScope::new(
+            "node-cache-aware-passkey-auth",
+            "admin.example.com",
+            "https://admin.example.com",
+        )
+        .expect("passkey scope");
+        let session = proxy
+            .create_admin_passkey_session(&scope, None, 120)
+            .await
+            .expect("create passkey session");
+        let state = Arc::new(AppState {
+            proxy,
+            static_dir: None,
+            forward_auth: ForwardAuthConfig::new(None, None, None, None),
+            forward_auth_enabled: false,
+            builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions {
+                enabled: true,
+                rp_id: Some("admin.example.com".to_string()),
+                rp_origin: Some("https://admin.example.com".to_string()),
+                scope: Some(scope),
+                challenge_ttl_secs: 300,
+                session_max_age_secs: 120,
+            },
+            linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+            dev_open_admin: false,
+            usage_base: "http://127.0.0.1:58088".to_string(),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+            remote_attempt_admission: new_remote_attempt_admission(),
+        });
+        let empty_headers = HeaderMap::new();
+        assert!(!is_admin_cache_aware_request(state.as_ref(), &empty_headers).await);
+        assert_eq!(state.proxy.foreground_activity_rps(), 0);
+
+        let mut passkey_headers = HeaderMap::new();
+        passkey_headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("{ADMIN_PASSKEY_COOKIE_NAME}={}", session.token))
+                .expect("cookie header should be valid"),
+        );
+        assert!(is_admin_cache_aware_request(state.as_ref(), &passkey_headers).await);
+        assert_eq!(
+            state.proxy.foreground_activity_rps(),
+            1,
+            "passkey auth must account for its bounded SQLite lookup"
+        );
+
+        let release_pool = Arc::new(tokio::sync::Notify::new());
+        let (pool_held_tx, pool_held_rx) = tokio::sync::oneshot::channel();
+        let pool_holder = {
+            let proxy = state.proxy.clone();
+            let release_pool = release_pool.clone();
+            tokio::spawn(async move { proxy.hold_sqlite_pool_until_for_test(pool_held_tx, release_pool).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), pool_held_rx)
+            .await
+            .expect("the app SQLite pool should be exhausted")
+            .expect("the pool holder should signal readiness");
+        let lookups = (0..5)
+            .map(|_| {
+                let state = state.clone();
+                let headers = passkey_headers.clone();
+                tokio::spawn(async move { is_admin_cache_aware_request(state.as_ref(), &headers).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.proxy.foreground_activity_rps() <= 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("passkey lookups should record before acquiring SQLite");
+        assert_eq!(
+            state.proxy.admin_alerts_cache_warm_pressure_reason(),
+            Some("foreground_pressure")
+        );
+        release_pool.notify_waiters();
+        for lookup in lookups {
+            assert!(lookup.await.expect("passkey lookup task joins"));
+        }
+        pool_holder
+            .await
+            .expect("pool holder joins")
+            .expect("pool holder releases cleanly");
+    }
+
+    #[tokio::test]
+    async fn passkey_authentication_start_is_available_on_standby() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("standby-passkey-auth.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(
+            Vec::<String>::new(),
+            DEFAULT_UPSTREAM,
+            &db_str,
+        )
+        .await
+        .expect("proxy created");
+        let passkey_scope = tavily_hikari::AdminPasskeyScope::new(
+            "node-passkey-standby",
+            "hikari.example.com",
+            "https://hikari.example.com",
+        )
+        .expect("test passkey scope");
+        let state = Arc::new(AppState {
+            proxy,
+            static_dir: None,
+            forward_auth: ForwardAuthConfig::new(None, None, None, None),
+            forward_auth_enabled: false,
+            builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions {
+                enabled: true,
+                rp_id: Some("hikari.example.com".to_string()),
+                rp_origin: Some("https://hikari.example.com".to_string()),
+                scope: Some(passkey_scope),
+                challenge_ttl_secs: 300,
+                session_max_age_secs: 60 * 60,
+            },
+            linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig {
+                mode: tavily_hikari::HaMode::ActiveStandby,
+                node_id: "node-passkey-standby".to_string(),
+                database_path: Some(db_str),
+                sync_source_url: Some("http://127.0.0.1:59999".to_string()),
+                internal_token: Some("ha-test-token".to_string()),
+                sync_interval_secs: 5,
+                ..tavily_hikari::HaConfig::default()
+            }),
+            dev_open_admin: false,
+            usage_base: "http://127.0.0.1:58088".to_string(),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+        });
+
+        assert!(!state.ha.allows_full_writes().await);
+
+        let result = post_admin_passkey_authentication_start(State(state)).await;
+
+        assert_eq!(result.expect_err("no passkey credentials yet"), StatusCode::CONFLICT);
+    }
+}

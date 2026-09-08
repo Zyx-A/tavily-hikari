@@ -1,28 +1,214 @@
-// kept for potential future direct serving; currently ServeDir handles '/'
-#[allow(dead_code)]
-async fn load_spa_response(
-    state: &AppState,
-    file_name: &str,
-) -> Result<Response<Body>, StatusCode> {
+fn response_content_type(file_name: &str) -> String {
+    if file_name.ends_with(".webmanifest") {
+        return "application/manifest+json".to_string();
+    }
+    let guess = mime_guess::from_path(file_name).first_or_octet_stream();
+    if guess.essence_str() == "text/html" {
+        "text/html; charset=utf-8".to_string()
+    } else {
+        guess.to_string()
+    }
+}
+
+fn is_content_hashed_pwa_asset(file_name: &str) -> bool {
+    let Some(file_name) = file_name.strip_prefix("pwa/") else {
+        return false;
+    };
+    if file_name.contains('/') {
+        return false;
+    }
+    let Some((stem, digest_with_extension)) = file_name.rsplit_once('-') else {
+        return false;
+    };
+    let Some(digest) = digest_with_extension.strip_suffix(".png") else {
+        return false;
+    };
+    let is_generated_icon = ["public-", "admin-"].iter().any(|prefix| {
+        let Some(size) = stem.strip_prefix(prefix) else {
+            return false;
+        };
+        let size = size.strip_prefix("maskable-").unwrap_or(size);
+        !size.is_empty() && size.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    is_generated_icon
+        && digest.len() == 12
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn response_cache_control(file_name: &str) -> Option<&'static str> {
+    if file_name.ends_with(".html")
+        || matches!(
+            file_name,
+            "version.json"
+                | "manifest.webmanifest"
+                | "manifest-admin.webmanifest"
+                | "sw-public.js"
+                | "sw-admin.js"
+        )
+    {
+        return Some("no-cache, must-revalidate");
+    }
+    if is_content_hashed_pwa_asset(file_name) {
+        return Some("public, max-age=31536000, immutable");
+    }
+    None
+}
+
+fn embedded_static_bytes(file_name: &str) -> Option<Bytes> {
+    tavily_hikari::web_assets::embedded_bytes(file_name).map(Bytes::from_static)
+}
+
+async fn read_static_bytes(state: &AppState, file_name: &str) -> Option<Bytes> {
+    if let Some(dir) = state.static_dir.as_ref() {
+        let path = dir.join(file_name);
+        if let Ok(bytes) = tokio::fs::read(path).await {
+            return Some(Bytes::from(bytes));
+        }
+    }
+
+    embedded_static_bytes(file_name)
+}
+
+async fn local_static_file_exists(state: &AppState, file_name: &str) -> bool {
     let Some(dir) = state.static_dir.as_ref() else {
+        return false;
+    };
+    tokio::fs::metadata(dir.join(file_name)).await.is_ok()
+}
+
+async fn load_spa_response(state: &AppState, file_name: &str) -> Result<Response<Body>, StatusCode> {
+    let Some(bytes) = read_static_bytes(state, file_name).await else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let path = dir.join(file_name);
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(CONTENT_TYPE, response_content_type(file_name));
+    if let Some(cache_control) = response_cache_control(file_name) {
+        response = response.header(CACHE_CONTROL, cache_control);
+    }
+    response
         .body(Body::from(bytes))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn spa_file_exists(state: &AppState, file_name: &str) -> bool {
-    let Some(dir) = state.static_dir.as_ref() else {
-        return false;
+    if let Some(dir) = state.static_dir.as_ref()
+        && tokio::fs::metadata(dir.join(file_name)).await.is_ok()
+    {
+        return true;
+    }
+
+    embedded_static_bytes(file_name).is_some()
+}
+
+fn is_safe_static_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains("..")
+        && FsPath::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+async fn serve_asset(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Result<Response<Body>, StatusCode> {
+    let asset_path = path.trim_start_matches('/');
+    if !is_safe_static_path(asset_path) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let file_name = format!("assets/{asset_path}");
+    let Some(bytes) = read_static_bytes(state.as_ref(), &file_name).await else {
+        return Err(StatusCode::NOT_FOUND);
     };
-    tokio::fs::metadata(dir.join(file_name)).await.is_ok()
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, response_content_type(&file_name))
+        .body(Body::from(bytes))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn serve_assets_root() -> Result<Response<Body>, StatusCode> {
+    Err(StatusCode::NOT_FOUND)
+}
+
+async fn serve_favicon(State(state): State<Arc<AppState>>) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "favicon.svg").await
+}
+
+async fn serve_version_json(State(state): State<Arc<AppState>>) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "version.json").await
+}
+
+async fn serve_public_manifest(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "manifest.webmanifest").await
+}
+
+async fn serve_admin_manifest(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "manifest-admin.webmanifest").await
+}
+
+async fn serve_public_sw(State(state): State<Arc<AppState>>) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "sw-public.js").await
+}
+
+async fn serve_admin_sw(State(state): State<Arc<AppState>>) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "sw-admin.js").await
+}
+
+async fn serve_pwa_asset(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Result<Response<Body>, StatusCode> {
+    let asset_path = path.trim_start_matches('/');
+    if !is_safe_static_path(asset_path) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let file_name = format!("pwa/{asset_path}");
+    load_spa_response(state.as_ref(), &file_name).await
+}
+
+#[cfg(test)]
+mod pwa_cache_tests {
+    use super::*;
+
+    #[test]
+    fn pwa_metadata_revalidates_and_hashed_icons_are_immutable() {
+        for file_name in [
+            "index.html",
+            "manifest.webmanifest",
+            "manifest-admin.webmanifest",
+            "sw-public.js",
+            "sw-admin.js",
+            "version.json",
+        ] {
+            assert_eq!(
+                response_cache_control(file_name),
+                Some("no-cache, must-revalidate"),
+                "metadata should be revalidated: {file_name}"
+            );
+        }
+        assert_eq!(
+            response_cache_control("pwa/admin-1024-0123456789ab.png"),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            response_cache_control("pwa/admin-maskable-512-0123456789ab.png"),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(response_cache_control("pwa/admin-touch-icon-0123456789ab.png"), None);
+        assert_eq!(response_cache_control("pwa/admin-1024.png"), None);
+        assert_eq!(response_cache_control("pwa/admin-1024-0123456789abc.png"), None);
+        assert_eq!(response_cache_control("assets/admin-1024-0123456789ab.png"), None);
+    }
 }
 
 async fn serve_index(
@@ -47,35 +233,81 @@ async fn serve_index(
     load_spa_response(state.as_ref(), "index.html").await
 }
 
+async fn serve_public_index_shell(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "index.html").await
+}
+
 async fn serve_admin_index(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
-    if is_admin_request(state.as_ref(), &headers) {
+    if is_admin_request(state.as_ref(), &headers).await {
         return load_spa_response(state.as_ref(), "admin.html").await;
     }
-    if state.builtin_admin.is_enabled() {
+    if state.builtin_admin.is_enabled() || state.admin_passkey.is_configured() {
         return Ok(Redirect::temporary("/login").into_response());
     }
     Err(StatusCode::FORBIDDEN)
 }
 
+async fn serve_admin_shell(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "admin.html").await
+}
+
 async fn serve_login(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
-    if !state.builtin_admin.is_enabled() {
+    if !state.builtin_admin.is_enabled() && !state.admin_passkey.is_configured() {
         return Err(StatusCode::NOT_FOUND);
     }
-    if is_admin_request(state.as_ref(), &headers) {
+    let has_reset_token = query
+        .get("adminPasskeyResetToken")
+        .map(String::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if has_reset_token {
+        return load_spa_response(state.as_ref(), "login.html").await;
+    }
+    if is_admin_request(state.as_ref(), &headers).await {
         return Ok(Redirect::temporary("/admin").into_response());
     }
+    load_spa_response(state.as_ref(), "login.html").await
+}
+
+async fn serve_login_shell(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, StatusCode> {
     load_spa_response(state.as_ref(), "login.html").await
 }
 
 async fn serve_registration_paused_index(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response<Body>, StatusCode> {
+    if state.static_dir.is_some()
+        && !local_static_file_exists(state.as_ref(), "registration-paused.html").await
+    {
+        return load_spa_response(state.as_ref(), "index.html").await;
+    }
+    if !spa_file_exists(state.as_ref(), "registration-paused.html").await {
+        return load_spa_response(state.as_ref(), "index.html").await;
+    }
+    load_spa_response(state.as_ref(), "registration-paused.html").await
+}
+
+async fn serve_registration_paused_shell(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, StatusCode> {
+    if state.static_dir.is_some()
+        && !local_static_file_exists(state.as_ref(), "registration-paused.html").await
+    {
+        return load_spa_response(state.as_ref(), "index.html").await;
+    }
     if !spa_file_exists(state.as_ref(), "registration-paused.html").await {
         return load_spa_response(state.as_ref(), "index.html").await;
     }
@@ -98,55 +330,101 @@ async fn serve_console_index(
     load_spa_response(state.as_ref(), "console.html").await
 }
 
+async fn serve_console_shell(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, StatusCode> {
+    load_spa_response(state.as_ref(), "console.html").await
+}
+
+const THEME_STORAGE_KEY: &str = "tavily-hikari-theme-mode";
+
 const BASE_404_STYLES: &str = r#"
   :root {
+    --not-found-background: var(--background, 210 40% 98%);
+    --not-found-foreground: var(--foreground, 222 47% 11%);
+    --not-found-card: var(--card, 0 0% 100%);
+    --not-found-primary: var(--primary, 221 72% 43%);
+    --not-found-primary-foreground: var(--primary-foreground, 210 100% 98%);
+    --not-found-secondary: var(--secondary, 217 91% 60%);
+    --not-found-muted: var(--muted, 210 32% 94%);
+    --not-found-muted-foreground: var(--muted-foreground, 215 20% 36%);
+    --not-found-border: var(--border, 214 32% 86%);
     color-scheme: light;
-    font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: 'IBM Plex Sans', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     text-rendering: optimizeLegibility;
   }
 
-  body {
-    margin: 0;
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: radial-gradient(circle at top left, rgba(99, 102, 241, 0.12), transparent 45%),
-      radial-gradient(circle at bottom right, rgba(236, 72, 153, 0.12), transparent 50%),
-      #f5f6fb;
-    color: #1f2937;
+  html.not-found-page.dark,
+  html.not-found-page[data-theme-mode='dark'] {
+    --not-found-background: var(--background, 222 47% 8%);
+    --not-found-foreground: var(--foreground, 210 40% 96%);
+    --not-found-card: var(--card, 222 40% 12%);
+    --not-found-primary: var(--primary, 217 91% 68%);
+    --not-found-primary-foreground: var(--primary-foreground, 222 47% 8%);
+    --not-found-secondary: var(--secondary, 211 89% 64%);
+    --not-found-muted: var(--muted, 217 25% 18%);
+    --not-found-muted-foreground: var(--muted-foreground, 215 18% 68%);
+    --not-found-border: var(--border, 217 22% 26%);
+    color-scheme: dark;
   }
 
   @media (prefers-color-scheme: dark) {
-    :root {
+    html.not-found-page:not([data-theme-mode='light']):not(.dark) {
+      --not-found-background: var(--background, 222 47% 8%);
+      --not-found-foreground: var(--foreground, 210 40% 96%);
+      --not-found-card: var(--card, 222 40% 12%);
+      --not-found-primary: var(--primary, 217 91% 68%);
+      --not-found-primary-foreground: var(--primary-foreground, 222 47% 8%);
+      --not-found-secondary: var(--secondary, 211 89% 64%);
+      --not-found-muted: var(--muted, 217 25% 18%);
+      --not-found-muted-foreground: var(--muted-foreground, 215 18% 68%);
+      --not-found-border: var(--border, 217 22% 26%);
       color-scheme: dark;
     }
-    body {
-      background: radial-gradient(circle at top left, rgba(129, 140, 248, 0.22), transparent 45%),
-        radial-gradient(circle at bottom right, rgba(236, 72, 153, 0.18), transparent 50%),
-        #0f172a;
-      color: #e2e8f0;
-    }
+  }
+
+  html.not-found-page,
+  body.not-found-page-body {
+    min-height: 100%;
+  }
+
+  body.not-found-page-body,
+  .not-found-page-body {
+    margin: 0;
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background:
+      radial-gradient(1000px 520px at 6% -8%, hsl(var(--not-found-primary) / 0.18), transparent 62%),
+      radial-gradient(900px 460px at 95% -14%, hsl(var(--not-found-secondary) / 0.16), transparent 64%),
+      linear-gradient(
+        180deg,
+        hsl(var(--not-found-background)) 0%,
+        hsl(var(--not-found-background)) 62%,
+        hsl(var(--not-found-muted) / 0.6) 100%
+      ),
+      hsl(var(--not-found-background));
+    color: hsl(var(--not-found-foreground));
   }
 
   .not-found-shell {
     max-width: 520px;
-    width: calc(100% - 48px);
-    padding: 48px 40px;
+    width: min(100%, 520px);
+    padding: clamp(32px, 5vw, 48px) clamp(24px, 5vw, 40px);
     border-radius: 28px;
-    background: rgba(255, 255, 255, 0.82);
-    border: 1px solid rgba(15, 23, 42, 0.08);
+    background: hsl(var(--not-found-card) / 0.82);
+    border: 1px solid hsl(var(--not-found-border) / 0.72);
     backdrop-filter: blur(18px);
-    box-shadow: 0 28px 65px rgba(15, 23, 42, 0.12);
+    box-shadow: 0 28px 65px hsl(222 47% 11% / 0.16);
     text-align: center;
+    color: hsl(var(--not-found-foreground));
   }
 
-  @media (prefers-color-scheme: dark) {
-    .not-found-shell {
-      background: rgba(15, 23, 42, 0.7);
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      box-shadow: 0 32px 65px rgba(15, 23, 42, 0.5);
-    }
+  .dark .not-found-shell {
+    box-shadow: 0 32px 65px hsl(222 47% 4% / 0.54);
   }
 
   .not-found-badge {
@@ -156,8 +434,8 @@ const BASE_404_STYLES: &str = r#"
     gap: 6px;
     padding: 8px 16px;
     border-radius: 999px;
-    background: rgba(99, 102, 241, 0.16);
-    color: #4338ca;
+    background: hsl(var(--not-found-primary) / 0.16);
+    color: hsl(var(--not-found-primary));
     font-size: 0.85rem;
     font-weight: 600;
     letter-spacing: 0.02em;
@@ -170,17 +448,12 @@ const BASE_404_STYLES: &str = r#"
     font-weight: 800;
     line-height: 1;
     letter-spacing: -0.04em;
-    color: #4f46e5;
-  }
-
-  @media (prefers-color-scheme: dark) {
-    .not-found-code {
-      color: #a5b4fc;
-    }
+    color: hsl(var(--not-found-primary));
   }
 
   .not-found-title {
     margin: 0;
+    color: hsl(var(--not-found-foreground));
     font-size: clamp(1.5rem, 4vw, 2.25rem);
     font-weight: 700;
     letter-spacing: -0.01em;
@@ -188,15 +461,20 @@ const BASE_404_STYLES: &str = r#"
 
   .not-found-description {
     margin: 20px 0 30px;
-    color: rgba(100, 116, 139, 0.95);
+    color: hsl(var(--not-found-muted-foreground));
     font-size: 1rem;
     line-height: 1.7;
   }
 
-  @media (prefers-color-scheme: dark) {
-    .not-found-description {
-      color: rgba(203, 213, 225, 0.82);
-    }
+  .not-found-description code {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid hsl(var(--not-found-border) / 0.9);
+    background: hsl(var(--not-found-muted) / 0.82);
+    color: hsl(var(--not-found-foreground));
+    font-size: 0.96em;
   }
 
   .not-found-actions {
@@ -213,31 +491,33 @@ const BASE_404_STYLES: &str = r#"
     gap: 8px;
     padding: 12px 22px;
     border-radius: 999px;
+    border: 1px solid transparent;
     font-weight: 600;
-    color: #fff;
-    background: linear-gradient(135deg, #6366f1, #8b5cf6);
-    box-shadow: 0 16px 35px rgba(99, 102, 241, 0.35);
+    color: hsl(var(--not-found-primary-foreground));
+    background: linear-gradient(135deg, hsl(var(--not-found-primary)), hsl(var(--not-found-secondary)));
+    box-shadow: 0 16px 35px hsl(var(--not-found-primary) / 0.35);
     text-decoration: none;
     transition: transform 0.12s ease, box-shadow 0.12s ease;
   }
 
   .not-found-primary:hover {
     transform: translateY(-1px);
-    box-shadow: 0 20px 40px rgba(99, 102, 241, 0.4);
+    box-shadow: 0 20px 40px hsl(var(--not-found-primary) / 0.42);
   }
 
   .not-found-footer {
     margin-top: 36px;
     font-size: 0.85rem;
-    color: rgba(100, 116, 139, 0.75);
-  }
-
-  @media (prefers-color-scheme: dark) {
-    .not-found-footer {
-      color: rgba(148, 163, 184, 0.78);
-    }
+    color: hsl(var(--not-found-muted-foreground) / 0.9);
   }
 "#;
+
+fn build_404_theme_bootstrap() -> String {
+    format!(
+        r#"<script>!function(){{try{{var root=document.documentElement;var media=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;var mode='system';var apply=function(resolved){{root.classList.toggle('dark',resolved==='dark');root.style.colorScheme=resolved;}};try{{var stored=window.localStorage.getItem('{storage_key}');if(stored==='light'||stored==='dark'||stored==='system')mode=stored;}}catch(_e){{}}var resolve=function(){{return mode==='system'?(media&&media.matches?'dark':'light'):mode;}};root.setAttribute('data-theme-mode',mode);apply(resolve());if(mode==='system'&&media){{var onChange=function(){{apply(media.matches?'dark':'light');}};if(typeof media.addEventListener==='function'){{media.addEventListener('change',onChange);}}else if(typeof media.addListener==='function'){{media.addListener(onChange);}}}}}}catch(_e){{}}}}()</script>"#,
+        storage_key = THEME_STORAGE_KEY
+    )
+}
 
 fn find_frontend_css_href(static_dir: Option<&FsPath>) -> Option<String> {
     let dir = static_dir?;
@@ -297,20 +577,65 @@ async fn not_found_landing(
 
 fn build_404_landing_inline(css_content: Option<&str>, original: String) -> String {
     let mut style_block = String::from("<style>\n");
-    style_block.push_str(BASE_404_STYLES);
     if let Some(content) = css_content {
         style_block.push_str(content);
+        style_block.push('\n');
     }
+    style_block.push_str(BASE_404_STYLES);
     style_block.push_str("\n</style>\n");
+    let theme_bootstrap = build_404_theme_bootstrap();
     // Safer: pass original path via data attribute and read it in script without string concatenation
     let script = format!(
         "<script data-p=\"{}\">!function(){{try{{var s=document.currentScript;var p=s&&s.getAttribute('data-p')||'/';history.replaceState(null,'', p)}}catch(_e){{}}}}()</script>",
         html_escape::encode_double_quoted_attribute(&original)
     );
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <title>404 Not Found</title>\n    {}  </head>\n  <body>\n    <main class=\"not-found-shell\" role=\"main\">\n      <span class=\"not-found-badge\" aria-hidden=\"true\">Tavily Hikari Proxy</span>\n      <p class=\"not-found-code\">404</p>\n      <h1 class=\"not-found-title\">Page not found</h1>\n      <p class=\"not-found-description\">The page you’re trying to visit, <code>{}</code>, isn’t available right now.</p>\n      <div class=\"not-found-actions\">\n        <a href=\"/\" class=\"not-found-primary\" aria-label=\"Back to dashboard\">Return to dashboard</a>\n      </div>\n      <p class=\"not-found-footer\">Error reference: 404</p>\n    </main>\n    {}\n  </body>\n</html>",
+        "<!doctype html>\n<html lang=\"en\" class=\"not-found-page\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <meta name=\"color-scheme\" content=\"light dark\" />\n    <title>404 Not Found</title>\n    {}\n    {}  </head>\n  <body class=\"not-found-page-body\">\n    <main class=\"not-found-shell\" role=\"main\">\n      <span class=\"not-found-badge\" aria-hidden=\"true\">Tavily Hikari Proxy</span>\n      <p class=\"not-found-code\">404</p>\n      <h1 class=\"not-found-title\">Page not found</h1>\n      <p class=\"not-found-description\">The page you’re trying to visit, <code>{}</code>, isn’t available right now.</p>\n      <div class=\"not-found-actions\">\n        <a href=\"/\" class=\"not-found-primary\" aria-label=\"Back to dashboard\">Return to dashboard</a>\n      </div>\n      <p class=\"not-found-footer\">Error reference: 404</p>\n    </main>\n    {}\n  </body>\n</html>",
+        theme_bootstrap,
         style_block,
         html_escape::encode_text(&original),
         script
     )
+}
+
+#[cfg(test)]
+mod spa_404_tests {
+    use super::{THEME_STORAGE_KEY, build_404_landing_inline};
+
+    #[test]
+    fn build_404_landing_inline_bootstraps_theme_and_keeps_404_overrides_last() {
+        let frontend_css = "body{background:#f5f6fb;color:#1f2937}.dark body{background:#0f172a;color:#e2e8f0}";
+        let html = build_404_landing_inline(Some(frontend_css), "/accounts?view=all".to_string());
+
+        let frontend_index = html
+            .find(frontend_css)
+            .expect("frontend css should be inlined before fallback overrides");
+        let override_index = html
+            .rfind(".not-found-page-body")
+            .expect("fallback styles should include the not-found page body override");
+
+        assert!(
+            frontend_index < override_index,
+            "frontend css must appear before 404 override styles so the fallback page wins the cascade"
+        );
+        assert!(html.contains(&format!("localStorage.getItem('{THEME_STORAGE_KEY}')")));
+        assert!(html.contains("root.setAttribute('data-theme-mode',mode)"));
+        assert!(html.contains("@media (prefers-color-scheme: dark)"));
+        assert!(html.contains("html.not-found-page:not([data-theme-mode='light']):not(.dark)"));
+        assert!(html.contains("media.addEventListener('change',onChange)"));
+        assert!(html.contains("body.not-found-page-body,"));
+        assert!(html.contains("<html lang=\"en\" class=\"not-found-page\">"));
+        assert!(html.contains("<body class=\"not-found-page-body\">"));
+        assert!(html.contains("history.replaceState(null,'', p)"));
+        assert!(html.contains("/accounts?view=all"));
+    }
+
+    #[test]
+    fn build_404_landing_inline_escapes_original_path_in_text_and_script() {
+        let html = build_404_landing_inline(None, "/accounts?<script>alert(1)</script>&\"".to_string());
+
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("data-p=\"/accounts?&lt;script&gt;alert(1)&lt;/script&gt;&amp;&quot;\""));
+        assert!(html.contains("Return to dashboard"));
+    }
 }

@@ -1,0 +1,2603 @@
+import {
+  createDemoAnnouncements,
+  demoUserActiveAnnouncements,
+  demoUserAnnouncementHistory,
+  handleAnnouncementsRoute,
+} from './demoAnnouncements'
+import { demoUserEntitlements } from './demoAccountEntitlements'
+import { createDemoRechargeOrders, demoAdminUserRechargeAudit, handleDemoAdminRechargeAction, handleDemoAdminRecharges, type DemoRechargeOrder } from './demoAdminRecharge'
+import { createDemoHaStatus, handleDemoHaRoute } from './demoHa'
+import { createDemoUpstreamPrivacyStatus } from './upstreamPrivacyStatusFixtures'
+import { rankingsStorySnapshot } from '../admin/rankingsStoryData'
+import { buildDemoAnalysisPressureSnapshot } from './demoAnalysisPressure'
+import type { RechargeQuote } from './recharge'
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
+type DemoListener = EventListenerOrEventListenerObject
+declare global {
+  interface Window {
+    __tavilyHikariDemoInstalled?: boolean
+    __tavilyHikariDemoFetch?: typeof fetch
+    __tavilyHikariDemoEventSource?: typeof EventSource
+  }
+}
+const DEMO_STORAGE_KEY = 'tavily-hikari-demo-mode'
+const DEMO_TOKEN = 'th-dm01-demoaccesssecret'
+const DEMO_TOKEN_ID = 'dm01'
+const DEMO_KEY_ID = 'Hk01'
+const DEMO_BACKUP_KEY_ID = 'Sf02'
+const DEMO_EU_KEY_ID = 'Fr03'
+const DEMO_QUOTA_KEY_ID = 'Qt04'
+const DEMO_QUARANTINE_KEY_ID = 'Qr05'
+const DEMO_TOKEN_OWNER = { userId: 'user-demo-admin', displayName: 'Hikari Demo Admin', username: 'hikari-demo' }
+const DEMO_RECHARGE_UNIT_CREDITS = 1000
+const DEMO_RECHARGE_UNIT_PRICE_LDC = 50
+const DEMO_TEST_RECHARGE_CREDITS = 1
+const DEMO_TEST_RECHARGE_MONTHS = 1
+const DEMO_TEST_RECHARGE_AMOUNT_LDC = 1
+function truthy(value: string | boolean | undefined | null): boolean {
+  if (value === true) return true
+  if (typeof value !== 'string') return false
+  return ['1', 'true', 'yes', 'on', 'demo'].includes(value.trim().toLowerCase())
+}
+export function isDemoMode(): boolean {
+  const env = (import.meta as unknown as { env?: { VITE_DEMO_MODE?: string } }).env
+  if (truthy(env?.VITE_DEMO_MODE)) return true
+  if (typeof window === 'undefined') return false
+  const params = new URLSearchParams(window.location.search)
+  if (truthy(params.get('demo')) || params.get('mode') === 'demo') return true
+  try {
+    return truthy(window.localStorage.getItem(DEMO_STORAGE_KEY))
+  } catch {
+    return false
+  }
+}
+
+function demoAnnouncementPreviewMode(): 'active' | 'closed' {
+  if (typeof window === 'undefined') return 'active'
+  const params = new URLSearchParams(window.location.search)
+  const raw = params.get('announcements')?.trim().toLowerCase()
+  return raw === 'closed' || raw === 'none' ? 'closed' : 'active'
+}
+
+function nowSeconds(offset = 0): number {
+  return Math.floor(Date.now() / 1000) + offset
+}
+
+function isoSeconds(offset = 0): string {
+  return new Date((nowSeconds(offset)) * 1000).toISOString()
+}
+
+function monthStartSeconds(monthOffset = 0): number {
+  const now = new Date()
+  return Math.floor(new Date(now.getFullYear(), now.getMonth() + monthOffset, 1).getTime() / 1000)
+}
+
+function demoPulse(now = Date.now()): number {
+  return Math.floor(now / 6000)
+}
+
+function range(count: number): number[] {
+  return Array.from({ length: count }, (_, index) => index)
+}
+
+function createRequestKindOptions() {
+  return [
+    { key: 'api:search', label: 'API | search', protocol_group: 'api', billing_group: 'billable', count: 34 },
+    { key: 'api:extract', label: 'API | extract', protocol_group: 'api', billing_group: 'billable', count: 18 },
+    { key: 'mcp:search', label: 'MCP | search', protocol_group: 'mcp', billing_group: 'billable', count: 26 },
+    { key: 'mcp:tools/list', label: 'MCP | tools/list', protocol_group: 'mcp', billing_group: 'non_billable', count: 12 },
+    { key: 'mcp:ping', label: 'MCP | ping', protocol_group: 'mcp', billing_group: 'non_billable', count: 8 },
+  ]
+}
+
+const requestKindOptions = createRequestKindOptions()
+
+function createDemoLog(index: number) {
+  const success = index % 7 !== 0
+  const quota = index % 19 === 0
+  const rebalance = index % 11 === 0
+  const mcp = !rebalance && index % 3 === 0
+  const kind = mcp ? (index % 2 === 0 ? 'mcp:search' : 'mcp:tools/list') : (index % 2 === 0 ? 'api:search' : 'api:extract')
+  const option = requestKindOptions.find((item) => item.key === kind) ?? requestKindOptions[0]
+  return {
+    id: 9000 + index,
+    key_id: rebalance || index % 5 === 0 ? DEMO_BACKUP_KEY_ID : DEMO_KEY_ID,
+    auth_token_id: index % 4 === 0 ? 'ops2' : DEMO_TOKEN_ID,
+    method: mcp ? 'POST' : (kind === 'api:extract' ? 'POST' : 'GET'),
+    path: mcp ? '/mcp' : `/api/tavily/${kind.endsWith('extract') ? 'extract' : 'search'}`,
+    query: kind === 'api:search' ? 'query=demo+mode&topic=general' : null,
+    http_status: success ? 200 : quota ? 432 : 502,
+    mcp_status: mcp ? (success ? 0 : -32603) : null,
+    business_credits: success && option.billing_group === 'billable' ? 1 : 0,
+    request_kind_key: option.key,
+    request_kind_label: option.label,
+    request_kind_detail: option.billing_group === 'billable' ? 'Billable request' : 'Control-plane request',
+    result_status: success ? 'success' : quota ? 'quota_exhausted' : 'error',
+    created_at: nowSeconds(-index * 900),
+    error_message: success ? null : quota ? 'Demo upstream monthly quota exhausted' : 'Demo upstream timeout',
+    failure_kind: success ? null : quota ? 'upstream_usage_limit_432' : 'upstream_error',
+    key_effect_code: success ? 'none' : quota ? 'marked_exhausted' : 'transient_backoff_set',
+    key_effect_summary: success ? null : quota ? 'Marked quota exhausted' : 'Applied transient upstream backoff',
+    binding_effect_code: rebalance ? (quota ? 'api_rebalance_route_rebound' : 'api_rebalance_route_reused') : (index % 6 === 0 ? 'http_project_affinity_reused' : 'none'),
+    binding_effect_summary: rebalance ? (quota ? 'API rebalance rebound this route to a backup key' : 'API rebalance reused the current route binding') : (index % 6 === 0 ? 'Sticky user binding preserved' : null),
+    selection_effect_code: rebalance ? (quota ? 'api_rebalance_rate_limit_avoided' : 'api_rebalance_pressure_avoided') : (success ? 'none' : 'http_project_affinity_pressure_avoided'),
+    selection_effect_summary: rebalance ? (quota ? 'API rebalance avoided a rate-limited key' : 'API rebalance skipped a hotter key') : (success ? null : 'Fallback path used'),
+    gateway_mode: rebalance ? 'rebalance_http' : mcp ? 'mcp' : 'http',
+    experiment_variant: rebalance ? 'rebalance' : index % 2 === 0 ? 'primary' : 'secondary',
+    proxy_session_id: rebalance ? `rebalance-demo-${index % 4}` : `demo-proxy-${index % 4}`,
+    routing_subject_hash: `demo-${index % 9}`,
+    upstream_operation: option.label,
+    fallback_reason: success ? null : rebalance ? 'api-rebalance' : 'demo-backoff',
+    request_body: JSON.stringify({ query: 'demo mode', max_results: 5 }, null, 2),
+    response_body: success
+      ? JSON.stringify({ answer: 'Mocked Tavily result for demo mode', results: [{ title: 'Demo result', url: 'https://example.test/demo' }] }, null, 2)
+      : JSON.stringify({ error: quota ? 'quota_exhausted' : 'upstream_timeout' }, null, 2),
+    forwarded_headers: ['authorization', 'content-type'],
+    dropped_headers: ['cookie', 'x-real-ip'],
+    remote_addr: `203.0.113.${10 + (index % 40)}`,
+    client_ip: `198.51.100.${20 + (index % 20)}`,
+    client_ip_source: index % 3 === 0 ? 'cf-connecting-ip' : 'x-forwarded-for',
+    client_ip_trusted: true,
+    ip_headers: [{ name: 'cf-connecting-ip', value: `198.51.100.${20 + (index % 20)}`, trusted: true }],
+    operationalClass: success ? 'success' : quota ? 'quota_exhausted' : 'upstream_error',
+    requestKindProtocolGroup: option.protocol_group,
+    requestKindBillingGroup: option.billing_group,
+  }
+}
+
+function createDemoState() {
+  const browserOrigin = typeof window === 'undefined' ? 'http://127.0.0.1:58087' : window.location.origin
+  const logs = range(64).map(createDemoLog)
+  const tokens = [
+    {
+      id: DEMO_TOKEN_ID,
+      enabled: true,
+      note: 'Demo operator token',
+      group: 'demo',
+      owner: { userId: 'user-demo-admin', displayName: 'Hikari Demo Admin', username: 'hikari-demo' },
+      total_requests: 1842,
+      created_at: nowSeconds(-86400 * 22),
+      last_used_at: nowSeconds(-120),
+      quota_state: 'normal',
+      quota_hourly_used: 42,
+      quota_hourly_limit: 180,
+      quota_daily_used: 388,
+      quota_daily_limit: 1600,
+      quota_monthly_used: 8400,
+      quota_monthly_limit: 24000,
+      quota_hourly_reset_at: nowSeconds(2500),
+      quota_daily_reset_at: nowSeconds(3600 * 8),
+      quota_monthly_reset_at: nowSeconds(86400 * 13),
+    },
+    {
+      id: 'ops2',
+      enabled: true,
+      note: 'Ops automation',
+      group: 'internal',
+      owner: { userId: 'user-ops', displayName: 'Ops Runner', username: 'ops-runner' },
+      total_requests: 954,
+      created_at: nowSeconds(-86400 * 44),
+      last_used_at: nowSeconds(-920),
+      quota_state: 'day',
+      quota_hourly_used: 12,
+      quota_hourly_limit: 80,
+      quota_daily_used: 760,
+      quota_daily_limit: 800,
+      quota_monthly_used: 7800,
+      quota_monthly_limit: 12000,
+      quota_hourly_reset_at: nowSeconds(2200),
+      quota_daily_reset_at: nowSeconds(3600 * 8),
+      quota_monthly_reset_at: nowSeconds(86400 * 13),
+    },
+  ]
+  const keys = [
+    createDemoKey(DEMO_KEY_ID, 'active', 'primary', 49000, 38640, 1230, 1122, 88, null),
+    createDemoKey(DEMO_BACKUP_KEY_ID, 'active', 'backup', 25000, 16120, 612, 574, 27, null),
+    createDemoKey(DEMO_EU_KEY_ID, 'temporarily_isolated', 'eu', 12000, 8500, 226, 206, 16, {
+      reasonCode: 'temporary_backoff',
+      cooldownUntil: nowSeconds(780),
+      retryAfterSecs: 780,
+      scopes: ['api', 'mcp'],
+    }),
+    createDemoKey(DEMO_QUOTA_KEY_ID, 'exhausted', 'primary', 10000, 0, 901, 816, 85, null),
+    createDemoKey(DEMO_QUARANTINE_KEY_ID, 'quarantined', 'legacy', 8000, 3100, 144, 105, 39, null, {
+      source: 'upstream',
+      reasonCode: 'upstream_key_blocked',
+      reasonSummary: 'Blocked by upstream during demo validation',
+      reasonDetail: 'This is mock data used by the standalone web demo.',
+      createdAt: nowSeconds(-3600 * 9),
+    }),
+  ]
+  return {
+    profile: {
+      displayName: 'Hikari Demo Admin',
+      isAdmin: true,
+      forwardAuthEnabled: false,
+      builtinAuthEnabled: true,
+      passkeyAuthEnabled: true,
+      adminLoginTotpRequired: true,
+      allowRegistration: false,
+      userLoggedIn: true,
+      userProvider: 'linuxdo',
+      userDisplayName: 'Hikari Demo Admin',
+      userAvatarUrl: null,
+    },
+    haStatus: createDemoHaStatus(nowSeconds),
+    version: { backend: '0.81.1', frontend: '0.1.0-demo' },
+    tokens,
+    tokenSecrets: new Map(tokens.map((token) => [token.id, token.id === DEMO_TOKEN_ID ? DEMO_TOKEN : `th-${token.id}-demoaccesssecret`])),
+    keys,
+    logs,
+    announcements: createDemoAnnouncements(nowSeconds),
+    users: createDemoUsers(),
+    jobs: createDemoJobs(),
+    forwardProxy: createDemoForwardProxy(),
+    systemSettings: createDemoSystemSettings(),
+    rechargeOrders: createDemoRechargeOrders(nowSeconds, browserOrigin),
+    userTags: [createDemoUserTag('tag-demo', {
+      name: 'demo',
+      displayName: 'Demo',
+      icon: 'sparkles',
+      effectKind: 'quota_delta',
+      hourlyAnyDelta: 20,
+      hourlyDelta: 20,
+      dailyDelta: 200,
+      monthlyDelta: 2000,
+    }, 3)],
+    registration: { allowRegistration: false },
+  }
+}
+
+function demoRechargeSummary() {
+  return {
+    currentMonthStart: monthStartSeconds(),
+    currentEntitlementCredits: DEMO_TEST_RECHARGE_CREDITS,
+    effectiveUntilMonthStart: monthStartSeconds(1),
+  }
+}
+
+function demoRechargeConfig() {
+  return {
+    visible: true,
+    enabled: true,
+    unitCredits: DEMO_RECHARGE_UNIT_CREDITS,
+    unitPriceLdc: DEMO_RECHARGE_UNIT_PRICE_LDC,
+    minCredits: DEMO_RECHARGE_UNIT_CREDITS,
+    maxCredits: 20_000,
+    creditsStep: DEMO_RECHARGE_UNIT_CREDITS,
+    defaultCredits: DEMO_TEST_RECHARGE_CREDITS,
+    minMonths: 1,
+    maxMonths: 12,
+    quotaDeltaBaseCredits: DEMO_RECHARGE_UNIT_CREDITS,
+    hourlyDeltaPerQuotaUnit: 20,
+    dailyDeltaPerQuotaUnit: 100,
+    monthlyDeltaPerQuotaUnit: 1000,
+    testPriceEnabled: true,
+    ...demoRechargeSummary(),
+  }
+}
+
+function demoUserBillingSummary() {
+  const currentMonthStart = monthStartSeconds(0)
+  const effectiveUntilMonthStart = monthStartSeconds(2)
+
+  return {
+    currentMonthStart,
+    effectiveUntilMonthStart,
+    blockAll: false,
+    currentTotal: {
+      hourly: 110,
+      daily: 625,
+      monthly: 6250,
+    },
+    composition: {
+      baseAccess: {
+        hourly: 20,
+        daily: 120,
+        monthly: 1200,
+      },
+      tagAdjustments: {
+        hourly: 0,
+        daily: 0,
+        monthly: 0,
+      },
+      permanentEntitlements: {
+        hourly: 5,
+        daily: 25,
+        monthly: 250,
+      },
+      monthlyAdjustments: {
+        hourly: 25,
+        daily: 180,
+        monthly: 1800,
+      },
+      recharge: {
+        credits: 3000,
+        quota: {
+          hourly: 60,
+          daily: 300,
+          monthly: 3000,
+        },
+      },
+    },
+    timeline: [
+      {
+        monthStart: monthStartSeconds(-1),
+        isCurrentMonth: false,
+        persistentTotal: {
+          hourly: 25,
+          daily: 145,
+          monthly: 1450,
+        },
+        monthlyAdjustments: {
+          hourly: 0,
+          daily: 0,
+          monthly: 0,
+        },
+        recharge: {
+          credits: 0,
+          quota: {
+            hourly: 0,
+            daily: 0,
+            monthly: 0,
+          },
+        },
+        effectiveTotal: {
+          hourly: 25,
+          daily: 145,
+          monthly: 1450,
+        },
+      },
+      {
+        monthStart: currentMonthStart,
+        isCurrentMonth: true,
+        persistentTotal: {
+          hourly: 25,
+          daily: 145,
+          monthly: 1450,
+        },
+        monthlyAdjustments: {
+          hourly: 25,
+          daily: 180,
+          monthly: 1800,
+        },
+        recharge: {
+          credits: 3000,
+          quota: {
+            hourly: 60,
+            daily: 300,
+            monthly: 3000,
+          },
+        },
+        effectiveTotal: {
+          hourly: 110,
+          daily: 625,
+          monthly: 6250,
+        },
+      },
+      {
+        monthStart: monthStartSeconds(1),
+        isCurrentMonth: false,
+        persistentTotal: {
+          hourly: 25,
+          daily: 145,
+          monthly: 1450,
+        },
+        monthlyAdjustments: {
+          hourly: 0,
+          daily: 0,
+          monthly: 0,
+        },
+        recharge: {
+          credits: 3000,
+          quota: {
+            hourly: 60,
+            daily: 300,
+            monthly: 3000,
+          },
+        },
+        effectiveTotal: {
+          hourly: 85,
+          daily: 445,
+          monthly: 4450,
+        },
+      },
+      {
+        monthStart: monthStartSeconds(2),
+        isCurrentMonth: false,
+        persistentTotal: {
+          hourly: 25,
+          daily: 145,
+          monthly: 1450,
+        },
+        monthlyAdjustments: {
+          hourly: 0,
+          daily: 0,
+          monthly: 0,
+        },
+        recharge: {
+          credits: 3000,
+          quota: {
+            hourly: 60,
+            daily: 300,
+            monthly: 3000,
+          },
+        },
+        effectiveTotal: {
+          hourly: 85,
+          daily: 445,
+          monthly: 4450,
+        },
+      },
+      {
+        monthStart: monthStartSeconds(3),
+        isCurrentMonth: false,
+        persistentTotal: {
+          hourly: 25,
+          daily: 145,
+          monthly: 1450,
+        },
+        monthlyAdjustments: {
+          hourly: 0,
+          daily: 0,
+          monthly: 0,
+        },
+        recharge: {
+          credits: 0,
+          quota: {
+            hourly: 0,
+            daily: 0,
+            monthly: 0,
+          },
+        },
+        effectiveTotal: {
+          hourly: 25,
+          daily: 145,
+          monthly: 1450,
+        },
+      },
+    ],
+  }
+}
+
+function demoUserDashboardSummary(now = Date.now()) {
+  const tokenSummaries = demoUserTokenSummaries(now)
+  const pulse = demoPulse(now)
+  const requestRateUsed = 42 + (pulse % 4)
+  const requestRateLimit = 180
+  const quotaHourlyUsed = tokenSummaries.reduce((total, token) => total + token.quotaHourlyUsed, 0)
+  const quotaHourlyLimit = tokenSummaries.reduce((total, token) => total + token.quotaHourlyLimit, 0)
+  const quotaDailyUsed = tokenSummaries.reduce((total, token) => total + token.quotaDailyUsed, 0)
+  const quotaDailyLimit = tokenSummaries.reduce((total, token) => total + token.quotaDailyLimit, 0)
+  const quotaMonthlyUsed = tokenSummaries.reduce((total, token) => total + token.quotaMonthlyUsed, 0)
+  const quotaMonthlyLimit = tokenSummaries.reduce((total, token) => total + token.quotaMonthlyLimit, 0)
+  const dailySuccess = tokenSummaries.reduce((total, token) => total + token.dailySuccess, 0)
+  const dailyFailure = tokenSummaries.reduce((total, token) => total + token.dailyFailure, 0)
+  const monthlySuccess = tokenSummaries.reduce((total, token) => total + token.monthlySuccess, 0)
+  const lastActivity = tokenSummaries.reduce<number | null>(
+    (latest, token) => latest == null || (token.lastUsedAt ?? 0) > latest ? token.lastUsedAt ?? latest : latest,
+    null,
+  )
+
+  return {
+    debugInfoShared: false,
+    requestRate: {
+      used: requestRateUsed,
+      limit: requestRateLimit,
+      windowMinutes: 5,
+      scope: 'user',
+    },
+    hourlyAnyUsed: requestRateUsed,
+    hourlyAnyLimit: requestRateLimit,
+    quotaHourlyUsed,
+    quotaHourlyLimit,
+    quotaDailyUsed,
+    quotaDailyLimit,
+    quotaMonthlyUsed,
+    quotaMonthlyLimit,
+    dailySuccess,
+    dailyFailure,
+    monthlySuccess,
+    lastActivity,
+    recharge: demoRechargeSummary(),
+  }
+}
+
+function createOverviewPoints(
+  values: Array<number | null>,
+  limit: number,
+  bucketSeconds: number,
+  offset = 0,
+) {
+  const start = monthStartSeconds() + offset
+  return values.map((value, index) => ({
+    bucketStart: start + index * bucketSeconds,
+    displayBucketStart: null,
+    value,
+    limitValue: limit,
+  }))
+}
+
+function demoUserDashboardOverview(now = Date.now()) {
+  const summary = demoUserDashboardSummary(now)
+  return {
+    summary,
+    progress: {
+      requestRate: {
+        used: summary.requestRate.used,
+        limit: summary.requestRate.limit,
+        points: createOverviewPoints(
+          [8, 10, 9, 15, 14, 16, 21, 23, 29, 35, 42, summary.requestRate.used],
+          summary.requestRate.limit,
+          300,
+        ),
+      },
+      quotaHourly: {
+        used: summary.quotaHourlyUsed,
+        limit: summary.quotaHourlyLimit,
+        points: createOverviewPoints(
+          [7, 12, 18, 24, 31, 40, 52, 63, 72, summary.quotaHourlyUsed, null, null],
+          summary.quotaHourlyLimit,
+          300,
+        ),
+      },
+      quotaDaily: {
+        used: summary.quotaDailyUsed,
+        limit: summary.quotaDailyLimit,
+        points: createOverviewPoints(
+          [
+            11,
+            19,
+            28,
+            36,
+            49,
+            63,
+            78,
+            92,
+            108,
+            126,
+            145,
+            169,
+            194,
+            228,
+            264,
+            302,
+            summary.quotaDailyUsed,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+          ],
+          summary.quotaDailyLimit,
+          3600,
+        ),
+      },
+      quotaMonthly: {
+        used: summary.quotaMonthlyUsed,
+        limit: summary.quotaMonthlyLimit,
+        points: createOverviewPoints(
+          [
+            130,
+            248,
+            364,
+            508,
+            672,
+            821,
+            983,
+            1_156,
+            1_344,
+            1_525,
+            1_711,
+            1_904,
+            2_118,
+            2_347,
+            2_589,
+            2_846,
+            3_124,
+            3_411,
+            3_762,
+            summary.quotaMonthlyUsed,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+          ],
+          summary.quotaMonthlyLimit,
+          86400,
+        ),
+      },
+    },
+  }
+}
+
+function demoUserTokenSummaryFromToken(
+  token: (typeof demoState.tokens)[number],
+  now = Date.now(),
+) {
+  const pulse = demoPulse(now)
+  const hourlyUsed = token.quota_hourly_used + (token.id === DEMO_TOKEN_ID ? pulse % 3 : 0)
+  const dailyUsed = token.quota_daily_used + (token.id === DEMO_TOKEN_ID ? (pulse % 4) * 2 : 0)
+  const monthlyUsed = token.quota_monthly_used + (token.id === DEMO_TOKEN_ID ? (pulse % 5) * 12 : 0)
+  const dailyFailure = token.id === DEMO_TOKEN_ID ? 18 + (pulse % 3) : 0
+
+  return {
+    tokenId: token.id,
+    enabled: token.enabled,
+    note: token.note,
+    lastUsedAt: token.last_used_at,
+    requestRate: { used: 0, limit: 60, windowMinutes: 5, scope: 'token' },
+    hourlyAnyUsed: 0,
+    hourlyAnyLimit: 60,
+    quotaHourlyUsed: hourlyUsed,
+    quotaHourlyLimit: token.quota_hourly_limit,
+    quotaDailyUsed: dailyUsed,
+    quotaDailyLimit: token.quota_daily_limit,
+    quotaMonthlyUsed: monthlyUsed,
+    quotaMonthlyLimit: token.quota_monthly_limit,
+    dailySuccess: dailyUsed,
+    dailyFailure,
+    monthlySuccess: monthlyUsed,
+  }
+}
+
+function demoUserTokenSummaries(now = Date.now()) {
+  return demoState.tokens.map((token) => demoUserTokenSummaryFromToken(token, now))
+}
+
+function createDemoAuthToken(id: string, note: string | null, createdAt = nowSeconds()) {
+  return {
+    id,
+    enabled: true,
+    note: note ?? 'Story token',
+    group: 'demo',
+    owner: DEMO_TOKEN_OWNER,
+    total_requests: 0,
+    created_at: createdAt,
+    last_used_at: createdAt,
+    quota_state: 'normal',
+    quota_hourly_used: 0,
+    quota_hourly_limit: 180,
+    quota_daily_used: 0,
+    quota_daily_limit: 1600,
+    quota_monthly_used: 0,
+    quota_monthly_limit: 24000,
+    quota_hourly_reset_at: nowSeconds(2500),
+    quota_daily_reset_at: nowSeconds(3600 * 8),
+    quota_monthly_reset_at: nowSeconds(86400 * 13),
+  }
+}
+
+async function createDemoToken(init?: RequestInit): Promise<Response> {
+  const body = await readJsonBody(init)
+  const note = typeof body.note === 'string' && body.note.trim().length > 0 ? body.note.trim() : null
+  const id = `dm${String(demoState.tokens.length + 1).padStart(2, '0')}`
+  const secret = `th-${id}-demoaccesssecret`
+  demoState.tokens.unshift(createDemoAuthToken(id, note))
+  demoState.tokenSecrets.set(id, secret)
+  return jsonResponse({ token: secret })
+}
+
+function createDemoUserTag(
+  id: string,
+  payload: {
+    name: string
+    displayName: string
+    icon: string | null
+    effectKind: string
+    hourlyAnyDelta: number
+    hourlyDelta: number
+    dailyDelta: number
+    monthlyDelta: number
+  },
+  userCount = 0,
+) {
+  return {
+    id,
+    name: payload.name,
+    displayName: payload.displayName,
+    icon: payload.icon,
+    systemKey: payload.name === 'demo' ? 'demo' : null,
+    effectKind: payload.effectKind,
+    hourlyAnyDelta: payload.hourlyAnyDelta,
+    hourlyDelta: payload.hourlyDelta,
+    dailyDelta: payload.dailyDelta,
+    monthlyDelta: payload.monthlyDelta,
+    userCount,
+  }
+}
+
+function createDemoKey(
+  id: string,
+  status: string,
+  group: string,
+  quotaLimit: number,
+  quotaRemaining: number,
+  total: number,
+  success: number,
+  error: number,
+  transient_backoff: JsonValue,
+  quarantine: JsonValue = null,
+) {
+  return {
+    id,
+    status,
+    group,
+    registration_ip: id.includes('sfo') ? '203.0.113.45' : '198.51.100.24',
+    registration_region: id.includes('fra') ? 'DE' : id.includes('sfo') ? 'US' : 'HK',
+    status_changed_at: nowSeconds(-3600 * 6),
+    last_used_at: status === 'exhausted' ? nowSeconds(-86400) : nowSeconds(-180),
+    deleted_at: null,
+    quota_limit: quotaLimit,
+    quota_remaining: quotaRemaining,
+    quota_synced_at: nowSeconds(-900),
+    total_requests: total,
+    success_count: success,
+    error_count: error,
+    quota_exhausted_count: status === 'exhausted' ? 22 : 0,
+    quarantine,
+    transient_backoff,
+  }
+}
+
+function createDemoUsers() {
+  return [
+    createDemoUser('user-demo-admin', 'Hikari Demo Admin', 'hikari-demo', 2, 3, 42, 180, 388, 1600, 8400, 24000),
+    createDemoUser('user-research', 'Research Team', 'research-team', 1, 1, 28, 100, 312, 900, 4200, 10000),
+    createDemoUser('user-ops', 'Ops Runner', 'ops-runner', 1, 1, 12, 80, 760, 800, 7800, 12000),
+    createDemoUser('user-charlie', 'Charlie Li', 'charlie', 0, 0, 0, 80, 0, 800, 0, 12000, {
+      active: false,
+      tags: [],
+      recentIpCount24h: 0,
+      recentIpCount7d: 0,
+      lastActivity: null,
+      dailySuccess: 0,
+      dailyFailure: 0,
+      monthlySuccess: 0,
+      monthlyFailure: 0,
+    }),
+  ]
+}
+
+function createDemoUser(
+  userId: string,
+  displayName: string,
+  username: string,
+  tokenCount: number,
+  apiKeyCount: number,
+  hourlyUsed: number,
+  hourlyLimit: number,
+  dailyUsed: number,
+  dailyLimit: number,
+  monthlyUsed: number,
+  monthlyLimit: number,
+  overrides: Partial<{
+    active: boolean
+    tags: Array<{
+      tagId: string
+      name: string
+      displayName: string
+      icon: string | null
+      systemKey: string | null
+      effectKind: string
+      hourlyAnyDelta: number
+      hourlyDelta: number
+      dailyDelta: number
+      monthlyDelta: number
+      source: string
+    }>
+    recentIpCount24h: number
+    recentIpCount7d: number
+    lastActivity: number | null
+    dailySuccess: number
+    dailyFailure: number
+    monthlySuccess: number
+    monthlyFailure: number
+    businessCalls1h: {
+      successCount: number
+      failureCount: number
+      totalCount: number
+      limit: number
+      windowMinutes: number
+    }
+    lastLoginAt: number
+  }> = {},
+) {
+  const dailySuccess = overrides.dailySuccess ?? Math.max(1, dailyUsed - 18)
+  const dailyFailure = overrides.dailyFailure ?? 18
+  const monthlySuccess = overrides.monthlySuccess ?? Math.max(1, monthlyUsed - 140)
+  const monthlyFailure = overrides.monthlyFailure ?? 140
+  return {
+    userId,
+    displayName,
+    username,
+    active: overrides.active ?? true,
+    lastLoginAt: overrides.lastLoginAt ?? nowSeconds(-1800),
+    tokenCount,
+    apiKeyCount,
+    tags: overrides.tags ?? [{
+      tagId: 'tag-demo',
+      name: 'demo',
+      displayName: 'Demo',
+      icon: 'sparkles',
+      systemKey: 'demo',
+      effectKind: 'quota_delta',
+      hourlyAnyDelta: 20,
+      hourlyDelta: 20,
+      dailyDelta: 200,
+      monthlyDelta: 2000,
+      source: 'system',
+    }],
+    requestRate: { used: hourlyUsed, limit: hourlyLimit, windowMinutes: 60, scope: 'user' },
+    hourlyAnyUsed: hourlyUsed,
+    hourlyAnyLimit: hourlyLimit,
+    quotaHourlyUsed: hourlyUsed,
+    quotaHourlyLimit: hourlyLimit,
+    quotaDailyUsed: dailyUsed,
+    quotaDailyLimit: dailyLimit,
+    quotaMonthlyUsed: monthlyUsed,
+    quotaMonthlyLimit: monthlyLimit,
+    dailySuccess,
+    dailyFailure,
+    monthlySuccess,
+    monthlyFailure,
+    businessCalls1h: overrides.businessCalls1h ?? {
+      successCount: Math.max(0, Math.min(hourlyUsed, dailySuccess)),
+      failureCount: Math.max(0, Math.min(2, dailyFailure)),
+      totalCount: Math.max(0, Math.min(hourlyUsed, dailySuccess) + Math.max(0, Math.min(2, dailyFailure))),
+      limit: hourlyLimit,
+      windowMinutes: 60,
+    },
+    monthlyBrokenCount: userId === 'user-ops' ? 3 : 1,
+    monthlyBrokenLimit: 5,
+    recentIpCount24h: overrides.recentIpCount24h ?? 3,
+    recentIpCount7d: overrides.recentIpCount7d ?? 7,
+    lastActivity: overrides.lastActivity === undefined ? nowSeconds(-240) : overrides.lastActivity,
+  }
+}
+
+function createDemoAdminUserListStats() {
+  const activeUsers90d = demoState.users.filter((user) => user.lastActivity != null).length
+  return {
+    activeUsers90d,
+    totalUsers: demoState.users.length,
+    windowDays: 90,
+  }
+}
+
+function demoShadowDailyCreditsUsed(user: {
+  userId: string
+  quotaDailyUsed: number
+  lastActivity: number | null
+}) {
+  if (user.lastActivity == null) {
+    return {
+      shadowDailyCreditsUsed: 0,
+      shadowDailyAvailability: 'confirmed' as const,
+    }
+  }
+
+  const delta =
+    user.userId === 'user-research'
+      ? -6
+      : user.userId === 'user-ops'
+        ? 4
+        : 8
+
+  const shadowUsed = Math.max(0, user.quotaDailyUsed + delta)
+  return {
+    shadowDailyCreditsUsed: shadowUsed,
+    shadowDailyAvailability: user.userId === 'user-ops' ? 'projected' as const : 'confirmed' as const,
+  }
+}
+
+function filterDemoUsers(url: URL) {
+  const query = (url.searchParams.get('q') ?? '').trim().toLowerCase()
+  const explicitScope = url.searchParams.get('activityScope')
+  const defaultActiveOnly = demoState.systemSettings.adminDefaultActiveUsersOnly && query.length === 0
+  const activityScope = explicitScope ?? (defaultActiveOnly ? 'active90d' : 'all')
+  const tagId = url.searchParams.get('tagId')
+
+  let items = demoState.users.slice()
+  if (activityScope === 'active90d') {
+    items = items.filter((user) => user.lastActivity != null)
+  }
+  if (tagId) {
+    items = items.filter((user) => user.tags.some((tag) => tag.tagId === tagId))
+  }
+  if (query.length > 0) {
+    items = items.filter((user) => {
+      const haystacks = [
+        user.userId,
+        user.displayName,
+        user.username,
+        ...user.tags.flatMap((tag) => [tag.name, tag.displayName]),
+      ]
+      return haystacks.some((value) => value.toLowerCase().includes(query))
+    })
+  }
+  return items.map((user) => {
+    const shadowDaily = demoState.systemSettings.upstreamPreciseReconciliationEnabled
+      ? { shadowDailyCreditsUsed: null, shadowDailyAvailability: null }
+      : demoShadowDailyCreditsUsed(user)
+    return {
+      ...user,
+      shadowDailyCreditsUsed: shadowDaily.shadowDailyCreditsUsed,
+      shadowDailyAvailability: shadowDaily.shadowDailyAvailability,
+    }
+  })
+}
+
+function createDemoJobs() {
+  return range(12).map((index) => ({
+    id: 3000 + index,
+    jobType: index % 3 === 0 ? 'quota_sync' : index % 3 === 1 ? 'usage_rollup' : 'geo_lookup',
+    triggerSource: index % 4 === 0 ? 'manual' : index % 4 === 1 ? 'auto' : 'scheduler',
+    keyId: index % 2 === 0 ? DEMO_KEY_ID : DEMO_BACKUP_KEY_ID,
+    keyGroup: index % 2 === 0 ? 'primary' : 'backup',
+    status: index % 5 === 0 ? 'failed' : 'success',
+    attempt: 1 + (index % 2),
+    message: index % 5 === 0 ? 'Demo retry scheduled' : 'Demo job completed',
+    queuedAt: nowSeconds(-index * 1800 - 15),
+    startedAt: nowSeconds(-index * 1800),
+    finishedAt: nowSeconds(-index * 1800 + 12),
+  }))
+}
+
+function createDemoForwardProxy() {
+  const nodes = ['HK edge', 'Tokyo relay', 'SFO relay'].map((displayName, index) => ({
+    key: `demo-proxy-${index + 1}`,
+    source: 'demo',
+    displayName,
+    endpointUrl: `socks5://demo-${index + 1}.internal:1080`,
+    resolvedIps: [`198.51.100.${30 + index}`],
+    resolvedRegions: [index === 1 ? 'JP' : index === 2 ? 'US' : 'HK'],
+    weight: 100 - index * 12,
+    available: index !== 2,
+    disabled: index === 2,
+    disabledAt: index === 2 ? nowSeconds(-4200) : null,
+    lastError: index === 2 ? 'Demo node disabled for presentation' : null,
+    penalized: index === 2,
+    primaryAssignmentCount: 40 - index * 5,
+    secondaryAssignmentCount: 18 + index * 2,
+    stats: {
+      oneMinute: { attempts: 8, successCount: 8, failureCount: 0, successRate: 1, avgLatencyMs: 86 + index * 12 },
+      fifteenMinutes: { attempts: 124, successCount: 119, failureCount: 5, successRate: 0.96, avgLatencyMs: 96 + index * 14 },
+      oneHour: { attempts: 420, successCount: 402, failureCount: 18, successRate: 0.957, avgLatencyMs: 104 + index * 18 },
+      oneDay: { attempts: 4420, successCount: 4260, failureCount: 160, successRate: 0.964, avgLatencyMs: 110 + index * 20 },
+      sevenDays: { attempts: 26800, successCount: 26020, failureCount: 780, successRate: 0.971, avgLatencyMs: 112 + index * 21 },
+    },
+  }))
+  return {
+    proxyUrls: ['socks5://hk-demo.internal:1080', 'socks5://tokyo-demo.internal:1080'],
+    subscriptionUrls: ['https://demo.example.test/proxy/subscription'],
+    subscriptionUpdateIntervalSecs: 3600,
+    insertDirect: true,
+    egressSocks5Enabled: true,
+    egressSocks5Url: 'socks5://hk-demo.internal:1080',
+    nodes,
+  }
+}
+
+function createDemoSystemSettings() {
+  return {
+    requestRateLimit: 180,
+    authTokenLogRetentionDays: 92,
+    mcpSessionAffinityKeyCount: 4,
+    rebalanceMcpEnabled: true,
+    rebalanceMcpSessionPercent: 100,
+    apiRebalanceEnabled: true,
+    apiRebalancePercent: 100,
+    upstreamProjectIdMode: 'accessToken',
+    upstreamProjectIdFixedValue: '',
+    upstreamMcpUserAgent: '',
+    upstreamPreciseReconciliationEnabled: false,
+    adminDefaultActiveUsersOnly: true,
+    rechargeFeatureEnabled: true,
+    rechargeUserEnabled: true,
+    userBlockedKeyBaseLimit: 5,
+    globalIpLimit: 8,
+    trustedProxyCidrs: ['127.0.0.0/8', '10.0.0.0/8'],
+    trustedClientIpHeaders: ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for'],
+    requestLogRetention: {
+      maxLogRetentionDays: 32,
+      heavyUsageThresholdPercent: 80,
+      global: { businessBodyDays: 7, nonBusinessBodyDays: 0, nonSuccessBodyDays: 3 },
+      heavyUsage: { businessBodyDays: 3, nonBusinessBodyDays: 0, nonSuccessBodyDays: 1 },
+      debugShared: { businessBodyDays: 14, nonBusinessBodyDays: 1, nonSuccessBodyDays: 7 },
+    },
+  }
+}
+
+const demoState = createDemoState()
+
+function demoSummary(now = Date.now()) {
+  const pulse = demoPulse(now)
+  const total = demoState.logs.length
+  const success = demoState.logs.filter((log) => log.result_status === 'success').length
+  const quota = demoState.logs.filter((log) => log.result_status === 'quota_exhausted').length
+  const requestDrift = pulse % 6
+  const quotaDrift = pulse % 4
+  return {
+    total_requests: 24882 + requestDrift * 48,
+    success_count: 23710 + requestDrift * 42,
+    error_count: 992 + quotaDrift * 8,
+    quota_exhausted_count: quota + quotaDrift,
+    active_keys: demoState.keys.filter((key) => key.status === 'active').length,
+    exhausted_keys: demoState.keys.filter((key) => key.status === 'exhausted').length,
+    quarantined_keys: demoState.keys.filter((key) => key.status === 'quarantined').length,
+    temporary_isolated_keys: demoState.keys.filter((key) => key.status === 'temporarily_isolated').length,
+    last_activity: (demoState.logs[0]?.created_at ?? nowSeconds(-120)) + requestDrift * 45,
+    total_quota_limit: 104000,
+    total_quota_remaining: 66360 - requestDrift * 64,
+    _demo_window_total: total,
+    _demo_window_success: success,
+  }
+}
+
+function demoSummaryWindows(
+  currentHourStart = Math.floor(Date.now() / 3_600_000) * 3_600,
+  now = Date.now(),
+) {
+  const pulse = demoPulse(now)
+  const todayDrift = pulse % 5
+  const monthDrift = pulse % 12
+  const todayStart = currentHourStart - 23 * 3_600
+  const quotaCharge = {
+    local_estimated_credits: 1260 + todayDrift * 6,
+    upstream_actual_credits: 1218 + todayDrift * 5,
+    sampled_key_count: 4,
+    stale_key_count: 1,
+    latest_sync_at: nowSeconds(-900 + todayDrift * 30),
+  }
+  return {
+    today: {
+      total_requests: 760 + todayDrift * 4,
+      success_count: 714 + todayDrift * 3,
+      error_count: 36 + (todayDrift % 3),
+      quota_exhausted_count: 10 + (todayDrift % 2),
+      valuable_success_count: 482 + todayDrift * 2,
+      valuable_failure_count: 18 + (todayDrift % 3),
+      other_success_count: 232 + todayDrift,
+      other_failure_count: 18 + (todayDrift % 2),
+      unknown_count: todayDrift % 2,
+      upstream_exhausted_key_count: 1 + (todayDrift % 3 === 0 ? 1 : 0),
+      new_keys: 1 + (todayDrift % 4 === 0 ? 1 : 0),
+      new_quarantines: 1 + (todayDrift % 5 === 0 ? 1 : 0),
+      quota_charge: quotaCharge,
+    },
+    yesterday: {
+      total_requests: 690,
+      success_count: 654,
+      error_count: 28,
+      quota_exhausted_count: 8,
+      valuable_success_count: 430,
+      valuable_failure_count: 12,
+      other_success_count: 224,
+      other_failure_count: 16,
+      unknown_count: 0,
+      upstream_exhausted_key_count: 1,
+      new_keys: 0,
+      new_quarantines: 0,
+      quota_charge: quotaCharge,
+    },
+    month: {
+      total_requests: 24882 + monthDrift * 60,
+      success_count: 23710 + monthDrift * 55,
+      error_count: 992 + monthDrift * 4,
+      quota_exhausted_count: 180 + monthDrift * 2,
+      valuable_success_count: 17880 + monthDrift * 38,
+      valuable_failure_count: 420 + (monthDrift % 4),
+      other_success_count: 5830 + monthDrift * 14,
+      other_failure_count: 572 + (monthDrift % 5),
+      unknown_count: monthDrift % 3,
+      upstream_exhausted_key_count: 1 + (monthDrift % 6 === 0 ? 1 : 0),
+      new_keys: 4 + (monthDrift % 4 === 0 ? 1 : 0),
+      new_quarantines: 2 + (monthDrift % 5 === 0 ? 1 : 0),
+      quota_charge: quotaCharge,
+    },
+    today_start: todayStart,
+    today_end: currentHourStart + 1,
+    today_period_end: todayStart + 24 * 3_600,
+    yesterday_start: todayStart - 24 * 3_600,
+    yesterday_end: currentHourStart + 1 - 24 * 3_600,
+    month_start: todayStart - 14 * 24 * 3_600,
+    month_end: currentHourStart + 1,
+    month_period_end: todayStart - 14 * 24 * 3_600 + 31 * 24 * 3_600,
+    previous_month_start: todayStart - 45 * 24 * 3_600,
+    previous_month_end: todayStart - 14 * 24 * 3_600,
+  }
+}
+
+function demoDashboardOverview(now = Date.now()) {
+  const pulse = demoPulse(now)
+  const nowSeconds = Math.floor(now / 1000)
+  const currentHourStart = Math.floor(Date.now() / 3_600_000) * 3_600
+  const currentRealtimeBucketStart = Math.floor(Date.now() / 300_000) * 300
+  const summaryWindows = demoSummaryWindows(currentHourStart, now)
+  const currentMonthDays = Math.max(0, Math.round((summaryWindows.month_period_end - summaryWindows.month_start) / 86_400))
+  const previousMonthDays = Math.max(0, Math.round((summaryWindows.previous_month_end - summaryWindows.previous_month_start) / 86_400))
+  const currentElapsedDays = Math.max(0, Math.ceil((summaryWindows.month_end - summaryWindows.month_start) / 86_400))
+  const monthSeriesCurrent = range(currentMonthDays).map((index) => {
+    const visible = index < currentElapsedDays
+    const total = visible ? 1_760 + index * 205 + ((index + pulse) % 3) * 55 : null
+    return {
+      bucketStart: summaryWindows.month_start + index * 86_400,
+      displayBucketStart: summaryWindows.month_start + index * 86_400,
+      total,
+      valuableSuccess: total == null ? null : Math.round(total * 0.67),
+      valuableFailure: total == null ? null : Math.round(total * 0.12),
+      otherSuccess: total == null ? null : Math.round(total * 0.14),
+      otherFailure: total == null ? null : Math.round(total * 0.04),
+      unknown: total == null ? null : Math.round(total * 0.03),
+      upstreamExhausted: total == null ? null : Math.floor(index / 4),
+      newKeys: total == null ? null : Math.floor(index / 3),
+      newQuarantines: total == null ? null : Math.floor(index / 7),
+    }
+  })
+  const monthSeriesComparison = range(previousMonthDays).map((index) => {
+    const total = 1_540 + index * 188 + ((index + pulse + 1) % 4) * 42
+    return {
+      bucketStart: summaryWindows.previous_month_start + index * 86_400,
+      displayBucketStart: monthSeriesCurrent[index]?.displayBucketStart ?? null,
+      total,
+      valuableSuccess: Math.round(total * 0.66),
+      valuableFailure: Math.round(total * 0.11),
+      otherSuccess: Math.round(total * 0.15),
+      otherFailure: Math.round(total * 0.05),
+      unknown: Math.round(total * 0.03),
+      upstreamExhausted: Math.floor((index + 1) / 5),
+      newKeys: Math.floor(index / 4),
+      newQuarantines: Math.floor(index / 8),
+    }
+  })
+  return {
+    summary: demoSummary(now),
+    summaryWindows,
+    hourlyRequestWindow: {
+      bucketSeconds: 300,
+      visibleBuckets: 73,
+      retainedBuckets: 589,
+      unverifiedBucketStarts: [],
+      buckets: range(589).map((index) => ({
+        bucketStart: currentRealtimeBucketStart - (588 - index) * 300,
+        secondarySuccess: 2 + (index % 5) + (index >= 576 ? pulse % 4 : 0),
+        primarySuccess: 6 + (index % 18) + (index >= 576 ? (pulse % 5) * 2 : 0),
+        secondaryFailure: (index % 5 === 0 ? 1 : 0) + (index >= 580 ? pulse % 2 : 0),
+        primaryFailure429: index % 41 === 0 ? 2 + (index >= 582 ? pulse % 2 : 0) : 0,
+        primaryFailureOther: (index % 17 === 0 ? 2 : index % 7 === 0 ? 1 : 0) + (index >= 576 ? pulse % 3 : 0),
+        unknown: index === 588 && pulse % 4 === 0 ? 1 : 0,
+        mcpNonBillable: 1 + (index % 3) + (index >= 578 ? pulse % 2 : 0),
+        mcpBillable: 3 + (index % 6) + (index >= 580 ? pulse % 3 : 0),
+        apiNonBillable: 1 + (index % 2) + (index >= 576 ? pulse % 2 : 0),
+        apiBillable: 4 + (index % 10) + (index >= 582 ? pulse % 4 : 0),
+        localEstimatedCredits: 5 + (index % 9) + (index >= 576 ? pulse % 4 : 0),
+        upstreamActualCredits:
+          index % 4 === 0 ? null : 3 + (index % 7) + (index >= 580 ? pulse % 3 : 0),
+      })),
+    },
+    rollupIntegrity: {
+      state: 'healthy',
+      lastVerifiedAt: nowSeconds,
+      nextAttemptAt: nowSeconds + 15,
+      unverifiedBucketCount: 0,
+    },
+    monthSeries: {
+      current: monthSeriesCurrent,
+      comparison: monthSeriesComparison,
+    },
+    siteStatus: {
+      remainingQuota: 66360 - (pulse % 7) * 24,
+      totalQuotaLimit: 104000,
+      activeKeys: 2,
+      quarantinedKeys: 1,
+      temporaryIsolatedKeys: 1,
+      exhaustedKeys: 1,
+      availableProxyNodes: 2,
+      totalProxyNodes: 3,
+    },
+    forwardProxy: { availableNodes: 2, totalNodes: 3 },
+    trend: {
+      request: range(24).map((index) => 28 + index * 2 + (index >= 20 ? pulse % 4 : 0)),
+      error: range(24).map((index) => (index % 5) + (index >= 20 ? pulse % 2 : 0)),
+    },
+    exhaustedKeys: demoState.keys.filter((key) => key.status !== 'active'),
+    recentLogs: demoState.logs.slice(0, 8),
+    recentJobs: demoState.jobs.slice(0, 6).map(serverJobToView),
+    recentAlerts: demoRecentAlerts(),
+  }
+}
+
+function demoRecentAlerts() {
+  const keyQuotaEventA = {
+    id: 'evt-demo-quota-a',
+    type: 'upstream_usage_limit_432',
+    title: 'Demo quota threshold reached',
+    summary: 'A mock upstream key reached its monthly limit.',
+    occurredAt: nowSeconds(-1200),
+    subjectKind: 'key',
+    subjectId: DEMO_QUOTA_KEY_ID,
+    subjectLabel: DEMO_QUOTA_KEY_ID,
+    user: null,
+    token: { id: DEMO_TOKEN_ID, label: 'Demo operator token' },
+    key: { id: DEMO_QUOTA_KEY_ID, label: DEMO_QUOTA_KEY_ID },
+    request: { id: 9000, method: 'POST', path: '/mcp', query: null },
+    requestKind: { key: 'mcp:search', label: 'MCP | search', detail: 'Billable request' },
+    failureKind: 'upstream_usage_limit_432',
+    resultStatus: 'quota_exhausted',
+    errorMessage: 'Demo upstream monthly quota exhausted',
+    reasonCode: 'upstream_usage_limit_432',
+    reasonSummary: 'Monthly quota exhausted',
+    reasonDetail: 'Mock alert generated by demo mode.',
+    source: { kind: 'request_log', id: '9000' },
+  }
+  const keyQuotaEventB = {
+    ...keyQuotaEventA,
+    id: 'evt-demo-quota-b',
+    occurredAt: nowSeconds(-3600),
+    request: { id: 9001, method: 'GET', path: '/api/tavily/search', query: 'query=quota+watch' },
+    requestKind: { key: 'api:search', label: 'API | search', detail: 'Billable request' },
+    source: { kind: 'request_log', id: '9001' },
+  }
+  const keyQuotaEventC = {
+    ...keyQuotaEventA,
+    id: 'evt-demo-quota-c',
+    occurredAt: nowSeconds(-7200),
+    request: { id: 9002, method: 'POST', path: '/api/tavily/extract', query: null },
+    requestKind: { key: 'api:extract', label: 'API | extract', detail: 'Billable request' },
+    source: { kind: 'request_log', id: '9002' },
+  }
+  const keyQuotaEventD = {
+    ...keyQuotaEventA,
+    id: 'evt-demo-quota-d',
+    occurredAt: nowSeconds(-3600 * 5),
+    request: { id: 9003, method: 'POST', path: '/mcp', query: null },
+    requestKind: { key: 'mcp:search', label: 'MCP | search', detail: 'Billable request' },
+    source: { kind: 'request_log', id: '9003' },
+  }
+
+  const userRateEventLatest = {
+    id: 'evt-demo-rate-4',
+    type: 'user_request_rate_limited',
+    title: '月月 hit the local request-rate limit',
+    summary: 'Token tok_rate_01 在 MCP | resources/list 阶段命中了本地滚动 5 分钟 request-rate 窗口。',
+    occurredAt: nowSeconds(-5400),
+    subjectKind: 'user',
+    subjectId: 'user-yueyue',
+    subjectLabel: '月月',
+    user: { userId: 'user-yueyue', displayName: '月月', username: 'yueyue' },
+    token: { id: 'tok_rate_01', label: 'tok_rate_01' },
+    key: null,
+    request: { id: 9104, method: 'POST', path: '/mcp', query: null },
+    requestKind: { key: 'mcp:resources/list', label: 'MCP | resources/list', detail: 'Control-plane request' },
+    failureKind: null,
+    resultStatus: 'quota_exhausted',
+    errorMessage: 'user request rate limit exceeded on rolling 5m window (limit 25, used 25)',
+    reasonCode: 'user_request_rate_limited',
+    reasonSummary: 'Rolling request-rate window exhausted',
+    reasonDetail: 'Mock alert generated by demo mode.',
+    source: { kind: 'auth_token_log', id: '9104' },
+    semanticWindow: {
+      kind: 'request_rate',
+      windowMinutes: 5,
+      windowStart: nowSeconds(-5700),
+      windowEnd: nowSeconds(-5400),
+      windowKey: 'request_rate:yueyue:1',
+    },
+  }
+  const userRateEvent3 = {
+    ...userRateEventLatest,
+    id: 'evt-demo-rate-3',
+    occurredAt: nowSeconds(-5460),
+    request: { id: 9103, method: 'POST', path: '/mcp', query: null },
+    requestKind: { key: 'mcp:notifications/initialized', label: 'MCP | notifications/initialized', detail: 'Control-plane request' },
+    source: { kind: 'auth_token_log', id: '9103' },
+  }
+  const userRateEvent2 = {
+    ...userRateEventLatest,
+    id: 'evt-demo-rate-2',
+    occurredAt: nowSeconds(-5520),
+    request: { id: 9102, method: 'POST', path: '/mcp', query: null },
+    requestKind: { key: 'mcp:tools/list', label: 'MCP | tools/list', detail: 'Control-plane request' },
+    source: { kind: 'auth_token_log', id: '9102' },
+    semanticWindow: {
+      kind: 'request_rate',
+      windowMinutes: 5,
+      windowStart: nowSeconds(-6000),
+      windowEnd: nowSeconds(-5520),
+      windowKey: 'request_rate:yueyue:0',
+    },
+  }
+  const userRateEvent1 = {
+    ...userRateEventLatest,
+    id: 'evt-demo-rate-1',
+    occurredAt: nowSeconds(-5580),
+    request: { id: 9101, method: 'POST', path: '/mcp', query: null },
+    requestKind: { key: 'mcp:initialize', label: 'MCP | initialize', detail: 'Control-plane request' },
+    source: { kind: 'auth_token_log', id: '9101' },
+    semanticWindow: {
+      kind: 'request_rate',
+      windowMinutes: 5,
+      windowStart: nowSeconds(-6000),
+      windowEnd: nowSeconds(-5520),
+      windowKey: 'request_rate:yueyue:0',
+    },
+  }
+
+  const quotaMonthLatest = {
+    id: 'evt-demo-month-quota-2',
+    type: 'user_quota_exhausted',
+    title: 'Zwalking exhausted business quota',
+    summary: 'Zwalking 的月额度已耗尽，后续计费请求继续被拒绝。',
+    occurredAt: nowSeconds(-3600 * 12),
+    subjectKind: 'user',
+    subjectId: 'user-zwalking',
+    subjectLabel: 'Zwalking',
+    user: { userId: 'user-zwalking', displayName: 'Zwalking', username: 'zwalking' },
+    token: { id: 'WU2z', label: 'WU2z' },
+    key: null,
+    request: { id: 9202, method: 'GET', path: '/api/tavily/search', query: 'query=quota+edge' },
+    requestKind: { key: 'api:search', label: 'API | search', detail: 'Billable request' },
+    failureKind: null,
+    resultStatus: 'quota_exhausted',
+    errorMessage: 'business quota exhausted on month window',
+    reasonCode: 'user_quota_exhausted',
+    reasonSummary: 'Monthly quota exhausted',
+    reasonDetail: 'Mock alert generated by demo mode.',
+    source: { kind: 'request_log', id: '9202' },
+    semanticWindow: {
+      kind: 'month',
+      windowMinutes: null,
+      windowStart: monthStartSeconds(),
+      windowEnd: monthStartSeconds(1) - 1,
+      windowKey: 'quota:month:zwalking:0',
+    },
+  }
+  const quotaMonthFirst = {
+    ...quotaMonthLatest,
+    id: 'evt-demo-month-quota-1',
+    occurredAt: nowSeconds(-3600 * 18),
+    request: { id: 9201, method: 'POST', path: '/api/tavily/extract', query: null },
+    requestKind: { key: 'api:extract', label: 'API | extract', detail: 'Billable request' },
+    source: { kind: 'request_log', id: '9201' },
+  }
+
+  const keyBlockedLatest = {
+    id: 'evt-demo-key-block-2',
+    type: 'upstream_key_blocked',
+    title: 'Upstream key Qr05 was blocked',
+    summary: 'Maintenance evidence marked key Qr05 as blocked by upstream.',
+    occurredAt: nowSeconds(-3600 * 20),
+    subjectKind: 'key',
+    subjectId: DEMO_QUARANTINE_KEY_ID,
+    subjectLabel: DEMO_QUARANTINE_KEY_ID,
+    user: null,
+    token: null,
+    key: { id: DEMO_QUARANTINE_KEY_ID, label: DEMO_QUARANTINE_KEY_ID },
+    request: null,
+    requestKind: null,
+    failureKind: 'upstream_key_blocked',
+    resultStatus: 'error',
+    errorMessage: 'upstream key blocked by provider',
+    reasonCode: 'upstream_key_blocked',
+    reasonSummary: 'Blocked by upstream during demo validation',
+    reasonDetail: 'This is mock data used by the standalone web demo.',
+    source: { kind: 'api_key_maintenance_record', id: '9302' },
+  }
+  const keyBlockedFirst = {
+    ...keyBlockedLatest,
+    id: 'evt-demo-key-block-1',
+    occurredAt: nowSeconds(-3600 * 24),
+    source: { kind: 'api_key_maintenance_record', id: '9301' },
+  }
+
+  const topGroups = [
+    {
+      id: 'grp-demo-quota-key-compat',
+      type: 'upstream_usage_limit_432',
+      subjectKind: 'key',
+      subjectId: DEMO_QUOTA_KEY_ID,
+      subjectLabel: DEMO_QUOTA_KEY_ID,
+      user: null,
+      token: { id: DEMO_TOKEN_ID, label: 'Demo operator token' },
+      key: { id: DEMO_QUOTA_KEY_ID, label: DEMO_QUOTA_KEY_ID },
+      requestKind: { key: 'mcp:search', label: 'MCP | search', detail: 'Billable request' },
+      count: 4,
+      firstSeen: keyQuotaEventD.occurredAt,
+      lastSeen: keyQuotaEventA.occurredAt,
+      latestEvent: keyQuotaEventA,
+      groupingKind: 'compat',
+      semanticWindowKind: null,
+      semanticWindowMinutes: null,
+      semanticWindowStart: null,
+      semanticWindowEnd: null,
+      semanticWindowKey: null,
+      childCount: 0,
+      eventCount: 4,
+      children: [],
+      childEvents: [],
+    },
+    {
+      id: 'grp-demo-user-rate-mother',
+      type: 'user_request_rate_limited',
+      subjectKind: 'user',
+      subjectId: 'user-yueyue',
+      subjectLabel: '月月',
+      user: { userId: 'user-yueyue', displayName: '月月', username: 'yueyue' },
+      token: { id: 'tok_rate_01', label: 'tok_rate_01' },
+      key: null,
+      requestKind: null,
+      count: 4,
+      firstSeen: userRateEvent1.occurredAt,
+      lastSeen: userRateEventLatest.occurredAt,
+      latestEvent: userRateEventLatest,
+      groupingKind: 'mother',
+      semanticWindowKind: 'request_rate',
+      semanticWindowMinutes: 5,
+      semanticWindowStart: userRateEvent1.semanticWindow.windowStart,
+      semanticWindowEnd: userRateEventLatest.semanticWindow.windowEnd,
+      semanticWindowKey: null,
+      childCount: 2,
+      eventCount: 4,
+      children: [
+        {
+          id: 'grp-demo-user-rate-child-0',
+          type: 'user_request_rate_limited',
+          subjectKind: 'user',
+          subjectId: 'user-yueyue',
+          subjectLabel: '月月',
+          user: { userId: 'user-yueyue', displayName: '月月', username: 'yueyue' },
+          token: { id: 'tok_rate_01', label: 'tok_rate_01' },
+          key: null,
+          requestKind: null,
+          count: 2,
+          firstSeen: userRateEvent1.occurredAt,
+          lastSeen: userRateEvent2.occurredAt,
+          latestEvent: userRateEvent2,
+          groupingKind: 'child',
+          semanticWindowKind: 'request_rate',
+          semanticWindowMinutes: 5,
+          semanticWindowStart: userRateEvent1.semanticWindow.windowStart,
+          semanticWindowEnd: userRateEvent2.semanticWindow.windowEnd,
+          semanticWindowKey: 'request_rate:yueyue:0',
+          childCount: 0,
+          eventCount: 2,
+          children: [],
+          childEvents: [userRateEvent2, userRateEvent1],
+        },
+        {
+          id: 'grp-demo-user-rate-child-1',
+          type: 'user_request_rate_limited',
+          subjectKind: 'user',
+          subjectId: 'user-yueyue',
+          subjectLabel: '月月',
+          user: { userId: 'user-yueyue', displayName: '月月', username: 'yueyue' },
+          token: { id: 'tok_rate_01', label: 'tok_rate_01' },
+          key: null,
+          requestKind: null,
+          count: 2,
+          firstSeen: userRateEvent3.occurredAt,
+          lastSeen: userRateEventLatest.occurredAt,
+          latestEvent: userRateEventLatest,
+          groupingKind: 'child',
+          semanticWindowKind: 'request_rate',
+          semanticWindowMinutes: 5,
+          semanticWindowStart: userRateEvent3.semanticWindow.windowStart,
+          semanticWindowEnd: userRateEventLatest.semanticWindow.windowEnd,
+          semanticWindowKey: 'request_rate:yueyue:1',
+          childCount: 0,
+          eventCount: 2,
+          children: [],
+          childEvents: [userRateEventLatest, userRateEvent3],
+        },
+      ],
+      childEvents: [],
+    },
+    {
+      id: 'grp-demo-user-month-quota-mother',
+      type: 'user_quota_exhausted',
+      subjectKind: 'user',
+      subjectId: 'user-zwalking',
+      subjectLabel: 'Zwalking',
+      user: { userId: 'user-zwalking', displayName: 'Zwalking', username: 'zwalking' },
+      token: { id: 'WU2z', label: 'WU2z' },
+      key: null,
+      requestKind: null,
+      count: 2,
+      firstSeen: quotaMonthFirst.occurredAt,
+      lastSeen: quotaMonthLatest.occurredAt,
+      latestEvent: quotaMonthLatest,
+      groupingKind: 'mother',
+      semanticWindowKind: 'month',
+      semanticWindowMinutes: null,
+      semanticWindowStart: quotaMonthLatest.semanticWindow.windowStart,
+      semanticWindowEnd: quotaMonthLatest.semanticWindow.windowEnd,
+      semanticWindowKey: null,
+      childCount: 1,
+      eventCount: 2,
+      children: [
+        {
+          id: 'grp-demo-user-month-quota-child-0',
+          type: 'user_quota_exhausted',
+          subjectKind: 'user',
+          subjectId: 'user-zwalking',
+          subjectLabel: 'Zwalking',
+          user: { userId: 'user-zwalking', displayName: 'Zwalking', username: 'zwalking' },
+          token: { id: 'WU2z', label: 'WU2z' },
+          key: null,
+          requestKind: null,
+          count: 2,
+          firstSeen: quotaMonthFirst.occurredAt,
+          lastSeen: quotaMonthLatest.occurredAt,
+          latestEvent: quotaMonthLatest,
+          groupingKind: 'child',
+          semanticWindowKind: 'month',
+          semanticWindowMinutes: null,
+          semanticWindowStart: quotaMonthLatest.semanticWindow.windowStart,
+          semanticWindowEnd: quotaMonthLatest.semanticWindow.windowEnd,
+          semanticWindowKey: 'quota:month:zwalking:0',
+          childCount: 0,
+          eventCount: 2,
+          children: [],
+          childEvents: [quotaMonthLatest, quotaMonthFirst],
+        },
+      ],
+      childEvents: [],
+    },
+    {
+      id: 'grp-demo-key-blocked-compat',
+      type: 'upstream_key_blocked',
+      subjectKind: 'key',
+      subjectId: DEMO_QUARANTINE_KEY_ID,
+      subjectLabel: DEMO_QUARANTINE_KEY_ID,
+      user: null,
+      token: null,
+      key: { id: DEMO_QUARANTINE_KEY_ID, label: DEMO_QUARANTINE_KEY_ID },
+      requestKind: null,
+      count: 2,
+      firstSeen: keyBlockedFirst.occurredAt,
+      lastSeen: keyBlockedLatest.occurredAt,
+      latestEvent: keyBlockedLatest,
+      groupingKind: 'compat',
+      semanticWindowKind: null,
+      semanticWindowMinutes: null,
+      semanticWindowStart: null,
+      semanticWindowEnd: null,
+      semanticWindowKey: null,
+      childCount: 0,
+      eventCount: 2,
+      children: [],
+      childEvents: [],
+    },
+  ] as const
+
+  const events = [
+    keyQuotaEventA,
+    userRateEventLatest,
+    userRateEvent3,
+    userRateEvent2,
+    userRateEvent1,
+    quotaMonthLatest,
+    keyBlockedLatest,
+    quotaMonthFirst,
+    keyQuotaEventB,
+    keyQuotaEventC,
+    keyBlockedFirst,
+    keyQuotaEventD,
+  ]
+  return {
+    windowHours: 24,
+    totalEvents: events.length,
+    groupedCount: topGroups.length,
+    groupedCountWindows: [
+      { windowHours: 1, groupedCount: 1 },
+      { windowHours: 24, groupedCount: topGroups.length },
+      { windowHours: 24 * 7, groupedCount: topGroups.length + 3 },
+    ],
+    countsByType: [
+      { type: 'upstream_usage_limit_432', count: 4 },
+      { type: 'user_request_rate_limited', count: 4 },
+      { type: 'user_quota_exhausted', count: 2 },
+      { type: 'upstream_key_blocked', count: 2 },
+    ],
+    topGroups,
+    events,
+  }
+}
+
+function buildAlertsPage<T>(items: T[], url: URL, defaultPerPage = 20) {
+  const page = Math.max(1, Number(url.searchParams.get('page') ?? '1') || 1)
+  const perPage = Math.max(1, Number(url.searchParams.get('per_page') ?? defaultPerPage) || defaultPerPage)
+  const start = (page - 1) * perPage
+  return {
+    items: items.slice(start, start + perPage),
+    total: items.length,
+    page,
+    perPage,
+  }
+}
+
+function timestampMatchesAlertWindow(timestamp: number, url: URL): boolean {
+  const since = url.searchParams.get('since')
+  const until = url.searchParams.get('until')
+  if (since) {
+    const sinceSeconds = Date.parse(since) / 1000
+    if (Number.isFinite(sinceSeconds) && timestamp < sinceSeconds) return false
+  }
+  if (until) {
+    const untilSeconds = Date.parse(until) / 1000
+    if (Number.isFinite(untilSeconds) && timestamp > untilSeconds) return false
+  }
+  return true
+}
+
+function requestKindMatchesAlertFilter(requestKindKey: string | undefined, url: URL): boolean {
+  const filters = url.searchParams.getAll('request_kind').filter(Boolean)
+  if (filters.length === 0) return true
+  return Boolean(requestKindKey && filters.includes(requestKindKey))
+}
+
+function alertEventMatchesFilters(event: ReturnType<typeof demoRecentAlerts>['events'][number], url: URL): boolean {
+  const type = url.searchParams.get('type')
+  const userId = url.searchParams.get('user_id')
+  const tokenId = url.searchParams.get('token_id')
+  const keyId = url.searchParams.get('key_id')
+  const eventUser = event.user as { userId?: string } | null
+  if (type && event.type !== type) return false
+  if (userId && eventUser?.userId !== userId) return false
+  if (tokenId && event.token?.id !== tokenId) return false
+  if (keyId && event.key?.id !== keyId) return false
+  if (!requestKindMatchesAlertFilter(event.requestKind?.key, url)) return false
+  return timestampMatchesAlertWindow(event.occurredAt, url)
+}
+
+function alertGroupMatchesFilters(group: ReturnType<typeof demoRecentAlerts>['topGroups'][number], url: URL): boolean {
+  const type = url.searchParams.get('type')
+  const userId = url.searchParams.get('user_id')
+  const tokenId = url.searchParams.get('token_id')
+  const keyId = url.searchParams.get('key_id')
+  const groupUser = group.user as { userId?: string } | null
+  if (type && group.type !== type) return false
+  if (userId && groupUser?.userId !== userId) return false
+  if (tokenId && group.token?.id !== tokenId) return false
+  if (keyId && group.key?.id !== keyId) return false
+  if (!requestKindMatchesAlertFilter(group.requestKind?.key, url)) return false
+  return timestampMatchesAlertWindow(group.lastSeen, url)
+}
+
+function demoAlertCatalogPayload() {
+  const alerts = demoRecentAlerts()
+  const events = alerts.events
+  const countBy = <T extends string>(values: T[]) =>
+    Array.from(values.reduce((map, value) => map.set(value, (map.get(value) ?? 0) + 1), new Map<T, number>()).entries())
+  const users = countBy(events.flatMap((event) => (event.user ? [event.user.userId] : []))).map(([userId, count]) => {
+    const user = demoState.users.find((item) => item.userId === userId)
+    return {
+      value: userId,
+      label: user?.displayName ?? user?.username ?? userId,
+      count,
+    }
+  })
+  const tokens = countBy(events.flatMap((event) => (event.token ? [event.token.id] : []))).map(([tokenId, count]) => {
+    const token = demoState.tokens.find((item) => item.id === tokenId)
+    return {
+      value: tokenId,
+      label: token?.note ?? token?.id ?? tokenId,
+      count,
+    }
+  })
+  const keys = countBy(events.flatMap((event) => (event.key ? [event.key.id] : []))).map(([keyId, count]) => ({
+    value: keyId,
+    label: keyId,
+    count,
+  }))
+  return {
+    retentionDays: 30,
+    types: alerts.countsByType.map((item) => ({ value: item.type, count: item.count })),
+    requestKindOptions,
+    users,
+    tokens,
+    keys,
+  }
+}
+
+function serverJobToView(job: ReturnType<typeof createDemoJobs>[number]) {
+  return {
+    id: job.id,
+    job_type: job.jobType,
+    trigger_source: job.triggerSource,
+    key_id: job.keyId,
+    key_group: job.keyGroup,
+    status: job.status,
+    attempt: job.attempt,
+    message: job.message,
+    queued_at: job.queuedAt,
+    started_at: job.startedAt,
+    finished_at: job.finishedAt,
+  }
+}
+
+function publicTokenLogs(items = demoState.logs) {
+  return items.slice(0, 18).map((log) => ({
+    id: log.id,
+    method: log.method,
+    path: log.path,
+    query: log.query,
+    httpStatus: log.http_status,
+    mcpStatus: log.mcp_status,
+    resultStatus: log.result_status,
+    errorMessage: log.error_message,
+    createdAt: log.created_at,
+  }))
+}
+
+function demoLogDetailForPath(path: string, fallbackItems = demoState.logs) {
+  const match = path.match(/\/logs\/(\d+)\/details$/)
+  const logId = match ? Number(match[1]) : NaN
+  const log = fallbackItems.find((item) => item.id === logId) ?? fallbackItems[0] ?? demoState.logs[0]
+  return { request_body: log?.request_body ?? null, response_body: log?.response_body ?? null }
+}
+
+function tokenSummary(tokenId = DEMO_TOKEN_ID) {
+  const logs = demoState.logs.filter((log) => log.auth_token_id === tokenId)
+  return {
+    total_requests: logs.length * 32,
+    success_count: logs.filter((log) => log.result_status === 'success').length * 32,
+    error_count: logs.filter((log) => log.result_status === 'error').length * 32,
+    quota_exhausted_count: logs.filter((log) => log.result_status === 'quota_exhausted').length * 32,
+    last_activity: logs[0]?.created_at ?? nowSeconds(-120),
+  }
+}
+
+function buildListPage<T>(items: T[], url: URL, defaultPerPage = 20) {
+  const page = Math.max(1, Number(url.searchParams.get('page') ?? '1') || 1)
+  const perPage = Math.max(1, Number(url.searchParams.get('per_page') ?? url.searchParams.get('limit') ?? defaultPerPage) || defaultPerPage)
+  const start = (page - 1) * perPage
+  return {
+    items: items.slice(start, start + perPage),
+    total: items.length,
+    page,
+    perPage,
+  }
+}
+
+function buildCursorListPage<T>(items: T[], url: URL, defaultPageSize = 20) {
+  const pageSize = Math.max(1, Number(url.searchParams.get('limit') ?? defaultPageSize) || defaultPageSize)
+  return {
+    items: items.slice(0, pageSize),
+    pageSize,
+    nextCursor: items.length > pageSize ? String((items[pageSize] as { id?: unknown } | undefined)?.id ?? pageSize) : null,
+    prevCursor: null,
+    hasOlder: items.length > pageSize,
+    hasNewer: false,
+  }
+}
+
+function demoUserRankingsSnapshot() {
+  const pulse = demoPulse()
+  return {
+    ...rankingsStorySnapshot,
+    generatedAt: nowSeconds(-((pulse % 5) + 1) * 12),
+  }
+}
+
+function requestLogFacets() {
+  return {
+    results: [
+      { value: 'success', count: 52 },
+      { value: 'error', count: 8 },
+      { value: 'quota_exhausted', count: 4 },
+    ],
+    keyEffects: [
+      { value: 'used', count: 52 },
+      { value: 'retry_next_key', count: 8 },
+      { value: 'quarantine', count: 4 },
+    ],
+    bindingEffects: [
+      { value: 'sticky_match', count: 11 },
+      { value: 'none', count: 53 },
+    ],
+    selectionEffects: [
+      { value: 'selected', count: 52 },
+      { value: 'fallback', count: 12 },
+    ],
+    tokens: demoState.tokens.map((token) => ({ value: token.id, count: token.total_requests })),
+    keys: demoState.keys.map((key) => ({ value: key.id, count: key.total_requests })),
+  }
+}
+
+function requestLogsPage(url: URL, items = demoState.logs) {
+  return {
+    ...buildListPage(items, url),
+    requestKindOptions,
+    facets: requestLogFacets(),
+  }
+}
+
+function requestLogsCatalog() {
+  return {
+    retentionDays: 30,
+    requestKindOptions,
+    facets: requestLogFacets(),
+  }
+}
+
+function tokenUsageSeries(url: URL) {
+  const bucketSecs = Math.max(3600, Number(url.searchParams.get('bucket_secs') ?? 3600) || 3600)
+  const count = bucketSecs >= 86400 ? 31 : 25
+  const currentBucket = Math.floor(nowSeconds() / bucketSecs) * bucketSecs
+  return range(count).map((index) => ({
+    bucket_start: currentBucket - (count - index - 1) * bucketSecs,
+    success_count: 18 + (index % 9) * 2,
+    system_failure_count: index % 5,
+    external_failure_count: index % 7 === 0 ? 2 : 0,
+  }))
+}
+
+function forwardProxyStats() {
+  const bucketSeconds = 3600
+  const rangeEnd = isoSeconds(0)
+  const rangeStart = isoSeconds(-24 * 3600)
+  return {
+    rangeStart,
+    rangeEnd,
+    bucketSeconds,
+    nodes: demoState.forwardProxy.nodes.map((node, nodeIndex) => ({
+      ...node,
+      last24h: range(24).map((index) => ({
+        bucketStart: isoSeconds(-(24 - index) * bucketSeconds),
+        bucketEnd: isoSeconds(-(23 - index) * bucketSeconds),
+        successCount: 20 + index + nodeIndex,
+        failureCount: index % (4 + nodeIndex),
+      })),
+      weight24h: range(24).map((index) => ({
+        bucketStart: isoSeconds(-(24 - index) * bucketSeconds),
+        bucketEnd: isoSeconds(-(23 - index) * bucketSeconds),
+        sampleCount: 8,
+        minWeight: node.weight - 8,
+        maxWeight: node.weight + 4,
+        avgWeight: node.weight - 2 + (index % 3),
+        lastWeight: node.weight,
+      })),
+    })),
+  }
+}
+
+function forwardProxyErrorStats() {
+  const stats = forwardProxyStats()
+  return {
+    rangeStart: stats.rangeStart,
+    rangeEnd: stats.rangeEnd,
+    bucketSeconds: stats.bucketSeconds,
+    nodes: stats.nodes.map((node, index) => ({
+      key: node.key,
+      source: node.source,
+      displayName: node.displayName,
+      endpointUrl: node.endpointUrl,
+      resolvedIps: node.resolvedIps,
+      resolvedRegions: node.resolvedRegions,
+      available: node.available,
+      disabled: node.disabled,
+      disabledAt: node.disabledAt,
+      windows: {
+        oneMinute: { totalCount: 8, errorCount: index === 2 ? 2 : 0, errorRate: index === 2 ? 0.25 : 0 },
+        fifteenMinutes: { totalCount: 124, errorCount: 5 + index, errorRate: 0.04 + index * 0.01 },
+        oneHour: { totalCount: 420, errorCount: 18 + index, errorRate: 0.04 + index * 0.01 },
+        oneDay: { totalCount: 4420, errorCount: 160 + index * 12, errorRate: 0.036 + index * 0.01 },
+        sevenDays: { totalCount: 26800, errorCount: 780 + index * 40, errorRate: 0.029 + index * 0.01 },
+      },
+      last24h: range(24).map((bucket) => ({
+        bucketStart: isoSeconds(-(24 - bucket) * 3600),
+        bucketEnd: isoSeconds(-(23 - bucket) * 3600),
+        totalCount: 32 + bucket,
+        successCount: 30 + bucket,
+        errorCount: bucket % 5,
+        errors: [{ kind: 'upstream_timeout', count: bucket % 5 }],
+      })),
+      distribution24h: [
+        { kind: 'upstream_timeout', count: 12 + index },
+        { kind: 'proxy_disabled', count: index === 2 ? 7 : 1 },
+      ],
+      total24h: 4420,
+      error24h: 160 + index * 12,
+      errorRate24h: 0.036 + index * 0.01,
+    })),
+  }
+}
+
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Tavily-Hikari-Demo': 'true',
+    },
+  })
+}
+
+function textResponse(payload: string, status = 200): Response {
+  return new Response(payload, {
+    status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-Tavily-Hikari-Demo': 'true' },
+  })
+}
+
+function noContentResponse(): Response {
+  return new Response(null, { status: 204, headers: { 'X-Tavily-Hikari-Demo': 'true' } })
+}
+
+function parseUrl(input: RequestInfo | URL): URL | null {
+  const raw = input instanceof Request ? input.url : String(input)
+  try {
+    return new URL(raw, window.location.origin)
+  } catch {
+    return null
+  }
+}
+
+async function readJsonBody(init?: RequestInit): Promise<Record<string, unknown>> {
+  const body = init?.body
+  if (typeof body === 'string') {
+    try {
+      const parsed = JSON.parse(body)
+      return typeof parsed === 'object' && parsed ? parsed as Record<string, unknown> : {}
+    } catch {
+      return {}
+    }
+  }
+  return {}
+}
+
+async function demoFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response | null> {
+  const url = parseUrl(input)
+  if (!url) return null
+  const path = url.pathname
+  if (!(path === '/health' || path === '/mcp' || path.startsWith('/api/'))) return null
+  if (init?.signal?.aborted) {
+    throw new DOMException('The operation was aborted.', 'AbortError')
+  }
+  await new Promise((resolve) => window.setTimeout(resolve, 60))
+  return handleDemoRoute(url, (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase(), init)
+}
+
+async function handleDemoRoute(url: URL, method: string, init?: RequestInit): Promise<Response> {
+  const path = url.pathname
+  if (path === '/health') return jsonResponse({ ok: true, mode: 'demo' })
+  if (path === '/mcp') return handleMcpDemo(init)
+
+  if (path === '/api/version') return jsonResponse(demoState.version)
+  if (path === '/api/profile') return jsonResponse(demoState.profile)
+  const haResponse = handleDemoHaRoute(path, method, demoState, await readJsonBody(init))
+  if (haResponse) return haResponse
+  if (path === '/api/summary') return jsonResponse(demoSummary())
+  if (path === '/api/summary/windows') return jsonResponse(demoSummaryWindows())
+  if (path === '/api/dashboard/overview') return jsonResponse(demoDashboardOverview())
+  if (path === '/api/user/dashboard/overview') return jsonResponse(demoUserDashboardOverview())
+  if (path === '/api/public/metrics') return jsonResponse({ monthlySuccess: 23710, dailySuccess: 714 })
+  if (path === '/api/token/metrics') return jsonResponse({
+    monthlySuccess: 8400,
+    dailySuccess: 388,
+    dailyFailure: 18,
+    quotaHourlyUsed: 42,
+    quotaHourlyLimit: 180,
+    quotaDailyUsed: 388,
+    quotaDailyLimit: 1600,
+    quotaMonthlyUsed: 8400,
+    quotaMonthlyLimit: 24000,
+  })
+  if (path === '/api/public/logs') return jsonResponse(publicTokenLogs())
+  if (path === '/api/public/events') return textResponse('demo event stream is provided by the browser demo runtime\n')
+  if (path === '/api/admin/login' && method === 'POST') return jsonResponse({ ok: true })
+  if (path === '/api/admin/registration') {
+    if (method === 'PATCH') {
+      const body = await readJsonBody(init)
+      demoState.registration.allowRegistration = Boolean(body.allowRegistration)
+    }
+    return jsonResponse(demoState.registration)
+  }
+  if (path === '/api/user/logout') return noContentResponse()
+  if (path === '/api/user/token') return jsonResponse({ token: DEMO_TOKEN })
+  if (path === '/api/user/dashboard') return jsonResponse(demoUserDashboardSummary())
+  if (path === '/api/user/recharge/config') return jsonResponse(demoRechargeConfig())
+  if (path === '/api/user/billing/summary') return jsonResponse(demoUserBillingSummary())
+  if (path === '/api/user/recharge/quote' && method === 'POST') return jsonResponse(buildDemoRechargeQuote())
+  if (path === '/api/user/recharge/orders') {
+    if (method === 'POST') return handleCreateDemoRechargeOrder(init)
+    return jsonResponse({ items: demoState.rechargeOrders })
+  }
+  if (path === '/api/admin/recharges') {
+    return handleDemoAdminRecharges(demoState.rechargeOrders, url, jsonResponse)
+  }
+  const adminRechargeAction = handleDemoAdminRechargeAction(demoState.rechargeOrders, path, method, jsonResponse, nowSeconds)
+  if (adminRechargeAction) return adminRechargeAction
+  if (path === '/api/admin/totp') {
+    return jsonResponse({ enabled: true, available: true, rechargeFeatureEnabled: true, missingCryptoKey: false, lockedUntil: null, issuer: 'Tavily Hikari', accountName: 'admin-recharge' })
+  }
+  if (path === '/api/admin/totp/setup' && method === 'POST') {
+    return jsonResponse({ secret: 'JBSWY3DPEHPK3PXP', otpAuthUrl: 'otpauth://totp/Tavily%20Hikari:admin-recharge?secret=JBSWY3DPEHPK3PXP&issuer=Tavily%20Hikari', qrPngBase64: '' })
+  }
+  if (path === '/api/admin/passkeys') {
+    return jsonResponse({
+      configured: true,
+      enabled: true,
+      credentialCount: 1,
+      scope: {
+        nodeId: 'demo-node',
+        rpId: 'localhost',
+        rpOrigin: 'http://localhost:55174',
+        inactiveCredentialCount: 0,
+        legacyCredentialCount: 0,
+      },
+      credentials: [{
+        credentialId: 'demo-passkey-credential',
+        label: 'Admin passkey',
+        createdAt: nowSeconds(-86400 * 9),
+        updatedAt: nowSeconds(-86400 * 2),
+        lastUsedAt: nowSeconds(-3600 * 5),
+      }],
+    })
+  }
+  if (path === '/api/admin/password') {
+    const body = await readJsonBody(init)
+    const loginTotpRequired = method === 'PATCH' && typeof body.loginTotpRequired === 'boolean'
+      ? body.loginTotpRequired
+      : true
+    if (method === 'DELETE') return jsonResponse({ enabled: false, updatedAt: nowSeconds(0), loginTotpRequired })
+    if (method === 'PUT') return jsonResponse({ enabled: true, updatedAt: nowSeconds(0), loginTotpRequired })
+    return jsonResponse({ enabled: true, updatedAt: nowSeconds(-86400), loginTotpRequired })
+  }
+  if (/^\/api\/admin\/passkeys\/[^/]+$/.test(path) && (method === 'PATCH' || method === 'DELETE')) {
+    return jsonResponse({
+      configured: true,
+      enabled: method !== 'DELETE',
+      credentialCount: method === 'DELETE' ? 0 : 1,
+      scope: {
+        nodeId: 'demo-node',
+        rpId: 'localhost',
+        rpOrigin: 'http://localhost:55174',
+        inactiveCredentialCount: 0,
+        legacyCredentialCount: 0,
+      },
+      credentials: method === 'DELETE' ? [] : [{
+        credentialId: 'demo-passkey-credential',
+        label: 'Updated passkey',
+        createdAt: nowSeconds(-86400 * 9),
+        updatedAt: nowSeconds(0),
+        lastUsedAt: nowSeconds(-3600 * 5),
+      }],
+    })
+  }
+  const rechargeOrderRoute = path.match(/^\/api\/user\/recharge\/orders\/([^/]+)$/)
+  if (rechargeOrderRoute) {
+    const outTradeNo = decodeURIComponent(rechargeOrderRoute[1])
+    const order = demoState.rechargeOrders.find((item) => item.outTradeNo === outTradeNo)
+    return order ? jsonResponse(order) : jsonResponse({ message: 'Demo recharge order not found' }, 404)
+  }
+  if (path === '/api/user/tokens') return jsonResponse(demoUserTokenSummaries())
+  if (path.startsWith('/api/user/tokens/')) return handleUserTokenRoute(path, url)
+  if (path === '/api/user/announcements') {
+    return jsonResponse({
+      items: demoAnnouncementPreviewMode() === 'closed'
+        ? []
+        : demoUserActiveAnnouncements(demoState.announcements),
+    })
+  }
+  if (path === '/api/user/announcements/history') return jsonResponse({ items: demoUserAnnouncementHistory(demoState.announcements) })
+
+  if (path === '/api/keys/validate' && method === 'POST') return jsonResponse({
+    summary: { input_lines: 2, valid_lines: 2, unique_in_input: 2, duplicate_in_input: 0, already_exists: 1, ok: 1, exhausted: 1, invalid: 0, error: 0 },
+    results: [
+      { api_key: 'tvly-dev-demo-one', status: 'ok', registration_ip: '198.51.100.24', registration_region: 'HK', assigned_proxy_key: 'demo-proxy-1', assigned_proxy_label: 'HK edge', assigned_proxy_match_kind: 'registration_ip', quota_limit: 1000, quota_remaining: 820 },
+      { api_key: 'tvly-dev-demo-two', status: 'exhausted', detail: 'Demo exhausted key', quota_limit: 1000, quota_remaining: 0 },
+    ],
+  })
+  if (path === '/api/keys/bulk-actions') return jsonResponse({
+    summary: { requested: 2, succeeded: 2, skipped: 0, failed: 0 },
+    results: [{ key_id: DEMO_KEY_ID, status: 'success', detail: 'Demo action applied' }],
+  })
+  if (path === '/api/keys/batch') return jsonResponse({
+    summary: { input_lines: 2, valid_lines: 2, unique_in_input: 2, created: 1, undeleted: 0, existed: 1, duplicate_in_input: 0, failed: 0 },
+    results: [{ api_key: 'tvly-dev-demo-one', status: 'created', id: 'key-new-demo' }],
+  })
+  if (path === '/api/keys' && method === 'GET') return jsonResponse({ ...buildListPage(demoState.keys, url), facets: {
+    groups: [{ value: 'primary', count: 2 }, { value: 'backup', count: 1 }, { value: 'eu', count: 1 }],
+    statuses: [{ value: 'active', count: 2 }, { value: 'quarantined', count: 1 }, { value: 'exhausted', count: 1 }],
+    regions: [{ value: 'HK', count: 2 }, { value: 'US', count: 1 }, { value: 'DE', count: 1 }],
+  } })
+  if (path === '/api/keys' && method === 'POST') return jsonResponse({ id: 'key-new-demo' })
+  if (path.startsWith('/api/keys/')) return handleKeyRoute(path, url, method)
+
+  if (path === '/api/logs/list') return jsonResponse(buildCursorListPage(demoState.logs, url))
+  if (path === '/api/logs/catalog') return jsonResponse(requestLogsCatalog())
+  if (path === '/api/logs') return jsonResponse(requestLogsPage(url))
+  if (/^\/api\/logs\/\d+\/details$/.test(path)) return jsonResponse(demoLogDetailForPath(path))
+  if (path === '/api/jobs/trigger' && method === 'POST') {
+    const body = await readJsonBody()
+    const jobType = typeof body?.jobType === 'string' ? body.jobType : 'request_logs_gc'
+    return jsonResponse({ jobId: nowSeconds(), jobType, triggerSource: 'manual' }, 202)
+  }
+  if (path === '/api/jobs') return jsonResponse({ ...buildListPage(demoState.jobs, url, 10), groupCounts: { all: demoState.jobs.length, quota: 4, usage: 4, logs: 2, db: 0, geo: 2, linuxdo: 0 } })
+
+  if (path === '/api/announcements') return handleAnnouncementsRoute({ announcements: demoState.announcements, path, method, init, nowSeconds, readJsonBody, jsonResponse })
+  if (path.startsWith('/api/announcements/')) return handleAnnouncementsRoute({ announcements: demoState.announcements, path, method, init, nowSeconds, readJsonBody, jsonResponse })
+
+  if (path === '/api/users') return jsonResponse(buildListPage(filterDemoUsers(url), url))
+  if (path === '/api/users/rankings') return jsonResponse(demoUserRankingsSnapshot())
+  if (path === '/api/analysis/pressure') {
+    return jsonResponse(buildDemoAnalysisPressureSnapshot(nowSeconds, filterDemoUsers))
+  }
+  if (path === '/api/users/rankings/events') return textResponse('demo event stream is provided by the browser demo runtime\n')
+  if (path.startsWith('/api/users/')) return handleUserRoute(path, url, method, init)
+  if (path === '/api/user-tags') return handleUserTags(path, method, init)
+  if (path.startsWith('/api/user-tags/')) return handleUserTags(path, method, init)
+
+  if (path === '/api/tokens/groups') return jsonResponse([{ name: 'demo', tokenCount: 1, latestCreatedAt: nowSeconds(-86400) }, { name: 'internal', tokenCount: 1, latestCreatedAt: nowSeconds(-86400 * 2) }])
+  if (path === '/api/tokens/unbound-usage') return jsonResponse({ items: [], total: 0, page: 1, perPage: 20 })
+  if (path === '/api/tokens/batch' && method === 'POST') return jsonResponse({ tokens: ['th-b001-demoaccesssecret', 'th-b002-demoaccesssecret'] })
+  if (path === '/api/tokens' && method === 'GET') return jsonResponse(buildListPage(demoState.tokens, url, 10))
+  if (path === '/api/tokens' && method === 'POST') return createDemoToken(init)
+  if (path.startsWith('/api/tokens/')) return handleTokenRoute(path, url, method)
+
+  if (path === '/api/settings') {
+    return jsonResponse({
+      forwardProxy: demoState.forwardProxy,
+      systemSettings: demoState.systemSettings,
+      adminUserListStats: createDemoAdminUserListStats(),
+    })
+  }
+  if (path === '/api/settings/forward-proxy') return jsonResponse(demoState.forwardProxy)
+  if (path === '/api/settings/system') return jsonResponse(demoState.systemSettings)
+  if (path === '/api/settings/system/status' || path === '/api/settings/system/privacy-status') {
+    return jsonResponse(createDemoUpstreamPrivacyStatus())
+  }
+  if (path === '/api/settings/forward-proxy/validate') return jsonResponse({ ok: true, message: 'Demo proxy candidate is reachable', normalizedValue: 'socks5://demo.internal:1080', discoveredNodes: 3, latencyMs: 94, nodes: [{ displayName: 'HK edge', protocol: 'socks5', ok: true, latencyMs: 94, ip: '198.51.100.30', location: 'HK' }] })
+  if (path === '/api/settings/forward-proxy/revalidate') return jsonResponse(demoState.forwardProxy)
+  if (path === '/api/settings/forward-proxy/nodes/state') return jsonResponse({ results: demoState.forwardProxy.nodes.map((node) => ({ proxyKey: node.key, disabled: Boolean(node.disabled), disabledAt: node.disabledAt ?? null })) })
+  if (path === '/api/stats/forward-proxy') return jsonResponse(forwardProxyStats())
+  if (path === '/api/stats/forward-proxy/errors') return jsonResponse(forwardProxyErrorStats())
+  if (path === '/api/stats/forward-proxy/summary') return jsonResponse({ availableNodes: 2, totalNodes: 3 })
+
+  if (path === '/api/alerts/catalog') return jsonResponse(demoAlertCatalogPayload())
+  if (path === '/api/alerts/events') {
+    const events = demoRecentAlerts().events.filter((event) => alertEventMatchesFilters(event, url))
+    return jsonResponse(buildAlertsPage(events, url))
+  }
+  if (path === '/api/alerts/groups') {
+    const groups = demoRecentAlerts().topGroups.filter((group) => alertGroupMatchesFilters(group, url))
+    return jsonResponse(buildAlertsPage(groups, url))
+  }
+
+  if (path.startsWith('/api/tavily/')) return jsonResponse(handleTavilyProbe(path))
+  return method === 'GET' ? jsonResponse({ demo: true, path }) : noContentResponse()
+}
+
+function handleUserTokenRoute(path: string, url: URL): Response {
+  const parts = path.split('/')
+  const id = decodeURIComponent(parts[4] ?? DEMO_TOKEN_ID)
+  const token = demoState.tokens.find((item) => item.id === id) ?? demoState.tokens[0]
+  if (path.endsWith('/secret')) return jsonResponse({ token: demoState.tokenSecrets.get(token.id) ?? DEMO_TOKEN })
+  if (path.endsWith('/logs')) return jsonResponse(publicTokenLogs(demoState.logs.filter((log) => log.auth_token_id === token.id)))
+  if (path.endsWith('/events')) return textResponse('demo event stream is provided by the browser demo runtime\n')
+  return jsonResponse(demoUserTokenSummaryFromToken(token))
+}
+
+function handleKeyRoute(path: string, url: URL, method: string): Response {
+  const match = path.match(/^\/api\/keys\/([^/]+)/)
+  const id = decodeURIComponent(match?.[1] ?? DEMO_KEY_ID)
+  const key = demoState.keys.find((item) => item.id === id) ?? demoState.keys[0]
+  if (method === 'DELETE') return noContentResponse()
+  if (path.endsWith('/sync-usage') || path.endsWith('/status') || path.endsWith('/quarantine')) return noContentResponse()
+  if (path.endsWith('/secret')) return jsonResponse({ api_key: `tvly-dev-${id.replace(/[^a-z0-9]/gi, '').slice(0, 18)}demo` })
+  if (path.includes('/metrics')) return jsonResponse({
+    total_requests: key.total_requests,
+    success_count: key.success_count,
+    error_count: key.error_count,
+    quota_exhausted_count: key.quota_exhausted_count,
+    active_keys: 1,
+    exhausted_keys: key.status === 'exhausted' ? 1 : 0,
+    last_activity: key.last_used_at,
+  })
+  if (path.endsWith('/logs/list')) return jsonResponse(buildCursorListPage(demoState.logs.filter((log) => log.key_id === id), url))
+  if (path.endsWith('/logs/catalog')) return jsonResponse(requestLogsCatalog())
+  if (path.endsWith('/logs/page')) return jsonResponse(requestLogsPage(url, demoState.logs.filter((log) => log.key_id === id)))
+  if (path.includes('/logs/') && path.endsWith('/details')) return jsonResponse(demoLogDetailForPath(path, demoState.logs.filter((log) => log.key_id === id)))
+  if (path.endsWith('/logs')) return jsonResponse(demoState.logs.filter((log) => log.key_id === id))
+  if (path.endsWith('/sticky-users')) return jsonResponse({ ...buildListPage(demoState.users.map((user) => ({
+    user: { userId: user.userId, displayName: user.displayName, username: user.username, active: user.active, lastLoginAt: user.lastLoginAt, tokenCount: user.tokenCount },
+    lastSuccessAt: nowSeconds(-360),
+    windows: { yesterday: { successCredits: 120, failureCredits: 4 }, today: { successCredits: 144, failureCredits: 6 }, month: { successCredits: 3200, failureCredits: 88 } },
+    dailyBuckets: range(7).map((index) => ({ bucketStart: nowSeconds(-(7 - index) * 86400), bucketEnd: nowSeconds(-(6 - index) * 86400), successCredits: 80 + index * 4, failureCredits: index % 3 })),
+  })), url) })
+  if (path.endsWith('/sticky-nodes')) return jsonResponse({ rangeStart: isoSeconds(-86400), rangeEnd: isoSeconds(0), bucketSeconds: 3600, nodes: forwardProxyStats().nodes.slice(0, 2).map((node, index) => ({ ...node, role: index === 0 ? 'primary' : 'secondary' })) })
+  return jsonResponse(key)
+}
+
+function handleUserRoute(path: string, url: URL, method: string, init?: RequestInit): Response {
+  const match = path.match(/^\/api\/users\/([^/]+)/)
+  const id = decodeURIComponent(match?.[1] ?? 'user-demo-admin')
+  const user = demoState.users.find((item) => item.userId === id) ?? demoState.users[0]
+  if (path.endsWith('/entitlements')) {
+    if (method === 'GET') return jsonResponse({ items: demoUserEntitlements(user.userId).items })
+    if (method === 'POST') return jsonResponse(demoUserEntitlements(user.userId).items[0], 201)
+  }
+  if (method !== 'GET') return noContentResponse()
+  if (path.endsWith('/usage-series')) return jsonResponse({ limit: user.quotaHourlyLimit, points: range(24).map((index) => ({ bucketStart: nowSeconds(-(23 - index) * 3600), displayBucketStart: nowSeconds(-(23 - index) * 3600), value: 20 + index, limitValue: user.quotaHourlyLimit })) })
+  if (path.endsWith('/broken-keys')) return jsonResponse({ ...buildListPage([{ keyId: DEMO_QUOTA_KEY_ID, currentStatus: 'exhausted', reasonCode: 'upstream_usage_limit_432', reasonSummary: 'Demo quota exhausted', latestBreakAt: nowSeconds(-4200), source: 'request_log', breakerTokenId: DEMO_TOKEN_ID, breakerUserId: user.userId, breakerUserDisplayName: user.displayName, manualActorDisplayName: null, relatedUsers: [] }], url) })
+  return jsonResponse({
+    ...user,
+    tokenCount: demoState.tokens.length,
+    tokens: demoState.tokens.map((token) => ({ tokenId: token.id, enabled: token.enabled, note: token.note, createdAt: token.created_at, lastUsedAt: token.last_used_at, totalRequests: token.total_requests, dailySuccess: token.quota_daily_used, dailyFailure: 18, monthlySuccess: token.quota_monthly_used })),
+    quotaBase: { hourlyAnyLimit: 100, hourlyLimit: 100, dailyLimit: 1000, monthlyLimit: 10000, inheritsDefaults: true },
+    effectiveQuota: { hourlyAnyLimit: user.hourlyAnyLimit, hourlyLimit: user.quotaHourlyLimit, dailyLimit: user.quotaDailyLimit, monthlyLimit: user.quotaMonthlyLimit, inheritsDefaults: false },
+    quotaBreakdown: [],
+    entitlements: demoUserEntitlements(user.userId),
+    businessCalls1h: user.businessCalls1h,
+    recentIpAddresses24h: ['198.51.100.24', '203.0.113.45'],
+    recentIpAddresses7d: ['198.51.100.24', '203.0.113.45', '192.0.2.14'],
+    recentIpTimeline7d: range(3).map((index) => ({ ipAddress: `198.51.100.${20 + index}`, firstSeenAt: nowSeconds(-(index + 1) * 86400), lastSeenAt: nowSeconds(-index * 2400), requestCount: 20 + index })),
+    recharge: demoAdminUserRechargeAudit(demoState.rechargeOrders, user.userId),
+  })
+}
+
+async function handleUserTags(path: string, method: string, init?: RequestInit): Promise<Response> {
+  const id = decodeURIComponent(path.match(/^\/api\/user-tags\/([^/]+)/)?.[1] ?? '')
+  if (method === 'GET') return jsonResponse({ items: demoState.userTags })
+  if (method === 'DELETE') {
+    demoState.userTags = demoState.userTags.filter((tag) => tag.id !== id)
+    return noContentResponse()
+  }
+
+  const body = await readJsonBody(init)
+  const payload = {
+    name: typeof body.name === 'string' && body.name.trim() ? body.name.trim() : 'demo',
+    displayName: typeof body.displayName === 'string' && body.displayName.trim() ? body.displayName.trim() : 'Demo',
+    icon: typeof body.icon === 'string' ? body.icon : null,
+    effectKind: typeof body.effectKind === 'string' ? body.effectKind : 'quota_delta',
+    hourlyAnyDelta: typeof body.hourlyAnyDelta === 'number' ? body.hourlyAnyDelta : 0,
+    hourlyDelta: typeof body.hourlyDelta === 'number' ? body.hourlyDelta : 0,
+    dailyDelta: typeof body.dailyDelta === 'number' ? body.dailyDelta : 0,
+    monthlyDelta: typeof body.monthlyDelta === 'number' ? body.monthlyDelta : 0,
+  }
+
+  if (method === 'PATCH') {
+    const index = demoState.userTags.findIndex((tag) => tag.id === id)
+    const nextTag = createDemoUserTag(id || `tag-${payload.name}`, payload, index >= 0 ? demoState.userTags[index].userCount : 0)
+    if (index >= 0) {
+      demoState.userTags[index] = nextTag
+    } else {
+      demoState.userTags.push(nextTag)
+    }
+    return jsonResponse(nextTag)
+  }
+
+  const nextId = `tag-${payload.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || Date.now()}`
+  const nextTag = createDemoUserTag(nextId, payload)
+  demoState.userTags.push(nextTag)
+  return jsonResponse(nextTag)
+}
+
+function handleTokenRoute(path: string, url: URL, method: string): Response {
+  const match = path.match(/^\/api\/tokens\/([^/]+)/)
+  const id = decodeURIComponent(match?.[1] ?? DEMO_TOKEN_ID)
+  const token = demoState.tokens.find((item) => item.id === id) ?? demoState.tokens[0]
+  if (method === 'DELETE') {
+    if (demoState.tokens.length > 1) {
+      demoState.tokens = demoState.tokens.filter((item) => item.id !== id)
+      demoState.tokenSecrets.delete(id)
+    }
+    return noContentResponse()
+  }
+  if (path.endsWith('/status') || path.endsWith('/note')) return noContentResponse()
+  if (path.endsWith('/secret') || path.endsWith('/secret/rotate')) return jsonResponse({ token: demoState.tokenSecrets.get(token.id) ?? DEMO_TOKEN })
+  if (path.endsWith('/metrics/hourly')) return jsonResponse(range(25).map((index) => ({ bucket_start: nowSeconds(-(24 - index) * 3600), success_count: 12 + index, system_failure_count: index % 4, external_failure_count: index % 6 === 0 ? 2 : 0 })))
+  if (path.endsWith('/metrics/usage-series')) return jsonResponse(tokenUsageSeries(url))
+  if (path.includes('/metrics')) return jsonResponse(tokenSummary(id))
+  if (path.endsWith('/logs/list')) return jsonResponse(buildCursorListPage(demoState.logs.filter((log) => log.auth_token_id === id), url))
+  if (path.endsWith('/logs/catalog')) return jsonResponse(requestLogsCatalog())
+  if (path.endsWith('/logs/page')) return jsonResponse(requestLogsPage(url, demoState.logs.filter((log) => log.auth_token_id === id)))
+  if (path.includes('/logs/') && path.endsWith('/details')) return jsonResponse(demoLogDetailForPath(path, demoState.logs.filter((log) => log.auth_token_id === id)))
+  if (path.endsWith('/broken-keys')) return jsonResponse({ ...buildListPage([{ keyId: DEMO_QUOTA_KEY_ID, currentStatus: 'exhausted', reasonCode: 'upstream_usage_limit_432', reasonSummary: 'Demo quota exhausted', latestBreakAt: nowSeconds(-4200), source: 'request_log', breakerTokenId: id, breakerUserId: 'user-demo-admin', breakerUserDisplayName: 'Hikari Demo Admin', manualActorDisplayName: null, relatedUsers: [] }], url) })
+  if (path.endsWith('/events')) return textResponse('demo event stream is provided by the browser demo runtime\n')
+  return jsonResponse(token)
+}
+
+async function handleCreateDemoRechargeOrder(init?: RequestInit): Promise<Response> {
+  const body = await readJsonBody(init)
+  const credits = typeof body.credits === 'number' ? body.credits : 0
+  const months = typeof body.months === 'number' ? body.months : 0
+  const quote = body.quote && typeof body.quote === 'object' ? body.quote as RechargeQuote : null
+  const isTestOffer = credits === DEMO_TEST_RECHARGE_CREDITS && months === DEMO_TEST_RECHARGE_MONTHS
+  const isRegularOffer = credits >= DEMO_RECHARGE_UNIT_CREDITS
+    && credits <= 20_000
+    && credits % DEMO_RECHARGE_UNIT_CREDITS === 0
+    && months >= 1
+    && months <= 12
+
+  if (!isTestOffer && !isRegularOffer) {
+    return jsonResponse({ message: 'Demo recharge only supports 1x1 test offer or regular 1000-credit steps.' }, 400)
+  }
+  if (!quote || quote.requestedCredits !== credits || quote.requestedMonths !== months) {
+    return jsonResponse({ message: 'Demo recharge quote mismatch.' }, 400)
+  }
+
+  const amountLdc = quote.finalOrderMoneyCents / 100
+  const outTradeNo = `ldc_demo_${Date.now()}`
+  const paymentUrl = `${window.location.origin}/console/dashboard?demo_checkout=${encodeURIComponent(outTradeNo)}`
+  const createdAt = nowSeconds()
+  const order: DemoRechargeOrder = {
+    outTradeNo,
+    userId: DEMO_TOKEN_OWNER.userId,
+    userDisplayName: DEMO_TOKEN_OWNER.displayName,
+    username: DEMO_TOKEN_OWNER.username,
+    status: 'pending',
+    credits,
+    months,
+    money: amountLdc.toFixed(2),
+    quoteMonthStart: quote.quoteMonthStart,
+    finalMoneyCents: quote.finalOrderMoneyCents,
+    finalHourlyDelta: quote.currentMonthFinalHourlyDelta,
+    finalDailyDelta: quote.currentMonthFinalDailyDelta,
+    finalMonthlyDelta: quote.currentMonthFinalMonthlyDelta,
+    monthEndClampApplied: quote.monthEndClampApplied,
+    tradeNo: null,
+    paymentUrl,
+    createdAt,
+    payExpiresAt: createdAt + 600,
+    cancelAfterAt: createdAt + 86_400,
+    cancelledAt: null,
+    updatedAt: createdAt,
+    paidAt: null,
+    refundedAt: null,
+    refundActor: null,
+    lastNotifyAt: null,
+    refundRetryAfterAt: null,
+    refundAttempts: 0,
+    lastError: null,
+  }
+  demoState.rechargeOrders.unshift(order)
+  return jsonResponse({ order, paymentUrl })
+}
+
+function buildDemoRechargeQuote(): RechargeQuote {
+  const quoteMonthStart = monthStartSeconds()
+  return {
+    requestedCredits: 1000,
+    requestedMonths: 2,
+    quoteMonthStart,
+    remainingDaysInclusive: 3,
+    unitCredits: DEMO_RECHARGE_UNIT_CREDITS,
+    unitPriceCents: DEMO_RECHARGE_UNIT_PRICE_LDC * 100,
+    fullMonthHourlyDelta: 20,
+    fullMonthDailyDelta: 100,
+    fullMonthMonthlyDelta: 1000,
+    fullMonthMoneyCents: 5000,
+    currentMonthFinalHourlyDelta: 12,
+    currentMonthFinalDailyDelta: 60,
+    currentMonthFinalMonthlyDelta: 600,
+    currentMonthFinalMoneyCents: 3000,
+    fullOrderMoneyCents: 10000,
+    finalOrderMoneyCents: 8000,
+    monthEndClampApplied: true,
+    orderName: 'Linux.do Credit recharge',
+    schedule: [
+      {
+        monthIndex: 0, monthStart: quoteMonthStart, isCurrentMonth: true,
+        hourlyDelta: 12, dailyDelta: 60, monthlyDelta: 600,
+        fullMonthlyDelta: 1000, monthMoneyCents: 3000, monthDiscountCents: 2000,
+        monthEndClampApplied: true,
+        discountReason: 'remaining_days_inclusive',
+      },
+      {
+        monthIndex: 1, monthStart: monthStartSeconds(1), isCurrentMonth: false,
+        hourlyDelta: 20, dailyDelta: 100, monthlyDelta: 1000,
+        fullMonthlyDelta: 1000, monthMoneyCents: 5000, monthDiscountCents: 0,
+        monthEndClampApplied: false,
+        discountReason: null,
+      },
+    ],
+  }
+}
+
+function handleTavilyProbe(path: string): JsonValue {
+  if (path.endsWith('/usage')) return { tokenId: DEMO_TOKEN_ID, dailySuccess: 12, dailyError: 0, monthlySuccess: 240, monthlyQuotaExhausted: 0 }
+  if (path.includes('/research/')) return { request_id: 'demo-research-001', status: 'completed', answer: 'Demo research result is ready.' }
+  if (path.endsWith('/research')) return { request_id: 'demo-research-001', status: 'queued' }
+  if (path.endsWith('/extract')) return { results: [{ url: 'https://example.test/demo', raw_content: 'Demo extracted content.' }] }
+  if (path.endsWith('/crawl')) return { base_url: 'https://example.test', results: [{ url: 'https://example.test/demo', title: 'Demo crawl page' }] }
+  if (path.endsWith('/map')) return { base_url: 'https://example.test', links: ['https://example.test/demo', 'https://example.test/docs'] }
+  return { query: 'demo mode', answer: 'Mocked Tavily search result', results: [{ title: 'Demo result', url: 'https://example.test/demo', content: 'This response is generated entirely in the browser demo mode.' }] }
+}
+
+async function handleMcpDemo(init?: RequestInit): Promise<Response> {
+  const body = await readJsonBody(init)
+  const method = typeof body.method === 'string' ? body.method : ''
+  const id = body.id ?? 'demo'
+  const headers = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Mcp-Session-Id': 'demo-session-001', 'X-Tavily-Hikari-Demo': 'true' })
+  if (method === 'notifications/initialized') return new Response(JSON.stringify({ jsonrpc: '2.0', result: null }), { status: 202, headers })
+  if (method === 'initialize') return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'tavily-hikari-demo', version: 'demo' } } }), { headers })
+  if (method === 'tools/list') return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { tools: [{ name: 'tavily_search', description: 'Browser-only demo search tool', inputSchema: { type: 'object' } }] } }), { headers })
+  if (method === 'tools/call') return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Demo MCP tool call completed without contacting an upstream service.' }] } }), { headers })
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: {} }), { headers })
+}
+
+class DemoEventSource {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSED = 2
+
+  readonly url: string
+  readonly withCredentials = false
+  readyState = DemoEventSource.CONNECTING
+  onopen: ((this: EventSource, ev: Event) => unknown) | null = null
+  onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null
+  onerror: ((this: EventSource, ev: Event) => unknown) | null = null
+  private listeners = new Map<string, Set<DemoListener>>()
+  private refreshTimer: number | null = null
+
+  constructor(url: string | URL) {
+    this.url = String(url)
+    activeEventSources.add(this)
+    window.setTimeout(() => {
+      if (this.readyState === DemoEventSource.CLOSED) return
+      this.readyState = DemoEventSource.OPEN
+      this.dispatch('open', new Event('open'))
+      this.emitInitialDemoEvent()
+    }, 40)
+  }
+
+  addEventListener(type: string, listener: DemoListener | null): void {
+    if (!listener) return
+    const set = this.listeners.get(type) ?? new Set<DemoListener>()
+    set.add(listener)
+    this.listeners.set(type, set)
+  }
+
+  removeEventListener(type: string, listener: DemoListener | null): void {
+    if (!listener) return
+    this.listeners.get(type)?.delete(listener)
+  }
+
+  dispatchEvent(event: Event): boolean {
+    this.dispatch(event.type, event)
+    return true
+  }
+
+  close(): void {
+    this.readyState = DemoEventSource.CLOSED
+    if (this.refreshTimer != null) {
+      window.clearInterval(this.refreshTimer)
+      this.refreshTimer = null
+    }
+    activeEventSources.delete(this)
+    this.listeners.clear()
+  }
+
+  emit(type: string, payload: unknown): void {
+    if (this.readyState === DemoEventSource.CLOSED) return
+    const event = new MessageEvent(type, { data: JSON.stringify(payload) })
+    this.dispatch(type, event)
+    if (type === 'message') this.onmessage?.call(this as unknown as EventSource, event)
+  }
+
+  private dispatch(type: string, event: Event): void {
+    if (type === 'open') this.onopen?.call(this as unknown as EventSource, event)
+    if (type === 'error') this.onerror?.call(this as unknown as EventSource, event)
+    for (const listener of this.listeners.get(type) ?? []) {
+      if (typeof listener === 'function') {
+        listener.call(this as unknown as EventSource, event)
+      } else {
+        listener.handleEvent(event)
+      }
+    }
+  }
+
+  private emitInitialDemoEvent(): void {
+    const url = parseUrl(this.url)
+    const path = url?.pathname ?? ''
+    if (path === '/api/events') {
+      this.emit('snapshot', demoDashboardOverview())
+      this.refreshTimer = window.setInterval(() => {
+        if (this.readyState !== DemoEventSource.OPEN) return
+        this.emit('snapshot', demoDashboardOverview())
+      }, 6000)
+      return
+    }
+    if (path === '/api/user/dashboard/events') {
+      this.emit('snapshot', demoUserDashboardOverview())
+      this.refreshTimer = window.setInterval(() => {
+        if (this.readyState !== DemoEventSource.OPEN) return
+        this.emit('snapshot', demoUserDashboardOverview())
+      }, 6000)
+      return
+    }
+    if (path === '/api/public/events') {
+      this.emit('metrics', {
+        public: { monthlySuccess: 23710, dailySuccess: 714 },
+        token: {
+          monthlySuccess: 8400,
+          dailySuccess: 388,
+          dailyFailure: 18,
+          quotaHourlyUsed: 42,
+          quotaHourlyLimit: 180,
+          quotaDailyUsed: 388,
+          quotaDailyLimit: 1600,
+          quotaMonthlyUsed: 8400,
+          quotaMonthlyLimit: 24000,
+        },
+      })
+      this.refreshTimer = window.setInterval(() => {
+        if (this.readyState !== DemoEventSource.OPEN) return
+        const pulse = demoPulse()
+        this.emit('metrics', {
+          public: { monthlySuccess: 23710 + (pulse % 6) * 20, dailySuccess: 714 + (pulse % 5) * 3 },
+          token: {
+            monthlySuccess: 8400 + (pulse % 6) * 12,
+            dailySuccess: 388 + (pulse % 5) * 2,
+            dailyFailure: 18 + (pulse % 3),
+            quotaHourlyUsed: 42 + (pulse % 4),
+            quotaHourlyLimit: 180,
+            quotaDailyUsed: 388 + (pulse % 5) * 2,
+            quotaDailyLimit: 1600,
+            quotaMonthlyUsed: 8400 + (pulse % 6) * 12,
+            quotaMonthlyLimit: 24000,
+          },
+        })
+      }, 6000)
+      return
+    }
+    if (path.startsWith('/api/user/tokens/')) {
+      const tokenId = decodeURIComponent(path.split('/')[4] ?? DEMO_TOKEN_ID)
+      const token = demoState.tokens.find((item) => item.id === tokenId) ?? demoState.tokens[0]
+      const logs = demoState.logs.filter((log) => log.auth_token_id === token.id)
+      this.emit('snapshot', { token: demoUserTokenSummaryFromToken(token), logs: publicTokenLogs(logs) })
+      return
+    }
+    if (path.startsWith('/api/tokens/')) {
+      const tokenId = decodeURIComponent(path.split('/')[3] ?? DEMO_TOKEN_ID)
+      const logs = demoState.logs.filter((log) => log.auth_token_id === tokenId)
+      this.emit('snapshot', { summary: tokenSummary(tokenId), logs: logs.slice(0, 12) })
+      return
+    }
+    if (path === '/api/users/rankings/events') {
+      this.emit('snapshot', demoUserRankingsSnapshot())
+      this.refreshTimer = window.setInterval(() => {
+        if (this.readyState !== DemoEventSource.OPEN) return
+        this.emit('snapshot', demoUserRankingsSnapshot())
+      }, 10_000)
+    }
+  }
+}
+
+const activeEventSources = new Set<DemoEventSource>()
+
+function overrideWindowEventSource(eventSource: typeof EventSource): void {
+  Object.defineProperty(window, 'EventSource', {
+    configurable: true,
+    writable: true,
+    value: eventSource,
+  })
+}
+
+export function installDemoRuntime(): void {
+  if (!isDemoMode() || typeof window === 'undefined' || window.__tavilyHikariDemoInstalled) return
+  window.__tavilyHikariDemoInstalled = true
+  document.documentElement.dataset.demoMode = 'true'
+  const originalFetch = window.fetch.bind(window)
+  window.__tavilyHikariDemoFetch = originalFetch
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await demoFetch(input, init)
+    if (response) return response
+    return originalFetch(input, init)
+  }
+  window.__tavilyHikariDemoEventSource = window.EventSource
+  overrideWindowEventSource(DemoEventSource as unknown as typeof EventSource)
+}

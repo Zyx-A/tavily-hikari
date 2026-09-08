@@ -1,0 +1,218 @@
+# Runtime：性能诊断日志与低内存稳定运行合同（#m2p6k）
+
+## 背景
+
+- 101 线上实例已经观察到进程组内存升到约 `438MiB`，其中主进程匿名 RSS 约 `375MiB`，历史
+  `VmHWM`/`VmSwap` 远高于当前常驻值，说明需要一套能直接从默认 runtime logs 里定位大对象链路的
+  稳定证据面。
+- 当前已确认的热点跨越 HA baseline/events export/import、standby sync、dashboard shared
+  snapshot，以及 owner-facing request logs list/catalog 读路径。
+- 现有日志基线已经是默认 JSON stderr、`RUNTIME_LOG_FORMAT=text` fallback、`RUST_LOG`
+  过滤、慢 SQL `250ms` 与 DB phase `1s`。新的性能诊断必须扩这个合同，而不是再加一套独立
+  telemetry。
+
+## Goals
+
+- 默认 runtime logs 直接暴露关键性能链路的稳定结构化事件，无需临时改代码或打开 debug dump。
+- 所有与 `256MiB` 稳定运行合同相关的关键路径都能在日志中看到内存头寸、作用域、耗时和结果。
+- 业务调用缓存只在最近一小时保留逐事件数据，前 1–25 小时使用五分钟桶聚合；backfill 使用
+  500 行分页和 generation/tail 合并。分页期间必须保留 last-good 快照，只有完整构建成功后才原子交换；
+  混合负载下以进程组 RSS P95 `<=256MiB` 作为 SLO 观测目标。
+- `/proc` 与 cgroup footprint 只在五分钟采样窗口、慢请求、错误或状态跃迁时读取；不设置
+  `memory.max`，也不将 file cache/swap 误判为堆泄漏。
+
+## Non-goals
+
+- 不新增 Prometheus/OTel/owner-facing metrics 页面。
+- 不改变 HA、dashboard、request logs、forward-proxy startup 的公开业务 contract。
+- 不把秘密、header/body 明文或全量 SQL debug 输出进默认日志。
+
+## Runtime Logging Contract
+
+- 普通 Dashboard phase、HA GC slice、逐 key 429 与 enqueue reuse 使用 DEBUG；聚合运行摘要最多每
+  60 秒输出一次 INFO。
+- HA GC slice 的 DEBUG 事件还必须区分 wall-clock `elapsed_ms` 与 active database work
+  `active_elapsed_ms`、`max_batch_elapsed_ms`，并记录 `deleted_rows` 与 `continuation_delay_secs`，使短让步与 SQLite
+  writer contention 不会被混为同一种性能问题。active 字段只包含 cleanup micro-batch，不包含 post-slice
+  state probe。
+- HA export/sync 的窗口采样以 `outbox_sequence_span_estimate` 与 `outbox_high_watermark` 表示积压趋势；不得在
+  该热路径计算或记录名为 `outbox_row_count` 的精确库存。
+- 内存 INFO 快照最多每 5 分钟真实读取一次 `/proc` 与 cgroup；slow/error 事件立即采集。
+- SQLite workload 以固定 operation/workload class 在有界内存窗口聚合；每 60 秒最多一条
+  `component=db event=sqlite_workload_window` INFO，报告调用量、pool/begin wait、transaction hold、
+  fixed-bucket transaction-hold p95、retries、logical rows、admitted/deferred 与原因、当前/峰值 pool acquire waiter、窗口最小 idle、
+  错误/丢弃连接、connection-level SQLite `CACHE_WRITE` page delta、按 reconciliation read kind 聚合的
+  cooperative source-read calls/elapsed/deadline/defer/discard，以及明确标为 process/cgroup aggregate 的
+  write-byte delta。窗口轮转时只可采样已配置 core/observability DB 与 WAL 的文件状态；不得 checkpoint、扫描
+  数据目录、记录 SQL、参数或请求正文。
+- `AdminMutation` is a foreground SQLite workload operation. It reports bounded acquire, begin,
+  hold, error, and connection-level cache-write metrics independently from background writes;
+  transient exhaustion remains a retryable HTTP outcome rather than a five-second hidden wait.
+- `ha_outbox_gc_watchdog` 是短 `maintenance_control` state read，按同一窗口归因；它不输出逐次
+  INFO/WARN，也不收集或输出 outbox inventory。
+- 内存字段同时报告 cgroup `anon/file/swap` 与进程 `RssAnon/RssFile/VmSwap`，避免把文件页缓存
+  误诊为堆泄漏。
+- Reconciliation run observation reports mode, projection phase/scanned rows/batch/transaction p95,
+  hydrate/first-remote/remote/finalization/research timing, typed outcome counts, continuation reason,
+  and next retry. Stable cursor values, token/key identifiers, SQL, and request content remain private.
+- Research-drain diagnostics report only polls, terminal/pending/retry counts, cooldown skips,
+  resumes, backlog deltas, cursor advance or wrap, and read/lease defers. The stable composite cursor
+  and source rows remain private; main outcome and drain outcome are separate aggregate fields.
+- Reconciliation diagnostics also aggregate partial-key observations, multi-key pending candidates,
+  `remote_attempt_budget` defers, resumed runs, and terminal completions. They expose counts only;
+  token ids, key ids, SQL, and upstream response content remain private.
+- Dashboard read-model invalidation is a durable business-write signal, not only a request-statistics
+  signal. A successful quota or other overview-visible write advances the shared dirty generation;
+  the read model coalesces dirty rebuilds to at most once per ten seconds and uses a sixty-second
+  safety probe only to catch a missed signal.
+- AlertProjection cursor/fence work is background-only. Its recent Dashboard tail and historical
+  administrator lane report distinct coverage. Dashboard HTTP and SSE consume the immutable
+  last-good snapshot only after recent coverage is `ok`; an incomplete or expired recent observation
+  is reported as `stale` with an explicit reason instead of being presented as a healthy refresh.
+- An idle alert probe is a no-work result, not a progress write. It leaves durable cursor/generation
+  state unchanged; a separately throttled observation heartbeat maintains recent-tail liveness.
+  Sidecar Dashboard aggregation returns only scalar counts and the bounded top-group page, never an
+  unbounded payload collection.
+- 事务污染、stale claim recovery、连续零进展、预算耗尽和逐 Key cooldown 只在进入、升级或恢复时告警；遗留 global-backoff meta 不作为 live 状态。
+- HA GC 低压恢复、SLO deadline、最老可删事件年龄与真实删除率必须可从管理员状态和聚合日志
+  还原；sequence span 仅作趋势估算，不作为库存或 ETA。
+- Request-log GC admission and an unsealed-day retention guard are DEBUG-level typed outcomes. They
+  retain the existing five-minute continuation but must not emit one WARN or repeat one failed
+  cleanup batch per scheduler loop.
+- 对账主结算与 Research drain 分别记录；本地预算压力与 upstream 429 必须分开记录。Research
+  的 `foreground_pressure`、`remote_lease`、`read_budget` 与 `control_defer` 也必须以脱敏聚合
+  区分。每个 Research poll 的远端观察、状态和精确 cursor 仅在 accepted drain claim 下原子落盘；
+  defer 只能记录已接受 continuation，不能伪造 progress 或 terminal。HA GC 正常进展继续按通道
+  60 秒聚合，不能恢复逐片 WARN。
+- Reconciliation 429 state is scoped to the affected `period_reconciliation` Key. Non-cooling Keys
+  remain eligible; an all-Key cooldown reports the earliest retry time. Legacy global-backoff meta
+  is compatibility data only and cannot gate work or representative wake.
+- Privacy status owns an AppState-owned immutable last-good controller. After ready it starts one
+  low-priority prewarm; deferred prewarm retries in the background until last-good is published or
+  shutdown fences it, without delaying readiness or competing with foreground work.
+  The controller's `AdminPrivacyRead` snapshot acquire and `BEGIN` are bounded to 100ms, never
+  enter maintenance-bulk admission, and explicitly close at a cooperative completion boundary.
+  Its complete diagnostic run is bounded to two seconds by SQLite's progress handler and an
+  explicit check before every next SQLite phase and each row of unbounded result shaping. The handler
+  interrupts the active statement; the phase checks prevent a series of short statements or a large
+  in-memory diagnostic projection from extending the snapshot past its run budget.
+  Both are cleared before the explicit rollback; HTTP and shutdown never cancel the task while it
+  owns a snapshot.
+  HTTP only copies last-good data: a cached value, including one older than 60 seconds, returns
+  additive `stale` coverage within 250ms while refresh is in flight or deferred; a true cold miss
+  returns `503 Retry-After: 1` without canceling an open SQLite transaction. Shutdown fences new
+  refreshes and waits for an active snapshot to close cooperatively.
+- A server-pressure rebuild scans at most 500 source rows per keyset slice below its fixed source
+  fence, writes only an inactive staged generation, then atomically publishes that generation before
+  replaying its buffered tail. Old generations are cleaned in 25-row slices; no rebuild may delete
+  the whole live bucket set or replace it with a partial result.
+- A writable tenure alone never starts that rebuild. It is admitted only for an overflow, confirmed
+  coverage loss, or five minutes of continuous stale pressure, and each serving generation spaces
+  qualifying rebuilds by at least five minutes.
+- The instance-owned observability writer debounces normal pressure and audit writes for one second.
+  A pressure batch contains at most 25 keys and an audit batch at most 10 rows; an uncommitted batch
+  is atomically requeued. The first two defers wait five seconds, sustained defer waits thirty
+  seconds, and ordinary defer alone never requests a rebuild.
+
+- 继续使用默认 `RUNTIME_LOG_FORMAT=json` + `stderr` 输出，保留 `text` fallback。
+- 新增的性能事件必须使用现有 `tracing` 结构化字段，按事件适用性包含：
+  - `component`
+  - `event`
+  - `elapsed_ms`
+  - 作用域字段：`route` / `scope` / `phase` / `channel` / `page_size` / `row_count` / `degraded`
+  - 预算字段：`memory_current_bytes` / `memory_limit_bytes` / `headroom_bytes`
+- 若可得，补充：
+  - `process_rss_bytes`
+  - `child_process_rss_bytes`
+  - `process_group_rss_bytes`
+  - `process_hwm_bytes`
+  - `process_swap_bytes`
+  - `payload_bytes`
+  - `compressed_bytes`
+  - `high_watermark`
+  - `outbox_sequence_span_estimate`（仅趋势估算，不是库存）
+  - `outbox_oldest_age_secs`
+  - `outbox_ack_lag`
+- HA normal completion events may be emitted at DEBUG, with an INFO sample per `(event, channel)`
+  at most once per minute. Outbox aggregation and full runtime-memory snapshots may be collected at
+  most once per channel every five minutes, except for slow operations.
+- Default SQLx logging must not emit complete statements at WARN. Stable operation-level logs retain
+  timing, rows, and error category; `RUST_LOG=sqlx::query=debug` remains the explicit opt-in for
+  raw SQL diagnostics.
+
+## Required Perf Events
+
+- HA:
+  - `component=ha event=baseline_export_completed`
+  - `component=ha event=events_export_completed`
+  - `component=ha event=baseline_import_completed`
+  - `component=ha event=events_import_completed`
+  - `component=ha event=standby_sync_baseline_completed`
+  - `component=ha event=standby_sync_events_completed`
+- Dashboard / shared snapshot:
+  - `component=startup event=dashboard_overview_prewarmed`
+  - `component=startup event=dashboard_overview_prewarm_deferred`
+  - `component=admin_read event=dashboard_snapshot_cache_hit`
+  - `component=admin_read event=dashboard_snapshot_rebuilt`
+  - `component=admin_read event=dashboard_overview_phase phase=freshness_probe`
+  - `component=admin_read event=dashboard_overview_phase phase=cache_wait`
+  - `component=admin_read event=dashboard_overview_phase phase=quota_charge_rebuild`
+  - `component=admin_read event=dashboard_overview_phase phase=recent_alerts_rebuild`
+  - `component=admin_read event=dashboard_overview_phase phase=overview_payload_build`
+  - `component=admin_read event=dashboard_overview_phase phase=overview_serialize`
+- Owner-facing recent request reads:
+  - `component=admin_read event=request_logs_catalog_completed`
+  - `component=admin_read event=request_logs_list_completed`
+  - `component=admin_read event=token_logs_catalog_completed`
+  - `component=admin_read event=token_logs_list_completed`
+  - `component=admin_read event=/api/alerts/events phase=projection_sidecar|alerts_projection`
+  - `component=admin_read event=/api/alerts/groups phase=projection_sidecar|alerts_grouping`
+- `component=admin_read event=alerts_last_good_served|alerts_cold_pressure`
+- `component=admin_read event=alerts_canonical_warm_published|alerts_canonical_warm_deferred`
+  Warm diagnostics report only the defer category, retry delay, projection generation outcome, and
+  aggregate slice counts. They never include SQL, filters, users, tokens, keys, or response bodies.
+- The canonical Events warm slice reports the bounded indexed projection phase separately from
+  filtered CTE reads. Its metrics cover only statement elapsed/defer and decoded row count; no SQL,
+  payload, or filter value is recorded. A future query-plan change must retain the same operation
+  boundary and native deadline.
+- `component=startup event=admin_privacy_status_prewarm_started|admin_privacy_status_prewarm_deferred`
+  - `component=admin_read event=low_memory_protection_decision`
+- `sqlite_workload_window` aggregates `observability_deferred_write` alongside other operation
+  classes. Per-flush defer/retry records remain DEBUG; queue recovery or a persistent stale state
+  is emitted only as a sampled state transition.
+- Forward proxy / xray startup:
+  - `component=forward_proxy event=startup_runtime_begin`
+  - `component=forward_proxy event=startup_runtime_snapshot_persisted`
+  - `component=forward_proxy event=startup_runtime_store_synced`
+
+## Validation
+
+- `cargo check`
+- `cargo test --lib runtime_logging::tests::runtime_memory_helpers_parse_status_and_cgroup_values -- --nocapture`
+- `cargo test --lib runtime_logging::tests::runtime_perf_scope_exposes_elapsed_and_memory_fields -- --nocapture`
+- `cargo test --lib store::tests::perf_logs_are_info_level_and_include_memory_budget_fields -- --nocapture`
+- `cargo test alerts_and_ha -- --nocapture`
+- `cargo test log_catalog_and_dashboard_sse -- --nocapture`
+- `cargo test --bin tavily-hikari listener_ready_hook_schedules_privacy_status_prewarm -- --nocapture`
+- `cargo test --lib admin_privacy_read_run_budget_interrupts_before_discarding_its_session -- --nocapture`
+- `cargo test --lib privacy_status_stops_at_a_safe_boundary_and_closes_its_snapshot -- --nocapture`
+
+## Notes
+
+- 这张 spec 是 runtime 诊断、低内存和恢复模式的程序级合同真相源。
+- 高频 `low_memory_protection_decision` 与 HA export/sync 信息应按状态跃迁或轻量采样输出，默认日志不再依赖密集重复 INFO 来做定位。
+- HA peer-less export and baseline samples report `ack_lag=null`; normal summaries stay sampled per
+  channel, while heavy outbox and memory snapshots remain reserved for slow, error, or threshold
+  transition events.
+- HA GC aggregate samples include the continuation delay and `next_retry_at`; the normal sampled
+  path remains sufficient to diagnose deferred recovery without restoring per-slice WARN logs.
+
+## Visual Evidence
+
+- evidence_note: This change only adjusts runtime diagnostics and scheduler recovery. Any future
+  UI-affecting change must add current-SHA visual evidence before selecting it for a PR.
+
+## Related ADRs
+
+- [ADR 0002: Scoped SQLite and Remote Admission](../../adr/0002-scoped-sqlite-and-remote-admission.md)
+- [ADR 0004: Research Uses an Independent Durable Drain](../../adr/0004-reconciliation-research-drain.md)

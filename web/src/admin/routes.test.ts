@@ -1,11 +1,33 @@
 import { describe, expect, it } from 'bun:test'
 
 import {
+  analysisPath,
+  announcementCreatePath,
+  announcementEditPath,
+  announcementListPath,
+  alertsPath,
   buildAdminKeysPath,
+  buildAdminUsersOverviewPath,
   buildAdminUsersPath,
+  getUserDetailTabFromSearch,
+  getRankingsTabFromSearch,
+  getAlertsViewFromSearch,
+  isAdminUsersOverviewSortField,
   isSameAdminRoute,
   keyDetailPath,
   parseAdminPath,
+  rankingsPath,
+  systemSettingsAdminPath,
+  systemSettingsMcpSessionBindingsPath,
+  systemSettingsStatusPath,
+  systemSettingsHaPath,
+  systemSettingsHaNodePath,
+  getMcpSessionBindingsCreatedFromSearch,
+  getMcpSessionBindingsCreatedToSearch,
+  getMcpSessionBindingsUpdatedFromSearch,
+  getMcpSessionBindingsUpdatedToSearch,
+  getMcpSessionBindingsPageFromSearch,
+  getMcpSessionBindingsStatusFromSearch,
   tokenDetailPath,
   unboundTokenUsagePath,
   userDetailPath,
@@ -20,12 +42,135 @@ describe('admin user tag routes', () => {
     expect(parseAdminPath('/admin/users/tags')).toEqual({ name: 'user-tags' })
   })
 
-  it('parses the dedicated user usage page before user detail fallback', () => {
-    expect(parseAdminPath('/admin/users/usage')).toEqual({ name: 'user-usage' })
+  it('parses the dedicated user usage page as an analysis usage alias before user detail fallback', () => {
+    expect(parseAdminPath('/admin/users/usage')).toEqual({ name: 'module', module: 'analysis', analysisView: 'usage' })
   })
 
   it('parses the unbound token usage page before token detail fallback', () => {
     expect(parseAdminPath('/admin/tokens/leaderboard')).toEqual({ name: 'unbound-token-usage' })
+  })
+
+  it('parses the analysis routes and rankings alias', () => {
+    expect(parseAdminPath('/admin/analysis')).toEqual({ name: 'module', module: 'analysis', analysisView: 'rankings' })
+    expect(parseAdminPath('/admin/analysis/rankings')).toEqual({ name: 'module', module: 'analysis', analysisView: 'rankings' })
+    expect(parseAdminPath('/admin/analysis/pressure')).toEqual({ name: 'module', module: 'analysis', analysisView: 'pressure' })
+    expect(parseAdminPath('/admin/rankings')).toEqual({ name: 'module', module: 'analysis', analysisView: 'rankings' })
+  })
+
+  it('builds and parses stable rankings tab paths', () => {
+    expect(rankingsPath()).toBe('/admin/rankings?tab=last24h')
+    expect(rankingsPath('uniqueIp')).toBe('/admin/rankings?tab=uniqueIp')
+    expect(getRankingsTabFromSearch('')).toBe('last24h')
+    expect(getRankingsTabFromSearch('?tab=businessCredits')).toBe('businessCredits')
+    expect(getRankingsTabFromSearch('?tab=invalid')).toBe('last24h')
+  })
+
+  it('builds and parses stable user detail tab paths', () => {
+    expect(userDetailPath('usr_alice')).toBe('/admin/users/usr_alice')
+    expect(userDetailPath('usr_alice', null, null, null, null, null, null, 'account')).toBe('/admin/users/usr_alice')
+    expect(userDetailPath('usr_alice', null, null, null, null, null, null, 'quota')).toBe('/admin/users/usr_alice?tab=quota')
+    expect(userDetailPath('usr_alice', 'L2', 'linuxdo_l2', 3, 'monthlySuccessRate', 'asc', 'usage', 'activity')).toBe(
+      '/admin/users/usr_alice?q=L2&tagId=linuxdo_l2&page=3&sort=monthlySuccessRate&order=asc&view=usage&tab=activity',
+    )
+    expect(getUserDetailTabFromSearch('')).toBe('account')
+    expect(getUserDetailTabFromSearch('?tab=activity')).toBe('activity')
+    expect(getUserDetailTabFromSearch('?tab=identity')).toBe('account')
+    expect(getUserDetailTabFromSearch('?tab=tags')).toBe('account')
+    expect(getUserDetailTabFromSearch('?tab=tokens')).toBe('account')
+    expect(getUserDetailTabFromSearch('?tab=invalid')).toBe('account')
+  })
+
+  it('parses the system settings module route', () => {
+    expect(parseAdminPath('/admin/system-settings')).toEqual({
+      name: 'module',
+      module: 'system-settings',
+      systemSettingsView: 'general',
+    })
+    expect(parseAdminPath('/admin/settings')).toEqual({
+      name: 'module',
+      module: 'system-settings',
+      systemSettingsView: 'general',
+    })
+  })
+
+  it('parses the system settings HA subpage route', () => {
+    expect(parseAdminPath('/admin/system-settings/ha')).toEqual({
+      name: 'module',
+      module: 'system-settings',
+      systemSettingsView: 'ha',
+    })
+  })
+
+  it('parses the system settings admin subpage route', () => {
+    expect(parseAdminPath('/admin/system-settings/admin')).toEqual({
+      name: 'module',
+      module: 'system-settings',
+      systemSettingsView: 'admin',
+    })
+  })
+
+  it('parses the system status route', () => {
+    expect(parseAdminPath('/admin/system-settings/status')).toEqual({
+      name: 'module',
+      module: 'system-settings',
+      systemSettingsView: 'status',
+    })
+    expect(parseAdminPath('/admin/system-settings/privacy-status')).toEqual({
+      name: 'module',
+      module: 'system-settings',
+      systemSettingsView: 'status',
+    })
+  })
+
+  it('parses the HA node detail route', () => {
+    expect(parseAdminPath('/admin/system-settings/ha/nodes/demo-standby')).toEqual({
+      name: 'ha-node',
+      nodeId: 'demo-standby',
+    })
+  })
+
+  it('parses and builds the hidden MCP session bindings route', () => {
+    expect(parseAdminPath('/admin/system-settings/mcp-session-bindings')).toEqual({
+      name: 'mcp-session-bindings',
+    })
+    expect(systemSettingsMcpSessionBindingsPath()).toBe('/admin/system-settings/mcp-session-bindings')
+    expect(
+      systemSettingsMcpSessionBindingsPath({
+        status: 'all',
+        createdFrom: '2026-07-15T00:00:00+08:00',
+        createdTo: '2026-07-15T11:00:00+08:00',
+        updatedFrom: '2026-07-15T11:00:00+08:00',
+        updatedTo: '2026-07-15T22:00:00+08:00',
+        page: 3,
+      }),
+    ).toBe(
+      '/admin/system-settings/mcp-session-bindings?status=all&createdFrom=2026-07-15T00%3A00%3A00%2B08%3A00&createdTo=2026-07-15T11%3A00%3A00%2B08%3A00&updatedFrom=2026-07-15T11%3A00%3A00%2B08%3A00&updatedTo=2026-07-15T22%3A00%3A00%2B08%3A00&page=3',
+    )
+    expect(getMcpSessionBindingsStatusFromSearch('')).toBe('active')
+    expect(getMcpSessionBindingsStatusFromSearch('?status=revoked')).toBe('revoked')
+    expect(getMcpSessionBindingsCreatedFromSearch('?createdFrom=2026-07-15T00:00:00%2B08:00')).toBe(
+      '2026-07-15T00:00:00+08:00',
+    )
+    expect(getMcpSessionBindingsCreatedToSearch('?createdTo=2026-07-15T11:00:00%2B08:00')).toBe(
+      '2026-07-15T11:00:00+08:00',
+    )
+    expect(getMcpSessionBindingsUpdatedFromSearch('?updatedFrom=2026-07-15T11:00:00%2B08:00')).toBe(
+      '2026-07-15T11:00:00+08:00',
+    )
+    expect(getMcpSessionBindingsUpdatedToSearch('?updatedTo=2026-07-15T22:00:00%2B08:00')).toBe(
+      '2026-07-15T22:00:00+08:00',
+    )
+    expect(getMcpSessionBindingsPageFromSearch('?page=4')).toBe(4)
+  })
+
+  it('parses dedicated announcement editor routes before module fallback', () => {
+    expect(parseAdminPath('/admin/announcements')).toEqual({ name: 'module', module: 'announcements' })
+    expect(parseAdminPath('/admin/announcements/new')).toEqual({ name: 'announcement-editor', mode: 'create' })
+    expect(parseAdminPath('/admin/announcements/ann%2042/edit')).toEqual({
+      name: 'announcement-editor',
+      mode: 'edit',
+      id: 'ann 42',
+    })
   })
 
   it('parses the user tag create page', () => {
@@ -42,8 +187,14 @@ describe('admin user tag routes', () => {
   })
 
   it('builds stable user tag management paths', () => {
+    expect(alertsPath()).toBe('/admin/alerts?view=groups')
+    expect(alertsPath({ view: 'events' })).toBe('/admin/alerts?view=events')
+    expect(getAlertsViewFromSearch('')).toBe('groups')
+    expect(getAlertsViewFromSearch('?view=events')).toBe('events')
     expect(userTagsPath()).toBe('/admin/users/tags')
-    expect(userUsagePath()).toBe('/admin/users/usage')
+    expect(analysisPath()).toBe('/admin/analysis/rankings')
+    expect(analysisPath('pressure')).toBe('/admin/analysis/pressure')
+    expect(userUsagePath()).toBe('/admin/analysis/usage')
     expect(unboundTokenUsagePath()).toBe('/admin/tokens/leaderboard')
     expect(unboundTokenUsagePath('ops', 2, 'quotaMonthlyUsed', 'asc')).toBe(
       '/admin/tokens/leaderboard?q=ops&page=2&sort=quotaMonthlyUsed&order=asc',
@@ -52,8 +203,24 @@ describe('admin user tag routes', () => {
     expect(tokenDetailPath('tok 42', 'ops', 2, 'quotaMonthlyUsed', 'asc', 'unbound-usage')).toBe(
       '/admin/tokens/tok%2042?q=ops&page=2&sort=quotaMonthlyUsed&order=asc&view=unbound-usage',
     )
+    expect(tokenDetailPath('tok 42', undefined, undefined, undefined, undefined, 'tokens', {
+      query: 'legacy',
+      group: 'ops',
+      owner: 'bound',
+      enabled: 'frozen',
+      quotaState: 'day',
+      page: 3,
+      perPage: 50,
+    })).toBe('/admin/tokens/tok%2042?q=legacy&group=ops&owner=bound&enabled=frozen&quota_state=day&page=3&perPage=50')
     expect(userTagCreatePath()).toBe('/admin/users/tags/new')
     expect(userTagEditPath('linuxdo l2')).toBe('/admin/users/tags/linuxdo%20l2')
+    expect(announcementListPath()).toBe('/admin/announcements')
+    expect(announcementCreatePath()).toBe('/admin/announcements/new')
+    expect(announcementEditPath('ann 42')).toBe('/admin/announcements/ann%2042/edit')
+    expect(systemSettingsAdminPath()).toBe('/admin/system-settings/admin')
+    expect(systemSettingsStatusPath()).toBe('/admin/system-settings/status')
+    expect(systemSettingsHaPath()).toBe('/admin/system-settings/ha')
+    expect(systemSettingsHaNodePath('demo standby')).toBe('/admin/system-settings/ha/nodes/demo%20standby')
   })
 
   it('preserves full users list context when building cross-page routes', () => {
@@ -67,7 +234,7 @@ describe('admin user tag routes', () => {
       '/admin/users/tags?q=L2&tagId=linuxdo_l2&page=3&sort=monthlySuccessRate&order=asc',
     )
     expect(userUsagePath('L2', 'linuxdo_l2', 3, 'monthlySuccessRate', 'asc')).toBe(
-      '/admin/users/usage?q=L2&tagId=linuxdo_l2&page=3&sort=monthlySuccessRate&order=asc',
+      '/admin/analysis/usage?q=L2&tagId=linuxdo_l2&page=3&sort=monthlySuccessRate&order=asc',
     )
     expect(userTagCreatePath('L2', 'linuxdo_l2', 3, 'monthlySuccessRate', 'asc')).toBe(
       '/admin/users/tags/new?q=L2&tagId=linuxdo_l2&page=3&sort=monthlySuccessRate&order=asc',
@@ -75,7 +242,17 @@ describe('admin user tag routes', () => {
     expect(userTagEditPath('linuxdo l2', 'L2', 'linuxdo_l2', 3, 'monthlySuccessRate', 'asc')).toBe(
       '/admin/users/tags/linuxdo%20l2?q=L2&tagId=linuxdo_l2&page=3&sort=monthlySuccessRate&order=asc',
     )
-    expect(userDetailPath('usr_alice')).toBe('/admin/users/usr_alice')
+  })
+
+  it('drops usage-only sort state when building an overview return path', () => {
+    expect(isAdminUsersOverviewSortField('recentIpCount7d')).toBe(true)
+    expect(isAdminUsersOverviewSortField('monthlySuccessRate')).toBe(false)
+    expect(buildAdminUsersOverviewPath('L2', 'linuxdo_l2', 3, 'recentIpCount7d', 'asc')).toBe(
+      '/admin/users?q=L2&tagId=linuxdo_l2&page=3&sort=recentIpCount7d&order=asc',
+    )
+    expect(buildAdminUsersOverviewPath('L2', 'linuxdo_l2', 3, 'monthlySuccessRate', 'asc')).toBe(
+      '/admin/users?q=L2&tagId=linuxdo_l2&page=3',
+    )
   })
 
   it('marks detail and tag routes that were opened from the usage view', () => {
@@ -130,7 +307,23 @@ describe('admin user tag routes', () => {
     ).toBe(false)
   })
 
-  it('compares user usage routes as the same logical page', () => {
-    expect(isSameAdminRoute({ name: 'user-usage' }, { name: 'user-usage' })).toBe(true)
+  it('compares analysis routes by logical subview', () => {
+    expect(
+      isSameAdminRoute(
+        { name: 'module', module: 'analysis', analysisView: 'usage' },
+        { name: 'module', module: 'analysis', analysisView: 'usage' },
+      ),
+    ).toBe(true)
+    expect(
+      isSameAdminRoute(
+        { name: 'module', module: 'analysis', analysisView: 'usage' },
+        { name: 'module', module: 'analysis', analysisView: 'pressure' },
+      ),
+    ).toBe(false)
+  })
+
+  it('compares HA node routes by node id', () => {
+    expect(isSameAdminRoute({ name: 'ha-node', nodeId: 'node-a' }, { name: 'ha-node', nodeId: 'node-a' })).toBe(true)
+    expect(isSameAdminRoute({ name: 'ha-node', nodeId: 'node-a' }, { name: 'ha-node', nodeId: 'node-b' })).toBe(false)
   })
 })

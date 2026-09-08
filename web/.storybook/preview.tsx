@@ -212,6 +212,16 @@ const viewportOptions = {
     ...(INITIAL_VIEWPORTS.iphone14 ?? INITIAL_VIEWPORTS.iphonex ?? {}),
     name: 'iPhone 14 portrait (390px)',
   },
+  '0390-device-short': {
+    name: 'Short mobile (390 x 640px)',
+    styles: { width: '390px', height: '640px' },
+    type: 'mobile',
+  },
+  '0393-admin-mobile': {
+    name: 'Admin mobile (393 x 852px)',
+    styles: { width: '393px', height: '852px' },
+    type: 'mobile',
+  },
   '0430-device-iphone-14-pro-max': {
     ...(INITIAL_VIEWPORTS.iphone14promax ?? INITIAL_VIEWPORTS.iphone12promax ?? {}),
     name: 'iPhone 14 Pro Max portrait (430px)',
@@ -259,6 +269,11 @@ const viewportOptions = {
     styles: { width: '1200px', height: '900px' },
     type: 'desktop',
   },
+  '1280-breakpoint-tailwind-xl': {
+    name: 'Tailwind xl breakpoint (1280px)',
+    styles: { width: '1280px', height: '900px' },
+    type: 'desktop',
+  },
   '1440-device-desktop': {
     name: 'Desktop baseline (1440px)',
     styles: { width: '1440px', height: '900px' },
@@ -290,7 +305,7 @@ const preview: Preview = {
     themeMode: {
       name: 'Theme',
       description: 'UI theme',
-      defaultValue: 'dark',
+      defaultValue: 'light',
       toolbar: {
         icon: 'mirror',
         items: [

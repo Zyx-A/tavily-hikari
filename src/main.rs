@@ -1,3 +1,29 @@
+#[allow(unused_macros)]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        tavily_hikari::emit_legacy_stdio_event(
+            tavily_hikari::LegacyStdIoLevel::Info,
+            module_path!(),
+            file!(),
+            line!(),
+            format_args!($($arg)*),
+        )
+    }};
+}
+
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        tavily_hikari::emit_legacy_stdio_event(
+            tavily_hikari::LegacyStdIoLevel::Warn,
+            module_path!(),
+            file!(),
+            line!(),
+            format_args!($($arg)*),
+        )
+    }};
+}
+
 mod server;
 
 use std::{
@@ -6,13 +32,21 @@ use std::{
 };
 
 use argon2::password_hash::PasswordHash;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
-use tavily_hikari::{DEFAULT_UPSTREAM, TavilyProxy, TavilyProxyOptions};
+use tavily_hikari::{
+    AdminPasskeyScope, DEFAULT_UPSTREAM, HaConfig, HaMode, LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT,
+    RuntimeLogFormat, TavilyProxy, TavilyProxyOptions,
+    create_admin_passkey_reset_token_for_database,
+};
+use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Tavily reverse proxy with key rotation")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     /// Tavily API keys（逗号分隔或重复传参）
     #[arg(
         long,
@@ -66,9 +100,14 @@ struct Cli {
     #[arg(long, env = "ADMIN_MODE_NAME")]
     admin_mode_name: Option<String>,
 
-    /// Enable/disable ForwardAuth admin authentication (default true).
-    #[arg(long, env = "ADMIN_AUTH_FORWARD_ENABLED", default_value_t = true)]
-    admin_auth_forward_enabled: bool,
+    /// Enable/disable ForwardAuth admin authentication (default false).
+    #[arg(
+        long,
+        env = "ADMIN_AUTH_FORWARD_ENABLED",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    admin_auth_forward_enabled: Option<bool>,
 
     /// Enable/disable built-in admin login (cookie session) (default false).
     #[arg(long, env = "ADMIN_AUTH_BUILTIN_ENABLED", default_value_t = false)]
@@ -82,6 +121,30 @@ struct Cli {
     #[arg(long, env = "ADMIN_AUTH_BUILTIN_PASSWORD_HASH", hide_env_values = true)]
     admin_auth_builtin_password_hash: Option<String>,
 
+    /// Enable/disable passkey admin login.
+    #[arg(long, env = "ADMIN_AUTH_PASSKEY_ENABLED", default_value_t = false)]
+    admin_auth_passkey_enabled: bool,
+
+    /// WebAuthn relying-party ID for admin passkeys, normally the public host.
+    #[arg(long, env = "ADMIN_PASSKEY_RP_ID")]
+    admin_passkey_rp_id: Option<String>,
+
+    /// WebAuthn origin for admin passkeys, for example https://tavily-tw.ivanli.cc.
+    #[arg(long, env = "ADMIN_PASSKEY_RP_ORIGIN")]
+    admin_passkey_rp_origin: Option<String>,
+
+    /// One-time passkey challenge TTL.
+    #[arg(long, env = "ADMIN_PASSKEY_CHALLENGE_TTL_SECS", default_value_t = 300)]
+    admin_passkey_challenge_ttl_secs: i64,
+
+    /// Admin passkey session cookie max age.
+    #[arg(
+        long,
+        env = "ADMIN_PASSKEY_SESSION_MAX_AGE_SECS",
+        default_value_t = 60 * 60 * 24 * 14
+    )]
+    admin_passkey_session_max_age_secs: i64,
+
     /// 开发模式：放开管理接口权限（仅本地验证使用）
     #[arg(long, env = "DEV_OPEN_ADMIN", default_value_t = false)]
     dev_open_admin: bool,
@@ -93,6 +156,14 @@ struct Cli {
         default_value = "https://api.tavily.com"
     )]
     usage_base: String,
+
+    /// Low remaining-credit threshold for suppressing monthly auto-restore after Tavily 432.
+    #[arg(
+        long,
+        env = "LOW_QUOTA_DEPLETION_THRESHOLD",
+        default_value_t = LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT.to_string()
+    )]
+    low_quota_depletion_threshold: String,
 
     /// Hosted API origin used to resolve registration IP geo metadata for imported API keys.
     #[arg(
@@ -146,6 +217,22 @@ struct Cli {
     #[arg(long, env = "LINUXDO_OAUTH_REDIRECT_URL")]
     linuxdo_oauth_redirect_url: Option<String>,
 
+    /// Encryption key used to persist LinuxDo refresh tokens (32 raw bytes or base64/base64url).
+    #[arg(
+        long,
+        env = "LINUXDO_OAUTH_REFRESH_TOKEN_CRYPT_KEY",
+        hide_env_values = true
+    )]
+    linuxdo_oauth_refresh_token_crypt_key: Option<String>,
+
+    /// Enable/disable the daily LinuxDo user profile sync scheduler.
+    #[arg(long, env = "LINUXDO_OAUTH_USER_SYNC_ENABLED", default_value_t = true)]
+    linuxdo_oauth_user_sync_enabled: bool,
+
+    /// Daily LinuxDo user profile sync time in server local time (`HH:mm`).
+    #[arg(long, env = "LINUXDO_OAUTH_USER_SYNC_AT", default_value = "06:20")]
+    linuxdo_oauth_user_sync_at: String,
+
     /// Max age for persisted user session cookie.
     #[arg(long, env = "USER_SESSION_MAX_AGE_SECS", default_value_t = 60 * 60 * 24 * 14)]
     user_session_max_age_secs: i64,
@@ -153,12 +240,190 @@ struct Cli {
     /// One-time OAuth login state TTL.
     #[arg(long, env = "OAUTH_LOGIN_STATE_TTL_SECS", default_value_t = 600)]
     oauth_login_state_ttl_secs: i64,
+
+    /// Enable LinuxDo Credit recharge payment flow.
+    #[arg(long, env = "LINUXDO_CREDIT_ENABLED", default_value_t = false)]
+    linuxdo_credit_enabled: bool,
+
+    /// LinuxDo Credit application client id.
+    #[arg(long, env = "LINUXDO_CREDIT_CLIENT_ID")]
+    linuxdo_credit_client_id: Option<String>,
+
+    /// LinuxDo Credit application client secret.
+    #[arg(long, env = "LINUXDO_CREDIT_CLIENT_SECRET", hide_env_values = true)]
+    linuxdo_credit_client_secret: Option<String>,
+
+    /// Ed25519 merchant private key for LinuxDo Credit LDC signing.
+    #[arg(
+        long,
+        env = "LINUXDO_CREDIT_MERCHANT_PRIVATE_KEY",
+        hide_env_values = true
+    )]
+    linuxdo_credit_merchant_private_key: Option<String>,
+
+    /// LinuxDo Credit LDC submit endpoint.
+    #[arg(
+        long,
+        env = "LINUXDO_CREDIT_SUBMIT_URL",
+        default_value = "https://credit.linux.do/epay/pay/submit.php"
+    )]
+    linuxdo_credit_submit_url: String,
+
+    /// Optional order-level LinuxDo Credit notify URL.
+    #[arg(long, env = "LINUXDO_CREDIT_NOTIFY_URL")]
+    linuxdo_credit_notify_url: Option<String>,
+
+    /// Optional order-level LinuxDo Credit return URL.
+    #[arg(long, env = "LINUXDO_CREDIT_RETURN_URL")]
+    linuxdo_credit_return_url: Option<String>,
+
+    /// Enable test pricing: 1 LDC buys 1 monthly credit.
+    #[arg(
+        long,
+        env = "LINUXDO_CREDIT_TEST_PRICE_ENABLED",
+        default_value_t = false
+    )]
+    linuxdo_credit_test_price_enabled: bool,
+
+    /// HA mode: single or active_standby.
+    #[arg(long, env = "HA_MODE", default_value = "single")]
+    ha_mode: String,
+
+    /// Stable node id for HA state and audit messages.
+    #[arg(long, env = "NODE_ID", default_value = "single")]
+    node_id: String,
+
+    /// Default HA source kind for this instance: direct or origin_group.
+    #[arg(long, env = "HA_SOURCE_KIND")]
+    ha_source_kind: Option<String>,
+
+    /// Default EdgeOne origin group id for this instance.
+    #[arg(long, env = "HA_SOURCE_ORIGIN_GROUP_ID")]
+    ha_source_origin_group_id: Option<String>,
+
+    /// Allow standby nodes to serve core business traffic in origin-group dual-active mode.
+    #[arg(
+        long,
+        env = "HA_CORE_DUAL_ACTIVE",
+        default_value_t = false,
+        value_parser = parse_bool_flag
+    )]
+    ha_core_dual_active: bool,
+
+    /// Public EdgeOne origin scheme for this node: http, https, or follow.
+    #[arg(long, env = "NODE_PUBLIC_SCHEME")]
+    node_public_scheme: Option<String>,
+
+    /// Public EdgeOne origin host for this node.
+    #[arg(long, env = "NODE_PUBLIC_HOST")]
+    node_public_host: Option<String>,
+
+    /// Public EdgeOne origin port for this node. Defaults from NODE_PUBLIC_SCHEME when omitted.
+    #[arg(long, env = "NODE_PUBLIC_PORT")]
+    node_public_port: Option<u16>,
+
+    /// Tencent EdgeOne zone id.
+    #[arg(long, env = "EDGEONE_ZONE_ID")]
+    edgeone_zone_id: Option<String>,
+
+    /// Tencent EdgeOne acceleration domain.
+    #[arg(long, env = "EDGEONE_DOMAIN")]
+    edgeone_domain: Option<String>,
+
+    /// Expected previous EdgeOne origin scheme before non-force promotion: http, https, or follow.
+    #[arg(long, env = "EDGEONE_EXPECTED_ORIGIN_SCHEME")]
+    edgeone_expected_origin_scheme: Option<String>,
+
+    /// Expected previous EdgeOne origin host before non-force promotion.
+    #[arg(long, env = "EDGEONE_EXPECTED_ORIGIN_HOST")]
+    edgeone_expected_origin_host: Option<String>,
+
+    /// Expected previous EdgeOne origin port before non-force promotion.
+    #[arg(long, env = "EDGEONE_EXPECTED_ORIGIN_PORT")]
+    edgeone_expected_origin_port: Option<u16>,
+
+    /// Tencent Cloud secret id for EdgeOne API.
+    #[arg(long, env = "EDGEONE_SECRET_ID", hide_env_values = true)]
+    edgeone_secret_id: Option<String>,
+
+    /// Tencent Cloud secret key for EdgeOne API.
+    #[arg(long, env = "EDGEONE_SECRET_KEY", hide_env_values = true)]
+    edgeone_secret_key: Option<String>,
+
+    /// Tencent EdgeOne API endpoint.
+    #[arg(
+        long,
+        env = "EDGEONE_API_ENDPOINT",
+        default_value = "https://teo.intl.tencentcloudapi.com"
+    )]
+    edgeone_api_endpoint: String,
+
+    /// Direct active/admin source URL used by standby pull-based HA sync.
+    #[arg(long, env = "HA_SYNC_SOURCE_URL")]
+    ha_sync_source_url: Option<String>,
+
+    /// Shared internal token for node-to-node HA sync calls.
+    #[arg(long, env = "HA_INTERNAL_TOKEN", hide_env_values = true)]
+    ha_internal_token: Option<String>,
+
+    /// HA standby pull sync interval in seconds, clamped to 5-15.
+    #[arg(long, env = "HA_SYNC_INTERVAL_SECS", default_value_t = 15)]
+    ha_sync_interval_secs: u64,
+
+    /// Static HA peer inventory JSON used by the admin control plane.
+    #[arg(long, env = "HA_PEER_NODES_JSON")]
+    ha_peer_nodes_json: Option<String>,
+
+    /// Runtime log formatter (`json` by default, `text` for fallback grep workflows).
+    #[arg(long, env = "RUNTIME_LOG_FORMAT", value_enum, default_value_t = RuntimeLogFormat::Json)]
+    log_format: RuntimeLogFormat,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    Admin(AdminCommand),
+}
+
+#[derive(Debug, Parser)]
+struct AdminCommand {
+    #[command(subcommand)]
+    command: AdminSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminSubcommand {
+    Passkey(AdminPasskeyCommand),
+}
+
+#[derive(Debug, Parser)]
+struct AdminPasskeyCommand {
+    #[command(subcommand)]
+    command: AdminPasskeySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminPasskeySubcommand {
+    /// Create a one-time URL for admin passkey enrollment.
+    ResetUrl(AdminPasskeyResetUrlCommand),
+}
+
+#[derive(Debug, Parser)]
+struct AdminPasskeyResetUrlCommand {
+    /// Public base URL for the Hikari instance, for example https://tavily.example.com.
+    #[arg(long)]
+    base_url: String,
+
+    /// One-time reset URL TTL in seconds.
+    #[arg(long, default_value_t = 3600)]
+    ttl_secs: i64,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     let cli = Cli::parse();
+    tavily_hikari::init_runtime_logging(cli.log_format);
+    reject_legacy_ha_origin_env_vars()?;
 
     // Ensure parent directory for database exists when using nested path like data/tavily_proxy.db
     let db_path = Path::new(&cli.db_path);
@@ -167,7 +432,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    println!("Using database: {}", db_path.display());
+    info!(
+        component = "startup",
+        event = "database_path_resolved",
+        path = %db_path.display(),
+        log_format = %cli.log_format,
+        "resolved runtime database path"
+    );
+
+    if let Some(command) = &cli.command {
+        handle_cli_command(command, &cli).await?;
+        return Ok(());
+    }
+
+    let admin_passkey_rp_id =
+        trim_optional(cli.admin_passkey_rp_id.clone()).or_else(|| infer_admin_passkey_rp_id(&cli));
+    let admin_passkey_rp_origin = trim_optional(cli.admin_passkey_rp_origin.clone())
+        .or_else(|| infer_admin_passkey_rp_origin(&cli));
 
     let proxy_options = TavilyProxyOptions {
         xray_binary: cli.xray_binary,
@@ -176,9 +457,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         forward_proxy_trace_url: TavilyProxyOptions::from_database_path(&cli.db_path)
             .forward_proxy_trace_url,
+        low_quota_depletion_threshold: tavily_hikari::parse_low_quota_depletion_threshold(
+            Some(&cli.low_quota_depletion_threshold),
+            "LOW_QUOTA_DEPLETION_THRESHOLD",
+        ),
+        health_readiness_grace_period: std::time::Duration::from_secs(90),
     };
-    let proxy =
-        TavilyProxy::with_options(cli.keys, &cli.upstream, &cli.db_path, proxy_options).await?;
+    let ha_mode = HaMode::parse(&cli.ha_mode);
+    let proxy = TavilyProxy::with_options_in_ha_mode(
+        cli.keys,
+        &cli.upstream,
+        &cli.db_path,
+        proxy_options,
+        ha_mode,
+    )
+    .await?;
     let addr: SocketAddr = format!("{}:{}", cli.bind, cli.port).parse()?;
 
     let forward_auth_header = parse_header_name(cli.forward_auth_header, "FORWARD_AUTH_HEADER")?;
@@ -190,6 +483,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .forward_auth_admin_value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+    let forward_auth_enabled = effective_forward_auth_enabled(
+        cli.admin_auth_forward_enabled,
+        forward_auth_header.is_some(),
+        forward_auth_admin_value.is_some(),
+    );
+    if forward_auth_enabled && cli.admin_auth_forward_enabled.is_none() {
+        warn!(
+            component = "startup",
+            event = "forward_auth_compat_auto_enabled",
+            "ForwardAuth auto-enabled because FORWARD_AUTH_HEADER and FORWARD_AUTH_ADMIN_VALUE are configured; set ADMIN_AUTH_FORWARD_ENABLED=true to make this explicit"
+        );
+    }
 
     let forward_auth = server::ForwardAuthConfig::new(
         forward_auth_header,
@@ -199,7 +504,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty()),
     );
-
     let builtin_password = cli
         .admin_auth_builtin_password
         .map(|value| value.trim().to_owned())
@@ -215,10 +519,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|_| "ADMIN_AUTH_BUILTIN_PASSWORD_HASH must be a valid PHC string")?;
     }
 
-    if cli.admin_auth_builtin_enabled
+    let persisted_admin_password_available = if cli.admin_auth_builtin_enabled
         && builtin_password.is_none()
         && builtin_password_hash.is_none()
     {
+        proxy
+            .get_admin_password_settings()
+            .await?
+            .is_some_and(admin_password_settings_has_enabled_hash)
+    } else {
+        false
+    };
+
+    if builtin_admin_requires_startup_secret(
+        cli.admin_auth_builtin_enabled,
+        builtin_password.is_some(),
+        builtin_password_hash.is_some(),
+        persisted_admin_password_available,
+    ) {
         return Err(
             "ADMIN_AUTH_BUILTIN_PASSWORD (or ADMIN_AUTH_BUILTIN_PASSWORD_HASH) must be set when ADMIN_AUTH_BUILTIN_ENABLED=true"
                 .into(),
@@ -227,21 +545,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.admin_auth_builtin_enabled {
         match (&builtin_password_hash, &builtin_password) {
-            (Some(_), Some(_)) => println!(
-                "Built-in auth: both password and password hash are set; using password hash"
+            (Some(_), Some(_)) => info!(
+                component = "startup",
+                event = "builtin_auth_configured",
+                mode = "password_hash_preferred",
+                "built-in auth configured with both password and password hash; preferring hash"
             ),
-            (None, Some(_)) => println!(
-                "Built-in auth: using plaintext password (not recommended); prefer ADMIN_AUTH_BUILTIN_PASSWORD_HASH"
+            (None, Some(_)) => warn!(
+                component = "startup",
+                event = "builtin_auth_configured",
+                mode = "plaintext_password",
+                "built-in auth configured with plaintext password; prefer ADMIN_AUTH_BUILTIN_PASSWORD_HASH"
             ),
             _ => {}
         }
     }
 
     let admin_auth = server::AdminAuthOptions {
-        forward_auth_enabled: cli.admin_auth_forward_enabled,
+        forward_auth_enabled,
         builtin_auth_enabled: cli.admin_auth_builtin_enabled,
         builtin_auth_password: builtin_password,
         builtin_auth_password_hash: builtin_password_hash,
+        passkey_auth_enabled: cli.admin_auth_passkey_enabled,
+        passkey_rp_id: admin_passkey_rp_id,
+        passkey_rp_origin: admin_passkey_rp_origin,
+        passkey_challenge_ttl_secs: cli.admin_passkey_challenge_ttl_secs,
+        passkey_session_max_age_secs: cli.admin_passkey_session_max_age_secs,
     };
 
     let linuxdo_oauth_client_id = cli
@@ -264,6 +593,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scope.to_string()
         }
     };
+    let linuxdo_oauth_refresh_token_crypt_key =
+        match parse_linuxdo_refresh_token_crypt_key(cli.linuxdo_oauth_refresh_token_crypt_key) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    component = "startup",
+                    event = "linuxdo_refresh_token_key_invalid",
+                    err = %err,
+                    "linuxdo refresh-token persistence and daily user sync stay disabled"
+                );
+                None
+            }
+        };
+    let linuxdo_oauth_user_sync_at =
+        parse_hhmm(&cli.linuxdo_oauth_user_sync_at).ok_or_else(|| {
+            format!(
+                "LINUXDO_OAUTH_USER_SYNC_AT must use HH:mm format, got '{}'",
+                cli.linuxdo_oauth_user_sync_at
+            )
+        })?;
 
     if cli.linuxdo_oauth_enabled
         && (linuxdo_oauth_client_id.is_none()
@@ -285,8 +634,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         userinfo_url: cli.linuxdo_oauth_userinfo_url.trim().to_string(),
         scope: linuxdo_oauth_scope,
         redirect_url: linuxdo_oauth_redirect_url,
+        refresh_token_crypt_key: linuxdo_oauth_refresh_token_crypt_key,
+        user_sync_enabled: cli.linuxdo_oauth_user_sync_enabled,
+        user_sync_at: linuxdo_oauth_user_sync_at,
         session_max_age_secs: cli.user_session_max_age_secs.max(60),
         login_state_ttl_secs: cli.oauth_login_state_ttl_secs.max(60),
+    };
+    let linuxdo_credit = server::LinuxDoCreditOptions {
+        enabled: cli.linuxdo_credit_enabled,
+        client_id: cli
+            .linuxdo_credit_client_id
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        client_secret: cli
+            .linuxdo_credit_client_secret
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        merchant_private_key: cli
+            .linuxdo_credit_merchant_private_key
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        submit_url: cli.linuxdo_credit_submit_url.trim().to_string(),
+        notify_url: cli
+            .linuxdo_credit_notify_url
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        return_url: cli
+            .linuxdo_credit_return_url
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        test_price_enabled: cli.linuxdo_credit_test_price_enabled,
+    };
+    let ha_peer_nodes = cli
+        .ha_peer_nodes_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(tavily_hikari::parse_ha_peer_nodes_json)
+        .transpose()?
+        .unwrap_or_default();
+    let ha_config = HaConfig {
+        mode: ha_mode,
+        node_id: cli.node_id.trim().to_string(),
+        database_path: Some(cli.db_path.clone()),
+        source_kind: cli
+            .ha_source_kind
+            .as_deref()
+            .and_then(tavily_hikari::parse_ha_source_kind),
+        source_origin_group_id: trim_optional(cli.ha_source_origin_group_id),
+        core_dual_active: cli.ha_core_dual_active,
+        node_public_scheme: trim_optional(cli.node_public_scheme),
+        node_public_host: trim_optional(cli.node_public_host),
+        node_public_port: cli.node_public_port,
+        edgeone_zone_id: trim_optional(cli.edgeone_zone_id),
+        edgeone_domain: trim_optional(cli.edgeone_domain),
+        edgeone_expected_origin_scheme: trim_optional(cli.edgeone_expected_origin_scheme),
+        edgeone_expected_origin_host: trim_optional(cli.edgeone_expected_origin_host),
+        edgeone_expected_origin_port: cli.edgeone_expected_origin_port,
+        edgeone_secret_id: trim_optional(cli.edgeone_secret_id),
+        edgeone_secret_key: trim_optional(cli.edgeone_secret_key),
+        edgeone_api_endpoint: cli.edgeone_api_endpoint.trim().to_string(),
+        sync_source_url: trim_optional(cli.ha_sync_source_url),
+        internal_token: trim_optional(cli.ha_internal_token),
+        sync_interval_secs: cli.ha_sync_interval_secs,
+        peer_nodes: ha_peer_nodes,
     };
 
     let static_dir = cli.static_dir.or_else(|| {
@@ -307,11 +718,259 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.dev_open_admin,
         cli.usage_base,
         cli.api_key_ip_geo_origin,
+        ha_config,
         linuxdo_oauth,
+        linuxdo_credit,
     )
     .await?;
 
     Ok(())
+}
+
+async fn handle_cli_command(
+    command: &CliCommand,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        CliCommand::Admin(admin) => match &admin.command {
+            AdminSubcommand::Passkey(passkey) => match &passkey.command {
+                AdminPasskeySubcommand::ResetUrl(command) => {
+                    print_admin_passkey_reset_url(cli, command).await
+                }
+            },
+        },
+    }
+}
+
+async fn print_admin_passkey_reset_url(
+    cli: &Cli,
+    command: &AdminPasskeyResetUrlCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let scope = admin_passkey_scope_for_cli(cli)?;
+    let base_url = url::Url::parse(command.base_url.trim())?;
+    if base_url.origin().ascii_serialization() != scope.rp_origin
+        || base_url.path() != "/"
+        || base_url.query().is_some()
+        || base_url.fragment().is_some()
+    {
+        return Err(
+            "--base-url origin must exactly match the effective admin passkey RP origin".into(),
+        );
+    }
+    let token =
+        create_admin_passkey_reset_token_for_database(&cli.db_path, &scope, command.ttl_secs)
+            .await?;
+    let raw_token = token
+        .token
+        .as_deref()
+        .ok_or("admin passkey reset token was not returned")?;
+    let encoded = urlencoding::encode(raw_token);
+    std::println!("{}/login?adminPasskeyResetToken={encoded}", scope.rp_origin);
+    Ok(())
+}
+
+fn admin_passkey_scope_for_cli(cli: &Cli) -> Result<AdminPasskeyScope, Box<dyn std::error::Error>> {
+    let rp_id = trim_optional(cli.admin_passkey_rp_id.clone())
+        .or_else(|| infer_admin_passkey_rp_id(cli))
+        .ok_or("admin passkey RP ID is not configured")?;
+    let rp_origin = trim_optional(cli.admin_passkey_rp_origin.clone())
+        .or_else(|| infer_admin_passkey_rp_origin(cli))
+        .ok_or("admin passkey RP origin is not configured")?;
+    AdminPasskeyScope::new(&cli.node_id, &rp_id, &rp_origin)
+        .map_err(|err| format!("invalid admin passkey scope: {err}").into())
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn effective_forward_auth_enabled(
+    explicit_enabled: Option<bool>,
+    header_configured: bool,
+    admin_value_configured: bool,
+) -> bool {
+    explicit_enabled.unwrap_or(header_configured && admin_value_configured)
+}
+
+fn builtin_admin_requires_startup_secret(
+    builtin_enabled: bool,
+    password_present: bool,
+    password_hash_present: bool,
+    persisted_password_available: bool,
+) -> bool {
+    builtin_enabled && !password_present && !password_hash_present && !persisted_password_available
+}
+
+fn admin_password_settings_has_enabled_hash(
+    settings: tavily_hikari::AdminPasswordSettingsRecord,
+) -> bool {
+    settings.disabled_at.is_none()
+        && settings
+            .password_hash
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|hash| !hash.is_empty())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminPasskeyRpHostSource {
+    EdgeOneDomain,
+    NodePublicHost,
+}
+
+fn preferred_admin_passkey_rp_host(
+    edgeone_domain: Option<String>,
+    node_public_host: Option<String>,
+) -> Option<(String, AdminPasskeyRpHostSource)> {
+    trim_optional(node_public_host)
+        .map(|host| (host, AdminPasskeyRpHostSource::NodePublicHost))
+        .or_else(|| {
+            trim_optional(edgeone_domain)
+                .map(|host| (host, AdminPasskeyRpHostSource::EdgeOneDomain))
+        })
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::{
+        AdminPasskeyRpHostSource, builtin_admin_requires_startup_secret,
+        effective_forward_auth_enabled, preferred_admin_passkey_rp_host,
+    };
+
+    #[test]
+    fn forward_auth_stays_compatible_when_legacy_headers_are_configured() {
+        assert!(effective_forward_auth_enabled(None, true, true));
+        assert!(effective_forward_auth_enabled(Some(true), false, false));
+        assert!(!effective_forward_auth_enabled(None, true, false));
+        assert!(!effective_forward_auth_enabled(None, false, true));
+        assert!(!effective_forward_auth_enabled(Some(false), true, true));
+    }
+
+    #[test]
+    fn builtin_admin_startup_secret_can_come_from_persisted_settings() {
+        assert!(builtin_admin_requires_startup_secret(
+            true, false, false, false
+        ));
+        assert!(!builtin_admin_requires_startup_secret(
+            true, true, false, false
+        ));
+        assert!(!builtin_admin_requires_startup_secret(
+            true, false, true, false
+        ));
+        assert!(!builtin_admin_requires_startup_secret(
+            true, false, false, true
+        ));
+        assert!(!builtin_admin_requires_startup_secret(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn builtin_admin_startup_secret_requires_enabled_persisted_password_hash() {
+        assert!(super::admin_password_settings_has_enabled_hash(
+            tavily_hikari::AdminPasswordSettingsRecord {
+                password_hash: Some(" stored-hash ".to_string()),
+                disabled_at: None,
+                updated_at: 123,
+                login_totp_required: false,
+            }
+        ));
+        assert!(!super::admin_password_settings_has_enabled_hash(
+            tavily_hikari::AdminPasswordSettingsRecord {
+                password_hash: None,
+                disabled_at: None,
+                updated_at: 123,
+                login_totp_required: true,
+            }
+        ));
+        assert!(!super::admin_password_settings_has_enabled_hash(
+            tavily_hikari::AdminPasswordSettingsRecord {
+                password_hash: Some("stored-hash".to_string()),
+                disabled_at: Some(456),
+                updated_at: 123,
+                login_totp_required: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn passkey_rp_host_prefers_node_public_host() {
+        assert_eq!(
+            preferred_admin_passkey_rp_host(
+                Some(" hikari.example.com ".to_string()),
+                Some("origin.internal".to_string()),
+            ),
+            Some((
+                "origin.internal".to_string(),
+                AdminPasskeyRpHostSource::NodePublicHost,
+            )),
+        );
+        assert_eq!(
+            preferred_admin_passkey_rp_host(None, Some(" origin.internal ".to_string())),
+            Some((
+                "origin.internal".to_string(),
+                AdminPasskeyRpHostSource::NodePublicHost,
+            )),
+        );
+    }
+}
+
+fn infer_admin_passkey_rp_id(cli: &Cli) -> Option<String> {
+    preferred_admin_passkey_rp_host(cli.edgeone_domain.clone(), cli.node_public_host.clone())
+        .map(|(host, _)| host)
+}
+
+fn infer_admin_passkey_rp_origin(cli: &Cli) -> Option<String> {
+    let (host, source) =
+        preferred_admin_passkey_rp_host(cli.edgeone_domain.clone(), cli.node_public_host.clone())?;
+    let scheme = if source == AdminPasskeyRpHostSource::EdgeOneDomain {
+        "https".to_string()
+    } else {
+        trim_optional(cli.node_public_scheme.clone())
+            .filter(|value| value != "follow")
+            .unwrap_or_else(|| "https".to_string())
+    };
+    let port = (source == AdminPasskeyRpHostSource::NodePublicHost)
+        .then_some(cli.node_public_port)
+        .flatten();
+    let default_port = match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    let port_suffix = port
+        .filter(|port| Some(*port) != default_port)
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    Some(format!("{scheme}://{host}{port_suffix}"))
+}
+
+fn reject_legacy_ha_origin_env_vars() -> Result<(), Box<dyn std::error::Error>> {
+    let legacy_vars = [
+        "NODE_PUBLIC_ORIGIN",
+        "EDGEONE_EXPECTED_ORIGIN",
+        "HA_SYNC_PEER_URL",
+    ];
+    let configured = legacy_vars
+        .into_iter()
+        .filter(|name| {
+            std::env::var(name)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+
+    if configured.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} are no longer supported; use NODE_PUBLIC_SCHEME, NODE_PUBLIC_HOST, NODE_PUBLIC_PORT, EDGEONE_EXPECTED_ORIGIN_SCHEME, EDGEONE_EXPECTED_ORIGIN_HOST, EDGEONE_EXPECTED_ORIGIN_PORT, and HA_SYNC_SOURCE_URL",
+        configured.join(", ")
+    )
+    .into())
 }
 
 fn parse_header_name(
@@ -325,5 +984,122 @@ fn parse_header_name(
     match raw.parse::<axum::http::HeaderName>() {
         Ok(parsed) => Ok(Some(parsed)),
         Err(err) => Err(format!("invalid header name for {field}: {err}").into()),
+    }
+}
+
+fn parse_bool_flag(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "invalid boolean value '{raw}' (expected one of: 1, 0, true, false, yes, no, on, off)"
+        )),
+    }
+}
+
+fn parse_hhmm(raw: &str) -> Option<(u32, u32)> {
+    let trimmed = raw.trim();
+    let mut parts = trimmed.split(':');
+    let hour = parts.next()?;
+    let minute = parts.next()?;
+    if parts.next().is_some() || hour.len() != 2 || minute.len() != 2 {
+        return None;
+    }
+    let hour = hour.parse::<u32>().ok()?;
+    let minute = minute.parse::<u32>().ok()?;
+    (hour <= 23 && minute <= 59).then_some((hour, minute))
+}
+
+fn parse_linuxdo_refresh_token_crypt_key(
+    value: Option<String>,
+) -> Result<Option<[u8; 32]>, String> {
+    fn decode_32_bytes(raw: &str) -> Option<[u8; 32]> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{
+            STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+        };
+
+        for engine in [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD] {
+            if let Ok(decoded) = engine.decode(raw)
+                && decoded.len() == 32
+            {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&decoded);
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    let Some(raw) = value
+        .map(|it| it.trim().to_owned())
+        .filter(|it| !it.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if raw.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(raw.as_bytes());
+        return Ok(Some(key));
+    }
+
+    decode_32_bytes(&raw).map(Some).ok_or_else(|| {
+        "LINUXDO_OAUTH_REFRESH_TOKEN_CRYPT_KEY must be 32 raw bytes or decode to 32 bytes from base64/base64url".to_string()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hhmm_accepts_strict_two_digit_format() {
+        assert_eq!(parse_hhmm("06:20"), Some((6, 20)));
+        assert_eq!(parse_hhmm("23:59"), Some((23, 59)));
+        assert_eq!(parse_hhmm("6:20"), None);
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("06:60"), None);
+    }
+
+    #[test]
+    fn parse_bool_flag_accepts_numeric_and_text_forms() {
+        assert!(parse_bool_flag("1").unwrap());
+        assert!(!parse_bool_flag("0").unwrap());
+        assert!(parse_bool_flag("true").unwrap());
+        assert!(!parse_bool_flag("false").unwrap());
+        assert!(parse_bool_flag("yes").unwrap());
+        assert!(!parse_bool_flag("off").unwrap());
+        assert!(parse_bool_flag("maybe").is_err());
+    }
+
+    #[test]
+    fn parse_linuxdo_refresh_token_crypt_key_accepts_raw_and_base64_inputs() {
+        use base64::Engine as _;
+
+        let raw = "0123456789abcdef0123456789abcdef".to_string();
+        let parsed = parse_linuxdo_refresh_token_crypt_key(Some(raw.clone()))
+            .expect("parse raw key")
+            .expect("raw key");
+        assert_eq!(parsed, *b"0123456789abcdef0123456789abcdef");
+
+        let base64_key = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+        let parsed = parse_linuxdo_refresh_token_crypt_key(Some(base64_key))
+            .expect("parse base64 key")
+            .expect("decoded base64 key");
+        assert_eq!(parsed, *b"0123456789abcdef0123456789abcdef");
+
+        let url_safe_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
+        let parsed = parse_linuxdo_refresh_token_crypt_key(Some(url_safe_key))
+            .expect("parse base64url key")
+            .expect("decoded base64url key");
+        assert_eq!(parsed, *b"0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn parse_linuxdo_refresh_token_crypt_key_rejects_invalid_lengths() {
+        let err = parse_linuxdo_refresh_token_crypt_key(Some("short-key".to_string()))
+            .expect_err("invalid key should be rejected");
+        assert!(err.contains("decode to 32 bytes"));
     }
 }

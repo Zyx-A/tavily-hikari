@@ -1,36 +1,37 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-
+import { createPortal } from 'react-dom'
 import type { QueryLoadState } from '../admin/queryLoadState'
 import type { LogFacetOption, RequestLog, RequestLogBodies } from '../api'
 import type { AdminTranslations } from '../i18n'
+import { cleanedRequestLogBodySummary } from '../requestLogBodySummary'
 import { Icon } from '../lib/icons'
 import {
-  buildRequestKindQuickFilterSelection,
-  buildVisibleRequestKindOptions,
-  hasActiveRequestKindQuickFilters,
-  mergeRequestKindCatalog,
-  summarizeRequestKindQuickFilters,
-  summarizeSelectedRequestKinds,
   type TokenLogRequestKindOption,
   type TokenLogRequestKindQuickBilling,
   type TokenLogRequestKindQuickProtocol,
 } from '../tokenLogRequestKinds'
 import RequestKindBadge from './RequestKindBadge'
+import RequestIpDiagnostics from './RequestIpDiagnostics'
+import AdminRecentRequestsRequestKindFilter from './AdminRecentRequestsRequestKindFilter'
 import AdminLoadingRegion from './AdminLoadingRegion'
 import AdminTablePagination from './AdminTablePagination'
 import AdminTableShell from './AdminTableShell'
+import {
+  RebalanceGatewayMarker,
+  apiRebalanceBindingEffectBadgeLabel,
+  apiRebalanceBindingEffectLabel,
+  apiRebalanceBindingEffectSummary,
+  apiRebalanceBindingEffectTone,
+  apiRebalanceSelectionEffectBadgeLabel,
+  apiRebalanceSelectionEffectLabel,
+  apiRebalanceSelectionEffectSummary,
+  apiRebalanceSelectionEffectTone,
+  isRebalanceGatewayLog,
+  rebalanceMarkerLabel,
+} from './requestLogRebalance'
 import SearchableFacetSelect from './SearchableFacetSelect'
 import { StatusBadge, type StatusTone } from './StatusBadge'
 import { Button } from './ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuCheckboxItem,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from './ui/dropdown-menu'
 import {
   Select,
   SelectContent,
@@ -40,25 +41,24 @@ import {
   SelectSeparator,
   SelectTrigger,
 } from './ui/select'
-import SegmentedTabs from './ui/SegmentedTabs'
 import { TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
-
+import { useViewportMode } from '../lib/responsive'
 type Language = 'en' | 'zh'
 type RecentRequestsVariant = 'admin' | 'token'
-type RecentRequestsOutcomeFilterKind = 'result' | 'keyEffect'
-
+type RecentRequestsOutcomeFilterKind = 'result' | 'keyEffect' | 'bindingEffect' | 'selectionEffect'
 export interface RecentRequestsOutcomeFilter {
   kind: RecentRequestsOutcomeFilterKind
   value: string
 }
-
 export interface AdminRecentRequestsPanelProps {
   variant: RecentRequestsVariant
   language: Language
   strings: AdminTranslations
   title: string
   description: string
+  showHeaderCopy?: boolean
+  headerFiltersTargetId?: string
   emptyLabel: string
   loadState: QueryLoadState
   loadingLabel: string
@@ -77,18 +77,21 @@ export interface AdminRecentRequestsPanelProps {
   outcomeFilter: RecentRequestsOutcomeFilter | null
   resultOptions: LogFacetOption[]
   keyEffectOptions: LogFacetOption[]
+  bindingEffectOptions?: LogFacetOption[]
+  selectionEffectOptions?: LogFacetOption[]
   onOutcomeFilterChange: (value: RecentRequestsOutcomeFilter | null) => void
   keyOptions?: LogFacetOption[]
   selectedKeyId?: string | null
   onKeyFilterChange?: (value: string | null) => void
   showKeyColumn: boolean
   showTokenColumn: boolean
-  page: number
   perPage: number
-  total: number
+  hasOlder: boolean
+  hasNewer: boolean
+  paginationSummary?: string
   paginationDisabled?: boolean
-  onPreviousPage: () => void | Promise<void>
-  onNextPage: () => void | Promise<void>
+  onOlderPage: () => void | Promise<void>
+  onNewerPage: () => void | Promise<void>
   onPerPageChange: (value: number) => void | Promise<void>
   formatTime: (ts: number | null) => string
   formatTimeDetail?: (ts: number | null) => string
@@ -96,27 +99,12 @@ export interface AdminRecentRequestsPanelProps {
   onOpenToken?: (id: string) => void
   loadLogBodies: (log: RequestLog, signal: AbortSignal) => Promise<RequestLogBodies>
 }
-
 type LogBodiesLoadState =
   | { status: 'loading' }
   | { status: 'ready'; value: RequestLogBodies }
   | { status: 'error'; message: string }
-
-const requestKindBillingQuickFilterOptions = [
-  { value: 'all', label: 'Any' },
-  { value: 'billable', label: 'Paid' },
-  { value: 'non_billable', label: 'Free' },
-] as const
-
-const requestKindProtocolQuickFilterOptions = [
-  { value: 'all', label: 'Any' },
-  { value: 'mcp', label: 'MCP' },
-  { value: 'api', label: 'API' },
-] as const
-
 const recentRequestsAllFilterValue = '__all__'
 const recentRequestsCompactAllLabel = 'All'
-
 function statusTone(status: string): StatusTone {
   const normalized = status.trim().toLowerCase()
   if (normalized === 'success') return 'success'
@@ -124,15 +112,14 @@ function statusTone(status: string): StatusTone {
   if (normalized === 'error') return 'error'
   return 'neutral'
 }
-
 function statusLabel(status: string, strings: AdminTranslations): string {
   const normalized = status.trim().toLowerCase()
   if (normalized === 'success') return strings.statuses.success
   if (normalized === 'error') return strings.statuses.error
+  if (normalized === 'neutral') return strings.statuses.neutral
   if (normalized === 'quota_exhausted') return strings.statuses.quota_exhausted
   return status || strings.logs.errors.none
 }
-
 function keyEffectTone(code: string | null | undefined): StatusTone {
   switch ((code ?? '').trim()) {
     case 'quarantined':
@@ -142,11 +129,18 @@ function keyEffectTone(code: string | null | undefined): StatusTone {
     case 'restored_active':
     case 'cleared_quarantine':
       return 'success'
+    case 'transient_backoff_set':
+      return 'warning'
+    case 'transient_backoff_cleared':
+      return 'success'
+    case 'mcp_session_init_backoff_set':
+    case 'mcp_session_retry_waited':
+    case 'mcp_session_retry_scheduled':
+      return 'warning'
     default:
       return 'neutral'
   }
 }
-
 function keyEffectLabel(code: string | null | undefined, strings: AdminTranslations): string {
   switch ((code ?? '').trim()) {
     case 'quarantined':
@@ -157,6 +151,16 @@ function keyEffectLabel(code: string | null | undefined, strings: AdminTranslati
       return strings.logs.keyEffects.restoredActive
     case 'cleared_quarantine':
       return strings.logs.keyEffects.clearedQuarantine
+    case 'transient_backoff_set':
+      return strings.logs.keyEffects.transientBackoffSet
+    case 'transient_backoff_cleared':
+      return strings.logs.keyEffects.transientBackoffCleared
+    case 'mcp_session_init_backoff_set':
+      return strings.logs.keyEffects.mcpSessionInitBackoffSet
+    case 'mcp_session_retry_waited':
+      return strings.logs.keyEffects.mcpSessionRetryWaited
+    case 'mcp_session_retry_scheduled':
+      return strings.logs.keyEffects.mcpSessionRetryScheduled
     case 'none':
     case '':
       return strings.logs.keyEffects.none
@@ -164,11 +168,134 @@ function keyEffectLabel(code: string | null | undefined, strings: AdminTranslati
       return strings.logs.keyEffects.unknown
   }
 }
-
 function keyEffectBadgeLabel(log: RequestLog, strings: AdminTranslations): string {
   return keyEffectLabel(log.key_effect_code, strings)
 }
-
+function keyEffectBadgeCompactLabel(log: RequestLog, strings: AdminTranslations, language: Language): string {
+  switch ((log.key_effect_code ?? '').trim()) {
+    case 'quarantined':
+      return language === 'zh' ? '隔离' : 'Quarantined'
+    case 'marked_exhausted':
+      return language === 'zh' ? '耗尽' : 'Exhausted'
+    case 'restored_active':
+      return language === 'zh' ? '恢复' : 'Restored'
+    case 'cleared_quarantine':
+      return language === 'zh' ? '解隔离' : 'Cleared'
+    case 'mcp_session_init_backoff_set':
+      return language === 'zh' ? 'MCP回退' : 'MCP backoff'
+    case 'mcp_session_retry_waited':
+      return language === 'zh' ? 'MCP已等待' : 'MCP waited'
+    case 'mcp_session_retry_scheduled':
+      return language === 'zh' ? 'MCP重试' : 'MCP retry'
+    default:
+      return keyEffectBadgeLabel(log, strings)
+  }
+}
+function bindingEffectTone(code: string | null | undefined): StatusTone {
+  const apiRebalanceTone = apiRebalanceBindingEffectTone(code)
+  if (apiRebalanceTone) return apiRebalanceTone
+  switch ((code ?? '').trim()) {
+    case 'http_project_affinity_bound':
+      return 'success'
+    case 'http_project_affinity_reused':
+      return 'neutral'
+    case 'http_project_affinity_rebound':
+      return 'warning'
+    default:
+      return 'neutral'
+  }
+}
+function bindingEffectLabel(code: string | null | undefined, strings: AdminTranslations): string {
+  const apiRebalanceLabel = apiRebalanceBindingEffectLabel(code, strings)
+  if (apiRebalanceLabel) return apiRebalanceLabel
+  switch ((code ?? '').trim()) {
+    case 'http_project_affinity_bound':
+      return strings.logs.bindingEffects.bound
+    case 'http_project_affinity_reused':
+      return strings.logs.bindingEffects.reused
+    case 'http_project_affinity_rebound':
+      return strings.logs.bindingEffects.rebound
+    case 'none':
+    case '':
+      return strings.logs.bindingEffects.none
+    default:
+      return strings.logs.bindingEffects.unknown
+  }
+}
+function bindingEffectBadgeLabel(log: RequestLog, strings: AdminTranslations, language: Language): string {
+  const apiRebalanceLabel = apiRebalanceBindingEffectBadgeLabel(log.binding_effect_code, language)
+  if (apiRebalanceLabel) return apiRebalanceLabel
+  switch ((log.binding_effect_code ?? '').trim()) {
+    case 'http_project_affinity_bound':
+      return language === 'zh' ? '绑定' : 'Bound'
+    case 'http_project_affinity_reused':
+      return language === 'zh' ? '复用' : 'Reused'
+    case 'http_project_affinity_rebound':
+      return language === 'zh' ? '重绑' : 'Rebound'
+    default:
+      return bindingEffectLabel(log.binding_effect_code, strings)
+  }
+}
+function selectionEffectTone(code: string | null | undefined): StatusTone {
+  const apiRebalanceTone = apiRebalanceSelectionEffectTone(code)
+  if (apiRebalanceTone) return apiRebalanceTone
+  switch ((code ?? '').trim()) {
+    case 'mcp_session_init_cooldown_avoided':
+    case 'http_project_affinity_cooldown_avoided':
+      return 'warning'
+    case 'mcp_session_init_rate_limit_avoided':
+    case 'http_project_affinity_rate_limit_avoided':
+      return 'error'
+    case 'mcp_session_init_pressure_avoided':
+    case 'http_project_affinity_pressure_avoided':
+      return 'success'
+    default:
+      return 'neutral'
+  }
+}
+function selectionEffectLabel(code: string | null | undefined, strings: AdminTranslations): string {
+  const apiRebalanceLabel = apiRebalanceSelectionEffectLabel(code, strings)
+  if (apiRebalanceLabel) return apiRebalanceLabel
+  switch ((code ?? '').trim()) {
+    case 'mcp_session_init_cooldown_avoided':
+      return strings.logs.selectionEffects.mcpSessionInitCooldownAvoided
+    case 'mcp_session_init_rate_limit_avoided':
+      return strings.logs.selectionEffects.mcpSessionInitRateLimitAvoided
+    case 'mcp_session_init_pressure_avoided':
+      return strings.logs.selectionEffects.mcpSessionInitPressureAvoided
+    case 'http_project_affinity_cooldown_avoided':
+      return strings.logs.selectionEffects.httpProjectAffinityCooldownAvoided
+    case 'http_project_affinity_rate_limit_avoided':
+      return strings.logs.selectionEffects.httpProjectAffinityRateLimitAvoided
+    case 'http_project_affinity_pressure_avoided':
+      return strings.logs.selectionEffects.httpProjectAffinityPressureAvoided
+    case 'none':
+    case '':
+      return strings.logs.selectionEffects.none
+    default:
+      return strings.logs.selectionEffects.unknown
+  }
+}
+function selectionEffectBadgeLabel(log: RequestLog, strings: AdminTranslations, language: Language): string {
+  const apiRebalanceLabel = apiRebalanceSelectionEffectBadgeLabel(log.selection_effect_code, language)
+  if (apiRebalanceLabel) return apiRebalanceLabel
+  switch ((log.selection_effect_code ?? '').trim()) {
+    case 'mcp_session_init_cooldown_avoided':
+      return language === 'zh' ? 'MCP避冷却' : 'MCP cooldown'
+    case 'mcp_session_init_rate_limit_avoided':
+      return language === 'zh' ? 'MCP避429' : 'MCP 429'
+    case 'mcp_session_init_pressure_avoided':
+      return language === 'zh' ? 'MCP避高压' : 'MCP pressure'
+    case 'http_project_affinity_cooldown_avoided':
+      return language === 'zh' ? '避冷却' : 'Cooldown'
+    case 'http_project_affinity_rate_limit_avoided':
+      return language === 'zh' ? '避429' : '429 avoided'
+    case 'http_project_affinity_pressure_avoided':
+      return language === 'zh' ? '避高压' : 'Pressure'
+    default:
+      return selectionEffectLabel(log.selection_effect_code, strings)
+  }
+}
 function formatKeyEffectSummary(
   log: RequestLog,
   strings: AdminTranslations,
@@ -186,34 +313,169 @@ function formatKeyEffectSummary(
         : 'The system automatically restored this exhausted key to active'
     case 'cleared_quarantine':
       return language === 'zh' ? '管理员已解除该 Key 的隔离' : 'An admin cleared the quarantine on this key'
+    case 'mcp_session_init_backoff_set':
+      return language === 'zh'
+        ? '系统已为 MCP 初始化请求设置临时退避'
+        : 'The system armed a temporary backoff for MCP session initialization'
+    case 'mcp_session_retry_waited':
+      return language === 'zh'
+        ? '该 MCP 会话请求在发送上游前等待了 Retry-After'
+        : 'This MCP session request waited for Retry-After before sending upstream'
+    case 'mcp_session_retry_scheduled':
+      return language === 'zh'
+        ? '该 MCP 会话请求命中上游 429 后按 Retry-After 安排了一次重试'
+        : 'This MCP session request hit upstream 429 and retried once after Retry-After'
     case 'none':
       return strings.logDetails.noKeyEffect
     default:
       return summary && summary.length > 0 ? summary : strings.logDetails.noKeyEffect
   }
 }
-
+function formatBindingEffectSummary(
+  log: RequestLog,
+  strings: AdminTranslations,
+  language: Language,
+): string {
+  const apiRebalanceSummary = apiRebalanceBindingEffectSummary(log.binding_effect_code, language)
+  if (apiRebalanceSummary) return apiRebalanceSummary
+  const summary = log.binding_effect_summary?.trim()
+  switch ((log.binding_effect_code ?? '').trim()) {
+    case 'http_project_affinity_bound':
+      return language === 'zh'
+        ? '系统为该项目创建了新的上游 Key 绑定'
+        : 'The system created a new upstream key binding for this project'
+    case 'http_project_affinity_reused':
+      return language === 'zh'
+        ? '系统继续复用该项目当前的上游 Key 绑定'
+        : 'The system reused the current upstream key binding for this project'
+    case 'http_project_affinity_rebound':
+      return language === 'zh'
+        ? '系统将该项目重新绑定到新的上游 Key'
+        : 'The system rebound this project to a different upstream key'
+    case 'none':
+      return strings.logDetails.noBindingEffect
+    default:
+      return summary && summary.length > 0 ? summary : strings.logDetails.noBindingEffect
+  }
+}
+function formatSelectionEffectSummary(
+  log: RequestLog,
+  strings: AdminTranslations,
+  language: Language,
+): string {
+  const apiRebalanceSummary = apiRebalanceSelectionEffectSummary(log.selection_effect_code, language)
+  if (apiRebalanceSummary) return apiRebalanceSummary
+  const summary = log.selection_effect_summary?.trim()
+  switch ((log.selection_effect_code ?? '').trim()) {
+    case 'mcp_session_init_cooldown_avoided':
+      return language === 'zh'
+        ? '初始化时避开了仍处于冷却中的 Key'
+        : 'Initialization avoided a key that is still in cooldown'
+    case 'mcp_session_init_rate_limit_avoided':
+      return language === 'zh'
+        ? '初始化时避开了最近更容易触发限流的 Key'
+        : 'Initialization avoided a key that was recently more rate-limited'
+    case 'mcp_session_init_pressure_avoided':
+      return language === 'zh'
+        ? '初始化时避开了近期压力更高的 Key'
+        : 'Initialization avoided a key under higher recent pressure'
+    case 'http_project_affinity_cooldown_avoided':
+      return language === 'zh'
+        ? '项目亲和选路避开了仍处于冷却中的 Key'
+        : 'Project affinity routing avoided a key that is still in cooldown'
+    case 'http_project_affinity_rate_limit_avoided':
+      return language === 'zh'
+        ? '项目亲和选路避开了最近更容易触发限流的 Key'
+        : 'Project affinity routing avoided a key that was recently more rate-limited'
+    case 'http_project_affinity_pressure_avoided':
+      return language === 'zh'
+        ? '项目亲和选路避开了近期压力更高的 Key'
+        : 'Project affinity routing avoided a key under higher recent pressure'
+    case 'none':
+      return strings.logDetails.noSelectionEffect
+    default:
+      return summary && summary.length > 0 ? summary : strings.logDetails.noSelectionEffect
+  }
+}
+function hasExplicitEffect(code: string | null | undefined): boolean {
+  const normalized = (code ?? '').trim()
+  return normalized.length > 0 && normalized !== 'none'
+}
+function renderEffectBadges(
+  log: RequestLog,
+  strings: AdminTranslations,
+  language: Language,
+  className?: string,
+): JSX.Element {
+  const badgeClassName = className ? `${className} recent-requests-effect-badge` : 'recent-requests-effect-badge'
+  const badges: JSX.Element[] = []
+  if (hasExplicitEffect(log.key_effect_code)) {
+    badges.push(
+      <StatusBadge
+        key="key"
+        className={badgeClassName}
+        tone={keyEffectTone(log.key_effect_code)}
+        title={formatKeyEffectSummary(log, strings, language)}
+      >
+        {keyEffectBadgeCompactLabel(log, strings, language)}
+      </StatusBadge>,
+    )
+  }
+  if (hasExplicitEffect(log.binding_effect_code)) {
+    badges.push(
+      <StatusBadge
+        key="binding"
+        className={badgeClassName}
+        tone={bindingEffectTone(log.binding_effect_code)}
+        title={formatBindingEffectSummary(log, strings, language)}
+      >
+        {bindingEffectBadgeLabel(log, strings, language)}
+      </StatusBadge>,
+    )
+  }
+  if (hasExplicitEffect(log.selection_effect_code)) {
+    badges.push(
+      <StatusBadge
+        key="selection"
+        className={badgeClassName}
+        tone={selectionEffectTone(log.selection_effect_code)}
+        title={formatSelectionEffectSummary(log, strings, language)}
+      >
+        {selectionEffectBadgeLabel(log, strings, language)}
+      </StatusBadge>,
+    )
+  }
+  if (badges.length === 0) {
+    badges.push(
+      <StatusBadge
+        key="none"
+        className={badgeClassName}
+        tone={keyEffectTone(log.key_effect_code)}
+        title={formatKeyEffectSummary(log, strings, language)}
+      >
+        {keyEffectBadgeCompactLabel(log, strings, language)}
+      </StatusBadge>,
+    )
+  }
+  return <div className="recent-requests-effect-badges">{badges}</div>
+}
 function formatRequestStatusPair(httpStatus: number | null, mcpStatus: number | null): string {
   return `${httpStatus ?? '—'} / ${mcpStatus ?? '—'}`
 }
-
+function requestStatusPairClassName(log: RequestLog): string { return `status-pair-trigger status-pair-trigger--${statusTone(log.result_status)}` }
 function formatRequestStatusTooltip(log: RequestLog, strings: AdminTranslations): string {
   return `${strings.logs.table.httpStatus}: ${log.http_status ?? '—'} · ${strings.logs.table.mcpStatus}: ${log.mcp_status ?? '—'}`
 }
-
 function formatChargedCredits(value: number | null | undefined): string {
   return value != null ? String(value) : '—'
 }
-
 function formatRequestLine(log: RequestLog): string {
   const query = log.query ? `?${log.query}` : ''
   return `${log.method} ${log.path}${query}`
 }
-
 function formatErrorMessage(log: RequestLog, strings: AdminTranslations['logs']['errors']): string {
   const message = log.error_message?.trim()
   if (message) return message
-
   const status = log.result_status.toLowerCase()
   if (status === 'quota_exhausted') {
     if (log.http_status != null) {
@@ -221,7 +483,6 @@ function formatErrorMessage(log: RequestLog, strings: AdminTranslations['logs'][
     }
     return strings.quotaExhausted
   }
-
   if (status === 'error') {
     if (log.http_status != null && log.mcp_status != null) {
       return strings.requestFailedHttpMcp
@@ -232,12 +493,10 @@ function formatErrorMessage(log: RequestLog, strings: AdminTranslations['logs'][
     if (log.mcp_status != null) return strings.requestFailedMcp.replace('{mcp}', String(log.mcp_status))
     return strings.requestFailedGeneric
   }
-
   if (status === 'success') return strings.none
   if (log.http_status != null) return strings.httpStatus.replace('{http}', String(log.http_status))
   return strings.none
 }
-
 function summarizeSingleFacet(
   selectedValue: string | null | undefined,
   options: LogFacetOption[] | undefined,
@@ -247,7 +506,6 @@ function summarizeSingleFacet(
   if (!normalized) return fallbackLabel
   return options?.find((option) => option.value === normalized)?.value ?? normalized
 }
-
 function summarizeOutcomeFilter(
   filter: RecentRequestsOutcomeFilter | null,
   strings: AdminTranslations,
@@ -257,33 +515,37 @@ function summarizeOutcomeFilter(
   if (filter.kind === 'result') {
     return statusLabel(filter.value, strings)
   }
-  return keyEffectLabel(filter.value, strings)
+  if (filter.kind === 'keyEffect') {
+    return keyEffectLabel(filter.value, strings)
+  }
+  if (filter.kind === 'bindingEffect') {
+    return bindingEffectLabel(filter.value, strings)
+  }
+  return selectionEffectLabel(filter.value, strings)
 }
-
 function renderOutcomeFacetLabel(
   kind: RecentRequestsOutcomeFilterKind,
   value: string,
   strings: AdminTranslations,
 ): JSX.Element {
-  const tone = kind === 'result' ? statusTone(value) : keyEffectTone(value)
-  const label = kind === 'result' ? statusLabel(value, strings) : keyEffectLabel(value, strings)
+  const tone =
+    kind === 'result'
+      ? statusTone(value)
+      : kind === 'keyEffect'
+        ? keyEffectTone(value)
+        : kind === 'bindingEffect'
+          ? bindingEffectTone(value)
+          : selectionEffectTone(value)
+  const label =
+    kind === 'result'
+      ? statusLabel(value, strings)
+      : kind === 'keyEffect'
+        ? keyEffectLabel(value, strings)
+        : kind === 'bindingEffect'
+          ? bindingEffectLabel(value, strings)
+          : selectionEffectLabel(value, strings)
   return <StatusBadge tone={tone}>{label}</StatusBadge>
 }
-
-function summarizeRequestKindTrigger(
-  effectiveSelectedRequestKinds: string[],
-  hasActiveQuickRequestKindFilters: boolean,
-  requestKindQuickSummary: string,
-  requestKindSummary: string,
-  language: Language,
-  allLabel: string,
-): string {
-  if (hasActiveQuickRequestKindFilters) return requestKindQuickSummary
-  if (effectiveSelectedRequestKinds.length === 0) return allLabel
-  if (effectiveSelectedRequestKinds.length <= 2) return requestKindSummary
-  return language === 'zh' ? `已选 ${effectiveSelectedRequestKinds.length} 项` : `${effectiveSelectedRequestKinds.length} selected`
-}
-
 function RecentRequestDetails({
   log,
   logBodiesState,
@@ -301,24 +563,74 @@ function RecentRequestDetails({
 }): JSX.Element {
   const forwarded = (log.forwarded_headers ?? []).filter((value) => value.trim().length > 0)
   const dropped = (log.dropped_headers ?? []).filter((value) => value.trim().length > 0)
+  const cleanedBodySummary = (
+    source: RequestLog | RequestLogBodies,
+    kind: 'request' | 'response',
+  ): string => cleanedRequestLogBodySummary({
+    source,
+    kind,
+    language,
+    noBodyLabel: strings.logDetails.noBody,
+    emptyValueLabel: strings.logs.errors.none,
+    formatTime,
+  })
   const requestBody =
     logBodiesState?.status === 'ready'
-      ? logBodiesState.value.request_body ?? strings.logDetails.noBody
+      ? logBodiesState.value.request_body ?? cleanedBodySummary(logBodiesState.value, 'request')
       : logBodiesState?.status === 'loading'
         ? strings.logDetails.loadingBody
         : logBodiesState?.status === 'error'
           ? strings.logDetails.loadBodyFailed
-          : log.request_body ?? strings.logDetails.noBody
+          : log.request_body ?? cleanedBodySummary(log, 'request')
   const responseBody =
     logBodiesState?.status === 'ready'
-      ? logBodiesState.value.response_body ?? strings.logDetails.noBody
+      ? logBodiesState.value.response_body ?? cleanedBodySummary(logBodiesState.value, 'response')
       : logBodiesState?.status === 'loading'
         ? strings.logDetails.loadingBody
         : logBodiesState?.status === 'error'
           ? strings.logDetails.loadBodyFailed
-          : log.response_body ?? strings.logDetails.noBody
+          : log.response_body ?? cleanedBodySummary(log, 'response')
   const requestKindLabel = log.request_kind_label ?? log.request_kind_key ?? strings.logs.errors.none
-
+  const effectEntries = [
+    hasExplicitEffect(log.key_effect_code)
+      ? {
+          label: strings.logDetails.keyEffect,
+          value: formatKeyEffectSummary(log, strings, language),
+        }
+      : null,
+    hasExplicitEffect(log.binding_effect_code)
+      ? {
+          label: strings.logDetails.bindingEffect,
+          value: formatBindingEffectSummary(log, strings, language),
+        }
+      : null,
+    hasExplicitEffect(log.selection_effect_code)
+      ? {
+          label: strings.logDetails.selectionEffect,
+          value: formatSelectionEffectSummary(log, strings, language),
+        }
+      : null,
+  ].filter((entry): entry is { label: string; value: string } => entry != null)
+  const diagnosticEntries = [
+    log.gateway_mode
+      ? { label: strings.logDetails.gatewayMode, value: log.gateway_mode }
+      : null,
+    log.experiment_variant
+      ? { label: strings.logDetails.experimentVariant, value: log.experiment_variant }
+      : null,
+    log.proxy_session_id
+      ? { label: strings.logDetails.proxySessionId, value: log.proxy_session_id }
+      : null,
+    log.routing_subject_hash
+      ? { label: strings.logDetails.routingSubjectHash, value: log.routing_subject_hash }
+      : null,
+    log.upstream_operation
+      ? { label: strings.logDetails.upstreamOperation, value: log.upstream_operation }
+      : null,
+    log.fallback_reason
+      ? { label: strings.logDetails.fallbackReason, value: log.fallback_reason }
+      : null,
+  ].filter((entry): entry is { label: string; value: string } => entry != null)
   return (
     <div className="log-details-panel">
       <div className="log-details-summary">
@@ -352,10 +664,27 @@ function RecentRequestDetails({
           <span className="log-details-label">{strings.logDetails.outcome}</span>
           <span className="log-details-value">{statusLabel(log.result_status, strings)}</span>
         </div>
-        <div>
-          <span className="log-details-label">{strings.logDetails.keyEffect}</span>
-          <span className="log-details-value">{formatKeyEffectSummary(log, strings, language)}</span>
-        </div>
+        {effectEntries.length === 0 ? (
+          <div>
+            <span className="log-details-label">{strings.logDetails.keyEffect}</span>
+            <span className="log-details-value">{strings.logDetails.noKeyEffect}</span>
+          </div>
+        ) : (
+          effectEntries.map((entry) => (
+            <div key={entry.label}>
+              <span className="log-details-label">{entry.label}</span>
+              <span className="log-details-value">{entry.value}</span>
+            </div>
+          ))
+        )}
+        {diagnosticEntries.map((entry) => (
+          <div key={entry.label}>
+            <span className="log-details-label">{entry.label}</span>
+            <span className="log-details-value">
+              <code>{entry.value}</code>
+            </span>
+          </div>
+        ))}
       </div>
       <div className="log-details-body">
         <div className="log-details-section">
@@ -381,6 +710,7 @@ function RecentRequestDetails({
           ) : null}
         </div>
       ) : null}
+      <RequestIpDiagnostics log={log} language={language} />
       {(forwarded.length > 0 || dropped.length > 0) && (
         <div className="log-details-headers">
           {forwarded.length > 0 ? (
@@ -408,13 +738,14 @@ function RecentRequestDetails({
     </div>
   )
 }
-
 export default function AdminRecentRequestsPanel({
   variant,
   language,
   strings,
   title,
   description,
+  showHeaderCopy = true,
+  headerFiltersTargetId,
   emptyLabel,
   loadState,
   loadingLabel,
@@ -430,18 +761,21 @@ export default function AdminRecentRequestsPanel({
   outcomeFilter,
   resultOptions,
   keyEffectOptions,
+  bindingEffectOptions = [],
+  selectionEffectOptions = [],
   onOutcomeFilterChange,
   keyOptions = [],
   selectedKeyId,
   onKeyFilterChange,
   showKeyColumn,
   showTokenColumn,
-  page,
   perPage,
-  total,
+  hasOlder,
+  hasNewer,
+  paginationSummary,
   paginationDisabled = false,
-  onPreviousPage,
-  onNextPage,
+  onOlderPage,
+  onNewerPage,
   onPerPageChange,
   formatTime,
   formatTimeDetail,
@@ -451,8 +785,17 @@ export default function AdminRecentRequestsPanel({
 }: AdminRecentRequestsPanelProps): JSX.Element {
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(() => new Set())
   const [logBodiesById, setLogBodiesById] = useState<Record<number, LogBodiesLoadState>>({})
+  const [headerFiltersTarget, setHeaderFiltersTarget] = useState<HTMLElement | null>(null)
   const logBodyControllersRef = useRef<Map<number, AbortController>>(new Map())
-
+  const viewportMode = useViewportMode()
+  const isSmallViewport = viewportMode === 'small'
+  useEffect(() => {
+    if (!headerFiltersTargetId) {
+      setHeaderFiltersTarget(null)
+      return
+    }
+    setHeaderFiltersTarget(document.getElementById(headerFiltersTargetId))
+  }, [headerFiltersTargetId])
   useEffect(() => {
     setExpandedLogs(new Set())
     for (const controller of logBodyControllersRef.current.values()) {
@@ -461,19 +804,16 @@ export default function AdminRecentRequestsPanel({
     logBodyControllersRef.current.clear()
     setLogBodiesById({})
   }, [loadLogBodies, logs])
-
   const triggerLoadLogBodies = useCallback(
     (log: RequestLog, force = false) => {
       const currentState = logBodiesById[log.id]
       if (!force && (currentState?.status === 'loading' || currentState?.status === 'ready')) {
         return
       }
-
       logBodyControllersRef.current.get(log.id)?.abort()
       const controller = new AbortController()
       logBodyControllersRef.current.set(log.id, controller)
       setLogBodiesById((current) => ({ ...current, [log.id]: { status: 'loading' } }))
-
       loadLogBodies(log, controller.signal)
         .then((value) => {
           if (controller.signal.aborted) return
@@ -503,7 +843,6 @@ export default function AdminRecentRequestsPanel({
     },
     [loadLogBodies, logBodiesById, strings.logDetails.loadBodyFailed],
   )
-
   const toggleExpandedLog = useCallback(
     (log: RequestLog) => {
       const expanded = expandedLogs.has(log.id)
@@ -522,79 +861,12 @@ export default function AdminRecentRequestsPanel({
     },
     [expandedLogs, triggerLoadLogBodies],
   )
-
   const retryLoadBodies = useCallback(
     (log: RequestLog) => {
       triggerLoadLogBodies(log, true)
     },
     [triggerLoadLogBodies],
   )
-
-  const normalizedSelectedRequestKinds = useMemo(
-    () => Array.from(new Set(selectedRequestKinds.map((value) => value.trim()).filter(Boolean))),
-    [selectedRequestKinds],
-  )
-  const requestKindCatalog = useMemo(
-    () => mergeRequestKindCatalog(requestKindOptions),
-    [requestKindOptions],
-  )
-  const requestKindQuickFilters = useMemo(
-    () => ({
-      billing: requestKindQuickBilling,
-      protocol: requestKindQuickProtocol,
-    }),
-    [requestKindQuickBilling, requestKindQuickProtocol],
-  )
-  const hasActiveQuickRequestKindFilters = useMemo(
-    () => hasActiveRequestKindQuickFilters(requestKindQuickFilters),
-    [requestKindQuickFilters],
-  )
-  const quickSelection = useMemo(
-    () => buildRequestKindQuickFilterSelection(requestKindOptions, requestKindQuickFilters),
-    [requestKindOptions, requestKindQuickFilters],
-  )
-  const effectiveSelectedRequestKinds = useMemo(
-    () => (hasActiveQuickRequestKindFilters ? quickSelection : normalizedSelectedRequestKinds),
-    [hasActiveQuickRequestKindFilters, normalizedSelectedRequestKinds, quickSelection],
-  )
-  const visibleRequestKindOptions = useMemo(
-    () =>
-      buildVisibleRequestKindOptions(
-        effectiveSelectedRequestKinds,
-        requestKindCatalog,
-        Object.fromEntries(requestKindCatalog.map((option) => [option.key, option])),
-      ),
-    [effectiveSelectedRequestKinds, requestKindCatalog],
-  )
-  const requestKindSummary = useMemo(
-    () =>
-      summarizeSelectedRequestKinds(
-        effectiveSelectedRequestKinds,
-        visibleRequestKindOptions,
-        strings.logs.filters.requestTypeAll,
-      ),
-    [effectiveSelectedRequestKinds, strings.logs.filters.requestTypeAll, visibleRequestKindOptions],
-  )
-  const requestKindQuickSummary = useMemo(
-    () => summarizeRequestKindQuickFilters(requestKindQuickFilters),
-    [requestKindQuickFilters],
-  )
-  const requestKindTriggerSummary = useMemo(() => {
-    return summarizeRequestKindTrigger(
-      effectiveSelectedRequestKinds,
-      hasActiveQuickRequestKindFilters,
-      requestKindQuickSummary,
-      requestKindSummary,
-      language,
-      recentRequestsCompactAllLabel,
-    )
-  }, [
-    effectiveSelectedRequestKinds.length,
-    hasActiveQuickRequestKindFilters,
-    language,
-    requestKindQuickSummary,
-    requestKindSummary,
-  ])
   const outcomeValue = outcomeFilter
     ? `${outcomeFilter.kind}:${outcomeFilter.value}`
     : recentRequestsAllFilterValue
@@ -611,7 +883,6 @@ export default function AdminRecentRequestsPanel({
     () => summarizeSingleFacet(selectedKeyId, keyOptions, recentRequestsCompactAllLabel),
     [keyOptions, selectedKeyId],
   )
-  const totalPages = Math.max(1, Math.ceil(total / Math.max(1, perPage)) || 1)
   const summaryColumnCount = 6 + Number(showKeyColumn) + Number(showTokenColumn)
   const desktopClassName = `recent-requests-desktop recent-requests-desktop--${variant}`
   const mobileClassName = `recent-requests-mobile-list recent-requests-mobile-list--${variant}`
@@ -623,185 +894,179 @@ export default function AdminRecentRequestsPanel({
     variant === 'token'
       ? 'user-console-mobile-kv user-console-mobile-kv--stacked'
       : 'admin-mobile-kv admin-mobile-kv--stacked'
-
+  const headerCopyVisible = showHeaderCopy && (title.trim().length > 0 || description.trim().length > 0)
+  const renderFilters = (className?: string) => (
+    <div className={['panel-actions recent-requests-filters', className].filter(Boolean).join(' ')}>
+      <AdminRecentRequestsRequestKindFilter
+        language={language}
+        isSmallViewport={isSmallViewport}
+        strings={strings}
+        requestKindOptions={requestKindOptions}
+        requestKindQuickBilling={requestKindQuickBilling}
+        requestKindQuickProtocol={requestKindQuickProtocol}
+        selectedRequestKinds={selectedRequestKinds}
+        onRequestKindQuickFiltersChange={onRequestKindQuickFiltersChange}
+        onToggleRequestKind={onToggleRequestKind}
+        onClearRequestKinds={onClearRequestKinds}
+      />
+      <div className="recent-requests-filter-field">
+        <span className="recent-requests-filter-label">{strings.logs.filters.resultOrEffect}</span>
+        <Select
+          value={outcomeValue}
+          onValueChange={(value) => {
+            if (!value || value === recentRequestsAllFilterValue) {
+              onOutcomeFilterChange(null)
+              return
+            }
+            const [kind, nextValue] = value.split(':', 2)
+            if (
+              !nextValue ||
+              (kind !== 'result'
+                && kind !== 'keyEffect'
+                && kind !== 'bindingEffect'
+                && kind !== 'selectionEffect')
+            ) {
+              onOutcomeFilterChange(null)
+              return
+            }
+            onOutcomeFilterChange({
+              kind: kind as RecentRequestsOutcomeFilterKind,
+              value: nextValue,
+            })
+          }}
+        >
+          <SelectTrigger
+            className="recent-requests-filter-select-trigger"
+            aria-label={`${strings.logs.filters.resultOrEffect}: ${outcomeSummary}`}
+          >
+            <span className="recent-requests-filter-select-text">{outcomeSummary}</span>
+          </SelectTrigger>
+          <SelectContent className="recent-requests-filter-content">
+            <SelectItem value={recentRequestsAllFilterValue}>{strings.logs.filters.resultOrEffectAll}</SelectItem>
+            <SelectSeparator />
+            <SelectGroup>
+              <SelectLabel>{strings.logs.filters.resultGroup}</SelectLabel>
+              {resultOptions.length === 0 ? (
+                <SelectItem value="__recent-requests-no-results__" disabled>
+                  {strings.logs.filters.noFacetOptions}
+                </SelectItem>
+              ) : (
+                resultOptions.map((option) => (
+                  <SelectItem key={`result-${option.value}`} value={`result:${option.value}`}>
+                    <span className="recent-requests-facet-option recent-requests-facet-option--status">
+                      <span className="recent-requests-facet-option-main">
+                        {renderOutcomeFacetLabel('result', option.value, strings)}
+                      </span>
+                      <span className="recent-requests-facet-option-spacer" aria-hidden="true" />
+                      <span className="recent-requests-facet-count">{`x${option.count ?? 0}`}</span>
+                    </span>
+                  </SelectItem>
+                ))
+              )}
+            </SelectGroup>
+            <SelectSeparator />
+            <SelectGroup>
+              <SelectLabel>{strings.logs.filters.keyEffectGroup}</SelectLabel>
+              {keyEffectOptions.length === 0 ? (
+                <SelectItem value="__recent-requests-no-effects__" disabled>
+                  {strings.logs.filters.noFacetOptions}
+                </SelectItem>
+              ) : (
+                keyEffectOptions.map((option) => (
+                  <SelectItem key={`effect-${option.value}`} value={`keyEffect:${option.value}`}>
+                    <span className="recent-requests-facet-option recent-requests-facet-option--status">
+                      <span className="recent-requests-facet-option-main">
+                        {renderOutcomeFacetLabel('keyEffect', option.value, strings)}
+                      </span>
+                      <span className="recent-requests-facet-option-spacer" aria-hidden="true" />
+                      <span className="recent-requests-facet-count">{`x${option.count ?? 0}`}</span>
+                    </span>
+                  </SelectItem>
+                ))
+              )}
+            </SelectGroup>
+            <SelectSeparator />
+            <SelectGroup>
+              <SelectLabel>{strings.logs.filters.bindingEffectGroup}</SelectLabel>
+              {bindingEffectOptions.length === 0 ? (
+                <SelectItem value="__recent-requests-no-binding-effects__" disabled>
+                  {strings.logs.filters.noFacetOptions}
+                </SelectItem>
+              ) : (
+                bindingEffectOptions.map((option) => (
+                  <SelectItem key={`binding-effect-${option.value}`} value={`bindingEffect:${option.value}`}>
+                    <span className="recent-requests-facet-option recent-requests-facet-option--status">
+                      <span className="recent-requests-facet-option-main">
+                        {renderOutcomeFacetLabel('bindingEffect', option.value, strings)}
+                      </span>
+                      <span className="recent-requests-facet-option-spacer" aria-hidden="true" />
+                      <span className="recent-requests-facet-count">{`x${option.count ?? 0}`}</span>
+                    </span>
+                  </SelectItem>
+                ))
+              )}
+            </SelectGroup>
+            <SelectSeparator />
+            <SelectGroup>
+              <SelectLabel>{strings.logs.filters.selectionEffectGroup}</SelectLabel>
+              {selectionEffectOptions.length === 0 ? (
+                <SelectItem value="__recent-requests-no-selection-effects__" disabled>
+                  {strings.logs.filters.noFacetOptions}
+                </SelectItem>
+              ) : (
+                selectionEffectOptions.map((option) => (
+                  <SelectItem key={`selection-effect-${option.value}`} value={`selectionEffect:${option.value}`}>
+                    <span className="recent-requests-facet-option recent-requests-facet-option--status">
+                      <span className="recent-requests-facet-option-main">
+                        {renderOutcomeFacetLabel('selectionEffect', option.value, strings)}
+                      </span>
+                      <span className="recent-requests-facet-option-spacer" aria-hidden="true" />
+                      <span className="recent-requests-facet-count">{`x${option.count ?? 0}`}</span>
+                    </span>
+                  </SelectItem>
+                ))
+              )}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+      </div>
+      {showKeyColumn && onKeyFilterChange ? (
+        <div className="recent-requests-filter-field">
+          <span className="recent-requests-filter-label">{strings.logs.table.key}</span>
+          <SearchableFacetSelect
+            value={selectedKeyId ?? null}
+            options={keyOptions}
+            summary={keyFilterSummary}
+            allLabel={strings.logs.filters.keyAll}
+            emptyLabel={strings.logs.filters.noFacetOptions}
+            searchPlaceholder={language === 'zh' ? '输入 Key 片段筛选' : 'Filter keys'}
+            searchAriaLabel={language === 'zh' ? '筛选 Key' : 'Filter keys'}
+            triggerAriaLabel={`${strings.logs.table.key}: ${keyFilterSummary}`}
+            listAriaLabel={strings.logs.table.key}
+            onChange={onKeyFilterChange}
+            disabled={keyOptions.length === 0 && !selectedKeyId}
+            triggerClassName="recent-requests-filter-select-trigger recent-requests-filter-select-trigger--menu"
+            contentClassName="recent-requests-filter-menu"
+          />
+        </div>
+      ) : null}
+    </div>
+  )
+  const headerFiltersPortal = headerFiltersTarget
+    ? createPortal(renderFilters('recent-requests-filters--header'), headerFiltersTarget)
+    : null
   return (
     <section className="surface panel">
-      <div className="panel-header recent-requests-header">
-        <div>
-          <h2>{title}</h2>
-          <p className="panel-description">{description}</p>
-        </div>
-        <div className="panel-actions recent-requests-filters">
-          <div className="recent-requests-filter-field recent-requests-filter-field--request-kind">
-            <span className="recent-requests-filter-label">{strings.logs.filters.requestType}</span>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  className="recent-requests-filter-select-trigger recent-requests-filter-select-trigger--menu"
-                  aria-label={`${strings.logs.filters.requestType}: ${requestKindTriggerSummary}`}
-                >
-                  <span className="recent-requests-filter-select-text">{requestKindTriggerSummary}</span>
-                  <Icon icon="mdi:chevron-down" width={16} height={16} aria-hidden="true" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="end"
-                className="token-request-kind-menu recent-requests-filter-menu recent-requests-filter-menu--request-kind"
-              >
-                <DropdownMenuLabel>{strings.logs.filters.requestType}</DropdownMenuLabel>
-                <div className="token-request-quick-filters">
-                  <div className="token-request-quick-filter-row">
-                    <span className="token-request-quick-filter-label">{strings.logs.filters.billingGroup}</span>
-                    <SegmentedTabs<TokenLogRequestKindQuickBilling>
-                      value={requestKindQuickBilling}
-                      onChange={(next) => onRequestKindQuickFiltersChange(next, requestKindQuickProtocol)}
-                      options={requestKindBillingQuickFilterOptions}
-                      ariaLabel={strings.logs.filters.billingGroup}
-                      className="token-request-quick-segmented"
-                    />
-                  </div>
-                  <div className="token-request-quick-filter-row">
-                    <span className="token-request-quick-filter-label">{strings.logs.filters.protocolGroup}</span>
-                    <SegmentedTabs<TokenLogRequestKindQuickProtocol>
-                      value={requestKindQuickProtocol}
-                      onChange={(next) => onRequestKindQuickFiltersChange(requestKindQuickBilling, next)}
-                      options={requestKindProtocolQuickFilterOptions}
-                      ariaLabel={strings.logs.filters.protocolGroup}
-                      className="token-request-quick-segmented"
-                    />
-                  </div>
-                </div>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  className="cursor-pointer"
-                  disabled={effectiveSelectedRequestKinds.length === 0 && !hasActiveQuickRequestKindFilters}
-                  onSelect={(event) => {
-                    event.preventDefault()
-                    onClearRequestKinds()
-                  }}
-                >
-                  {strings.logs.filters.requestTypeAll}
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                {visibleRequestKindOptions.length === 0 ? (
-                  <DropdownMenuItem disabled>{strings.logs.filters.requestTypeEmpty}</DropdownMenuItem>
-                ) : (
-                  visibleRequestKindOptions.map((option) => (
-                    <DropdownMenuCheckboxItem
-                      key={option.key}
-                      className="cursor-pointer"
-                      checked={effectiveSelectedRequestKinds.includes(option.key)}
-                      onSelect={(event) => event.preventDefault()}
-                      onCheckedChange={() => onToggleRequestKind(option.key)}
-                    >
-                      <span className="recent-requests-request-kind-option">
-                        <RequestKindBadge requestKindKey={option.key} requestKindLabel={option.label} size="sm" />
-                        <span className="recent-requests-request-kind-count">
-                          {`x${option.count ?? 0}`}
-                        </span>
-                      </span>
-                    </DropdownMenuCheckboxItem>
-                  ))
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+      {headerFiltersPortal}
+      <div className={`panel-header recent-requests-header${headerCopyVisible ? '' : ' recent-requests-header--filters-only'}${headerFiltersTarget ? ' recent-requests-header--portal' : ''}`}>
+        {headerCopyVisible ? (
+          <div>
+            <h2>{title}</h2>
+            <p className="panel-description">{description}</p>
           </div>
-
-          <div className="recent-requests-filter-field">
-            <span className="recent-requests-filter-label">{strings.logs.filters.resultOrEffect}</span>
-            <Select
-              value={outcomeValue}
-              onValueChange={(value) => {
-                if (!value || value === recentRequestsAllFilterValue) {
-                  onOutcomeFilterChange(null)
-                  return
-                }
-                const [kind, nextValue] = value.split(':', 2)
-                if (!nextValue || (kind !== 'result' && kind !== 'keyEffect')) {
-                  onOutcomeFilterChange(null)
-                  return
-                }
-                onOutcomeFilterChange({ kind, value: nextValue })
-              }}
-            >
-              <SelectTrigger
-                className="recent-requests-filter-select-trigger"
-                aria-label={`${strings.logs.filters.resultOrEffect}: ${outcomeSummary}`}
-              >
-                <span className="recent-requests-filter-select-text">{outcomeSummary}</span>
-              </SelectTrigger>
-              <SelectContent className="recent-requests-filter-content">
-                <SelectItem value={recentRequestsAllFilterValue}>{strings.logs.filters.resultOrEffectAll}</SelectItem>
-                <SelectSeparator />
-                <SelectGroup>
-                  <SelectLabel>{strings.logs.filters.resultGroup}</SelectLabel>
-                  {resultOptions.length === 0 ? (
-                    <SelectItem value="__recent-requests-no-results__" disabled>
-                      {strings.logs.filters.noFacetOptions}
-                    </SelectItem>
-                  ) : (
-                    resultOptions.map((option) => (
-                      <SelectItem key={`result-${option.value}`} value={`result:${option.value}`}>
-                        <span className="recent-requests-facet-option recent-requests-facet-option--status">
-                          <span className="recent-requests-facet-option-main">
-                            {renderOutcomeFacetLabel('result', option.value, strings)}
-                          </span>
-                          <span className="recent-requests-facet-option-spacer" aria-hidden="true" />
-                          <span className="recent-requests-facet-count">{`x${option.count ?? 0}`}</span>
-                        </span>
-                      </SelectItem>
-                    ))
-                  )}
-                </SelectGroup>
-                <SelectSeparator />
-                <SelectGroup>
-                  <SelectLabel>{strings.logs.filters.keyEffectGroup}</SelectLabel>
-                  {keyEffectOptions.length === 0 ? (
-                    <SelectItem value="__recent-requests-no-effects__" disabled>
-                      {strings.logs.filters.noFacetOptions}
-                    </SelectItem>
-                  ) : (
-                    keyEffectOptions.map((option) => (
-                      <SelectItem key={`effect-${option.value}`} value={`keyEffect:${option.value}`}>
-                        <span className="recent-requests-facet-option recent-requests-facet-option--status">
-                          <span className="recent-requests-facet-option-main">
-                            {renderOutcomeFacetLabel('keyEffect', option.value, strings)}
-                          </span>
-                          <span className="recent-requests-facet-option-spacer" aria-hidden="true" />
-                          <span className="recent-requests-facet-count">{`x${option.count ?? 0}`}</span>
-                        </span>
-                      </SelectItem>
-                    ))
-                  )}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </div>
-
-          {showKeyColumn && onKeyFilterChange ? (
-            <div className="recent-requests-filter-field">
-              <span className="recent-requests-filter-label">{strings.logs.table.key}</span>
-              <SearchableFacetSelect
-                value={selectedKeyId ?? null}
-                options={keyOptions}
-                summary={keyFilterSummary}
-                allLabel={strings.logs.filters.keyAll}
-                emptyLabel={strings.logs.filters.noFacetOptions}
-                searchPlaceholder={language === 'zh' ? '输入 Key 片段筛选' : 'Filter keys'}
-                searchAriaLabel={language === 'zh' ? '筛选 Key' : 'Filter keys'}
-                triggerAriaLabel={`${strings.logs.table.key}: ${keyFilterSummary}`}
-                listAriaLabel={strings.logs.table.key}
-                onChange={onKeyFilterChange}
-                disabled={keyOptions.length === 0 && !selectedKeyId}
-                triggerClassName="recent-requests-filter-select-trigger recent-requests-filter-select-trigger--menu"
-                contentClassName="recent-requests-filter-menu"
-              />
-            </div>
-          ) : null}
-        </div>
+        ) : null}
+        {renderFilters(headerFiltersTarget ? 'recent-requests-filters--mobile-only' : undefined)}
       </div>
-
       <AdminTableShell
         className={desktopClassName}
         tableClassName={`recent-requests-table recent-requests-table--${variant}`}
@@ -823,7 +1088,7 @@ export default function AdminRecentRequestsPanel({
             <TableHead className="recent-requests-col recent-requests-col--status">{strings.logs.table.status}</TableHead>
             <TableHead className="recent-requests-col recent-requests-col--credits">{strings.logs.table.chargedCredits}</TableHead>
             <TableHead className="recent-requests-col recent-requests-col--result">{strings.logs.table.result}</TableHead>
-            <TableHead className="recent-requests-col recent-requests-col--key-effect">{strings.logs.table.keyEffect}</TableHead>
+            <TableHead className="recent-requests-col recent-requests-col--key-effect">{strings.logs.table.effects}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -846,6 +1111,7 @@ export default function AdminRecentRequestsPanel({
               const requestKindLabel = log.request_kind_label ?? log.request_kind_key ?? strings.logs.errors.none
               const keyId = log.key_id?.trim() || null
               const tokenId = log.auth_token_id?.trim() || null
+              const isRebalanceGateway = isRebalanceGatewayLog(log)
               const timeLabel = formatTime(log.created_at)
               const timeDetailLabel = formatTimeDetail?.(log.created_at) ?? null
               const hasTimeBubble = Boolean(timeDetailLabel && timeDetailLabel !== timeLabel)
@@ -869,7 +1135,11 @@ export default function AdminRecentRequestsPanel({
                     {showTokenColumn ? (
                       <TableCell className="recent-requests-col recent-requests-col--token">
                         {tokenId ? (
-                          <button type="button" className="link-button log-token-link request-entity-button" onClick={() => onOpenToken?.(tokenId)}>
+                          <button
+                            type="button"
+                            className="link-button log-token-link recent-requests-entity-link request-entity-button"
+                            onClick={() => onOpenToken?.(tokenId)}
+                          >
                             <code>{tokenId}</code>
                           </button>
                         ) : (
@@ -882,9 +1152,25 @@ export default function AdminRecentRequestsPanel({
                         {keyId ? (
                           <button
                             type="button"
-                            className="link-button log-token-link log-key-link request-entity-button"
+                            className={[
+                              'link-button',
+                              'log-token-link',
+                              'log-key-link',
+                              'recent-requests-entity-link',
+                              'recent-requests-key-id-link',
+                              'request-entity-button',
+                              isRebalanceGateway ? 'recent-requests-key-id-link--rebalance' : '',
+                            ].filter(Boolean).join(' ')}
+                            aria-label={`${strings.logs.table.key}: ${keyId}`}
+                            title={keyId}
                             onClick={() => onOpenKey?.(keyId)}
                           >
+                            {isRebalanceGateway ? (
+                              <>
+                                <RebalanceGatewayMarker />
+                                <span className="sr-only">{rebalanceMarkerLabel(log, strings)}</span>
+                              </>
+                            ) : null}
                             <code>{keyId}</code>
                           </button>
                         ) : (
@@ -900,7 +1186,7 @@ export default function AdminRecentRequestsPanel({
                         <TooltipTrigger asChild>
                         <button
                           type="button"
-                          className="status-pair-trigger"
+                          className={requestStatusPairClassName(log)}
                           aria-label={formatRequestStatusTooltip(log, strings)}
                         >
                           {formatRequestStatusPair(log.http_status, log.mcp_status)}
@@ -936,9 +1222,7 @@ export default function AdminRecentRequestsPanel({
                       </Button>
                     </TableCell>
                     <TableCell className="recent-requests-col recent-requests-col--key-effect">
-                      <StatusBadge tone={keyEffectTone(log.key_effect_code)} title={formatKeyEffectSummary(log, strings, language)}>
-                        {keyEffectBadgeLabel(log, strings)}
-                      </StatusBadge>
+                      {renderEffectBadges(log, strings, language)}
                     </TableCell>
                   </TableRow>
                   {expanded ? (
@@ -964,7 +1248,6 @@ export default function AdminRecentRequestsPanel({
           )}
         </TableBody>
       </AdminTableShell>
-
       <AdminLoadingRegion
         className={mobileClassName}
         loadState={loadState}
@@ -986,6 +1269,7 @@ export default function AdminRecentRequestsPanel({
                 : undefined)
             const keyId = log.key_id?.trim() || null
             const tokenId = log.auth_token_id?.trim() || null
+            const isRebalanceGateway = isRebalanceGatewayLog(log)
             return (
               <article key={log.id} className={mobileCardClassName}>
                 <div className={mobileKvClassName}>
@@ -1010,9 +1294,23 @@ export default function AdminRecentRequestsPanel({
                     {keyId ? (
                       <button
                         type="button"
-                        className="request-entity-button admin-mobile-request-entity-button log-key-link"
+                        className={[
+                          'request-entity-button',
+                          'admin-mobile-request-entity-button',
+                          'log-key-link',
+                          'recent-requests-key-id-link',
+                          isRebalanceGateway ? 'recent-requests-key-id-link--rebalance' : '',
+                        ].filter(Boolean).join(' ')}
+                        aria-label={`${strings.logs.table.key}: ${keyId}`}
+                        title={keyId}
                         onClick={() => onOpenKey?.(keyId)}
                       >
+                        {isRebalanceGateway ? (
+                          <>
+                            <RebalanceGatewayMarker />
+                            <span className="sr-only">{rebalanceMarkerLabel(log, strings)}</span>
+                          </>
+                        ) : null}
                         <strong><code>{keyId}</code></strong>
                       </button>
                     ) : (
@@ -1037,7 +1335,7 @@ export default function AdminRecentRequestsPanel({
                   <span>{strings.logs.table.status}</span>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                    <button type="button" className="status-pair-trigger" aria-label={formatRequestStatusTooltip(log, strings)}>
+                    <button type="button" className={requestStatusPairClassName(log)} aria-label={formatRequestStatusTooltip(log, strings)}>
                       <strong>{formatRequestStatusPair(log.http_status, log.mcp_status)}</strong>
                     </button>
                     </TooltipTrigger>
@@ -1072,14 +1370,13 @@ export default function AdminRecentRequestsPanel({
                   </button>
                 </div>
                 <div className={mobileStackedClassName}>
-                  <span>{strings.logs.table.keyEffect}</span>
-                  <StatusBadge
-                    className={variant === 'token' ? 'user-console-mobile-status' : undefined}
-                    tone={keyEffectTone(log.key_effect_code)}
-                    title={formatKeyEffectSummary(log, strings, language)}
-                  >
-                    {keyEffectBadgeLabel(log, strings)}
-                  </StatusBadge>
+                  <span>{strings.logs.table.effects}</span>
+                  {renderEffectBadges(
+                    log,
+                    strings,
+                    language,
+                    variant === 'token' ? 'user-console-mobile-status' : undefined,
+                  )}
                 </div>
                 {expanded ? (
                   <div className="recent-requests-mobile-details" id={`recent-request-mobile-details-${log.id}`}>
@@ -1098,18 +1395,18 @@ export default function AdminRecentRequestsPanel({
           })
         )}
       </AdminLoadingRegion>
-
       <AdminTablePagination
-        page={page}
-        totalPages={totalPages}
+        page={1}
+        totalPages={1}
+        pageSummary={paginationSummary}
         perPage={perPage}
-        previousLabel={strings.tokens.pagination.prev}
-        nextLabel={strings.tokens.pagination.next}
-        previousDisabled={page <= 1}
-        nextDisabled={page >= totalPages}
+        previousLabel={strings.logs.pagination.newer}
+        nextLabel={strings.logs.pagination.older}
+        previousDisabled={!hasNewer}
+        nextDisabled={!hasOlder}
         disabled={paginationDisabled}
-        onPrevious={onPreviousPage}
-        onNext={onNextPage}
+        onPrevious={onNewerPage}
+        onNext={onOlderPage}
         onPerPageChange={onPerPageChange}
       />
     </section>

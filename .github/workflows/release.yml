@@ -1,4 +1,5 @@
 name: Release
+# portable_release_contract=v1
 
 on:
   workflow_run:
@@ -20,7 +21,6 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  PLATFORMS: linux/amd64
   RELEASE_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.workflow_run.head_sha }}
 
 concurrency:
@@ -30,7 +30,7 @@ concurrency:
 jobs:
   prepare:
     name: Prepare (intent + version + tag)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     if: >-
       (github.event_name == 'workflow_run' &&
@@ -47,12 +47,20 @@ jobs:
       reason: ${{ steps.intent.outputs.reason }}
       version: ${{ steps.tagmeta.outputs.version }}
       tag: ${{ steps.tagmeta.outputs.tag }}
+      supports_portable: ${{ steps.capabilities.outputs.supports_portable }}
     steps:
       - name: Checkout (workflow_run)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_HEAD_SHA }}
+
+      - name: Log release target markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RELEASE_REQUESTED_SHA=${RELEASE_HEAD_SHA}"
+          echo "RELEASE_TARGET_SHA=${RELEASE_HEAD_SHA}"
 
       - name: Determine release intent (labels)
         id: intent
@@ -62,6 +70,20 @@ jobs:
           WORKFLOW_RUN_SHA: ${{ env.RELEASE_HEAD_SHA }}
         run: |
           bash ./.github/scripts/release-intent.sh
+
+      - name: Detect release asset capabilities
+        id: capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          supports_portable=false
+          if [[ -f ".github/workflows/release.yml" ]] &&
+            grep -Fq 'portable_release_contract=v1' ".github/workflows/release.yml"; then
+            supports_portable=true
+          fi
+
+          echo "supports_portable=${supports_portable}" >> "${GITHUB_OUTPUT}"
 
       - name: Determine release version/tag (idempotent)
         id: tagmeta
@@ -167,37 +189,30 @@ jobs:
             echo "- reason: ${{ steps.intent.outputs.reason }}"
             echo "- tag: ${{ steps.tagmeta.outputs.tag || '<none>' }}"
             echo "- version: ${{ steps.tagmeta.outputs.version || '<none>' }}"
+            echo "- supports_portable: ${{ steps.capabilities.outputs.supports_portable }}"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  docker:
-    name: Build and push image (ghcr)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  web-assets:
+    name: Build web assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: [prepare]
     if: ${{ needs.prepare.outputs.should_release == 'true' }}
-    permissions:
-      contents: read
-      packages: write
     env:
       APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - name: Checkout (workflow_run)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.RELEASE_HEAD_SHA }}
-
-      - name: Install Rust native dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.91.0
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: .bun-version
+
+      - name: Install PWA asset dependencies
+        run: python3 -m pip install --user Pillow
 
       - name: Build web assets
         working-directory: web
@@ -208,8 +223,77 @@ jobs:
           bun install --frozen-lockfile
           bun run build
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Upload web assets artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  docker-native:
+    name: Build and smoke image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    needs: [prepare, web-assets]
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout (workflow_run)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_HEAD_SHA }}
+
+      - name: Download web assets artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-web-dist
+          path: web/dist
+
+      - name: Restore release smoke helper for backfill
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags --depth=1 origin main
+          force_restore=0
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            force_restore=1
+          fi
+
+          for helper_path in \
+            ".github/scripts/release-mcp-billing-smoke.sh" \
+            ".github/scripts/release_smoke_sqlite_check.py"
+          do
+            if [[ "${force_restore}" != "1" && ( -x "${helper_path}" || -f "${helper_path}" ) ]]; then
+              continue
+            fi
+            echo "restoring ${helper_path} from origin/main for backfill ${RELEASE_HEAD_SHA}"
+            mkdir -p "$(dirname "${helper_path}")"
+            git show FETCH_HEAD:"${helper_path}" > "${helper_path}"
+            chmod +x "${helper_path}"
+          done
+
+      - name: Install Rust native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.0
 
       - name: Compute lowercase image name
         id: image-name
@@ -217,334 +301,556 @@ jobs:
         run: |
           set -euo pipefail
           lower="${GITHUB_REPOSITORY,,}"
-          echo "IMAGE_NAME_LOWER=${lower}" >> "$GITHUB_ENV"
-          echo "LOCAL_SMOKE_IMAGE=tavily-hikari-release-smoke:${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          {
+            echo "IMAGE_NAME_LOWER=${lower}"
+            echo "LOCAL_SMOKE_IMAGE=tavily-hikari-release-smoke:${GITHUB_RUN_ID}-${{ matrix.arch }}"
+            echo "DIGEST_FILE=${RUNNER_TEMP}/release-digests/${{ matrix.arch }}.txt"
+          } >> "$GITHUB_ENV"
           echo "image_name_lower=${lower}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build local Docker image for MCP billing smoke
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           load: true
+          platforms: ${{ matrix.platform }}
           tags: ${{ env.LOCAL_SMOKE_IMAGE }}
           build-args: |
             APP_EFFECTIVE_VERSION=${{ env.APP_EFFECTIVE_VERSION }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }}:buildcache-${{ matrix.arch }}
 
       - name: Build smoke helpers
         run: cargo build --locked --bin mock_tavily
 
       - name: MCP billing smoke gate
         shell: bash
+        env:
+          LOCAL_SMOKE_IMAGE: ${{ env.LOCAL_SMOKE_IMAGE }}
+        run: |
+          ./.github/scripts/release-mcp-billing-smoke.sh
+
+      - name: Extract metadata labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }}
+          labels: |
+            org.opencontainers.image.version=${{ env.APP_EFFECTIVE_VERSION }}
+
+      - name: Build and push Docker image by digest
+        id: build-push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ env.APP_EFFECTIVE_VERSION }}
+          build-args: |
+            APP_EFFECTIVE_VERSION=${{ env.APP_EFFECTIVE_VERSION }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }}:buildcache-${{ matrix.arch }},mode=max
+
+      - name: Export image digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build-push.outputs.digest }}"
+          if [[ -z "${digest}" ]]; then
+            echo "missing pushed digest for ${{ matrix.arch }}" >&2
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "${DIGEST_FILE}")"
+          printf '%s\n' "${digest}" > "${DIGEST_FILE}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-digest-${{ matrix.arch }}
+          path: ${{ env.DIGEST_FILE }}
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Native image build (${{ matrix.arch }})"
+            echo "- runner: ${{ matrix.runner }}"
+            echo "- platform: ${{ matrix.platform }}"
+            echo "- version: ${{ env.APP_EFFECTIVE_VERSION }}"
+            echo "- digest: ${{ steps.build-push.outputs.digest || '<none>' }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  binary-native:
+    name: Build binary release (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    needs: [prepare, web-assets]
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Checkout (workflow_run)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_HEAD_SHA }}
+
+      - name: Download web assets artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-web-dist
+          path: web/dist
+
+      - name: Install Rust native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.0
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin tavily-hikari
+
+      - name: Package release binary
+        shell: bash
         run: |
           set -euo pipefail
 
-          MOCK_PORT=58088
-          PROXY_PORT=58087
-          DATA_DIR="${RUNNER_TEMP}/tavily-hikari-release-smoke-data"
-          DB_PATH="${DATA_DIR}/tavily_proxy.db"
-          MOCK_LOG="${RUNNER_TEMP}/mock-tavily.log"
-          CONTAINER_NAME="tavily-hikari-release-smoke"
+          release_dir="${RUNNER_TEMP}/release-binary-${{ matrix.arch }}"
+          package_root="${release_dir}/tavily-hikari-${RELEASE_TAG}-linux-${{ matrix.arch }}"
+          tarball="${release_dir}/tavily-hikari-${RELEASE_TAG}-linux-${{ matrix.arch }}.tar.gz"
+          sha_file="${tarball}.sha256"
 
-          cleanup() {
-            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-            if [[ -n "${MOCK_PID:-}" ]]; then
-              kill "${MOCK_PID}" >/dev/null 2>&1 || true
-              wait "${MOCK_PID}" >/dev/null 2>&1 || true
-            fi
-          }
-          trap cleanup EXIT
+          mkdir -p "${package_root}"
+          install -m 0755 target/release/tavily-hikari "${package_root}/tavily-hikari"
+          tar -C "${release_dir}" -czf "${tarball}" "$(basename "${package_root}")"
+          (cd "${release_dir}" && sha256sum "$(basename "${tarball}")" > "$(basename "${sha_file}")")
 
-          mkdir -p "${DATA_DIR}"
+          {
+            echo "PACKAGE_ROOT=${package_root}"
+            echo "TARBALL=${tarball}"
+            echo "SHA_FILE=${sha_file}"
+          } >> "${GITHUB_ENV}"
 
-          ./target/debug/mock_tavily --bind "0.0.0.0:${MOCK_PORT}" >"${MOCK_LOG}" 2>&1 &
-          MOCK_PID=$!
+      - name: Smoke packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          for _ in {1..50}; do
-            if curl -fsS "http://127.0.0.1:${MOCK_PORT}/admin/state" >/dev/null; then
-              break
-            fi
-            sleep 0.2
-          done
-          curl -fsS "http://127.0.0.1:${MOCK_PORT}/admin/state" >/dev/null
+          smoke_root="${RUNNER_TEMP}/release-smoke-${{ matrix.arch }}"
+          extract_dir="${smoke_root}/extract"
+          db_path="${smoke_root}/data/tavily_proxy.db"
+          port="$(
+            python3 - <<'PY'
+          import socket
+          s = socket.socket()
+          s.bind(("127.0.0.1", 0))
+          print(s.getsockname()[1])
+          s.close()
+          PY
+          )"
 
-          curl -fsS \
-            -X POST \
-            "http://127.0.0.1:${MOCK_PORT}/admin/keys" \
-            -H 'content-type: application/json' \
-            -d '{"secret":"tvly-test-key","limit":1000,"remaining":1000}' \
-            >/dev/null
+          mkdir -p "${extract_dir}" "$(dirname "${db_path}")"
+          tar -xzf "${TARBALL}" -C "${extract_dir}"
+          binary="${extract_dir}/tavily-hikari-${RELEASE_TAG}-linux-${{ matrix.arch }}/tavily-hikari"
 
-          docker run -d --rm \
-            --name "${CONTAINER_NAME}" \
-            --add-host host.docker.internal:host-gateway \
-            -p "127.0.0.1:${PROXY_PORT}:8787" \
-            -v "${DATA_DIR}:/srv/app/data" \
-            -e TAVILY_API_KEYS=tvly-test-key \
-            -e TAVILY_UPSTREAM="http://host.docker.internal:${MOCK_PORT}/mcp" \
-            -e TAVILY_USAGE_BASE="http://host.docker.internal:${MOCK_PORT}" \
-            -e DEV_OPEN_ADMIN=true \
-            -e PROXY_DB_PATH=/srv/app/data/tavily_proxy.db \
-            "${LOCAL_SMOKE_IMAGE}" \
-            >/dev/null
+          "${binary}" \
+            --bind 127.0.0.1 \
+            --port "${port}" \
+            --db-path "${db_path}" \
+            --dev-open-admin \
+            >"${smoke_root}/stdout.log" \
+            2>"${smoke_root}/stderr.log" &
+          pid=$!
+          trap 'kill "${pid}" >/dev/null 2>&1 || true' EXIT
 
           for _ in {1..60}; do
-            if curl -fsS "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null; then
+            if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null; then
               break
+            fi
+            if ! kill -0 "${pid}" >/dev/null 2>&1; then
+              echo "binary exited early" >&2
+              cat "${smoke_root}/stdout.log" >&2 || true
+              cat "${smoke_root}/stderr.log" >&2 || true
+              exit 1
             fi
             sleep 1
           done
-          curl -fsS "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null
 
-          TOKEN_PAYLOAD="$(
-            curl -fsS \
-              -X POST \
-              "http://127.0.0.1:${PROXY_PORT}/api/tokens" \
-              -H 'content-type: application/json' \
-              -d '{}'
-          )"
-          export TOKEN_PAYLOAD
-          TOKEN="$(python3 - <<'PY'
-          import json, os
-          payload = json.loads(os.environ["TOKEN_PAYLOAD"])
-          print(payload["token"])
-          PY
-          )"
-          TOKEN_ID="$(python3 - <<'PY'
-          import os
-          token = os.environ["TOKEN_PAYLOAD"]
-          payload = __import__("json").loads(token)
-          full_token = payload["token"]
-          token_id = full_token.removeprefix("th-").split("-", 1)[0]
-          print(token_id)
-          PY
-          )"
+          curl -fsS "http://127.0.0.1:${port}/health" >/dev/null
+          curl -fsSL "http://127.0.0.1:${port}/" | grep -qi '<html'
+          curl -fsS "http://127.0.0.1:${port}/admin" | grep -qi '<html'
+          curl -fsS "http://127.0.0.1:${port}/console" | grep -qi '<html'
+          curl -fsS "http://127.0.0.1:${port}/version.json" | grep -q '"version"'
+          curl -fsS "http://127.0.0.1:${port}/favicon.svg" >/dev/null
+          curl -fsS "http://127.0.0.1:${port}/assets/linuxdo-logo.svg" >/dev/null
+          curl -fsS "http://127.0.0.1:${port}/assets/relay-mesh-lockup-light.png" >/dev/null
 
-          SEARCH_RESPONSE="$(
-            curl -fsS \
-              -X POST \
-              "http://127.0.0.1:${PROXY_PORT}/mcp" \
-              -H "Authorization: Bearer ${TOKEN}" \
-              -H 'Accept: application/json, text/event-stream' \
-              -H 'content-type: application/json' \
-              -d '{"jsonrpc":"2.0","id":"release-smoke-search","method":"tools/call","params":{"name":"tavily_search","arguments":{"query":"release smoke gate","search_depth":"advanced"}}}'
-          )"
-          export SEARCH_RESPONSE
-          python3 - <<'PY'
-          import json, os
-          payload = json.loads(os.environ["SEARCH_RESPONSE"])
-          assert payload.get("result"), payload
-          PY
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-binary-${{ matrix.arch }}
+          path: |
+            ${{ env.TARBALL }}
+            ${{ env.SHA_FILE }}
+          if-no-files-found: error
+          overwrite: true
 
-          curl -fsS \
-            -X POST \
-            "http://127.0.0.1:${PROXY_PORT}/mcp" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H 'Accept: application/json, text/event-stream' \
-            -H 'content-type: application/json' \
-            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            >/dev/null
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Binary release (${{ matrix.arch }})"
+            echo "- runner: ${{ matrix.runner }}"
+            echo "- platform: ${{ matrix.platform }}"
+            echo "- tag: ${RELEASE_TAG}"
+            echo "- tarball: $(basename "${TARBALL}")"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-          curl -fsS \
-            -X POST \
-            "http://127.0.0.1:${MOCK_PORT}/admin/force-response" \
-            -H 'content-type: application/json' \
-            -d '{"http_status":406,"body":{"error":"client must accept both application/json and text/event-stream"},"once":true}' \
-            >/dev/null
+  binary-portable:
+    name: Build portable binary release (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    needs: [prepare, web-assets]
+    if: ${{ needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.supports_portable == 'true' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    env:
+      APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Checkout (workflow_run)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_HEAD_SHA }}
 
-          CLIENT_ERROR_HTTP="$(
-            curl -sS \
-              -o /dev/null \
-              -w '%{http_code}' \
-              -X POST \
-              "http://127.0.0.1:${PROXY_PORT}/mcp" \
-              -H "Authorization: Bearer ${TOKEN}" \
-              -H 'Accept: application/json, text/event-stream' \
-              -H 'content-type: application/json' \
-              -d '{"jsonrpc":"2.0","id":"release-smoke-406","method":"tools/call","params":{"name":"tavily_search","arguments":{"query":"release smoke client error"}}}'
-          )"
-          if [[ "${CLIENT_ERROR_HTTP}" != "406" ]]; then
-            echo "expected 406 MCP client error, got ${CLIENT_ERROR_HTTP}" >&2
+      - name: Download web assets artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-web-dist
+          path: web/dist
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.0
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-zigbuild --locked --version 0.22.1
+
+      - name: Build portable release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked --target "${{ matrix.target }}" --bin tavily-hikari
+
+      - name: Verify portable binary linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/tavily-hikari"
+          file_output="$(file "${binary}")"
+          printf '%s\n' "${file_output}" | tee "${RUNNER_TEMP}/portable-file-${{ matrix.arch }}.log"
+          ldd_output="$(ldd "${binary}" 2>&1 || true)"
+          printf '%s\n' "${ldd_output}" | tee "${RUNNER_TEMP}/portable-ldd-${{ matrix.arch }}.log"
+          readelf_dynamic="$(readelf -d "${binary}" 2>&1 || true)"
+          printf '%s\n' "${readelf_dynamic}" | tee "${RUNNER_TEMP}/portable-readelf-dynamic-${{ matrix.arch }}.log"
+          readelf_program_headers="$(readelf -l "${binary}" 2>&1 || true)"
+          printf '%s\n' "${readelf_program_headers}" | tee "${RUNNER_TEMP}/portable-readelf-program-headers-${{ matrix.arch }}.log"
+          if ! grep -Eq 'statically linked|static-pie linked' <<< "${file_output}"; then
+            echo "portable binary must be statically linked" >&2
+            exit 1
+          fi
+          if grep -q 'Requesting program interpreter' <<< "${readelf_program_headers}"; then
+            echo "portable binary unexpectedly requires a runtime loader" >&2
+            exit 1
+          fi
+          if grep -q '(NEEDED)' <<< "${readelf_dynamic}"; then
+            echo "portable binary unexpectedly exposes dynamic library dependencies" >&2
+            exit 1
+          fi
+          if grep -Eq 'libc\.so\.6|ld-linux|libssl|libcrypto|libsqlite3|GLIBC' <<< "${file_output}"$'\n'"${ldd_output}"$'\n'"${readelf_dynamic}"$'\n'"${readelf_program_headers}"; then
+            echo "portable binary still exposes forbidden dynamic runtime dependencies" >&2
             exit 1
           fi
 
-          curl -fsS \
-            -X POST \
-            "http://127.0.0.1:${MOCK_PORT}/admin/force-response" \
-            -H 'content-type: application/json' \
-            -d '{"http_status":429,"body":{"error":"release smoke upstream rate limit"},"once":true}' \
-            >/dev/null
+      - name: Package portable release binary
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          UPSTREAM_ERROR_HTTP="$(
-            curl -sS \
-              -o /dev/null \
-              -w '%{http_code}' \
-              -X POST \
-              "http://127.0.0.1:${PROXY_PORT}/mcp" \
-              -H "Authorization: Bearer ${TOKEN}" \
-              -H 'Accept: application/json, text/event-stream' \
-              -H 'content-type: application/json' \
-              -d '{"jsonrpc":"2.0","id":"release-smoke-429","method":"tools/call","params":{"name":"tavily_search","arguments":{"query":"release smoke upstream error"}}}'
-          )"
-          if [[ "${UPSTREAM_ERROR_HTTP}" != "429" ]]; then
-            echo "expected 429 MCP upstream failure, got ${UPSTREAM_ERROR_HTTP}" >&2
-            exit 1
-          fi
+          release_dir="${RUNNER_TEMP}/release-binary-portable-${{ matrix.arch }}"
+          package_root="${release_dir}/tavily-hikari-${RELEASE_TAG}-linux-${{ matrix.arch }}-portable"
+          tarball="${release_dir}/tavily-hikari-${RELEASE_TAG}-linux-${{ matrix.arch }}-portable.tar.gz"
+          sha_file="${tarball}.sha256"
 
-          python3 - "${DB_PATH}" "${TOKEN_ID}" <<'PY'
-          import json
-          import pathlib
-          import sqlite3
-          import sys
+          mkdir -p "${package_root}"
+          install -m 0755 "target/${{ matrix.target }}/release/tavily-hikari" "${package_root}/tavily-hikari"
+          tar -C "${release_dir}" -czf "${tarball}" "$(basename "${package_root}")"
+          (cd "${release_dir}" && sha256sum "$(basename "${tarball}")" > "$(basename "${sha_file}")")
 
-          db_path = pathlib.Path(sys.argv[1])
-          token_id = sys.argv[2]
-          conn = sqlite3.connect(db_path)
-          request_rows = conn.execute(
-              "SELECT request_body, result_status, failure_kind FROM request_logs WHERE auth_token_id = ? ORDER BY id DESC",
-              (token_id,),
-          ).fetchall()
-          if not request_rows:
-              raise SystemExit("missing request_logs row for smoke token")
+          {
+            echo "PACKAGE_ROOT=${package_root}"
+            echo "TARBALL=${tarball}"
+            echo "SHA_FILE=${sha_file}"
+          } >> "${GITHUB_ENV}"
 
-          success_search_rows = []
-          for request_body_raw, result_status, failure_kind in request_rows:
-              request_body = json.loads(request_body_raw.decode())
-              request_id = request_body.get("id")
-              if request_id == "release-smoke-search":
-                  success_search_rows.append((request_body, result_status, failure_kind))
+      - name: Smoke portable binary
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if len(success_search_rows) != 1:
-              raise SystemExit(
-                  f"expected exactly one successful MCP search request_logs row for smoke token, got {len(success_search_rows)}"
-              )
-
-          request_body, result_status, failure_kind = success_search_rows[0]
-          if request_body["params"]["arguments"].get("include_usage") is not None:
-              raise SystemExit(f"include_usage must not be forwarded for MCP smoke: {request_body}")
-          if result_status != "success" or failure_kind is not None:
-              raise SystemExit(
-                  f"unexpected request_logs outcome for MCP smoke search: result={result_status} failure={failure_kind}"
-              )
-
-          token_log_row = conn.execute(
-              "SELECT business_credits FROM auth_token_logs WHERE token_id = ? AND request_kind_key = 'mcp:search' AND result_status = 'success' ORDER BY id DESC LIMIT 1",
-              (token_id,),
-          ).fetchone()
-          if token_log_row is None or token_log_row[0] is None or token_log_row[0] <= 0:
-              raise SystemExit(f"missing charged credits for smoke token: {token_log_row}")
-
-          month_row = conn.execute(
-              "SELECT COALESCE(month_count, 0) FROM auth_token_quota WHERE token_id = ? LIMIT 1",
-              (token_id,),
-          ).fetchone()
-          if month_row is None or month_row[0] < token_log_row[0]:
-              raise SystemExit(
-                  f"token monthly quota did not increase with billed credits: month_row={month_row} charged={token_log_row}"
-              )
+          smoke_root="${RUNNER_TEMP}/release-smoke-portable-${{ matrix.arch }}"
+          extract_dir="${smoke_root}/extract"
+          db_path="${smoke_root}/data/tavily_proxy.db"
+          port="$(
+            python3 - <<'PY'
+          import socket
+          s = socket.socket()
+          s.bind(("127.0.0.1", 0))
+          print(s.getsockname()[1])
+          s.close()
           PY
-
-          ADMIN_LOGS_JSON="$(
-            curl -fsS "http://127.0.0.1:${PROXY_PORT}/api/logs?page=1&per_page=20"
           )"
-          TOKEN_LOGS_NEUTRAL_JSON="$(
-            curl -fsS "http://127.0.0.1:${PROXY_PORT}/api/tokens/${TOKEN_ID}/logs/page?page=1&per_page=20&since=0&operational_class=neutral"
-          )"
-          export ADMIN_LOGS_JSON TOKEN_LOGS_NEUTRAL_JSON
-          python3 - <<'PY'
-          import json
-          import os
 
-          admin_logs = json.loads(os.environ["ADMIN_LOGS_JSON"])
-          neutral_token_logs = json.loads(os.environ["TOKEN_LOGS_NEUTRAL_JSON"])
+          mkdir -p "${extract_dir}" "$(dirname "${db_path}")"
+          tar -xzf "${TARBALL}" -C "${extract_dir}"
+          binary="${extract_dir}/tavily-hikari-${RELEASE_TAG}-linux-${{ matrix.arch }}-portable/tavily-hikari"
 
-          def find_log(items, predicate, label):
-              for item in items:
-                  if predicate(item):
-                      return item
-              raise SystemExit(f"missing {label} in admin logs: {items}")
+          "${binary}" \
+            --bind 127.0.0.1 \
+            --port "${port}" \
+            --db-path "${db_path}" \
+            --dev-open-admin \
+            >"${smoke_root}/stdout.log" \
+            2>"${smoke_root}/stderr.log" &
+          pid=$!
+          trap 'kill "${pid}" >/dev/null 2>&1 || true' EXIT
 
-          items = admin_logs.get("items") or []
-          neutral_log = find_log(
-              items,
-              lambda item: item.get("request_kind_key") == "mcp:notifications/initialized",
-              "neutral MCP notification",
-          )
-          if neutral_log.get("operationalClass") != "neutral":
-              raise SystemExit(f"expected neutral operational class, got {neutral_log}")
-          if neutral_log.get("requestKindProtocolGroup") != "mcp":
-              raise SystemExit(f"expected MCP protocol group, got {neutral_log}")
-          if neutral_log.get("requestKindBillingGroup") != "non_billable":
-              raise SystemExit(f"expected non-billable MCP notification, got {neutral_log}")
+          for _ in {1..60}; do
+            if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null; then
+              break
+            fi
+            if ! kill -0 "${pid}" >/dev/null 2>&1; then
+              echo "portable binary exited early" >&2
+              cat "${smoke_root}/stdout.log" >&2 || true
+              cat "${smoke_root}/stderr.log" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
 
-          client_error_log = find_log(
-              items,
-              lambda item: item.get("failure_kind") == "mcp_accept_406",
-              "client_error MCP accept failure",
-          )
-          if client_error_log.get("operationalClass") != "client_error":
-              raise SystemExit(f"expected client_error operational class, got {client_error_log}")
+          curl -fsS "http://127.0.0.1:${port}/health" >/dev/null
+          curl -fsSL "http://127.0.0.1:${port}/" | grep -qi '<html'
+          curl -fsS "http://127.0.0.1:${port}/admin" | grep -qi '<html'
+          curl -fsS "http://127.0.0.1:${port}/console" | grep -qi '<html'
+          curl -fsS "http://127.0.0.1:${port}/version.json" | grep -q '"version"'
+          curl -fsS "http://127.0.0.1:${port}/favicon.svg" >/dev/null
+          curl -fsS "http://127.0.0.1:${port}/assets/linuxdo-logo.svg" >/dev/null
+          curl -fsS "http://127.0.0.1:${port}/assets/relay-mesh-lockup-light.png" >/dev/null
 
-          upstream_error_log = find_log(
-              items,
-              lambda item: item.get("failure_kind") == "upstream_rate_limited_429",
-              "upstream_error MCP rate limit",
-          )
-          if upstream_error_log.get("operationalClass") != "upstream_error":
-              raise SystemExit(f"expected upstream_error operational class, got {upstream_error_log}")
+      - name: Upload portable binary artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-binary-portable-${{ matrix.arch }}
+          path: |
+            ${{ env.TARBALL }}
+            ${{ env.SHA_FILE }}
+          if-no-files-found: error
+          overwrite: true
 
-          neutral_items = neutral_token_logs.get("items") or []
-          if neutral_token_logs.get("total") != 1 or len(neutral_items) != 1:
-              raise SystemExit(f"expected exactly one neutral token log row, got {neutral_token_logs}")
-          neutral_token_log = neutral_items[0]
-          if neutral_token_log.get("request_kind_key") != "mcp:notifications/initialized":
-              raise SystemExit(f"unexpected neutral token log row: {neutral_token_log}")
-          if neutral_token_log.get("operationalClass") != "neutral":
-              raise SystemExit(f"expected neutral token log operational class, got {neutral_token_log}")
-          PY
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Portable binary release (${{ matrix.arch }})"
+            echo "- runner: ${{ matrix.runner }}"
+            echo "- target: ${{ matrix.target }}"
+            echo "- tag: ${RELEASE_TAG}"
+            echo "- tarball: $(basename "${TARBALL}")"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  docker-manifest:
+    name: Publish multi-arch manifest (ghcr)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [prepare, docker-native]
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Compute lowercase image name
+        id: image-name
+        shell: bash
+        run: |
+          set -euo pipefail
+          lower="${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_NAME_LOWER=${lower}" >> "$GITHUB_ENV"
+          echo "image_name_lower=${lower}" >> "$GITHUB_OUTPUT"
+
+      - name: Download image digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-digest-*
+          path: ${{ runner.temp }}/release-digests
+          merge-multiple: true
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Extract metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }}
           tags: |
             type=raw,value=latest,enable=${{ needs.prepare.outputs.release_channel == 'stable' }}
             type=raw,value=v${{ env.APP_EFFECTIVE_VERSION }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            APP_EFFECTIVE_VERSION=${{ env.APP_EFFECTIVE_VERSION }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name_lower }}:buildcache,mode=max
+      - name: Create multi-arch manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="${REGISTRY}/${IMAGE_NAME_LOWER}"
+          refs=()
+          while IFS= read -r digest_file; do
+            digest="$(tr -d '\n' < "${digest_file}")"
+            [[ -n "${digest}" ]] || continue
+            refs+=("${image}@${digest}")
+          done < <(find "${RUNNER_TEMP}/release-digests" -type f -name '*.txt' | sort)
+
+          if [[ "${#refs[@]}" -ne 2 ]]; then
+            echo "expected exactly 2 architecture digests, got ${#refs[@]}" >&2
+            printf 'refs=%s\n' "${refs[*]}" >&2
+            exit 1
+          fi
+
+          tag_args=()
+          while IFS= read -r tag; do
+            [[ -n "${tag}" ]] || continue
+            tag_args+=("-t" "${tag}")
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+          if [[ "${#tag_args[@]}" -eq 0 ]]; then
+            echo "metadata-action produced no tags" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
+
+      - name: Validate manifest platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [[ -n "${tag}" ]] || continue
+            inspect_output="$(docker buildx imagetools inspect "${tag}")"
+            printf '%s\n' "${inspect_output}"
+            grep -q 'linux/amd64' <<< "${inspect_output}"
+            grep -q 'linux/arm64' <<< "${inspect_output}"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Multi-arch manifest"
+            echo "- version: ${{ env.APP_EFFECTIVE_VERSION }}"
+            echo "- tags:"
+            while IFS= read -r tag; do
+              [[ -n "${tag}" ]] || continue
+              echo "  - ${tag}"
+            done <<< "${{ steps.meta.outputs.tags }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   github-release:
     name: GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [prepare, docker]
-    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    needs: [prepare, docker-manifest, binary-native, binary-portable]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.outputs.should_release == 'true' &&
+        needs.prepare.result == 'success' &&
+        needs.docker-manifest.result == 'success' &&
+        needs.binary-native.result == 'success' &&
+        (needs.binary-portable.result == 'success' || needs.binary-portable.result == 'skipped')
+      }}
     permissions:
       contents: write
     steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
       - name: Create/Update GitHub Release
         uses: ncipollo/release-action@v1
         with:
@@ -555,3 +861,123 @@ jobs:
           omitBodyDuringUpdate: true
           prerelease: ${{ needs.prepare.outputs.release_channel == 'rc' }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate CLI release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f scripts/install-tvly-hikari.sh || ! -f scripts/tvly-hikari ]]; then
+            echo "CLI release assets are not present in this ref; skipping CLI validation."
+            exit 0
+          fi
+
+          bash -n scripts/install-tvly-hikari.sh scripts/tvly-hikari
+
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "${smoke_root}"' EXIT
+          mkdir -p "${smoke_root}/bin"
+
+          cat > "${smoke_root}/bin/tvly" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "${1:-}" == "--version" ]]; then
+            echo "tavily-cli 0.1.4"
+            exit 0
+          fi
+          python3 - "$@" <<'PY' > "${TVLY_HIKARI_SMOKE_CAPTURE}"
+          import json
+          import os
+          import sys
+
+          json.dump({
+              "api_base_url": os.environ.get("TAVILY_API_BASE_URL"),
+              "api_key": os.environ.get("TAVILY_API_KEY"),
+              "args": sys.argv[1:],
+          }, sys.stdout)
+          PY
+          EOF
+          chmod 0755 "${smoke_root}/bin/tvly"
+
+          export PATH="${smoke_root}/bin:${PATH}"
+          export HOME="${smoke_root}/home"
+          export TVLY_HIKARI_SMOKE_CAPTURE="${smoke_root}/capture.json"
+
+          bash scripts/tvly-hikari configure \
+            --base-url http://127.0.0.1:58087 \
+            --token th-test-secretsecret \
+            --config-dir "${smoke_root}/config"
+
+          mode="$(python3 - "${smoke_root}/config/config.json" <<'PY'
+          import os
+          import stat
+          import sys
+
+          print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))
+          PY
+          )"
+          [[ "${mode}" == "0o600" ]] || {
+            echo "expected config mode 0600, got ${mode}" >&2
+            exit 1
+          }
+
+          TAVILY_HIKARI_CONFIG_FILE="${smoke_root}/config/config.json" \
+            bash scripts/tvly-hikari search "release smoke" --json
+
+          python3 - "${TVLY_HIKARI_SMOKE_CAPTURE}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              payload = json.load(handle)
+          assert payload["api_base_url"] == "http://127.0.0.1:58087/api/tavily", payload
+          assert payload["api_key"] == "th-test-secretsecret", payload
+          assert payload["args"] == ["search", "release smoke", "--json"], payload
+          PY
+
+      - name: Download binary release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-binary*
+          path: ${{ runner.temp }}/release-binary-assets
+          merge-multiple: true
+
+      - name: Upload binary assets to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' assets < <(
+            find "${RUNNER_TEMP}/release-binary-assets" -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -print0 | sort -z
+          )
+
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "no binary release assets found" >&2
+            exit 1
+          fi
+
+          gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+
+      - name: Upload CLI assets to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f scripts/install-tvly-hikari.sh || ! -f scripts/tvly-hikari ]]; then
+            echo "CLI release assets are not present in this ref; skipping CLI asset upload."
+            exit 0
+          fi
+
+          install -m 0755 scripts/install-tvly-hikari.sh "${RUNNER_TEMP}/install-tvly-hikari.sh"
+          install -m 0755 scripts/tvly-hikari "${RUNNER_TEMP}/tvly-hikari"
+          gh release upload "${RELEASE_TAG}" \
+            "${RUNNER_TEMP}/install-tvly-hikari.sh" \
+            "${RUNNER_TEMP}/tvly-hikari" \
+            --clobber \
+            --repo "${GITHUB_REPOSITORY}"

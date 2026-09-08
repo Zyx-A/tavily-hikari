@@ -1,15 +1,29 @@
+#[macro_use]
+mod runtime_logging;
+mod admin_mcp_session_bindings;
+mod admin_token_filters;
 mod analysis;
+mod backend_time;
 mod forward_proxy;
+mod ha;
+mod linuxdo_credit_recharge;
 mod models;
+mod remote_attempt_admission;
 mod store;
 mod tavily_proxy;
 #[cfg(test)]
 mod tests;
+mod upstream_privacy;
+mod upstream_privacy_status;
+pub mod web_assets;
 
+pub use admin_mcp_session_bindings::*;
+pub use admin_token_filters::*;
 pub use analysis::{
     analyze_http_attempt, analyze_mcp_attempt, canonical_request_kind_key_for_filter,
     canonicalize_request_log_request_kind, classify_token_request_kind,
-    extract_mcp_has_error_by_id_from_bytes, extract_mcp_usage_credits_by_id_from_bytes,
+    display_result_status_for_request_kind, extract_mcp_has_error_by_id_from_bytes,
+    extract_mcp_usage_credits_by_id_from_bytes, extract_research_request_id,
     extract_usage_credits_from_json_bytes, extract_usage_credits_total_from_json_bytes,
     failure_kind_solution_guidance, finalize_token_request_kind, is_canonical_request_kind_key,
     mcp_response_has_any_error, mcp_response_has_any_success, normalize_operational_class_filter,
@@ -19,31 +33,51 @@ pub use analysis::{
     token_request_kind_billing_group_for_request, token_request_kind_billing_group_for_request_log,
     token_request_kind_billing_group_for_token_log, token_request_kind_protocol_group,
 };
+pub use backend_time::*;
 pub use forward_proxy::{
-    ForwardProxyHourlyBucketResponse, ForwardProxyLiveNodeResponse, ForwardProxyLiveStatsResponse,
-    ForwardProxySettings, ForwardProxySettingsResponse, ForwardProxyStatsResponse,
-    ForwardProxyValidationError, ForwardProxyValidationNodeResult,
+    ForwardProxyErrorStatsResponse, ForwardProxyHourlyBucketResponse, ForwardProxyLiveNodeResponse,
+    ForwardProxyLiveStatsResponse, ForwardProxyNodeStateUpdateResponse,
+    ForwardProxyNodeStateUpdateResult, ForwardProxySettings, ForwardProxySettingsResponse,
+    ForwardProxyStatsResponse, ForwardProxyValidationError, ForwardProxyValidationNodeResult,
     ForwardProxyValidationProbeResult, ForwardProxyValidationResponse,
     ForwardProxyWeightHourlyBucketResponse,
 };
+pub use ha::*;
+pub use linuxdo_credit_recharge::*;
 pub use models::*;
+pub use remote_attempt_admission::{
+    ReconciliationTurn, ReconciliationTurnKind, RemoteAttemptAdmissionController,
+    RemoteAttemptLease, RemoteAttemptMetrics, ResearchDrainDeferReason,
+};
+pub use runtime_logging::{
+    LegacyStdIoLevel, RuntimeLogFormat, RuntimeMemorySnapshot, RuntimePerfScope,
+    capture_runtime_memory_snapshot, emit_legacy_stdio_event, init_runtime_logging,
+};
+pub use store::{
+    DbLogStatus, HaApplyResult, HaBaselineApplyMode, HaBaselineApplySession, HaEventsApplySession,
+    HaEventsReadSession, PerfLogScope, emit_low_memory_protection_decision, emit_perf_log,
+    emit_sampled_perf_log, is_transient_sqlite_write_error,
+};
 pub use tavily_proxy::*;
+pub use upstream_privacy::*;
+pub use upstream_privacy_status::*;
 
 use std::{
+    cell::Cell,
     cmp::min,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+        Arc, Mutex as StdMutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;
 use chrono::{Datelike, Local, TimeZone, Utc};
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use nanoid::nanoid;
 use rand::Rng;
 use reqwest::{
@@ -53,10 +87,256 @@ use reqwest::{
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Executor, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio::time::Instant;
 use url::form_urlencoded;
+
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HaPerfSampling {
+    pub emit_info: bool,
+    pub capture_heavy_stats: bool,
+}
+
+static HA_PERF_INFO_SAMPLE_WINDOWS: OnceLock<StdMutex<HashMap<(String, String), Instant>>> =
+    OnceLock::new();
+static HA_PERF_HEAVY_SAMPLE_WINDOWS: OnceLock<StdMutex<HashMap<String, Instant>>> = OnceLock::new();
+static HA_PERF_GC_INFO_SAMPLE_WINDOWS: OnceLock<StdMutex<HashMap<(String, String), Instant>>> =
+    OnceLock::new();
+
+pub fn sample_ha_perf_event(
+    event: &str,
+    channel: HaSyncChannel,
+    elapsed: Duration,
+) -> HaPerfSampling {
+    sample_ha_perf_event_mode(event, channel, elapsed, true)
+}
+
+pub fn sample_ha_perf_event_windowed(event: &str, channel: HaSyncChannel) -> HaPerfSampling {
+    let windows = HA_PERF_GC_INFO_SAMPLE_WINDOWS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut windows = windows
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sample_ha_perf_event_windowed_at(&mut windows, event, channel, Instant::now())
+}
+
+fn sample_ha_perf_event_windowed_at(
+    windows: &mut HashMap<(String, String), Instant>,
+    event: &str,
+    channel: HaSyncChannel,
+    now: Instant,
+) -> HaPerfSampling {
+    const HA_PERF_INFO_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+    let key = (event.to_string(), channel.as_str().to_string());
+    let last_info = windows.entry(key).or_insert(now);
+    let emit_info = now.duration_since(*last_info) >= HA_PERF_INFO_SAMPLE_INTERVAL;
+    if emit_info {
+        *last_info = now;
+    }
+    HaPerfSampling {
+        emit_info,
+        capture_heavy_stats: false,
+    }
+}
+
+fn sample_ha_perf_event_mode(
+    event: &str,
+    channel: HaSyncChannel,
+    elapsed: Duration,
+    immediate_slow: bool,
+) -> HaPerfSampling {
+    let info_windows = HA_PERF_INFO_SAMPLE_WINDOWS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let heavy_windows = HA_PERF_HEAVY_SAMPLE_WINDOWS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut info_windows = info_windows
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut heavy_windows = heavy_windows
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sample_ha_perf_event_at(
+        &mut info_windows,
+        &mut heavy_windows,
+        event,
+        channel,
+        elapsed,
+        Instant::now(),
+        immediate_slow,
+    )
+}
+
+fn sample_ha_perf_event_at(
+    info_windows: &mut HashMap<(String, String), Instant>,
+    heavy_windows: &mut HashMap<String, Instant>,
+    event: &str,
+    channel: HaSyncChannel,
+    elapsed: Duration,
+    now: Instant,
+    immediate_slow: bool,
+) -> HaPerfSampling {
+    const HA_PERF_INFO_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+    const HA_PERF_HEAVY_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+    const HA_PERF_SLOW_OPERATION_THRESHOLD: Duration = Duration::from_secs(1);
+
+    if immediate_slow && elapsed >= HA_PERF_SLOW_OPERATION_THRESHOLD {
+        return HaPerfSampling {
+            emit_info: true,
+            capture_heavy_stats: true,
+        };
+    }
+
+    let channel = channel.as_str().to_string();
+    let info_key = (event.to_string(), channel.clone());
+    let last_info = info_windows.entry(info_key).or_insert(now);
+    let emit_info = now.duration_since(*last_info) >= HA_PERF_INFO_SAMPLE_INTERVAL;
+    if emit_info {
+        *last_info = now;
+    }
+
+    let last_heavy_stats = heavy_windows.entry(channel).or_insert(now);
+    let capture_heavy_stats =
+        now.duration_since(*last_heavy_stats) >= HA_PERF_HEAVY_SAMPLE_INTERVAL;
+    if capture_heavy_stats {
+        *last_heavy_stats = now;
+    }
+    HaPerfSampling {
+        emit_info,
+        capture_heavy_stats,
+    }
+}
+
+#[cfg(test)]
+mod ha_perf_sampling_tests {
+    use super::*;
+
+    #[test]
+    fn ha_perf_sampling_limits_heavy_stats_per_channel() {
+        let now = Instant::now();
+        let mut info_windows = HashMap::new();
+        let mut heavy_windows = HashMap::new();
+
+        let first = sample_ha_perf_event_at(
+            &mut info_windows,
+            &mut heavy_windows,
+            "events_export_completed",
+            HaSyncChannel::Control,
+            Duration::ZERO,
+            now,
+            true,
+        );
+        assert_eq!(
+            first,
+            HaPerfSampling {
+                emit_info: false,
+                capture_heavy_stats: false,
+            }
+        );
+
+        let info_sample = sample_ha_perf_event_at(
+            &mut info_windows,
+            &mut heavy_windows,
+            "events_export_completed",
+            HaSyncChannel::Control,
+            Duration::ZERO,
+            now + Duration::from_secs(60),
+            true,
+        );
+        assert!(info_sample.emit_info);
+        assert!(!info_sample.capture_heavy_stats);
+
+        let heavy_sample = sample_ha_perf_event_at(
+            &mut info_windows,
+            &mut heavy_windows,
+            "baseline_export_completed",
+            HaSyncChannel::Control,
+            Duration::ZERO,
+            now + Duration::from_secs(5 * 60),
+            true,
+        );
+        assert!(heavy_sample.capture_heavy_stats);
+
+        let other_channel = sample_ha_perf_event_at(
+            &mut info_windows,
+            &mut heavy_windows,
+            "baseline_export_completed",
+            HaSyncChannel::Billing,
+            Duration::ZERO,
+            now + Duration::from_secs(5 * 60),
+            true,
+        );
+        assert!(!other_channel.capture_heavy_stats);
+
+        let slow_operation = sample_ha_perf_event_at(
+            &mut info_windows,
+            &mut heavy_windows,
+            "events_export_completed",
+            HaSyncChannel::Billing,
+            Duration::from_secs(1),
+            now + Duration::from_secs(5 * 60),
+            true,
+        );
+        assert!(slow_operation.emit_info);
+        assert!(slow_operation.capture_heavy_stats);
+
+        let mut windowed_info = HashMap::new();
+        let mut windowed_heavy = HashMap::new();
+        let first_windowed = sample_ha_perf_event_at(
+            &mut windowed_info,
+            &mut windowed_heavy,
+            "gc_aggregate",
+            HaSyncChannel::Runtime,
+            Duration::from_secs(1),
+            now,
+            false,
+        );
+        assert!(!first_windowed.emit_info);
+        assert!(!first_windowed.capture_heavy_stats);
+        let second_windowed = sample_ha_perf_event_at(
+            &mut windowed_info,
+            &mut windowed_heavy,
+            "gc_aggregate",
+            HaSyncChannel::Runtime,
+            Duration::from_secs(1),
+            now + Duration::from_secs(60),
+            false,
+        );
+        assert!(second_windowed.emit_info);
+
+        let mut gc_info = HashMap::new();
+        let first_gc = sample_ha_perf_event_windowed_at(
+            &mut gc_info,
+            "gc_aggregate",
+            HaSyncChannel::Runtime,
+            now,
+        );
+        assert!(!first_gc.emit_info);
+        assert!(!first_gc.capture_heavy_stats);
+        let second_gc = sample_ha_perf_event_windowed_at(
+            &mut gc_info,
+            "gc_aggregate",
+            HaSyncChannel::Runtime,
+            now + Duration::from_secs(60),
+        );
+        assert!(second_gc.emit_info);
+        assert!(!second_gc.capture_heavy_stats);
+    }
+}
+
+pub fn emit_db_operation_slow_log(operation: &str, elapsed: Duration, context: Option<&str>) {
+    store::log_slow_db_operation(operation, elapsed, context);
+}
+
+pub fn emit_db_operation_error_log(
+    operation: &str,
+    elapsed: Duration,
+    context: Option<&str>,
+    err: &ProxyError,
+) {
+    store::log_db_operation_error(operation, elapsed, context, err);
+}
 
 pub type ForwardProxyProgressCallback = dyn Fn(ForwardProxyProgressEvent) + Send + Sync;
 
@@ -168,6 +448,485 @@ pub struct RequestKindCanonicalBackfillReport {
     pub batch_size: i64,
     pub request_logs: RequestKindCanonicalBackfillTableReport,
     pub auth_token_logs: RequestKindCanonicalBackfillTableReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestUserIdBackfillReport {
+    pub batch_size: i64,
+    pub cursor_before: i64,
+    pub cursor_after: i64,
+    pub upper_bound: i64,
+    pub rows_scanned: i64,
+    pub rows_updated: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLogsGcOptions {
+    pub batch_size: i64,
+    pub max_batches: i64,
+    pub max_runtime_secs: u64,
+    pub inter_batch_sleep_ms: u64,
+}
+
+impl Default for RequestLogsGcOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: 100,
+            max_batches: 30,
+            max_runtime_secs: 300,
+            inter_batch_sleep_ms: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogsGcReport {
+    pub retention_days: i64,
+    pub threshold: i64,
+    pub batch_size: i64,
+    pub max_batches: i64,
+    pub cleaned_request_log_bodies: i64,
+    pub deleted_request_logs: i64,
+    pub deleted_rollups: i64,
+    pub batches: i64,
+    pub completed: bool,
+    pub has_more: bool,
+    pub elapsed_ms: u128,
+    pub scanned_body_candidates: i64,
+    pub unique_retention_users: i64,
+    pub retention_context_cache_hits: i64,
+    pub body_candidate_query_elapsed_ms: u128,
+    pub body_retention_decision_elapsed_ms: u128,
+    pub body_write_elapsed_ms: u128,
+    pub progress_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbCompactionReport {
+    pub skipped: bool,
+    pub forced: bool,
+    pub reason: Option<String>,
+    pub min_reclaimable_bytes: u64,
+    pub min_reclaimable_ratio: f64,
+    pub before: SqliteDbStats,
+    pub after: SqliteDbStats,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservabilitySidecarMigrationReport {
+    pub dry_run: bool,
+    pub offline_lock_acquired: bool,
+    pub sibling_lock_path: String,
+    pub sqlite_write_probe_ok: bool,
+    pub core_path: String,
+    pub sidecar_path: String,
+    pub attached_observability_path: String,
+    pub legacy_request_logs_exists: bool,
+    pub legacy_api_key_usage_buckets_exists: bool,
+    pub legacy_dashboard_request_rollup_buckets_exists: bool,
+    pub legacy_request_log_catalog_rollups_exists: bool,
+    pub large_legacy_fallback_active: bool,
+    pub large_legacy_fallback_threshold_bytes: u64,
+    pub core_file_bytes: u64,
+    pub sidecar_file_bytes_before: u64,
+    pub sidecar_file_bytes_after: u64,
+    pub available_bytes_before: u64,
+    pub available_bytes_after: u64,
+    pub source_min_request_log_id: Option<i64>,
+    pub source_max_request_log_id: Option<i64>,
+    pub source_request_log_rows: i64,
+    pub sidecar_request_log_rows_before: i64,
+    pub sidecar_request_log_rows_after: i64,
+    pub copied_request_logs: i64,
+    pub resumed_copy: bool,
+    pub already_migrated: bool,
+    pub dropped_main_request_logs: bool,
+    pub dropped_legacy_api_key_usage_buckets: bool,
+    pub dropped_legacy_dashboard_request_rollup_buckets: bool,
+    pub dropped_legacy_request_log_catalog_rollups: bool,
+    pub reset_api_key_usage_buckets_meta: bool,
+    pub reset_dashboard_request_rollup_buckets_meta: bool,
+    pub reset_request_log_catalog_rollup_meta: bool,
+    pub rebuilt_api_key_usage_buckets: bool,
+    pub rebuilt_dashboard_request_rollup_buckets: bool,
+    pub rebuilt_request_log_catalog_rollups: bool,
+    pub marked_api_key_usage_buckets_meta_complete: bool,
+    pub marked_dashboard_request_rollup_buckets_meta_complete: bool,
+    pub marked_request_log_catalog_rollup_meta_complete: bool,
+    pub startup_reopen_verified: bool,
+    pub startup_rebuild_required: bool,
+    pub derived_rebuild_elapsed_ms: u128,
+    pub child_reference_checks_passed: bool,
+    pub batch_size: i64,
+    pub batches: i64,
+    pub completed: bool,
+    pub elapsed_ms: u128,
+}
+
+pub fn format_request_logs_gc_report_message(
+    report: &RequestLogsGcReport,
+    passes: usize,
+) -> String {
+    format!(
+        "cleaned_bodies={} deleted_rows={} rollup_deleted={} scanned_candidates={} unique_users={} retention_cache_hits={} progress={} completed={} has_more={} retention_days={} batches={} passes={} elapsed_ms={} candidate_query_ms={} decision_ms={} write_ms={}",
+        report.cleaned_request_log_bodies,
+        report.deleted_request_logs,
+        report.deleted_rollups,
+        report.scanned_body_candidates,
+        report.unique_retention_users,
+        report.retention_context_cache_hits,
+        report.progress_status,
+        report.completed,
+        report.has_more,
+        report.retention_days,
+        report.batches,
+        passes,
+        report.elapsed_ms,
+        report.body_candidate_query_elapsed_ms,
+        report.body_retention_decision_elapsed_ms,
+        report.body_write_elapsed_ms,
+    )
+}
+
+pub async fn run_request_logs_gc_once(
+    database_path: &str,
+    options: RequestLogsGcOptions,
+) -> Result<RequestLogsGcReport, ProxyError> {
+    run_request_logs_gc_once_with_time(database_path, options, BackendTime::system()).await
+}
+
+pub(crate) async fn run_request_logs_gc_once_with_time(
+    database_path: &str,
+    options: RequestLogsGcOptions,
+    backend_time: BackendTime,
+) -> Result<RequestLogsGcReport, ProxyError> {
+    let key_store =
+        crate::store::KeyStore::open_for_request_logs_gc_with_time(database_path, backend_time)
+            .await?;
+    let settings = key_store.get_system_settings().await?;
+    let retention_days = settings.request_log_retention.max_log_retention_days;
+    let threshold = configured_request_logs_retention_threshold_utc_ts_at(
+        retention_days,
+        key_store.backend_time.local_now(),
+    );
+    key_store
+        .delete_old_request_logs_bounded(
+            threshold,
+            options,
+            retention_days,
+            &settings.request_log_retention,
+        )
+        .await
+}
+
+pub const SQLITE_POOL_MAX_CONNECTIONS_DEFAULT: u32 = 3;
+pub const USAGE_PROBE_TIMEOUT_SECS: u64 = 8;
+pub const QUOTA_SYNC_FETCH_TIMEOUT_SECS: u64 = USAGE_PROBE_TIMEOUT_SECS;
+pub const QUOTA_SYNC_JOB_TIMEOUT_SECS: u64 = 20;
+pub const QUOTA_SYNC_STALE_RUNNING_SECS: i64 = 40;
+pub const DB_COMPACTION_MIN_RECLAIMABLE_BYTES: u64 = 512 * 1024 * 1024;
+pub const DB_COMPACTION_MIN_RECLAIMABLE_RATIO: f64 = 0.20;
+pub const DB_COMPACTION_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+pub const HA_OUTBOX_GC_DEFAULT_BATCH_SIZE: i64 = 20_000;
+pub const HA_OUTBOX_GC_DEFAULT_MAX_BATCHES: i64 = 8;
+pub const HA_OUTBOX_GC_DEFAULT_MAX_RUNTIME_SECS: u64 = 20;
+
+pub async fn run_db_compaction_once(
+    database_path: &str,
+    force: bool,
+) -> Result<DbCompactionReport, ProxyError> {
+    let key_store = crate::store::KeyStore::open_for_request_logs_gc(database_path).await?;
+    let started = Instant::now();
+    let before = key_store.sqlite_db_stats().await?;
+
+    if !force
+        && (before.reclaimable_bytes < DB_COMPACTION_MIN_RECLAIMABLE_BYTES
+            || before.reclaimable_ratio < DB_COMPACTION_MIN_RECLAIMABLE_RATIO)
+    {
+        return Ok(DbCompactionReport {
+            skipped: true,
+            forced: false,
+            reason: Some(format!(
+                "reclaimable space below threshold (bytes={} ratio={:.6})",
+                before.reclaimable_bytes, before.reclaimable_ratio
+            )),
+            min_reclaimable_bytes: DB_COMPACTION_MIN_RECLAIMABLE_BYTES,
+            min_reclaimable_ratio: DB_COMPACTION_MIN_RECLAIMABLE_RATIO,
+            before: before.clone(),
+            after: before,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+    }
+
+    let after = key_store.compact_sqlite_database().await?;
+    Ok(DbCompactionReport {
+        skipped: false,
+        forced: force,
+        reason: None,
+        min_reclaimable_bytes: DB_COMPACTION_MIN_RECLAIMABLE_BYTES,
+        min_reclaimable_ratio: DB_COMPACTION_MIN_RECLAIMABLE_RATIO,
+        before,
+        after,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HaOutboxGcOptions {
+    pub batch_size: i64,
+    pub max_batches: i64,
+    pub max_runtime_secs: u64,
+    pub inter_batch_sleep_ms: u64,
+}
+
+impl Default for HaOutboxGcOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: HA_OUTBOX_GC_DEFAULT_BATCH_SIZE,
+            max_batches: HA_OUTBOX_GC_DEFAULT_MAX_BATCHES,
+            max_runtime_secs: HA_OUTBOX_GC_DEFAULT_MAX_RUNTIME_SECS,
+            inter_batch_sleep_ms: 0,
+        }
+    }
+}
+
+impl HaOutboxGcOptions {
+    /// Bounds used by the in-process scheduler. The standalone maintenance
+    /// command intentionally keeps the larger default window.
+    pub const fn online() -> Self {
+        Self {
+            batch_size: 250,
+            max_batches: 4,
+            max_runtime_secs: 1,
+            inter_batch_sleep_ms: 100,
+        }
+    }
+}
+
+pub const HA_OUTBOX_GC_MIN_BATCH_SIZE: i64 = 25;
+pub const HA_OUTBOX_GC_MAX_ONLINE_BATCH_SIZE: i64 = 250;
+pub const HA_OUTBOX_GC_ACTIVE_BUDGET_MS: u128 = 50;
+pub const HA_OUTBOX_GC_FAST_CONTINUATION_DELAY_SECS: i64 = 5;
+pub const HA_OUTBOX_GC_DEFERRED_CONTINUATION_DELAY_SECS: i64 = 30;
+pub const HA_OUTBOX_GC_LEGACY_SCAN_CONTINUATION_DELAY_SECS: i64 = 5 * 60;
+pub const HA_OUTBOX_GC_RECOVERY_CONTINUATION_DELAY_SECS: i64 = 1;
+pub const HA_OUTBOX_GC_IDLE_DISCOVERY_SECS: i64 = 5 * 60;
+pub const HA_OUTBOX_GC_LOW_PRESSURE_RPS: i64 = 5;
+pub const HA_OUTBOX_GC_LOW_PRESSURE_WINDOW_SECS: i64 = 5 * 60;
+pub const HA_OUTBOX_GC_RECOVERY_SLO_SECS: i64 = 24 * 60 * 60;
+
+pub fn ha_outbox_gc_continuation_delay_secs_for_pressure(
+    has_more: bool,
+    slowest_batch_elapsed_ms: u128,
+    recovery_mode: bool,
+    foreground_rps: i64,
+) -> Option<i64> {
+    if !has_more {
+        return None;
+    }
+    if foreground_rps > HA_OUTBOX_GC_LOW_PRESSURE_RPS
+        || slowest_batch_elapsed_ms > HA_OUTBOX_GC_ACTIVE_BUDGET_MS
+    {
+        return Some(HA_OUTBOX_GC_DEFERRED_CONTINUATION_DELAY_SECS);
+    }
+    if recovery_mode {
+        return Some(HA_OUTBOX_GC_RECOVERY_CONTINUATION_DELAY_SECS);
+    }
+    Some(HA_OUTBOX_GC_FAST_CONTINUATION_DELAY_SECS)
+}
+
+/// Chooses the next online continuation without counting outbox rows. A fast
+/// productive slice may catch up quickly, while any individual database-work
+/// batch that exceeded its budget yields long enough for foreground writes to
+/// win. The total active time is intentionally diagnostic only: a full slice
+/// may contain several healthy micro-batches.
+pub fn ha_outbox_gc_continuation_delay_secs(
+    has_more: bool,
+    slowest_batch_elapsed_ms: u128,
+) -> Option<i64> {
+    has_more.then_some(
+        if slowest_batch_elapsed_ms <= HA_OUTBOX_GC_ACTIVE_BUDGET_MS {
+            HA_OUTBOX_GC_FAST_CONTINUATION_DELAY_SECS
+        } else {
+            HA_OUTBOX_GC_DEFERRED_CONTINUATION_DELAY_SECS
+        },
+    )
+}
+
+pub fn next_ha_outbox_gc_batch_size(
+    current_batch_size: i64,
+    maximum_batch_size: i64,
+    slowest_batch_elapsed_ms: u128,
+) -> i64 {
+    let maximum_batch_size = maximum_batch_size.clamp(
+        HA_OUTBOX_GC_MIN_BATCH_SIZE,
+        HA_OUTBOX_GC_MAX_ONLINE_BATCH_SIZE,
+    );
+    let current_batch_size =
+        current_batch_size.clamp(HA_OUTBOX_GC_MIN_BATCH_SIZE, maximum_batch_size);
+    if slowest_batch_elapsed_ms > HA_OUTBOX_GC_ACTIVE_BUDGET_MS {
+        (current_batch_size / 2).max(HA_OUTBOX_GC_MIN_BATCH_SIZE)
+    } else if slowest_batch_elapsed_ms.saturating_mul(2) < HA_OUTBOX_GC_ACTIVE_BUDGET_MS {
+        (current_batch_size + HA_OUTBOX_GC_MIN_BATCH_SIZE).min(maximum_batch_size)
+    } else {
+        current_batch_size
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HaOutboxGcChannelReport {
+    pub channel: HaSyncChannel,
+    pub retention_secs: i64,
+    pub threshold: i64,
+    pub invalid_legacy_deleted_rows: i64,
+    pub retention_deleted_rows: i64,
+    pub deleted_rows: i64,
+    pub batches: i64,
+    pub has_more: bool,
+    pub debt_mode: String,
+    pub oldest_deletable_age_secs: Option<i64>,
+    pub deleted_rows_per_minute: f64,
+    pub recovery_deadline_at: Option<i64>,
+    pub slo_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slo_state_transition: Option<String>,
+    pub foreground_rps: i64,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HaOutboxGcReport {
+    pub batch_size: i64,
+    pub max_batches: i64,
+    pub deleted_rows: i64,
+    pub batches: i64,
+    pub completed: bool,
+    pub has_more: bool,
+    pub channels: Vec<HaOutboxGcChannelReport>,
+    pub wal_checkpoint_busy: bool,
+    pub wal_checkpoint_log_frames: i64,
+    pub wal_checkpoint_checkpointed_frames: i64,
+    pub active_elapsed_ms: u128,
+    pub max_batch_elapsed_ms: u128,
+    pub elapsed_ms: u128,
+    pub continuation_delay_secs: Option<i64>,
+}
+
+pub fn format_ha_outbox_gc_report_message(report: &HaOutboxGcReport, passes: usize) -> String {
+    format!(
+        "deleted_rows={} completed={} has_more={} channels={} batches={} passes={} wal_busy={} wal_log_frames={} wal_checkpointed_frames={} active_elapsed_ms={} max_batch_elapsed_ms={} elapsed_ms={} continuation_delay_secs={:?}",
+        report.deleted_rows,
+        report.completed,
+        report.has_more,
+        report
+            .channels
+            .iter()
+            .map(|channel| format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                channel.channel.as_str(),
+                channel.deleted_rows,
+                channel.invalid_legacy_deleted_rows,
+                channel.retention_deleted_rows,
+                channel.retention_secs,
+                channel.batches,
+                channel.has_more
+            ))
+            .collect::<Vec<_>>()
+            .join(","),
+        report.batches,
+        passes,
+        report.wal_checkpoint_busy,
+        report.wal_checkpoint_log_frames,
+        report.wal_checkpoint_checkpointed_frames,
+        report.active_elapsed_ms,
+        report.max_batch_elapsed_ms,
+        report.elapsed_ms,
+        report.continuation_delay_secs,
+    )
+}
+
+/// Resource names that the bounded outbox GC retains for a channel.
+pub fn ha_outbox_gc_allowed_resources(channel: HaSyncChannel) -> &'static [&'static str] {
+    crate::store::ha_outbox_gc_allowed_resources(channel)
+}
+
+pub async fn run_ha_outbox_gc_once(
+    database_path: &str,
+    options: HaOutboxGcOptions,
+) -> Result<HaOutboxGcReport, ProxyError> {
+    let key_store = crate::store::KeyStore::open_for_request_logs_gc(database_path).await?;
+    key_store.gc_ha_outbox_with_options(options).await
+}
+
+pub async fn run_observability_sidecar_migrate(
+    database_path: &str,
+    batch_size: i64,
+    dry_run: bool,
+) -> Result<ObservabilitySidecarMigrationReport, ProxyError> {
+    crate::store::KeyStore::run_observability_sidecar_migrate(database_path, batch_size, dry_run)
+        .await
+}
+
+pub async fn verify_observability_sidecar_reopen(database_path: &str) -> Result<(), ProxyError> {
+    let _store = crate::store::KeyStore::new_with_time(database_path, BackendTime::system())
+        .await
+        .map_err(|err| {
+            ProxyError::Other(format!(
+                "observability sidecar migration completed but reopen verification failed: {err}"
+            ))
+        })?;
+    Ok(())
+}
+
+pub async fn configure_ha_write_mode(database_path: &str, mode: HaMode) -> Result<(), ProxyError> {
+    let store = crate::store::KeyStore::new_with_time(database_path, BackendTime::system()).await?;
+    store.configure_ha_event_writes(mode).await
+}
+
+pub async fn create_admin_passkey_reset_token_for_database(
+    database_path: &str,
+    scope: &AdminPasskeyScope,
+    ttl_secs: i64,
+) -> Result<AdminPasskeyResetTokenRecord, ProxyError> {
+    let store = crate::store::KeyStore::new_with_time(database_path, BackendTime::system()).await?;
+    store.ensure_admin_passkey_scope(scope).await?;
+    store
+        .create_admin_passkey_reset_token(scope, ttl_secs)
+        .await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HaTriggerRepairChannelReport {
+    pub channel: HaSyncChannel,
+    pub legacy_triggers_dropped: i64,
+    pub current_triggers_dropped: i64,
+    pub triggers_created: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HaTriggerRepairReport {
+    pub mode: HaMode,
+    pub legacy_triggers_dropped: i64,
+    pub current_triggers_dropped: i64,
+    pub triggers_created: i64,
+    pub channels: Vec<HaTriggerRepairChannelReport>,
+    pub elapsed_ms: u128,
+}
+
+pub async fn repair_ha_triggers_once(
+    database_path: &str,
+    mode: HaMode,
+) -> Result<HaTriggerRepairReport, ProxyError> {
+    let store = crate::store::KeyStore::new_with_time(database_path, BackendTime::system()).await?;
+    store.repair_ha_triggers(mode).await
 }
 
 impl ForwardProxyProgressEvent {
@@ -289,6 +1048,39 @@ fn compute_latency_median(samples: &[f64]) -> Option<f64> {
 /// Tavily MCP upstream默认端点。
 pub const DEFAULT_UPSTREAM: &str = "https://mcp.tavily.com/mcp";
 
+fn join_url_paths(prefix_path: &str, appended_path: &str) -> String {
+    let prefix = prefix_path.trim_matches('/');
+    let appended = appended_path.trim_matches('/');
+    match (prefix.is_empty(), appended.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{appended}"),
+        (false, true) => format!("/{prefix}"),
+        (false, false) => format!("/{prefix}/{appended}"),
+    }
+}
+
+pub(crate) fn build_path_prefixed_url(base: &Url, appended_path: &str) -> Url {
+    let mut url = base.clone();
+    url.set_path(&join_url_paths(base.path(), appended_path));
+    url
+}
+
+pub(crate) fn build_mcp_upstream_url(base: &Url, request_path: &str) -> Url {
+    if matches!(base.path(), "" | "/") {
+        return build_path_prefixed_url(base, request_path);
+    }
+
+    let appended_path = if request_path == "/mcp" {
+        ""
+    } else if let Some(relative) = request_path.strip_prefix("/mcp/") {
+        relative
+    } else {
+        request_path
+    };
+
+    build_path_prefixed_url(base, appended_path)
+}
+
 const STATUS_ACTIVE: &str = "active";
 const STATUS_EXHAUSTED: &str = "exhausted";
 const STATUS_DISABLED: &str = "disabled";
@@ -301,10 +1093,13 @@ const OUTCOME_UNKNOWN: &str = "unknown";
 pub const REQUEST_LOG_VISIBILITY_VISIBLE: &str = "visible";
 pub const REQUEST_LOG_VISIBILITY_SUPPRESSED_RETRY_SHADOW: &str = "suppressed_retry_shadow";
 pub const REQUEST_KIND_CANONICAL_BACKFILL_BATCH_SIZE: i64 = 500;
+pub const REQUEST_USER_ID_BACKFILL_BATCH_SIZE: i64 = 1000;
+const REQUEST_USER_ID_BACKFILL_STABILITY_GRACE_SECS: i64 = 60;
 const REQUEST_KIND_CANONICAL_MIGRATION_WAIT_POLL_MS: u64 = 200;
 const REQUEST_KIND_CANONICAL_MIGRATION_STALE_SECS: i64 = 300;
 const FAILURE_KIND_UPSTREAM_GATEWAY_5XX: &str = "upstream_gateway_5xx";
 const FAILURE_KIND_UPSTREAM_RATE_LIMITED_429: &str = "upstream_rate_limited_429";
+const FAILURE_KIND_UPSTREAM_UNKNOWN_403: &str = "upstream_unknown_403";
 const FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401: &str = "upstream_account_deactivated_401";
 const FAILURE_KIND_TRANSPORT_SEND_ERROR: &str = "transport_send_error";
 const FAILURE_KIND_MCP_ACCEPT_406: &str = "mcp_accept_406";
@@ -321,11 +1116,35 @@ const KEY_EFFECT_NONE: &str = "none";
 const KEY_EFFECT_QUARANTINED: &str = "quarantined";
 const KEY_EFFECT_MARKED_EXHAUSTED: &str = "marked_exhausted";
 const KEY_EFFECT_RESTORED_ACTIVE: &str = "restored_active";
+const KEY_EFFECT_TRANSIENT_BACKOFF_SET: &str = "transient_backoff_set";
+const KEY_EFFECT_TRANSIENT_BACKOFF_CLEARED: &str = "transient_backoff_cleared";
+const KEY_EFFECT_MCP_SESSION_INIT_BACKOFF_SET: &str = "mcp_session_init_backoff_set";
+const KEY_EFFECT_MCP_SESSION_RETRY_WAITED: &str = "mcp_session_retry_waited";
+const KEY_EFFECT_MCP_SESSION_RETRY_SCHEDULED: &str = "mcp_session_retry_scheduled";
+const KEY_EFFECT_MCP_SESSION_INIT_COOLDOWN_AVOIDED: &str = "mcp_session_init_cooldown_avoided";
+const KEY_EFFECT_MCP_SESSION_INIT_RATE_LIMIT_AVOIDED: &str = "mcp_session_init_rate_limit_avoided";
+const KEY_EFFECT_MCP_SESSION_INIT_PRESSURE_AVOIDED: &str = "mcp_session_init_pressure_avoided";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_REUSED: &str = "http_project_affinity_reused";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_BOUND: &str = "http_project_affinity_bound";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_REBOUND: &str = "http_project_affinity_rebound";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_COOLDOWN_AVOIDED: &str =
+    "http_project_affinity_cooldown_avoided";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_RATE_LIMIT_AVOIDED: &str =
+    "http_project_affinity_rate_limit_avoided";
+const KEY_EFFECT_HTTP_PROJECT_AFFINITY_PRESSURE_AVOIDED: &str =
+    "http_project_affinity_pressure_avoided";
+const KEY_EFFECT_API_REBALANCE_ROUTE_REUSED: &str = "api_rebalance_route_reused";
+const KEY_EFFECT_API_REBALANCE_ROUTE_BOUND: &str = "api_rebalance_route_bound";
+const KEY_EFFECT_API_REBALANCE_ROUTE_REBOUND: &str = "api_rebalance_route_rebound";
+const KEY_EFFECT_API_REBALANCE_COOLDOWN_AVOIDED: &str = "api_rebalance_cooldown_avoided";
+const KEY_EFFECT_API_REBALANCE_RATE_LIMIT_AVOIDED: &str = "api_rebalance_rate_limit_avoided";
+const KEY_EFFECT_API_REBALANCE_PRESSURE_AVOIDED: &str = "api_rebalance_pressure_avoided";
 const MAINTENANCE_SOURCE_SYSTEM: &str = "system";
 const MAINTENANCE_SOURCE_ADMIN: &str = "admin";
 const MAINTENANCE_OP_AUTO_QUARANTINE: &str = "auto_quarantine";
 const MAINTENANCE_OP_AUTO_MARK_EXHAUSTED: &str = "auto_mark_exhausted";
 const MAINTENANCE_OP_AUTO_RESTORE_ACTIVE: &str = "auto_restore_active";
+const MAINTENANCE_OP_AUTO_CLEAR_TRANSIENT_BACKOFF: &str = "auto_clear_transient_backoff";
 const MAINTENANCE_OP_MANUAL_CLEAR_QUARANTINE: &str = "manual_clear_quarantine";
 const MAINTENANCE_OP_MANUAL_MARK_EXHAUSTED: &str = "manual_mark_exhausted";
 const API_KEY_IP_GEO_BATCH_FIELDS: &str = "?fields=city,subdivision,asn";
@@ -340,78 +1159,105 @@ const DEV_OPEN_ADMIN_TOKEN_ID: &str = "dev";
 const DEV_OPEN_ADMIN_TOKEN_SECRET: &str = "dev-open-admin";
 const DEV_OPEN_ADMIN_TOKEN_NOTE: &str = "[system] dev-open-admin placeholder";
 pub const USER_MONTHLY_BROKEN_LIMIT_DEFAULT: i64 = 5;
+pub const GLOBAL_IP_LIMIT_DEFAULT: i64 = 5;
+pub const ADMIN_ACTIVE_USERS_WINDOW_DAYS: i64 = 90;
 pub const UNBOUND_TOKEN_MONTHLY_BROKEN_LIMIT_DEFAULT: i64 = 2;
+pub const LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT: i64 = 15;
+const BLOCKED_KEY_REASON_ACCOUNT_DEACTIVATED: &str = "account_deactivated";
+const BLOCKED_KEY_REASON_KEY_REVOKED: &str = "key_revoked";
+const BLOCKED_KEY_REASON_INVALID_API_KEY: &str = "invalid_api_key";
+const MCP_SESSION_INIT_BACKOFF_SCOPE: &str = "mcp_session_init";
+const HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE: &str = "http_project_affinity";
+const HTTP_GLOBAL_BACKOFF_SCOPE: &str = "http_global";
+const API_REBALANCE_HTTP_BACKOFF_SCOPE: &str = "api_rebalance_http";
+const MCP_SESSION_INIT_BACKOFF_DEFAULT_SECS: i64 = 60;
+const MCP_SESSION_INIT_BACKOFF_MIN_SECS: i64 = 30;
+const MCP_SESSION_INIT_BACKOFF_MAX_SECS: i64 = 300;
+const UNKNOWN_403_TRANSIENT_BACKOFF_DEFAULT_SECS: i64 = 120;
+const MCP_SESSION_INIT_RECENT_PRESSURE_WINDOW_SECS: i64 = 60;
+const HTTP_PROJECT_AFFINITY_RECENT_PRESSURE_WINDOW_SECS: i64 = 60;
 const BROKEN_KEY_SUBJECT_USER: &str = "user";
 const BROKEN_KEY_SUBJECT_TOKEN: &str = "token";
 const BROKEN_KEY_SOURCE_AUTO: &str = "auto";
 const BROKEN_KEY_SOURCE_MANUAL: &str = "manual";
 
-const BLOCKED_HEADERS: &[&str] = &[
-    "forwarded",
-    "via",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
-    "x-forwarded-port",
-    "x-forwarded-server",
-    "x-original-forwarded-for",
-    "x-forwarded-protocol",
-    "x-real-ip",
-    "true-client-ip",
-    "cf-connecting-ip",
-    "cf-true-client-ip",
-    "cf-ipcountry",
-    "cf-ray",
-    "cf-visitor",
-    "x-cluster-client-ip",
-    "x-proxy-user-ip",
-    "fastly-client-ip",
-    "proxy-authorization",
-    "proxy-connection",
-    "akamai-origin-hop",
-    "x-akamai-edgescape",
-    "x-akamai-forwarded-for",
-    "cdn-loop",
-];
+pub(crate) fn is_binding_effect_code(code: &str) -> bool {
+    matches!(
+        code,
+        KEY_EFFECT_NONE
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_BOUND
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_REUSED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_REBOUND
+            | KEY_EFFECT_API_REBALANCE_ROUTE_BOUND
+            | KEY_EFFECT_API_REBALANCE_ROUTE_REUSED
+            | KEY_EFFECT_API_REBALANCE_ROUTE_REBOUND
+    )
+}
 
-const ALLOWED_HEADERS: &[&str] = &[
-    "accept",
-    "accept-encoding",
-    "accept-language",
-    "authorization",
-    "cache-control",
-    "content-type",
-    "last-event-id",
-    "mcp-protocol-version",
-    "mcp-session-id",
-    "pragma",
-    "user-agent",
-    "sec-ch-ua",
-    "sec-ch-ua-mobile",
-    "sec-ch-ua-platform",
-    "sec-fetch-site",
-    "sec-fetch-mode",
-    "sec-fetch-dest",
-    "sec-fetch-user",
-    "origin",
-    "referer",
-];
+pub(crate) fn is_selection_effect_code(code: &str) -> bool {
+    matches!(
+        code,
+        KEY_EFFECT_NONE
+            | KEY_EFFECT_MCP_SESSION_INIT_COOLDOWN_AVOIDED
+            | KEY_EFFECT_MCP_SESSION_INIT_RATE_LIMIT_AVOIDED
+            | KEY_EFFECT_MCP_SESSION_INIT_PRESSURE_AVOIDED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_COOLDOWN_AVOIDED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_RATE_LIMIT_AVOIDED
+            | KEY_EFFECT_HTTP_PROJECT_AFFINITY_PRESSURE_AVOIDED
+            | KEY_EFFECT_API_REBALANCE_COOLDOWN_AVOIDED
+            | KEY_EFFECT_API_REBALANCE_RATE_LIMIT_AVOIDED
+            | KEY_EFFECT_API_REBALANCE_PRESSURE_AVOIDED
+    )
+}
 
-const ALLOWED_PREFIXES: &[&str] = &["x-mcp-", "x-tavily-", "tavily-"];
+pub(crate) fn is_key_effect_code(code: &str) -> bool {
+    matches!(
+        code,
+        KEY_EFFECT_NONE
+            | KEY_EFFECT_QUARANTINED
+            | KEY_EFFECT_MARKED_EXHAUSTED
+            | KEY_EFFECT_RESTORED_ACTIVE
+            | KEY_EFFECT_TRANSIENT_BACKOFF_SET
+            | KEY_EFFECT_TRANSIENT_BACKOFF_CLEARED
+            | "cleared_quarantine"
+            | KEY_EFFECT_MCP_SESSION_INIT_BACKOFF_SET
+            | KEY_EFFECT_MCP_SESSION_RETRY_WAITED
+            | KEY_EFFECT_MCP_SESSION_RETRY_SCHEDULED
+    )
+}
 
 // Default per-token quota limits. These are used when no environment override is provided.
 pub const TOKEN_HOURLY_LIMIT: i64 = 100;
 pub const TOKEN_DAILY_LIMIT: i64 = 500;
 pub const TOKEN_MONTHLY_LIMIT: i64 = 5000;
-// Default per-token raw request limit (any request type) per hour.
-// This is enforced separately from the business quota above, and counts every
-// successful token-authenticated request regardless of MCP method.
+// Legacy per-token raw request limit defaults that still back stored quota rows and
+// deprecated read aliases. The active runtime request-rate limiter now uses a fixed
+// rolling 5-minute window and no longer reads these values.
 pub const TOKEN_HOURLY_REQUEST_LIMIT: i64 = 500;
+pub const REQUEST_RATE_LIMIT_WINDOW_MINUTES: i64 = 5;
+pub const REQUEST_RATE_LIMIT_WINDOW_SECS: i64 = REQUEST_RATE_LIMIT_WINDOW_MINUTES * SECS_PER_MINUTE;
+pub const REQUEST_RATE_LIMIT: i64 = 100;
+pub const REQUEST_RATE_LIMIT_MIN: i64 = 1;
 // Keep a request_id -> key affinity for Tavily research result polling.
 // This avoids switching keys between POST /research and GET /research/{request_id}.
 const RESEARCH_REQUEST_AFFINITY_TTL_SECS: i64 = 24 * 60 * 60;
-const MCP_SESSION_IDLE_TTL_SECS: i64 = 24 * 60 * 60;
-const MCP_PROXY_USER_AGENT: &str = "tavily-hikari-mcp-proxy/1.0";
+const MCP_SESSION_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+pub const MCP_SESSION_AFFINITY_KEY_COUNT_DEFAULT: i64 = 5;
+pub const MCP_SESSION_AFFINITY_KEY_COUNT_MIN: i64 = 1;
+pub const MCP_SESSION_AFFINITY_KEY_COUNT_MAX: i64 = 1_000;
+pub const REBALANCE_MCP_ENABLED_DEFAULT: bool = false;
+pub const REBALANCE_MCP_SESSION_PERCENT_DEFAULT: i64 = 100;
+pub const REBALANCE_MCP_SESSION_PERCENT_MIN: i64 = 0;
+pub const REBALANCE_MCP_SESSION_PERCENT_MAX: i64 = 100;
+pub const API_REBALANCE_ENABLED_DEFAULT: bool = false;
+pub const API_REBALANCE_PERCENT_DEFAULT: i64 = 0;
+pub const API_REBALANCE_PERCENT_MIN: i64 = 0;
+pub const API_REBALANCE_PERCENT_MAX: i64 = 100;
+pub const MCP_GATEWAY_MODE_UPSTREAM: &str = "upstream_mcp";
+pub const MCP_GATEWAY_MODE_REBALANCE: &str = "rebalance_http";
+pub const MCP_EXPERIMENT_VARIANT_CONTROL: &str = "control";
+pub const MCP_EXPERIMENT_VARIANT_REBALANCE: &str = "rebalance";
+pub const REBALANCE_MCP_HTTP_BACKOFF_SCOPE: &str = "rebalance_mcp_http";
 // Hard cap on the number of token→key affinity entries kept in memory to prevent
 // unbounded growth under churny traffic (many distinct tokens).
 const TOKEN_AFFINITY_MAX_ENTRIES: usize = 10_000;
@@ -422,52 +1268,228 @@ const TOKEN_BINDING_CACHE_TTL_SECS: u64 = 30;
 const TOKEN_BINDING_CACHE_MAX_ENTRIES: usize = 10_000;
 const ACCOUNT_QUOTA_RESOLUTION_CACHE_TTL_SECS: u64 = 5;
 const ACCOUNT_QUOTA_RESOLUTION_CACHE_MAX_ENTRIES: usize = 10_000;
-// Keep the lease TTL below the acquisition wait so a crashed holder can be recovered
-// by the next in-flight request instead of blocking the subject for minutes.
+const ADMIN_REQUEST_LOGS_CATALOG_CACHE_TTL_SECS: i64 = 30;
+const ADMIN_HEAVY_READ_CONCURRENCY: usize = 1;
+// Test-only coverage still exercises the legacy SQLite subject-lock helper retry path.
+#[cfg(test)]
+#[allow(dead_code)]
 const QUOTA_SUBJECT_LOCK_TTL_SECS: u64 = 20;
+#[cfg(test)]
+#[allow(dead_code)]
 const QUOTA_SUBJECT_LOCK_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+#[cfg(test)]
+#[allow(dead_code)]
 const QUOTA_SUBJECT_LOCK_REFRESH_SECS: u64 = 5;
+#[cfg(test)]
+#[allow(dead_code)]
 const QUOTA_SUBJECT_LOCK_REFRESH_RETRY_SECS: u64 = 1;
 
-const REQUEST_LOGS_MIN_RETENTION_DAYS: i64 = 7;
+const REQUEST_LOGS_MIN_RETENTION_DAYS: i64 = 32;
+pub const REQUEST_LOG_RETENTION_DAYS_MIN: i64 = 0;
+pub const REQUEST_LOG_RETENTION_DAYS_MAX: i64 = 92;
+pub const REQUEST_LOG_RETENTION_MAX_DAYS_DEFAULT: i64 = 32;
+pub const AUTH_TOKEN_LOG_RETENTION_DAYS_DEFAULT: i64 = 92;
+pub const REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_DEFAULT: i64 = 80;
+pub const REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_MIN: i64 = 50;
+pub const REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_MAX: i64 = 150;
+pub const REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_STEP: i64 = 10;
+pub const REQUEST_LOG_BODY_CLEANED_REASON_POLICY_ZERO: &str = "policy_zero_days";
+pub const REQUEST_LOG_BODY_CLEANED_REASON_RETENTION_EXPIRED: &str = "retention_expired";
 
+const BILLING_STATE_NONE: &str = "none";
 const BILLING_STATE_PENDING: &str = "pending";
 const BILLING_STATE_CHARGED: &str = "charged";
 
+#[cfg(test)]
 static QUOTA_SUBJECT_LOCK_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const GRANULARITY_MINUTE: &str = "minute";
 const GRANULARITY_HOUR: &str = "hour";
+const GRANULARITY_DAY: &str = "day";
 // Per-token raw request counter (any request type), aggregated per minute.
+#[allow(dead_code)]
 const GRANULARITY_REQUEST_MINUTE: &str = "request_minute";
 const BUCKET_RETENTION_SECS: i64 = 2 * 24 * 3600; // 48h，足够覆盖 24h 窗口
 const CLEANUP_INTERVAL_SECS: i64 = 600;
 const SECS_PER_MINUTE: i64 = 60;
+const SECS_PER_FIVE_MINUTES: i64 = 5 * SECS_PER_MINUTE;
 const SECS_PER_HOUR: i64 = 3600;
 const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
 const TOKEN_USAGE_STATS_BUCKET_SECS: i64 = SECS_PER_HOUR;
-const USAGE_PROBE_TIMEOUT_SECS: u64 = 8;
-const USAGE_PROBE_RETRY_ATTEMPTS: usize = 3;
-const USAGE_PROBE_RETRY_DELAY_MS: u64 = 200;
 
-// Time-based retention for per-token access logs (auth_token_logs).
-// This is purely time-driven and must not depend on access token enable/disable/delete status,
-// to preserve auditability.
-const AUTH_TOKEN_LOG_RETENTION_SECS: i64 = 90 * SECS_PER_DAY;
+pub const ADMIN_ACTIVE_USERS_WINDOW_SECS: i64 = ADMIN_ACTIVE_USERS_WINDOW_DAYS * SECS_PER_DAY;
 
 const META_KEY_DATA_CONSISTENCY_DONE: &str = "data_consistency_v1_done";
 const META_KEY_TOKEN_USAGE_ROLLUP_TS: &str = "token_usage_rollup_last_ts";
 const META_KEY_TOKEN_USAGE_ROLLUP_LOG_ID_V2: &str = "token_usage_rollup_last_log_id_v2";
 const META_KEY_HEAL_ORPHAN_TOKENS_V1: &str = "heal_orphan_auth_tokens_from_logs_v1";
 const META_KEY_API_KEY_USAGE_BUCKETS_V1_DONE: &str = "api_key_usage_buckets_v1_done";
+const META_KEY_API_KEY_USAGE_BUCKETS_REQUEST_VALUE_V2_DONE: &str =
+    "api_key_usage_buckets_request_value_v2_done";
+const META_KEY_DASHBOARD_REQUEST_ROLLUP_BUCKETS_V1_DONE: &str =
+    "dashboard_request_rollup_buckets_v1_done";
+const META_KEY_BILLING_LEDGER_STARTUP_HIGH_WATERMARK_V1: &str =
+    "billing_ledger_startup_high_watermark_v1";
+const META_KEY_REQUEST_STATS_LAST_FLUSHED_AT_V1: &str = "request_stats_last_flushed_at_v1";
+const META_KEY_REQUEST_LOG_EFFECT_BUCKET_MIGRATION_V1_DONE: &str =
+    "request_log_effect_bucket_migration_v1_done";
+const META_KEY_REQUEST_LOG_CATALOG_ROLLUP_V1_DONE: &str = "request_log_catalog_rollup_v1_done";
+const META_KEY_REQUEST_LOG_CATALOG_ROLLUP_V1_RETENTION_DAYS: &str =
+    "request_log_catalog_rollup_v1_retention_days";
+const META_KEY_OBSERVABILITY_SIDECAR_EXPLICIT_CUTOVER_V1_DONE: &str =
+    "observability_sidecar_explicit_cutover_v1_done";
 const META_KEY_ACCOUNT_QUOTA_BACKFILL_V1: &str = "account_quota_backfill_v1";
 const META_KEY_ACCOUNT_QUOTA_INHERITS_DEFAULTS_BACKFILL_V1: &str =
     "account_quota_inherits_defaults_backfill_v1";
 const META_KEY_ACCOUNT_QUOTA_ZERO_BASE_CUTOVER_V1: &str = "account_quota_zero_base_cutover_v1";
+const META_KEY_ACCOUNT_BASE_ENTITLEMENT_BACKFILL_V1: &str = "account_base_entitlement_backfill_v1";
 const META_KEY_FORCE_USER_RELOGIN_V1: &str = "force_user_relogin_v1";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_V1_DONE: &str = "account_usage_rollup_v1_done";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_RATE5M_COVERAGE_START: &str =
+    "account_usage_rollup_rate5m_coverage_start";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_REQUEST_DAY_COVERAGE_START: &str =
+    "account_usage_rollup_request_day_coverage_start";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_QUOTA1H_COVERAGE_START: &str =
+    "account_usage_rollup_quota1h_coverage_start";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_QUOTA24H_COVERAGE_START: &str =
+    "account_usage_rollup_quota24h_coverage_start";
+const META_KEY_ACCOUNT_USAGE_ROLLUP_QUOTA_MONTH_COVERAGE_START: &str =
+    "account_usage_rollup_quota_month_coverage_start";
+const META_KEY_ACCOUNT_LIMIT_SNAPSHOT_BACKFILL_V1: &str = "account_limit_snapshot_backfill_v1";
 const META_KEY_ALLOW_REGISTRATION_V1: &str = "allow_registration_v1";
+const META_KEY_RECHARGE_FEATURE_ENABLED_V1: &str = "recharge_feature_enabled_v1";
+const META_KEY_RECHARGE_USER_ENABLED_V1: &str = "recharge_user_enabled_v1";
+const META_KEY_ADMIN_DEFAULT_ACTIVE_USERS_ONLY_V1: &str = "admin_default_active_users_only_v1";
+const META_KEY_ADMIN_TOTP_SECRET_CIPHERTEXT_V1: &str = "admin_totp_secret_ciphertext_v1";
+const META_KEY_ADMIN_TOTP_SECRET_NONCE_V1: &str = "admin_totp_secret_nonce_v1";
+const META_KEY_ADMIN_TOTP_ENABLED_AT_V1: &str = "admin_totp_enabled_at_v1";
+const META_KEY_ADMIN_TOTP_FAILURE_COUNT_V1: &str = "admin_totp_failure_count_v1";
+const META_KEY_ADMIN_TOTP_LOCKED_UNTIL_V1: &str = "admin_totp_locked_until_v1";
+const META_KEY_REQUEST_RATE_LIMIT_V1: &str = "request_rate_limit_v1";
+const META_KEY_AUTH_TOKEN_LOG_RETENTION_DAYS_V1: &str = "auth_token_log_retention_days_v1";
+
+static PROCESS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+thread_local! {
+    static PROCESS_ENV_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+pub struct ProcessEnvLockGuard {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+pub fn lock_process_env() -> ProcessEnvLockGuard {
+    let nested = PROCESS_ENV_LOCK_DEPTH.with(|depth| {
+        let current = depth.get();
+        depth.set(current + 1);
+        current > 0
+    });
+    if nested {
+        ProcessEnvLockGuard { _guard: None }
+    } else {
+        let guard = PROCESS_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ProcessEnvLockGuard {
+            _guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for ProcessEnvLockGuard {
+    fn drop(&mut self) {
+        PROCESS_ENV_LOCK_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "process env lock depth underflow");
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
+fn with_process_env_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = lock_process_env();
+    f()
+}
+const META_KEY_MCP_SESSION_AFFINITY_KEY_COUNT_V1: &str = "mcp_session_affinity_key_count_v1";
+const META_KEY_REBALANCE_MCP_ENABLED_V1: &str = "rebalance_mcp_enabled_v1";
+const META_KEY_REBALANCE_MCP_SESSION_PERCENT_V1: &str = "rebalance_mcp_session_percent_v1";
+const META_KEY_API_REBALANCE_ENABLED_V1: &str = "api_rebalance_enabled_v1";
+const META_KEY_API_REBALANCE_PERCENT_V1: &str = "api_rebalance_percent_v1";
+const META_KEY_UPSTREAM_PROJECT_ID_MODE_V1: &str = "upstream_project_id_mode_v1";
+const META_KEY_UPSTREAM_PROJECT_ID_FIXED_VALUE_V1: &str = "upstream_project_id_fixed_value_v1";
+const META_KEY_UPSTREAM_MCP_USER_AGENT_V1: &str = "upstream_mcp_user_agent_v1";
+const META_KEY_UPSTREAM_PRECISE_RECONCILIATION_ENABLED_V1: &str =
+    "upstream_precise_reconciliation_enabled_v1";
+const META_KEY_UPSTREAM_PROJECT_ID_HMAC_SECRET_V1: &str = "upstream_project_id_hmac_secret_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_READY_AFTER_V1: &str =
+    "upstream_reconciliation_ready_after_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_RUN_AT_V1: &str =
+    "upstream_reconciliation_last_run_at_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_SHADOW_ADJUSTMENT_AT_V1: &str =
+    "upstream_reconciliation_last_shadow_adjustment_at_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_ENQUEUE_ERROR_AT_V1: &str =
+    "upstream_reconciliation_last_enqueue_error_at_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_RESEARCH_SWEEP_AT_V1: &str =
+    "upstream_reconciliation_last_research_sweep_at_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_RESEARCH_TERMINAL_AT_V1: &str =
+    "upstream_reconciliation_last_research_terminal_at_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_PRESSURE_STREAK_V1: &str =
+    "upstream_reconciliation_pressure_streak_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_BACKOFF_LEVEL_V1: &str =
+    "upstream_reconciliation_backoff_level_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_BACKOFF_UNTIL_V1: &str =
+    "upstream_reconciliation_backoff_until_v1";
+#[cfg(test)]
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_RECOVERED_AT_V1: &str =
+    "upstream_reconciliation_last_recovered_at_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LOCAL_PRESSURE_STREAK_V1: &str =
+    "upstream_reconciliation_local_pressure_streak_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LOCAL_BACKOFF_LEVEL_V1: &str =
+    "upstream_reconciliation_local_backoff_level_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LOCAL_BACKOFF_UNTIL_V1: &str =
+    "upstream_reconciliation_local_backoff_until_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LOCAL_LAST_RECOVERED_AT_V1: &str =
+    "upstream_reconciliation_local_last_recovered_at_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_DURATION_MS_V1: &str =
+    "upstream_reconciliation_last_duration_ms_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_ATTEMPTED_V1: &str =
+    "upstream_reconciliation_last_attempted_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_SETTLED_V1: &str =
+    "upstream_reconciliation_last_settled_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_NO_ADJUSTMENT_V1: &str =
+    "upstream_reconciliation_last_no_adjustment_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_429_V1: &str = "upstream_reconciliation_last_429_v1";
+const META_KEY_UPSTREAM_RECONCILIATION_LAST_BUDGET_EXHAUSTED_V1: &str =
+    "upstream_reconciliation_last_budget_exhausted_v1";
+const META_KEY_USER_BLOCKED_KEY_BASE_LIMIT_V1: &str = "user_blocked_key_base_limit_v1";
+const META_KEY_GLOBAL_IP_LIMIT_V1: &str = "global_ip_limit_v1";
+const META_KEY_TRUSTED_PROXY_CIDRS_V1: &str = "trusted_proxy_cidrs_v1";
+const META_KEY_TRUSTED_CLIENT_IP_HEADERS_V1: &str = "trusted_client_ip_headers_v1";
+const META_KEY_REQUEST_LOG_RETENTION_MAX_DAYS_V1: &str = "request_log_retention_max_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_V1: &str =
+    "request_log_retention_heavy_threshold_percent_v1";
+const META_KEY_REQUEST_LOG_RETENTION_GLOBAL_BUSINESS_BODY_DAYS_V1: &str =
+    "request_log_retention_global_business_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_GLOBAL_NON_BUSINESS_BODY_DAYS_V1: &str =
+    "request_log_retention_global_non_business_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_GLOBAL_NON_SUCCESS_BODY_DAYS_V1: &str =
+    "request_log_retention_global_non_success_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_HEAVY_BUSINESS_BODY_DAYS_V1: &str =
+    "request_log_retention_heavy_business_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_HEAVY_NON_BUSINESS_BODY_DAYS_V1: &str =
+    "request_log_retention_heavy_non_business_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_HEAVY_NON_SUCCESS_BODY_DAYS_V1: &str =
+    "request_log_retention_heavy_non_success_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_DEBUG_BUSINESS_BODY_DAYS_V1: &str =
+    "request_log_retention_debug_business_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_DEBUG_NON_BUSINESS_BODY_DAYS_V1: &str =
+    "request_log_retention_debug_non_business_body_days_v1";
+const META_KEY_REQUEST_LOG_RETENTION_DEBUG_NON_SUCCESS_BODY_DAYS_V1: &str =
+    "request_log_retention_debug_non_success_body_days_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_V1: &str = "linuxdo_system_tag_defaults_v1";
 const META_KEY_LINUXDO_SYSTEM_TAG_DEFAULTS_TUPLE_V1: &str = "linuxdo_system_tag_defaults_tuple_v1";
+const META_KEY_LINUXDO_USER_TAG_BINDINGS_REFRESH_V1: &str = "linuxdo_user_tag_bindings_refresh_v1";
 const META_KEY_REQUEST_KIND_CANONICAL_MIGRATION_V1_STATE: &str =
     "request_kind_canonical_migration_v1_state";
 const META_KEY_REQUEST_KIND_CANONICAL_MIGRATION_V1_DONE: &str =
@@ -480,13 +1502,24 @@ const META_KEY_REQUEST_KIND_CANONICAL_BACKFILL_REQUEST_LOGS_CURSOR_V1: &str =
     "request_kind_canonical_backfill_request_logs_v1";
 const META_KEY_REQUEST_KIND_CANONICAL_BACKFILL_AUTH_TOKEN_LOGS_CURSOR_V1: &str =
     "request_kind_canonical_backfill_auth_token_logs_v1";
+const META_KEY_REQUEST_USER_ID_BACKFILL_CURSOR_V1: &str = "request_user_id_backfill_cursor_v1";
 const META_KEY_API_KEY_CREATED_AT_BACKFILL_V1: &str = "api_key_created_at_backfill_v1";
 // Cutover marker for switching business quota counters from "requests" to "credits".
 // We cannot retroactively convert legacy request counts into credits, so we reset the
 // lightweight counters once and start charging by upstream credits going forward.
 const META_KEY_BUSINESS_QUOTA_CREDITS_CUTOVER_V1: &str = "business_quota_credits_cutover_v1";
 const META_KEY_BUSINESS_QUOTA_MONTHLY_REBASE_V1: &str = "business_quota_monthly_rebase_v1";
+const ACCOUNT_USAGE_ROLLUP_REQUEST_BACKFILL_SECS: i64 = 35 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_REQUEST_DAY_BACKFILL_SECS: i64 = 92 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_BUSINESS_BACKFILL_SECS: i64 = 90 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_MONTH_CHART_MONTHS: i32 = 12;
+const ACCOUNT_USAGE_ROLLUP_FIVE_MINUTE_RETENTION_SECS: i64 = 35 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_HOUR_RETENTION_SECS: i64 = 8 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_REQUEST_DAY_RETENTION_SECS: i64 = 92 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_DAY_RETENTION_SECS: i64 = 400 * SECS_PER_DAY;
+const ACCOUNT_USAGE_ROLLUP_MONTH_RETENTION_MONTHS: i32 = 24;
 const API_KEY_UPSERT_TRANSIENT_RETRY_BACKOFF_MS: [u64; 2] = [20, 50];
+const API_KEY_UPSERT_RETRY_BUDGET: Duration = Duration::from_millis(250);
 const TOKEN_USAGE_ROLLUP_TRANSIENT_RETRY_BACKOFF_MS: [u64; 3] = [20, 50, 100];
 
 pub async fn run_request_kind_canonical_backfill(
@@ -495,8 +1528,25 @@ pub async fn run_request_kind_canonical_backfill(
     dry_run: bool,
 ) -> Result<RequestKindCanonicalBackfillReport, ProxyError> {
     let pool = store::open_sqlite_pool(database_path, true, false).await?;
-    store::run_request_kind_canonical_backfill_with_pool(&pool, batch_size, dry_run, None, None)
-        .await
+    let backend_time = BackendTime::system();
+    store::run_request_kind_canonical_backfill_with_pool(
+        &pool,
+        batch_size,
+        dry_run,
+        None,
+        None,
+        &backend_time,
+    )
+    .await
+}
+
+pub async fn run_request_user_id_backfill(
+    database_path: &str,
+    batch_size: i64,
+) -> Result<RequestUserIdBackfillReport, ProxyError> {
+    let pool = store::open_sqlite_pool(database_path, true, false).await?;
+    let backend_time = BackendTime::system();
+    store::run_request_user_id_backfill_with_pool(&pool, batch_size, &backend_time).await
 }
 
 fn token_limit_from_env(var: &str, default: i64) -> i64 {
@@ -546,13 +1596,171 @@ pub fn effective_request_logs_gc_at() -> (u32, u32) {
 
 /// Effective request log retention days (minimum enforced), including environment overrides.
 ///
-/// Environment variable: `REQUEST_LOGS_RETENTION_DAYS` (positive integer; min 7).
+/// Environment variable: `REQUEST_LOGS_RETENTION_DAYS` (positive integer; min 32).
 pub fn effective_request_logs_retention_days() -> i64 {
     let days = token_limit_from_env(
         "REQUEST_LOGS_RETENTION_DAYS",
         REQUEST_LOGS_MIN_RETENTION_DAYS,
     );
     days.max(REQUEST_LOGS_MIN_RETENTION_DAYS)
+}
+
+fn request_log_retention_profile(
+    business_body_days: i64,
+    non_business_body_days: i64,
+    non_success_body_days: i64,
+) -> RequestLogRetentionProfile {
+    RequestLogRetentionProfile {
+        business_body_days,
+        non_business_body_days,
+        non_success_body_days,
+    }
+}
+
+pub fn default_request_log_retention_settings() -> RequestLogRetentionSettings {
+    RequestLogRetentionSettings {
+        max_log_retention_days: REQUEST_LOG_RETENTION_MAX_DAYS_DEFAULT,
+        heavy_usage_threshold_percent: REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_DEFAULT,
+        global: request_log_retention_profile(7, 0, 3),
+        heavy_usage: request_log_retention_profile(3, 0, 1),
+        debug_shared: request_log_retention_profile(14, 1, 7),
+    }
+}
+
+pub const AUTH_TOKEN_LOG_RETENTION_DAY_STOPS: &[i64] = &[1, 2, 3, 7, 14, 32, 62, 92];
+
+pub fn normalize_auth_token_log_retention_days(value: i64) -> Option<i64> {
+    AUTH_TOKEN_LOG_RETENTION_DAY_STOPS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == value)
+}
+
+fn parse_auth_token_log_retention_days_env() -> Result<Option<i64>, String> {
+    with_process_env_lock(|| match std::env::var("AUTH_TOKEN_LOG_RETENTION_DAYS") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed.parse::<i64>().map_err(|err| {
+                format!("AUTH_TOKEN_LOG_RETENTION_DAYS must be an integer: {err}")
+            })?;
+            normalize_auth_token_log_retention_days(parsed)
+                .map(Some)
+                .ok_or_else(|| {
+                    let allowed = AUTH_TOKEN_LOG_RETENTION_DAY_STOPS
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    format!("AUTH_TOKEN_LOG_RETENTION_DAYS must be one of {allowed}")
+                })
+        }
+        Err(_) => Ok(None),
+    })
+}
+
+pub fn default_auth_token_log_retention_days() -> i64 {
+    match parse_auth_token_log_retention_days_env() {
+        Ok(Some(value)) => value,
+        Ok(None) => AUTH_TOKEN_LOG_RETENTION_DAYS_DEFAULT,
+        Err(err) => {
+            eprintln!("{err}; falling back to {AUTH_TOKEN_LOG_RETENTION_DAYS_DEFAULT}");
+            AUTH_TOKEN_LOG_RETENTION_DAYS_DEFAULT
+        }
+    }
+}
+
+pub fn validate_auth_token_log_retention_days(value: i64) -> Result<(), ProxyError> {
+    if normalize_auth_token_log_retention_days(value).is_none() {
+        let allowed = AUTH_TOKEN_LOG_RETENTION_DAY_STOPS
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join("/");
+        return Err(ProxyError::Other(format!(
+            "auth_token_log_retention_days must be one of {allowed}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_request_log_retention_days(field: &str, value: i64) -> Result<(), ProxyError> {
+    if !(REQUEST_LOG_RETENTION_DAYS_MIN..=REQUEST_LOG_RETENTION_DAYS_MAX).contains(&value) {
+        return Err(ProxyError::Other(format!(
+            "{field} must be between {} and {}",
+            REQUEST_LOG_RETENTION_DAYS_MIN, REQUEST_LOG_RETENTION_DAYS_MAX
+        )));
+    }
+    Ok(())
+}
+
+fn validate_request_log_retention_profile(
+    prefix: &str,
+    profile: &RequestLogRetentionProfile,
+) -> Result<(), ProxyError> {
+    validate_request_log_retention_days(
+        &format!("{prefix}.business_body_days"),
+        profile.business_body_days,
+    )?;
+    validate_request_log_retention_days(
+        &format!("{prefix}.non_business_body_days"),
+        profile.non_business_body_days,
+    )?;
+    validate_request_log_retention_days(
+        &format!("{prefix}.non_success_body_days"),
+        profile.non_success_body_days,
+    )?;
+    Ok(())
+}
+
+fn clamp_request_log_retention_profile(
+    profile: &RequestLogRetentionProfile,
+    max_days: i64,
+) -> RequestLogRetentionProfile {
+    RequestLogRetentionProfile {
+        business_body_days: profile.business_body_days.min(max_days),
+        non_business_body_days: profile.non_business_body_days.min(max_days),
+        non_success_body_days: profile.non_success_body_days.min(max_days),
+    }
+}
+
+pub fn normalize_request_log_retention_settings(
+    settings: &RequestLogRetentionSettings,
+) -> Result<RequestLogRetentionSettings, ProxyError> {
+    validate_request_log_retention_days("max_log_retention_days", settings.max_log_retention_days)?;
+    if !(REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_MIN
+        ..=REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_MAX)
+        .contains(&settings.heavy_usage_threshold_percent)
+        || settings.heavy_usage_threshold_percent
+            % REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_STEP
+            != 0
+    {
+        return Err(ProxyError::Other(format!(
+            "heavy_usage_threshold_percent must be between {} and {} in steps of {}",
+            REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_MIN,
+            REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_MAX,
+            REQUEST_LOG_RETENTION_HEAVY_THRESHOLD_PERCENT_STEP
+        )));
+    }
+    validate_request_log_retention_profile("global", &settings.global)?;
+    validate_request_log_retention_profile("heavy_usage", &settings.heavy_usage)?;
+    validate_request_log_retention_profile("debug_shared", &settings.debug_shared)?;
+    let max_days = settings.max_log_retention_days;
+    Ok(RequestLogRetentionSettings {
+        max_log_retention_days: max_days,
+        heavy_usage_threshold_percent: settings.heavy_usage_threshold_percent,
+        global: clamp_request_log_retention_profile(&settings.global, max_days),
+        heavy_usage: clamp_request_log_retention_profile(&settings.heavy_usage, max_days),
+        debug_shared: clamp_request_log_retention_profile(&settings.debug_shared, max_days),
+    })
+}
+
+pub fn effective_auth_token_log_retention_days() -> Result<i64, ProxyError> {
+    parse_auth_token_log_retention_days_env()
+        .map(|value| value.unwrap_or(AUTH_TOKEN_LOG_RETENTION_DAYS_DEFAULT))
+        .map_err(ProxyError::Other)
 }
 
 /// Effective hourly quota limit per access token, including environment overrides.
@@ -581,6 +1789,18 @@ pub fn effective_token_monthly_limit() -> i64 {
 /// Environment variable: `TOKEN_HOURLY_REQUEST_LIMIT` (must be a positive integer).
 pub fn effective_token_hourly_request_limit() -> i64 {
     token_limit_from_env("TOKEN_HOURLY_REQUEST_LIMIT", TOKEN_HOURLY_REQUEST_LIMIT)
+}
+
+pub fn request_rate_limit_window_minutes() -> i64 {
+    REQUEST_RATE_LIMIT_WINDOW_MINUTES
+}
+
+pub fn request_rate_limit_window_secs() -> i64 {
+    REQUEST_RATE_LIMIT_WINDOW_SECS
+}
+
+pub fn request_rate_limit() -> i64 {
+    REQUEST_RATE_LIMIT
 }
 
 #[derive(Debug, Clone)]
@@ -751,91 +1971,82 @@ const USER_TAG_ICON_LINUXDO: &str = "linuxdo";
 // LinuxDo trust tiers intentionally ship with the legacy token quota tuple as their
 // additive delta, so auto-bound LinuxDo users receive that uplift on top of the
 // account base quota unless an admin edits the system tag effect later.
-fn linuxdo_system_tag_default_deltas() -> (i64, i64, i64, i64) {
+fn linuxdo_system_tag_default_deltas() -> (i64, i64, i64) {
     (
-        effective_token_hourly_request_limit(),
         effective_token_hourly_limit(),
         effective_token_daily_limit(),
         effective_token_monthly_limit(),
     )
 }
 
-fn format_linuxdo_system_tag_default_deltas(value: (i64, i64, i64, i64)) -> String {
-    format!("{},{},{},{}", value.0, value.1, value.2, value.3)
+fn format_linuxdo_system_tag_default_deltas(value: (i64, i64, i64)) -> String {
+    format!("{},{},{}", value.0, value.1, value.2)
 }
 
-fn parse_linuxdo_system_tag_default_deltas(raw: &str) -> Option<(i64, i64, i64, i64)> {
+fn parse_linuxdo_system_tag_default_deltas(raw: &str) -> Option<(i64, i64, i64)> {
     let mut parts = raw.split(',').map(str::trim);
-    let hourly_any = parts.next()?.parse().ok()?;
-    let hourly = parts.next()?.parse().ok()?;
+    let business_calls_1h = parts.next()?.parse().ok()?;
     let daily = parts.next()?.parse().ok()?;
     let monthly = parts.next()?.parse().ok()?;
     if parts.next().is_some() {
         return None;
     }
-    Some((hourly_any, hourly, daily, monthly))
+    Some((business_calls_1h, daily, monthly))
 }
 
 #[derive(Debug, Clone)]
 struct AccountQuotaLimits {
-    hourly_any_limit: i64,
-    hourly_limit: i64,
-    daily_limit: i64,
-    monthly_limit: i64,
+    business_calls_1h_limit: i64,
+    daily_credits_limit: i64,
+    monthly_credits_limit: i64,
     inherits_defaults: bool,
 }
 
 impl AccountQuotaLimits {
     fn zero_base() -> Self {
         Self {
-            hourly_any_limit: 0,
-            hourly_limit: 0,
-            daily_limit: 0,
-            monthly_limit: 0,
+            business_calls_1h_limit: 0,
+            daily_credits_limit: 0,
+            monthly_credits_limit: 0,
             inherits_defaults: false,
         }
     }
 
     fn legacy_defaults() -> Self {
         Self {
-            hourly_any_limit: effective_token_hourly_request_limit(),
-            hourly_limit: effective_token_hourly_limit(),
-            daily_limit: effective_token_daily_limit(),
-            monthly_limit: effective_token_monthly_limit(),
+            business_calls_1h_limit: effective_token_hourly_limit(),
+            daily_credits_limit: effective_token_daily_limit(),
+            monthly_credits_limit: effective_token_monthly_limit(),
             inherits_defaults: true,
         }
     }
 
     fn clamped_non_negative(&self) -> Self {
         Self {
-            hourly_any_limit: self.hourly_any_limit.max(0),
-            hourly_limit: self.hourly_limit.max(0),
-            daily_limit: self.daily_limit.max(0),
-            monthly_limit: self.monthly_limit.max(0),
+            business_calls_1h_limit: self.business_calls_1h_limit.max(0),
+            daily_credits_limit: self.daily_credits_limit.max(0),
+            monthly_credits_limit: self.monthly_credits_limit.max(0),
             inherits_defaults: self.inherits_defaults,
         }
     }
 
     fn same_limits_as(&self, other: &Self) -> bool {
-        self.hourly_any_limit == other.hourly_any_limit
-            && self.hourly_limit == other.hourly_limit
-            && self.daily_limit == other.daily_limit
-            && self.monthly_limit == other.monthly_limit
+        self.business_calls_1h_limit == other.business_calls_1h_limit
+            && self.daily_credits_limit == other.daily_credits_limit
+            && self.monthly_credits_limit == other.monthly_credits_limit
     }
 }
 
 fn account_quota_limits_from_row(
-    hourly_any_limit: i64,
-    hourly_limit: i64,
-    daily_limit: i64,
-    monthly_limit: i64,
+    business_calls_1h_limit: i64,
+    daily_credits_limit: i64,
+    monthly_credits_limit: i64,
     inherits_defaults: i64,
 ) -> AccountQuotaLimits {
     AccountQuotaLimits {
-        hourly_any_limit,
-        hourly_limit,
-        daily_limit,
-        monthly_limit,
+        business_calls_1h_limit,
+        daily_credits_limit,
+        monthly_credits_limit,
         inherits_defaults: inherits_defaults == 1,
     }
 }
@@ -863,7 +2074,7 @@ struct CountryIsBatchEntry {
 }
 
 #[derive(Debug, Clone)]
-struct ForwardProxyGeoCandidate {
+pub struct ForwardProxyGeoCandidate {
     endpoint: forward_proxy::ForwardProxyEndpoint,
     host_ips: Vec<String>,
     regions: Vec<String>,
@@ -1047,7 +2258,13 @@ fn format_registration_region(country: &str, subdivision: &str, city: &str) -> O
     }
 }
 
-async fn resolve_registration_regions(origin: &str, ips: &[String]) -> HashMap<String, String> {
+pub(crate) async fn resolve_registration_regions_with_remote_attempt_admission(
+    origin: &str,
+    ips: &[String],
+    backend_time: &BackendTime,
+    remote_attempt_admission: Option<&std::sync::Arc<RemoteAttemptAdmissionController>>,
+    manual_remote_attempt: bool,
+) -> HashMap<String, String> {
     let pending = ips
         .iter()
         .filter_map(|ip| normalize_ip_string(ip))
@@ -1076,29 +2293,47 @@ async fn resolve_registration_regions(origin: &str, ips: &[String]) -> HashMap<S
     'batch_lookup: for batch in pending.chunks(API_KEY_IP_GEO_BATCH_SIZE) {
         let mut attempt = 0usize;
         let response = loop {
-            match client.post(&batch_url).json(batch).send().await {
+            let remote_attempt = match remote_attempt_admission {
+                Some(controller) => match if manual_remote_attempt {
+                    controller.acquire_manual_attempt().await
+                } else {
+                    controller.acquire_attempt().await
+                } {
+                    Ok(lease) => Some(lease),
+                    Err(_) => break 'batch_lookup,
+                },
+                None => None,
+            };
+            let response = client.post(&batch_url).json(batch).send().await;
+            match response {
                 Ok(response)
                     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
                         && attempt == 0 =>
                 {
+                    drop(remote_attempt);
                     attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    backend_time.sleep(Duration::from_millis(250)).await;
                     continue;
                 }
-                Ok(response) => break response,
+                Ok(response) => break (response, remote_attempt),
                 Err(err) if attempt == 0 => {
+                    drop(remote_attempt);
                     attempt += 1;
                     eprintln!("api key geo lookup request error, retrying once: {err}");
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    backend_time.sleep(Duration::from_millis(250)).await;
                 }
                 Err(err) => {
+                    drop(remote_attempt);
                     eprintln!("api key geo lookup request error: {err}");
                     continue 'batch_lookup;
                 }
             }
         };
 
+        let (response, remote_attempt) = response;
+
         if !response.status().is_success() {
+            drop(remote_attempt);
             eprintln!("api key geo lookup returned status: {}", response.status());
             continue;
         }
@@ -1106,10 +2341,12 @@ async fn resolve_registration_regions(origin: &str, ips: &[String]) -> HashMap<S
         let entries = match response.json::<Vec<CountryIsBatchEntry>>().await {
             Ok(entries) => entries,
             Err(err) => {
+                drop(remote_attempt);
                 eprintln!("api key geo lookup decode error: {err}");
                 continue;
             }
         };
+        drop(remote_attempt);
 
         for entry in entries {
             let Some(ip) = normalize_ip_string(&entry.ip) else {
@@ -1148,10 +2385,9 @@ struct UserTagRecord {
     icon: Option<String>,
     system_key: Option<String>,
     effect_kind: String,
-    hourly_any_delta: i64,
-    hourly_delta: i64,
-    daily_delta: i64,
-    monthly_delta: i64,
+    business_calls_1h_delta: i64,
+    daily_credits_delta: i64,
+    monthly_credits_delta: i64,
     user_count: i64,
 }
 
@@ -1179,10 +2415,9 @@ struct AccountQuotaBreakdownRecord {
     tag_name: Option<String>,
     source: Option<String>,
     effect_kind: String,
-    hourly_any_delta: i64,
-    hourly_delta: i64,
-    daily_delta: i64,
-    monthly_delta: i64,
+    business_calls_1h_delta: i64,
+    daily_credits_delta: i64,
+    monthly_credits_delta: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1211,10 +2446,9 @@ fn linuxdo_system_key_for_level(level: i64) -> String {
 
 fn to_admin_quota_limit_set(limits: &AccountQuotaLimits) -> AdminQuotaLimitSet {
     AdminQuotaLimitSet {
-        hourly_any_limit: limits.hourly_any_limit,
-        hourly_limit: limits.hourly_limit,
-        daily_limit: limits.daily_limit,
-        monthly_limit: limits.monthly_limit,
+        business_calls_1h_limit: limits.business_calls_1h_limit,
+        daily_credits_limit: limits.daily_credits_limit,
+        monthly_credits_limit: limits.monthly_credits_limit,
         inherits_defaults: limits.inherits_defaults,
     }
 }
@@ -1227,10 +2461,9 @@ fn to_admin_user_tag(tag: &UserTagRecord) -> AdminUserTag {
         icon: tag.icon.clone(),
         system_key: tag.system_key.clone(),
         effect_kind: tag.effect_kind.clone(),
-        hourly_any_delta: tag.hourly_any_delta,
-        hourly_delta: tag.hourly_delta,
-        daily_delta: tag.daily_delta,
-        monthly_delta: tag.monthly_delta,
+        business_calls_1h_delta: tag.business_calls_1h_delta,
+        daily_credits_delta: tag.daily_credits_delta,
+        monthly_credits_delta: tag.monthly_credits_delta,
         user_count: tag.user_count,
     }
 }
@@ -1243,10 +2476,9 @@ fn to_admin_user_tag_binding(binding: &UserTagBindingRecord) -> AdminUserTagBind
         icon: binding.tag.icon.clone(),
         system_key: binding.tag.system_key.clone(),
         effect_kind: binding.tag.effect_kind.clone(),
-        hourly_any_delta: binding.tag.hourly_any_delta,
-        hourly_delta: binding.tag.hourly_delta,
-        daily_delta: binding.tag.daily_delta,
-        monthly_delta: binding.tag.monthly_delta,
+        business_calls_1h_delta: binding.tag.business_calls_1h_delta,
+        daily_credits_delta: binding.tag.daily_credits_delta,
+        monthly_credits_delta: binding.tag.monthly_credits_delta,
         source: binding.source.clone(),
     }
 }
@@ -1261,18 +2493,49 @@ fn to_admin_quota_breakdown_entry(
         tag_name: entry.tag_name.clone(),
         source: entry.source.clone(),
         effect_kind: entry.effect_kind.clone(),
-        hourly_any_delta: entry.hourly_any_delta,
-        hourly_delta: entry.hourly_delta,
-        daily_delta: entry.daily_delta,
-        monthly_delta: entry.monthly_delta,
+        business_calls_1h_delta: entry.business_calls_1h_delta,
+        daily_credits_delta: entry.daily_credits_delta,
+        monthly_credits_delta: entry.monthly_credits_delta,
     }
 }
 
+#[cfg(test)]
 fn build_account_quota_resolution(
     base: AccountQuotaLimits,
     tags: Vec<UserTagBindingRecord>,
 ) -> AccountQuotaResolution {
-    let mut effective = base.clone();
+    build_account_quota_resolution_with_recharge(
+        base,
+        tags,
+        LinuxDoCreditRechargeQuotaDelta::default(),
+        LinuxDoCreditRechargeQuotaDelta::default(),
+        LinuxDoCreditRechargeQuotaDelta::default(),
+    )
+}
+
+fn build_account_quota_resolution_with_recharge(
+    base: AccountQuotaLimits,
+    tags: Vec<UserTagBindingRecord>,
+    base_entitlement_delta: LinuxDoCreditRechargeQuotaDelta,
+    monthly_entitlement_delta: LinuxDoCreditRechargeQuotaDelta,
+    permanent_entitlement_delta: LinuxDoCreditRechargeQuotaDelta,
+) -> AccountQuotaResolution {
+    let base_with_entitlements = AccountQuotaLimits {
+        business_calls_1h_limit: apply_quota_delta(
+            base.business_calls_1h_limit,
+            base_entitlement_delta.hourly_delta,
+        ),
+        daily_credits_limit: apply_quota_delta(
+            base.daily_credits_limit,
+            base_entitlement_delta.daily_delta,
+        ),
+        monthly_credits_limit: apply_quota_delta(
+            base.monthly_credits_limit,
+            base_entitlement_delta.monthly_delta,
+        ),
+        inherits_defaults: base.inherits_defaults,
+    };
+    let mut effective = base_with_entitlements.clone();
     let mut breakdown = vec![AccountQuotaBreakdownRecord {
         kind: "base".to_string(),
         label: "base".to_string(),
@@ -1280,10 +2543,9 @@ fn build_account_quota_resolution(
         tag_name: None,
         source: None,
         effect_kind: "base".to_string(),
-        hourly_any_delta: base.hourly_any_limit,
-        hourly_delta: base.hourly_limit,
-        daily_delta: base.daily_limit,
-        monthly_delta: base.monthly_limit,
+        business_calls_1h_delta: base_with_entitlements.business_calls_1h_limit,
+        daily_credits_delta: base_with_entitlements.daily_credits_limit,
+        monthly_credits_delta: base_with_entitlements.monthly_credits_limit,
     }];
     let mut block_all = false;
 
@@ -1295,10 +2557,9 @@ fn build_account_quota_resolution(
             tag_name: Some(binding.tag.name.clone()),
             source: Some(binding.source.clone()),
             effect_kind: binding.tag.effect_kind.clone(),
-            hourly_any_delta: binding.tag.hourly_any_delta,
-            hourly_delta: binding.tag.hourly_delta,
-            daily_delta: binding.tag.daily_delta,
-            monthly_delta: binding.tag.monthly_delta,
+            business_calls_1h_delta: binding.tag.business_calls_1h_delta,
+            daily_credits_delta: binding.tag.daily_credits_delta,
+            monthly_credits_delta: binding.tag.monthly_credits_delta,
         });
 
         if binding.tag.is_block_all() {
@@ -1306,21 +2567,83 @@ fn build_account_quota_resolution(
             continue;
         }
 
-        effective.hourly_any_limit =
-            apply_quota_delta(effective.hourly_any_limit, binding.tag.hourly_any_delta);
-        effective.hourly_limit =
-            apply_quota_delta(effective.hourly_limit, binding.tag.hourly_delta);
-        effective.daily_limit = apply_quota_delta(effective.daily_limit, binding.tag.daily_delta);
-        effective.monthly_limit =
-            apply_quota_delta(effective.monthly_limit, binding.tag.monthly_delta);
+        effective.business_calls_1h_limit = apply_quota_delta(
+            effective.business_calls_1h_limit,
+            binding.tag.business_calls_1h_delta,
+        );
+        effective.daily_credits_limit = apply_quota_delta(
+            effective.daily_credits_limit,
+            binding.tag.daily_credits_delta,
+        );
+        effective.monthly_credits_limit = apply_quota_delta(
+            effective.monthly_credits_limit,
+            binding.tag.monthly_credits_delta,
+        );
+    }
+
+    if monthly_entitlement_delta.hourly_delta != 0
+        || monthly_entitlement_delta.daily_delta != 0
+        || monthly_entitlement_delta.monthly_delta != 0
+    {
+        breakdown.push(AccountQuotaBreakdownRecord {
+            kind: "entitlement_month".to_string(),
+            label: "account_entitlement_month".to_string(),
+            tag_id: None,
+            tag_name: None,
+            source: Some("account_entitlement".to_string()),
+            effect_kind: "quota_delta".to_string(),
+            business_calls_1h_delta: monthly_entitlement_delta.hourly_delta,
+            daily_credits_delta: monthly_entitlement_delta.daily_delta,
+            monthly_credits_delta: monthly_entitlement_delta.monthly_delta,
+        });
+        effective.business_calls_1h_limit = apply_quota_delta(
+            effective.business_calls_1h_limit,
+            monthly_entitlement_delta.hourly_delta,
+        );
+        effective.daily_credits_limit = apply_quota_delta(
+            effective.daily_credits_limit,
+            monthly_entitlement_delta.daily_delta,
+        );
+        effective.monthly_credits_limit = apply_quota_delta(
+            effective.monthly_credits_limit,
+            monthly_entitlement_delta.monthly_delta,
+        );
+    }
+
+    if permanent_entitlement_delta.hourly_delta != 0
+        || permanent_entitlement_delta.daily_delta != 0
+        || permanent_entitlement_delta.monthly_delta != 0
+    {
+        breakdown.push(AccountQuotaBreakdownRecord {
+            kind: "entitlement_permanent".to_string(),
+            label: "account_entitlement_permanent".to_string(),
+            tag_id: None,
+            tag_name: None,
+            source: Some("account_entitlement".to_string()),
+            effect_kind: "quota_delta".to_string(),
+            business_calls_1h_delta: permanent_entitlement_delta.hourly_delta,
+            daily_credits_delta: permanent_entitlement_delta.daily_delta,
+            monthly_credits_delta: permanent_entitlement_delta.monthly_delta,
+        });
+        effective.business_calls_1h_limit = apply_quota_delta(
+            effective.business_calls_1h_limit,
+            permanent_entitlement_delta.hourly_delta,
+        );
+        effective.daily_credits_limit = apply_quota_delta(
+            effective.daily_credits_limit,
+            permanent_entitlement_delta.daily_delta,
+        );
+        effective.monthly_credits_limit = apply_quota_delta(
+            effective.monthly_credits_limit,
+            permanent_entitlement_delta.monthly_delta,
+        );
     }
 
     effective = if block_all {
         AccountQuotaLimits {
-            hourly_any_limit: 0,
-            hourly_limit: 0,
-            daily_limit: 0,
-            monthly_limit: 0,
+            business_calls_1h_limit: 0,
+            daily_credits_limit: 0,
+            monthly_credits_limit: 0,
             inherits_defaults: base.inherits_defaults,
         }
     } else {
@@ -1338,14 +2661,13 @@ fn build_account_quota_resolution(
         } else {
             "effective".to_string()
         },
-        hourly_any_delta: effective.hourly_any_limit,
-        hourly_delta: effective.hourly_limit,
-        daily_delta: effective.daily_limit,
-        monthly_delta: effective.monthly_limit,
+        business_calls_1h_delta: effective.business_calls_1h_limit,
+        daily_credits_delta: effective.daily_credits_limit,
+        monthly_credits_delta: effective.monthly_credits_limit,
     });
 
     AccountQuotaResolution {
-        base,
+        base: base_with_entitlements.clamped_non_negative(),
         effective,
         breakdown,
         tags,
@@ -1383,11 +2705,13 @@ impl QuotaSubject {
 #[derive(Debug, Clone)]
 struct TokenBindingCacheEntry {
     user_id: Option<String>,
-    expires_at: Instant,
+    expires_at: i64,
 }
 
 #[derive(Debug, Clone)]
 struct AccountQuotaResolutionCacheEntry {
     resolution: AccountQuotaResolution,
-    expires_at: Instant,
+    expires_at: i64,
+    global_generation: u64,
+    user_generation: u64,
 }

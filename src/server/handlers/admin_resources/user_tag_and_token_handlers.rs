@@ -1,0 +1,1761 @@
+async fn list_user_tags(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ListUserTagsResponse>, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let items = state
+        .proxy
+        .list_user_tags()
+        .await
+        .map_err(|err| admin_proxy_error_response("list user tags error", err))?
+        .iter()
+        .map(build_admin_user_tag_view)
+        .collect();
+    Ok(Json(ListUserTagsResponse { items }))
+}
+
+async fn create_user_tag(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<UserTagMutationRequest>,
+) -> Result<Json<AdminUserTagView>, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let name = payload.name.trim();
+    let display_name = payload.display_name.trim();
+    if name.is_empty() || display_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name and displayName are required".to_string(),
+        ));
+    }
+    let icon = normalize_optional_text(payload.icon);
+    let tag = state
+        .proxy
+        .create_user_tag(
+            name,
+            display_name,
+            icon.as_deref(),
+            payload.effect_kind.trim(),
+            payload.business_calls_1h_delta,
+            payload.daily_credits_delta,
+            payload.monthly_credits_delta,
+        )
+        .await
+        .map_err(|err| admin_proxy_error_response("create user tag error", err))?;
+    Ok(Json(build_admin_user_tag_view(&tag)))
+}
+
+async fn update_user_tag(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tag_id): Path<String>,
+    Json(payload): Json<UserTagMutationRequest>,
+) -> Result<Json<AdminUserTagView>, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let name = payload.name.trim();
+    let display_name = payload.display_name.trim();
+    if name.is_empty() || display_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name and displayName are required".to_string(),
+        ));
+    }
+    let icon = normalize_optional_text(payload.icon);
+    let Some(tag) = state
+        .proxy
+        .update_user_tag(
+            &tag_id,
+            name,
+            display_name,
+            icon.as_deref(),
+            payload.effect_kind.trim(),
+            payload.business_calls_1h_delta,
+            payload.daily_credits_delta,
+            payload.monthly_credits_delta,
+        )
+        .await
+        .map_err(|err| admin_proxy_error_response("update user tag error", err))?
+    else {
+        return Err((StatusCode::NOT_FOUND, "user tag not found".to_string()));
+    };
+    Ok(Json(build_admin_user_tag_view(&tag)))
+}
+
+async fn delete_user_tag(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tag_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let deleted = state
+        .proxy
+        .delete_user_tag(&tag_id)
+        .await
+        .map_err(|err| admin_proxy_error_response("delete user tag error", err))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "user tag not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn bind_user_tag(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<BindUserTagRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let tag_id = payload.tag_id.trim();
+    if tag_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tagId is required".to_string()));
+    }
+    let bound = state
+        .proxy
+        .bind_user_tag_to_user(&id, tag_id)
+        .await
+        .map_err(|err| admin_proxy_error_response("bind user tag error", err))?;
+    if !bound {
+        return Err((StatusCode::NOT_FOUND, "user or tag not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unbind_user_tag(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, tag_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let unbound = state
+        .proxy
+        .unbind_user_tag_from_user(&id, &tag_id)
+        .await
+        .map_err(|err| admin_proxy_error_response("unbind user tag error", err))?;
+    if !unbound {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "user tag binding not found".to_string(),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_users(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ListUsersQuery>,
+) -> Result<Json<ListUsersResponse>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let page = q.page.unwrap_or(1).max(1);
+    let per_page = q.per_page.unwrap_or(20).clamp(1, 100);
+    let requested_sort = q.sort;
+    let requested_order = if requested_sort.is_some() {
+        Some(q.order.unwrap_or(AdminUsersSortDirection::Desc))
+    } else {
+        None
+    };
+    let activity_scope = q.activity_scope.to_admin_user_activity_scope();
+    let effective_sort_field = requested_sort.unwrap_or(AdminUsersSortField::LastLoginAt);
+    let effective_sort_order = requested_order.unwrap_or(AdminUsersSortDirection::Desc);
+    let use_default_paged_query =
+        requested_sort.is_none()
+            || (effective_sort_field == AdminUsersSortField::LastLoginAt
+                && effective_sort_order == AdminUsersSortDirection::Desc);
+
+    let paged_sort_field = effective_sort_field.to_paged_admin_user_sort_field();
+    let (paged_rows, total) = if use_default_paged_query {
+        let (users, total) = state
+            .proxy
+            .list_admin_users_paged(
+                page,
+                per_page,
+                q.q.as_deref(),
+                q.tag_id.as_deref(),
+                activity_scope,
+            )
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let user_ids: Vec<String> = users.iter().map(|user| user.user_id.clone()).collect();
+        let summaries = state
+            .proxy
+            .user_dashboard_summaries_for_users(&user_ids, None)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users dashboard summaries error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let monthly_broken_counts = state
+            .proxy
+            .fetch_monthly_broken_counts_for_users(&user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users monthly broken counts error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let monthly_broken_limits = state
+            .proxy
+            .fetch_account_monthly_broken_limits_bulk(&user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users monthly broken limits error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let rows: Vec<AdminUserSummaryRow> = users
+            .into_iter()
+            .map(|user| AdminUserSummaryRow {
+                summary: summaries
+                    .get(&user.user_id)
+                    .cloned()
+                    .unwrap_or_else(empty_user_dashboard_summary),
+                monthly_broken_count: monthly_broken_counts
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or_default(),
+                monthly_broken_limit: monthly_broken_limits
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or(USER_MONTHLY_BROKEN_LIMIT_DEFAULT),
+                recent_ip_count_7d: 0,
+                user,
+            })
+            .collect();
+        (rows, total)
+    } else if let Some(paged_sort_field) = paged_sort_field {
+        let (users, total) = state
+            .proxy
+            .list_admin_users_sorted_paged(AdminUserSortedPageRequest {
+                page,
+                per_page,
+                query: q.q.as_deref(),
+                tag_id: q.tag_id.as_deref(),
+                activity_scope,
+                sort: paged_sort_field,
+                direction: effective_sort_order.to_admin_list_sort_direction(),
+            })
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users sorted page error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let user_ids: Vec<String> = users.iter().map(|user| user.user_id.clone()).collect();
+        let summaries = state
+            .proxy
+            .user_dashboard_summaries_for_users(&user_ids, None)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users sorted page dashboard summaries error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let monthly_broken_counts = state
+            .proxy
+            .fetch_monthly_broken_counts_for_users(&user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users sorted page monthly broken counts error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let monthly_broken_limits = state
+            .proxy
+            .fetch_account_monthly_broken_limits_bulk(&user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users sorted page monthly broken limits error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let now_ts = state.proxy.backend_time().now_ts();
+        let recent_ip_counts_7d = if user_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            state
+                .proxy
+                .recent_client_ip_counts_by_user(&user_ids, now_ts - 7 * 24 * 60 * 60)
+                .await
+                .map_err(|err| {
+                    eprintln!("list admin users sorted page recent ip counts error: {err}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+        };
+        let rows: Vec<AdminUserSummaryRow> = users
+            .into_iter()
+            .map(|user| AdminUserSummaryRow {
+                summary: summaries
+                    .get(&user.user_id)
+                    .cloned()
+                    .unwrap_or_else(empty_user_dashboard_summary),
+                monthly_broken_count: monthly_broken_counts
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or_default(),
+                monthly_broken_limit: monthly_broken_limits
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or(USER_MONTHLY_BROKEN_LIMIT_DEFAULT),
+                recent_ip_count_7d: recent_ip_counts_7d
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or_default(),
+                user,
+            })
+            .collect();
+        (rows, total)
+    } else {
+        let users = state
+            .proxy
+            .list_admin_users_filtered(q.q.as_deref(), q.tag_id.as_deref(), activity_scope)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let user_ids: Vec<String> = users.iter().map(|user| user.user_id.clone()).collect();
+        let summaries = state
+            .proxy
+            .user_dashboard_summaries_for_users(&user_ids, None)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users dashboard summaries error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let monthly_broken_counts = state
+            .proxy
+            .fetch_monthly_broken_counts_for_users(&user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users monthly broken counts error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let monthly_broken_limits = state
+            .proxy
+            .fetch_account_monthly_broken_limits_bulk(&user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin users monthly broken limits error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let now_ts = state.proxy.backend_time().now_ts();
+        let recent_ip_counts_7d = if user_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            state
+                .proxy
+                .recent_client_ip_counts_by_user(&user_ids, now_ts - 7 * 24 * 60 * 60)
+                .await
+                .map_err(|err| {
+                    eprintln!("list admin users sort recent ip counts error: {err}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+        };
+        let mut rows: Vec<AdminUserSummaryRow> = users
+            .into_iter()
+            .map(|user| AdminUserSummaryRow {
+                summary: summaries
+                    .get(&user.user_id)
+                    .cloned()
+                    .unwrap_or_else(empty_user_dashboard_summary),
+                monthly_broken_count: monthly_broken_counts
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or_default(),
+                monthly_broken_limit: monthly_broken_limits
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or(USER_MONTHLY_BROKEN_LIMIT_DEFAULT),
+                recent_ip_count_7d: recent_ip_counts_7d
+                    .get(&user.user_id)
+                    .copied()
+                    .unwrap_or_default(),
+                user,
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            compare_admin_user_rows(
+                left,
+                right,
+                Some(effective_sort_field),
+                Some(effective_sort_order),
+            )
+        });
+        let total = rows.len() as i64;
+        let offset = ((page - 1) * per_page) as usize;
+        let paged_rows = rows
+            .into_iter()
+            .skip(offset)
+            .take(per_page as usize)
+            .collect();
+        (paged_rows, total)
+    };
+    let page_user_ids: Vec<String> = paged_rows
+        .iter()
+        .map(|row| row.user.user_id.clone())
+        .collect();
+    let system_settings = state.proxy.get_system_settings().await.map_err(|err| {
+        eprintln!("get system settings for admin users error: {err}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut user_tags = if page_user_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .proxy
+            .list_user_tag_bindings_for_users(&page_user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin user tags error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+    let mut items = Vec::with_capacity(paged_rows.len());
+    let api_key_counts = if page_user_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .proxy
+            .list_api_key_binding_counts_for_users(&page_user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin user api key counts error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+    let now_ts = state.proxy.backend_time().now_ts();
+    let recent_ip_counts_24h = if page_user_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .proxy
+            .recent_client_ip_counts_by_user(&page_user_ids, now_ts - 24 * 60 * 60)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin user recent 24h ip counts error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+    let recent_ip_counts_7d = if page_user_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .proxy
+            .recent_client_ip_counts_by_user(&page_user_ids, now_ts - 7 * 24 * 60 * 60)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin user recent ip counts error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+    let shadow_compare_active = if page_user_ids.is_empty() {
+        false
+    } else {
+        state
+            .proxy
+            .upstream_reconciliation_shadow_compare_active_with_settings(&system_settings)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin user shadow compare state error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+    let shadow_daily_projection = if page_user_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .proxy
+            .shadow_daily_projection_for_accounts(&page_user_ids)
+            .await
+            .map_err(|err| {
+                eprintln!("list admin user shadow daily projection error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+    for row in paged_rows {
+        let tags = user_tags.remove(&row.user.user_id).unwrap_or_default();
+        let api_key_count = api_key_counts
+            .get(&row.user.user_id)
+            .copied()
+            .unwrap_or_default();
+        let recent_ip_count_7d = recent_ip_counts_7d
+            .get(&row.user.user_id)
+            .copied()
+            .unwrap_or_default();
+        let recent_ip_count_24h = recent_ip_counts_24h
+            .get(&row.user.user_id)
+            .copied()
+            .unwrap_or_default();
+        let projection = shadow_daily_projection.get(&row.user.user_id);
+        let precise_cutover_configured = system_settings.upstream_project_id_mode
+            == tavily_hikari::UpstreamProjectIdMode::AccessToken
+            && system_settings.api_rebalance_enabled
+            && system_settings.rebalance_mcp_enabled
+            && system_settings.upstream_precise_reconciliation_enabled;
+        // Actual-mode windows must not turn an otherwise settled historical
+        // shadow projection back into a hybrid display. Only unresolved shadow
+        // work requires adding today's live billing usage to the shadow view.
+        let has_pending_shadow_projection = projection.is_some_and(|value| {
+            value.shadow_observed_window_count > value.shadow_resolved_window_count
+        });
+        let has_persisted_shadow_projection = projection.is_some_and(|value| {
+            value.shadow_observed_window_count > 0
+                && value.shadow_observed_window_count == value.shadow_resolved_window_count
+        });
+        let show_hybrid_shadow_projection =
+            shadow_compare_active
+                || (precise_cutover_configured && has_pending_shadow_projection);
+        let show_shadow_projection =
+            show_hybrid_shadow_projection || has_persisted_shadow_projection;
+        let (
+            shadow_daily_credits_used,
+            shadow_daily_availability,
+            shadow_daily_observed_period_count,
+            shadow_daily_settled_period_count,
+            shadow_daily_degraded_period_count,
+        ) = if show_shadow_projection {
+            let shadow_daily_credits_used = Some(if show_hybrid_shadow_projection {
+                row.summary.daily_credits_used.saturating_add(
+                    projection.map(|value| value.confirmed_delta_credits).unwrap_or_default(),
+                )
+            } else {
+                projection
+                    .map(|value| value.shadow_settled_credits_used)
+                    .unwrap_or_default()
+            });
+            let shadow_daily_availability = if show_hybrid_shadow_projection {
+                // During the activation boundary the current actual-only work
+                // is intentionally not part of the historical shadow proof.
+                // Its unresolved state must not downgrade an already settled
+                // shadow window from confirmed to projected.
+                if projection.is_some_and(|value| {
+                    (value.observed_window_count > 0
+                        && value.observed_window_count == value.resolved_window_count)
+                        || (value.shadow_observed_window_count > 0
+                            && value.shadow_observed_window_count
+                                == value.shadow_resolved_window_count)
+                }) || (projection.is_none() && row.summary.daily_credits_used == 0)
+                {
+                    Some(AdminUserShadowDailyAvailability::Confirmed)
+                } else {
+                    Some(AdminUserShadowDailyAvailability::Projected)
+                }
+            } else {
+                Some(AdminUserShadowDailyAvailability::Confirmed)
+            };
+            (
+                shadow_daily_credits_used,
+                shadow_daily_availability,
+                Some(projection.map(|value| value.shadow_observed_window_count).unwrap_or(0)),
+                Some(projection.map(|value| value.shadow_settled_window_count).unwrap_or(0)),
+                Some(projection.map(|value| value.shadow_degraded_window_count).unwrap_or(0)),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+        items.push(build_admin_user_summary_view(
+            &row.user,
+            &row.summary,
+            AdminUserSummaryViewInput {
+                api_key_count,
+                monthly_broken_count: row.monthly_broken_count,
+                monthly_broken_limit: row.monthly_broken_limit,
+                recent_ip_count_24h,
+                recent_ip_count_7d,
+                shadow_daily_credits_used,
+                shadow_daily_availability,
+                shadow_daily_observed_period_count,
+                shadow_daily_settled_period_count,
+                shadow_daily_degraded_period_count,
+                tags,
+            },
+        ));
+    }
+    Ok(Json(ListUsersResponse {
+        items,
+        total,
+        page,
+        per_page,
+    }))
+}
+
+async fn list_unbound_token_usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ListUnboundTokenUsageQuery>,
+) -> Result<Json<ListUnboundTokenUsageResponse>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let page = q.page.unwrap_or(1).max(1);
+    let per_page = q.per_page.unwrap_or(20).clamp(1, 100);
+    let normalized_query = q.q.as_deref().map(str::trim).filter(|value| !value.is_empty());
+
+    let tokens = state.proxy.list_access_tokens().await.map_err(|err| {
+        eprintln!("list unbound token usage tokens error: {err}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let token_ids: Vec<String> = tokens.iter().map(|token| token.id.clone()).collect();
+    let owners = state
+        .proxy
+        .get_admin_token_owners(&token_ids)
+        .await
+        .map_err(|err| {
+            eprintln!("list unbound token usage owners error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let filtered_tokens: Vec<AuthToken> = tokens
+        .into_iter()
+        .filter(|token| !owners.contains_key(&token.id))
+        .filter(|token| {
+            normalized_query
+                .map(|query| token_usage_matches_query(token, query))
+                .unwrap_or(true)
+        })
+        .collect();
+    let filtered_ids: Vec<String> = filtered_tokens
+        .iter()
+        .map(|token| token.id.clone())
+        .collect();
+
+    let hourly_any_map = state
+        .proxy
+        .token_hourly_any_snapshot(&filtered_ids)
+        .await
+        .map_err(|err| {
+            eprintln!("list unbound token usage hourly-any error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let log_metrics = state
+        .proxy
+        .token_log_metrics_for_tokens(&filtered_ids)
+        .await
+        .map_err(|err| {
+            eprintln!("list unbound token usage log metrics error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let monthly_broken_counts = state
+        .proxy
+        .fetch_monthly_broken_counts_for_tokens(&filtered_ids)
+        .await
+        .map_err(|err| {
+            eprintln!("list unbound token usage monthly broken counts error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let monthly_broken_subjects = state
+        .proxy
+        .list_monthly_broken_subjects_for_tokens(&filtered_ids)
+        .await
+        .map_err(|err| {
+            eprintln!("list unbound token usage monthly broken subjects error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut rows: Vec<AdminUnboundTokenUsageRow> = filtered_tokens
+        .into_iter()
+        .map(|token| {
+            let hourly_any = hourly_any_map.get(&token.id).cloned().unwrap_or_else(|| {
+                state
+                    .proxy
+                    .default_request_rate_verdict(tavily_hikari::RequestRateScope::Token)
+            });
+            let metrics = log_metrics.get(&token.id).cloned().unwrap_or_default();
+            let has_monthly_broken_record = monthly_broken_subjects.contains(&token.id);
+            AdminUnboundTokenUsageRow {
+                last_used_at: metrics.last_activity.or(token.last_used_at),
+                monthly_broken_count: has_monthly_broken_record.then(|| {
+                    monthly_broken_counts
+                        .get(&token.id)
+                        .copied()
+                        .unwrap_or_default()
+                }),
+                monthly_broken_limit: has_monthly_broken_record
+                    .then_some(UNBOUND_TOKEN_MONTHLY_BROKEN_LIMIT_DEFAULT),
+                token,
+                request_rate: hourly_any.request_rate(),
+                hourly_any_used: hourly_any.hourly_used,
+                hourly_any_limit: hourly_any.hourly_limit,
+                daily_success: metrics.daily_success,
+                daily_failure: metrics.daily_failure,
+                monthly_success: metrics.monthly_success,
+                monthly_failure: metrics.monthly_failure,
+            }
+        })
+        .collect();
+
+    rows.sort_by(|left, right| {
+        compare_admin_unbound_token_usage_rows(left, right, q.sort, q.order)
+    });
+
+    let total = rows.len() as i64;
+    let offset = ((page - 1) * per_page) as usize;
+    let items = rows
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .map(build_admin_unbound_token_usage_view)
+        .collect();
+
+    Ok(Json(ListUnboundTokenUsageResponse {
+        items,
+        total,
+        page,
+        per_page,
+    }))
+}
+
+async fn get_user_detail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<AdminUserDetailView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let Some(user) = state
+        .proxy
+        .get_admin_user_identity(&id)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user identity error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let Some(quota_details) = state
+        .proxy
+        .get_admin_user_quota_details(&id)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user quota details error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let summary = state
+        .proxy
+        .user_dashboard_summary(&user.user_id, None)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user dashboard summary error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let api_key_count = state
+        .proxy
+        .list_api_key_binding_counts_for_users(std::slice::from_ref(&user.user_id))
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user api key counts error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .get(&user.user_id)
+        .copied()
+        .unwrap_or_default();
+    let monthly_broken_count = state
+        .proxy
+        .fetch_monthly_broken_counts_for_users(std::slice::from_ref(&user.user_id))
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user monthly broken counts error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .get(&user.user_id)
+        .copied()
+        .unwrap_or_default();
+    let monthly_broken_limit = state
+        .proxy
+        .fetch_account_monthly_broken_limit(&user.user_id)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user monthly broken limit error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let now_ts = state.proxy.backend_time().now_ts();
+    let recent_ip_counts_24h = state
+        .proxy
+        .recent_client_ip_counts_by_user(
+            std::slice::from_ref(&user.user_id),
+            now_ts - 24 * 60 * 60,
+        )
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user recent 24h ip count error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let recent_ip_count_7d = state
+        .proxy
+        .recent_client_ip_counts_by_user(
+            std::slice::from_ref(&user.user_id),
+            now_ts - 7 * 24 * 60 * 60,
+        )
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user recent ip count error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .get(&user.user_id)
+        .copied()
+        .unwrap_or_default();
+    let recent_ip_count_24h = recent_ip_counts_24h
+        .get(&user.user_id)
+        .copied()
+        .unwrap_or_default();
+    let ip_usage = state
+        .proxy
+        .admin_user_ip_usage(&user.user_id, now_ts)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user ip usage error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let tokens = state
+        .proxy
+        .list_user_tokens(&user.user_id)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user tokens error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let mut token_items = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let (monthly_success, daily_success, daily_failure) = state
+            .proxy
+            .token_success_breakdown(&token.id, None)
+            .await
+            .map_err(|err| {
+                eprintln!("get admin user token success breakdown error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        token_items.push(AdminUserTokenSummaryView {
+            token_id: token.id,
+            enabled: token.enabled,
+            note: token.note,
+            created_at: token.created_at,
+            last_used_at: token.last_used_at,
+            total_requests: token.total_requests,
+            daily_success,
+            daily_failure,
+            monthly_success,
+        });
+    }
+    let recharge = state
+        .proxy
+        .linuxdo_credit_recharge_admin_audit(&user.user_id)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user recharge audit error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let entitlement_summary = state
+        .proxy
+        .account_entitlement_summary(&user.user_id)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user entitlement summary error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let entitlement_items = state
+        .proxy
+        .list_account_entitlements(&user.user_id, None, None, None, 60)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user entitlements error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(AdminUserDetailView {
+        user_id: user.user_id,
+        display_name: user.display_name,
+        username: user.username,
+        active: user.active,
+        last_login_at: user.last_login_at,
+        token_count: user.token_count,
+        api_key_count,
+        request_rate: summary.request_rate.clone(),
+        business_calls_1h: AdminBusinessCalls1hSummaryView {
+            success_count: summary.business_calls_1h.success_count,
+            failure_count: summary.business_calls_1h.failure_count,
+            total_count: summary.business_calls_1h.total_count,
+            limit: summary.business_calls_1h.limit,
+            window_minutes: summary.business_calls_1h.window_minutes,
+        },
+        daily_credits_used: summary.daily_credits_used,
+        daily_credits_limit: summary.daily_credits_limit,
+        monthly_credits_used: summary.monthly_credits_used,
+        monthly_credits_limit: summary.monthly_credits_limit,
+        daily_success: summary.daily_success,
+        daily_failure: summary.daily_failure,
+        monthly_success: summary.monthly_success,
+        monthly_failure: summary.monthly_failure,
+        monthly_broken_count,
+        monthly_broken_limit,
+        recent_ip_count_24h,
+        recent_ip_count_7d,
+        recent_ip_addresses_24h: ip_usage.recent_ip_addresses_24h,
+        recent_ip_addresses_7d: ip_usage.recent_ip_addresses_7d,
+        recent_ip_timeline_7d: ip_usage
+            .recent_ip_timeline_7d
+            .into_iter()
+            .map(build_admin_user_ip_timeline_entry_view)
+            .collect(),
+        last_activity: summary.last_activity,
+        tags: quota_details
+            .tags
+            .iter()
+            .map(build_admin_user_tag_binding_view)
+            .collect(),
+        quota_base: build_admin_quota_view(&quota_details.base),
+        effective_quota: build_admin_quota_view(&quota_details.effective),
+        quota_breakdown: quota_details
+            .breakdown
+            .iter()
+            .map(build_admin_quota_breakdown_view)
+            .collect(),
+        recharge: AdminUserRechargeAuditView {
+            current_month_entitlement_credits: recharge.current_month_entitlement_credits,
+            current_month_entitlement_hourly_delta: recharge.current_month_entitlement_hourly_delta,
+            current_month_entitlement_daily_delta: recharge.current_month_entitlement_daily_delta,
+            current_month_entitlement_monthly_delta: recharge.current_month_entitlement_monthly_delta,
+            effective_until_month_start: recharge.effective_until_month_start,
+            orders: recharge
+                .orders
+                .into_iter()
+                .map(build_admin_user_recharge_order_view)
+                .collect(),
+            entitlements: recharge
+                .entitlements
+                .into_iter()
+                .map(build_admin_user_recharge_entitlement_view)
+                .collect(),
+        },
+        entitlements: AdminUserEntitlementsView {
+            current_month_start: entitlement_summary.current_month_start,
+            current_base_delta: build_admin_user_entitlement_delta_view(
+                entitlement_summary.current_base_delta,
+            ),
+            current_month_delta: build_admin_user_entitlement_delta_view(
+                entitlement_summary.current_month_delta,
+            ),
+            current_permanent_delta: build_admin_user_entitlement_delta_view(
+                entitlement_summary.current_permanent_delta,
+            ),
+            items: entitlement_items
+                .into_iter()
+                .map(build_admin_user_entitlement_view)
+                .collect(),
+        },
+        tokens: token_items,
+    }))
+}
+
+async fn list_user_entitlements(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<AdminUserEntitlementsQuery>,
+) -> Result<Json<ListUserEntitlementsResponse>, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let Some(_) = state
+        .proxy
+        .get_admin_user_identity(&id)
+        .await
+        .map_err(|err| admin_proxy_error_response("get admin user identity error", err))?
+    else {
+        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+    };
+    let scope_kind = q
+        .scope_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "all");
+    if let Some(scope_kind) = scope_kind
+        && !matches!(
+            scope_kind,
+            tavily_hikari::ACCOUNT_ENTITLEMENT_SCOPE_BASE
+                | tavily_hikari::ACCOUNT_ENTITLEMENT_SCOPE_MONTH
+                | tavily_hikari::ACCOUNT_ENTITLEMENT_SCOPE_PERMANENT
+        )
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid scopeKind".to_string()));
+    }
+    let items = state
+        .proxy
+        .list_account_entitlements(
+            &id,
+            scope_kind,
+            q.start_month,
+            q.end_month_before,
+            q.limit.unwrap_or(60),
+        )
+        .await
+        .map_err(|err| admin_proxy_error_response("list user entitlements error", err))?
+        .into_iter()
+        .map(build_admin_user_entitlement_view)
+        .collect();
+    Ok(Json(ListUserEntitlementsResponse { items }))
+}
+
+async fn create_user_entitlement(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<CreateUserEntitlementRequest>,
+) -> Result<(StatusCode, Json<AdminUserEntitlementView>), (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    require_full_master_write(state.as_ref()).await?;
+    let Some(_) = state
+        .proxy
+        .get_admin_user_identity(&id)
+        .await
+        .map_err(|err| admin_proxy_error_response("get admin user identity error", err))?
+    else {
+        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+    };
+    let scope_kind = payload.scope_kind.trim();
+    let month_start = match scope_kind {
+        tavily_hikari::ACCOUNT_ENTITLEMENT_SCOPE_BASE => 0,
+        tavily_hikari::ACCOUNT_ENTITLEMENT_SCOPE_MONTH => {
+            let Some(month_start) = payload.month_start else {
+                return Err((StatusCode::BAD_REQUEST, "monthStart is required".to_string()));
+            };
+            let Some(month_start) = canonical_account_entitlement_month_start(month_start) else {
+                return Err((StatusCode::BAD_REQUEST, "invalid monthStart".to_string()));
+            };
+            month_start
+        }
+        tavily_hikari::ACCOUNT_ENTITLEMENT_SCOPE_PERMANENT => 0,
+        _ => return Err((StatusCode::BAD_REQUEST, "invalid scopeKind".to_string())),
+    };
+    let backend_note = payload.backend_note.trim();
+    let frontend_note = payload.frontend_note.trim();
+    if frontend_note.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "frontendNote is required".to_string(),
+        ));
+    }
+    if payload.business_calls_1h_delta == 0
+        && payload.daily_credits_delta == 0
+        && payload.monthly_credits_delta == 0
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "at least one entitlement delta must be non-zero".to_string(),
+        ));
+    }
+    let actor = admin_maintenance_actor(state.as_ref(), &headers, None).await;
+    let created_at = state.proxy.backend_time().now_ts();
+    let created = state
+        .proxy
+        .create_account_entitlement(&tavily_hikari::AccountEntitlementRecord {
+            id: 0,
+            user_id: id,
+            scope_kind: scope_kind.to_string(),
+            month_start,
+            business_calls_1h_delta: payload.business_calls_1h_delta,
+            daily_credits_delta: payload.daily_credits_delta,
+            monthly_credits_delta: payload.monthly_credits_delta,
+            backend_note: backend_note.to_string(),
+            frontend_note: frontend_note.to_string(),
+            source_kind: tavily_hikari::ACCOUNT_ENTITLEMENT_SOURCE_KIND_ADMIN.to_string(),
+            source_id: format!("admin:{created_at}:{}", nanoid!(10)),
+            actor_user_id: actor.actor_user_id,
+            actor_display_name: actor.actor_display_name,
+            created_at,
+        })
+        .await
+        .map_err(|err| admin_proxy_error_response("create user entitlement error", err))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(build_admin_user_entitlement_view(created)),
+    ))
+}
+
+fn canonical_account_entitlement_month_start(month_start: i64) -> Option<i64> {
+    let month_time = Utc.timestamp_opt(month_start, 0).single()?;
+    let local_time = month_time.with_timezone(&Local);
+    let first_day = NaiveDate::from_ymd_opt(local_time.year(), local_time.month(), 1)?;
+    let naive = first_day.and_hms_opt(0, 0, 0)?;
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+            Some(dt.with_timezone(&Utc).timestamp())
+        }
+        chrono::LocalResult::None => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUserUsageSeriesQuery {
+    series: Option<String>,
+}
+
+async fn get_user_usage_series(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<AdminUserUsageSeriesQuery>,
+) -> Result<Json<AdminUserUsageSeriesView>, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    let Some(series_key) = q.series.as_deref() else {
+        return Err((StatusCode::BAD_REQUEST, "series is required".to_string()));
+    };
+    let Some(series) = AdminUserUsageSeriesKind::parse(series_key) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid series".to_string()));
+    };
+    let Some(_) = state
+        .proxy
+        .get_admin_user_identity(&id)
+        .await
+        .map_err(|err| admin_proxy_error_response("get admin user identity error", err))?
+    else {
+        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+    };
+
+    let payload = if series == AdminUserUsageSeriesKind::BusinessCalls1h {
+        let usage = state
+            .proxy
+            .admin_user_business_calls_1h_series(&id)
+            .await
+            .map_err(|err| admin_proxy_error_response("get admin user business usage series error", err))?;
+        AdminUserUsageSeriesView::BusinessCalls1h {
+            limit: usage.limit,
+            points: usage
+                .points
+                .into_iter()
+                .map(|point| AdminUserBusinessCalls1hPointView {
+                    bucket_start: point.bucket_start,
+                    display_bucket_start: point.display_bucket_start,
+                    bars: AdminUserBusinessCalls1hBarsPointView {
+                        success: point.bars.success,
+                        failure: point.bars.failure,
+                    },
+                    pressure: point.pressure,
+                    limit_value: point.limit_value,
+                })
+                .collect(),
+        }
+    } else {
+        let usage = state
+            .proxy
+            .admin_user_usage_series(&id, series)
+            .await
+            .map_err(|err| admin_proxy_error_response("get admin user usage series error", err))?;
+        AdminUserUsageSeriesView::QuotaLike {
+            limit: usage.limit,
+            points: usage
+                .points
+                .into_iter()
+                .map(|point| AdminUserUsageSeriesQuotaPointView {
+                    bucket_start: point.bucket_start,
+                    display_bucket_start: point.display_bucket_start,
+                    value: point.value,
+                    limit_value: point.limit_value,
+                })
+                .collect(),
+        }
+    };
+
+    Ok(Json(payload))
+}
+
+async fn get_analysis_pressure_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AnalysisPressureSnapshot>, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+
+    state
+        .proxy
+        .analysis_pressure_snapshot()
+        .await
+        .map(Json)
+        .map_err(|err| admin_proxy_error_response("get analysis pressure snapshot error", err))
+}
+
+#[axum::debug_handler]
+async fn create_user_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<AuthTokenSecretView>), (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    require_full_master_write(state.as_ref()).await?;
+
+    match state.proxy.create_user_bound_access_token(&id, None).await {
+        Ok(secret) => Ok((
+            StatusCode::CREATED,
+            Json(AuthTokenSecretView {
+                token: secret.token,
+            }),
+        )),
+        Err(ProxyError::Database(sqlx::Error::RowNotFound)) => {
+            Err((StatusCode::NOT_FOUND, "user not found".to_string()))
+        }
+        Err(err) => Err(admin_proxy_error_response(
+            "create admin user token error",
+            err,
+        )),
+    }
+}
+
+async fn delete_user_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, token_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    require_full_master_write(state.as_ref()).await?;
+
+    match state
+        .proxy
+        .delete_user_bound_access_token(&id, &token_id)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(ProxyError::Database(sqlx::Error::RowNotFound)) => Err((
+            StatusCode::NOT_FOUND,
+            "user token binding not found".to_string(),
+        )),
+        Err(err) => Err(admin_proxy_error_response(
+            "delete admin user token error",
+            err,
+        )),
+    }
+}
+
+async fn update_user_broken_key_limit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateUserBrokenKeyLimitRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+    if payload.monthly_broken_limit < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "monthlyBrokenLimit must be a non-negative integer".to_string(),
+        ));
+    }
+    let updated = state
+        .proxy
+        .update_account_monthly_broken_limit(&id, payload.monthly_broken_limit)
+        .await
+        .map_err(|err| admin_proxy_error_response("update user broken key limit error", err))?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_user_monthly_broken_keys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<BrokenKeysPageQuery>,
+) -> Result<Json<PaginatedMonthlyBrokenKeysView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let exists = state
+        .proxy
+        .get_admin_user_identity(&id)
+        .await
+        .map_err(|err| {
+            eprintln!("get admin user identity for broken keys error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    state
+        .proxy
+        .fetch_user_monthly_broken_keys(&id, q.page.unwrap_or(1), q.per_page.unwrap_or(20))
+        .await
+        .map(build_monthly_broken_keys_view)
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("get user monthly broken keys error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+// ----- Access token management handlers -----
+
+#[derive(Debug, Deserialize)]
+struct ListTokensQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+    group: Option<String>,
+    no_group: Option<bool>,
+    q: Option<String>,
+    owner: Option<String>,
+    quota_state: Option<String>,
+    enabled: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListTokensResponse {
+    items: Vec<AuthTokenView>,
+    total: i64,
+    page: i64,
+    per_page: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchTokenIdsRequest {
+    ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchTokenStatusRequest {
+    ids: Vec<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTokenMutationResponse {
+    updated: i64,
+    missing: Vec<String>,
+}
+
+fn normalize_token_ids(ids: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || normalized.iter().any(|existing| existing == id) {
+            continue;
+        }
+        normalized.push(id.to_owned());
+    }
+    normalized
+}
+
+fn parse_token_owner_filter(value: Option<&str>) -> AdminTokenOwnerFilter {
+    match value.map(str::trim) {
+        Some("bound") => AdminTokenOwnerFilter::Bound,
+        Some("unbound") => AdminTokenOwnerFilter::Unbound,
+        _ => AdminTokenOwnerFilter::All,
+    }
+}
+
+fn parse_token_enabled_filter(value: Option<&str>) -> AdminTokenEnabledFilter {
+    match value.map(str::trim) {
+        Some("active") => AdminTokenEnabledFilter::Active,
+        Some("frozen") => AdminTokenEnabledFilter::Frozen,
+        _ => AdminTokenEnabledFilter::All,
+    }
+}
+
+fn parse_token_quota_state(value: Option<&str>) -> Option<String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value @ ("normal" | "hour" | "day" | "month")) => Some(value.to_owned()),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenGroupView {
+    name: String,
+    token_count: i64,
+    latest_created_at: i64,
+}
+
+async fn build_auth_token_views(
+    state: &Arc<AppState>,
+    items: Vec<AuthToken>,
+) -> Result<Vec<AuthTokenView>, ProxyError> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let token_ids: Vec<String> = items.iter().map(|token| token.id.clone()).collect();
+    let owners = state.proxy.get_admin_token_owners(&token_ids).await?;
+    Ok(items
+        .into_iter()
+        .map(|token| {
+            let owner = owners.get(&token.id);
+            AuthTokenView::from_token_and_owner(token, owner)
+        })
+        .collect())
+}
+
+async fn list_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ListTokensQuery>,
+) -> Result<Json<ListTokensResponse>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let page = q.page.unwrap_or(1).max(1);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 200);
+    let group = q
+        .group
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let no_group = q.no_group.unwrap_or(false);
+
+    let filters = AdminTokenListFilters {
+        group,
+        no_group,
+        search: normalize_optional_text(q.q),
+        owner: parse_token_owner_filter(q.owner.as_deref()),
+        enabled: parse_token_enabled_filter(q.enabled.as_deref()),
+        quota_state: parse_token_quota_state(q.quota_state.as_deref()),
+    };
+
+    match state
+        .proxy
+        .list_access_tokens_filtered_paged(page, per_page, filters)
+        .await
+    {
+        Ok((items, total)) => Ok(Json(ListTokensResponse {
+            items: build_auth_token_views(&state, items).await.map_err(|err| {
+                eprintln!("list tokens owner resolution error: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?,
+            total,
+            page,
+            per_page,
+        })),
+        Err(err) => {
+            eprintln!("list tokens error: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[axum::debug_handler]
+async fn list_token_groups(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TokenGroupView>>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    match state.proxy.list_access_tokens().await {
+        Ok(tokens) => {
+            let mut groups: HashMap<String, TokenGroupView> = HashMap::new();
+            for t in tokens {
+                let raw = t.group_name.as_deref().map(str::trim).unwrap_or("");
+                let key = raw.to_owned();
+                let entry = groups.entry(key.clone()).or_insert(TokenGroupView {
+                    name: key.clone(),
+                    token_count: 0,
+                    latest_created_at: t.created_at,
+                });
+                entry.token_count += 1;
+                if t.created_at > entry.latest_created_at {
+                    entry.latest_created_at = t.created_at;
+                }
+            }
+            let mut out: Vec<TokenGroupView> = groups.into_values().collect();
+            out.sort_by(|a, b| {
+                b.latest_created_at
+                    .cmp(&a.latest_created_at)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            Ok(Json(out))
+        }
+        Err(err) => {
+            eprintln!("list token groups error: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[axum::debug_handler]
+async fn create_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<AuthTokenSecretView>), StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    state
+        .proxy
+        .create_access_token(payload.note.as_deref())
+        .await
+        .map(|secret| {
+            (
+                StatusCode::CREATED,
+                Json(AuthTokenSecretView {
+                    token: secret.token,
+                }),
+            )
+        })
+        .map_err(|err| {
+            eprintln!("create token error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn delete_token(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    state
+        .proxy
+        .delete_access_token(&id)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|err| {
+            eprintln!("delete token error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTokenStatus {
+    enabled: bool,
+}
+
+async fn update_token_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateTokenStatus>,
+) -> Result<StatusCode, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    state
+        .proxy
+        .set_access_token_enabled(&id, payload.enabled)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|err| {
+            eprintln!("update token status error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn update_tokens_status_batch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<BatchTokenStatusRequest>,
+) -> Result<Json<BatchTokenMutationResponse>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let ids = normalize_token_ids(payload.ids);
+    if ids.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .proxy
+        .set_access_tokens_enabled(&ids, payload.enabled)
+        .await
+        .map(|result| Json(BatchTokenMutationResponse {
+            updated: result.updated,
+            missing: result.missing,
+        }))
+        .map_err(|err| {
+            eprintln!("batch update token status error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn delete_tokens_batch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<BatchTokenIdsRequest>,
+) -> Result<Json<BatchTokenMutationResponse>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let ids = normalize_token_ids(payload.ids);
+    if ids.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .proxy
+        .delete_access_tokens(&ids)
+        .await
+        .map(|result| Json(BatchTokenMutationResponse {
+            updated: result.updated,
+            missing: result.missing,
+        }))
+        .map_err(|err| {
+            eprintln!("batch delete tokens error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTokenNote {
+    note: String,
+}
+
+async fn update_token_note(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateTokenNote>,
+) -> Result<StatusCode, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    state
+        .proxy
+        .update_access_token_note(&id, payload.note.trim())
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|err| {
+            eprintln!("update token note error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn get_token_secret(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AuthTokenSecretView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    match state.proxy.get_access_token_secret(&id).await {
+        Ok(Some(secret)) => Ok(Json(AuthTokenSecretView {
+            token: secret.token,
+        })),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            eprintln!("get token secret error: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[axum::debug_handler]
+async fn rotate_token_secret(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AuthTokenSecretView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    state
+        .proxy
+        .rotate_access_token_secret(&id)
+        .await
+        .map(|secret| {
+            Json(AuthTokenSecretView {
+                token: secret.token,
+            })
+        })
+        .map_err(|err| {
+            eprintln!("rotate token secret error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchCreateTokenRequest {
+    group: String,
+    count: usize,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchCreateTokenResponse {
+    tokens: Vec<String>,
+}
+
+#[axum::debug_handler]
+async fn create_tokens_batch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<BatchCreateTokenRequest>,
+) -> Result<Json<BatchCreateTokenResponse>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if require_full_master_write(state.as_ref()).await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let group = payload.group.trim();
+    if group.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let count = payload.count.clamp(1, 1000);
+    state
+        .proxy
+        .create_access_tokens_batch(group, count, payload.note.as_deref())
+        .await
+        .map(|secrets| {
+            Json(BatchCreateTokenResponse {
+                tokens: secrets.into_iter().map(|s| s.token).collect(),
+            })
+        })
+        .map_err(|err| {
+            eprintln!("batch create tokens error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}

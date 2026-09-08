@@ -182,6 +182,7 @@ describe('token log request kind helpers', () => {
 
     expect(merged.some((option) => option.key === 'api:search')).toBe(true)
     expect(merged.some((option) => option.key === 'mcp:tools/list')).toBe(true)
+    expect(merged.some((option) => option.key === 'mcp:session-delete-unsupported')).toBe(true)
     expect(merged.find((option) => option.key === 'mcp:third-party-tool')).toEqual({
       key: 'mcp:third-party-tool',
       label: 'MCP | third-party tool',

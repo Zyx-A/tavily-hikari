@@ -2,13 +2,16 @@ async fn fetch_summary(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<SummaryView>, StatusCode> {
+    let is_admin = is_admin_request(state.as_ref(), &headers).await;
     state
         .proxy
         .summary()
         .await
         .map(|mut summary| {
-            if !is_admin_request(state.as_ref(), &headers) {
+            if !is_admin {
+                summary.active_keys += summary.temporary_isolated_keys;
                 summary.quarantined_keys = 0;
+                summary.temporary_isolated_keys = 0;
             }
             Json(summary.into())
         })
@@ -18,29 +21,259 @@ async fn fetch_summary(
         })
 }
 
-#[derive(Debug, Serialize)]
+fn dashboard_hourly_window_anchor(now_ts: i64) -> i64 {
+    const DASHBOARD_HOURLY_WINDOW_BUCKET_SECS: i64 = 5 * 60;
+    now_ts
+        .div_euclid(DASHBOARD_HOURLY_WINDOW_BUCKET_SECS)
+        .saturating_mul(DASHBOARD_HOURLY_WINDOW_BUCKET_SECS)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SummaryQuotaChargeView {
+    local_estimated_credits: i64,
+    upstream_actual_credits: i64,
+    sampled_key_count: i64,
+    stale_key_count: i64,
+    latest_sync_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SummaryWindowView {
     total_requests: i64,
     success_count: i64,
     error_count: i64,
     quota_exhausted_count: i64,
+    valuable_success_count: i64,
+    valuable_failure_count: i64,
+    other_success_count: i64,
+    other_failure_count: i64,
+    unknown_count: i64,
     upstream_exhausted_key_count: i64,
     new_keys: i64,
     new_quarantines: i64,
+    quota_charge: SummaryQuotaChargeView,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SummaryWindowsView {
     today: SummaryWindowView,
     yesterday: SummaryWindowView,
     month: SummaryWindowView,
+    today_start: i64,
+    today_end: i64,
+    today_period_end: i64,
+    yesterday_start: i64,
+    yesterday_end: i64,
+    month_start: i64,
+    month_end: i64,
+    month_period_end: i64,
+    previous_month_start: i64,
+    previous_month_end: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserRankingIdentityView {
+    user_id: String,
+    display_name: Option<String>,
+    username: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserRankingRowView {
+    rank: i64,
+    value: i64,
+    user: UserRankingIdentityView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserRankingWindowView {
+    primary_success_top: Vec<UserRankingRowView>,
+    business_credits_top: Vec<UserRankingRowView>,
+    unique_ip_top: Vec<UserRankingRowView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserRankingsSnapshotView {
+    generated_at: i64,
+    refresh_interval_secs: i64,
+    stale: bool,
+    last24h: UserRankingWindowView,
+    last7d: UserRankingWindowView,
+    last30d: UserRankingWindowView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardHourlyRequestBucketView {
+    bucket_start: i64,
+    secondary_success: i64,
+    primary_success: i64,
+    secondary_failure: i64,
+    primary_failure_429: i64,
+    primary_failure_other: i64,
+    unknown: i64,
+    mcp_non_billable: i64,
+    mcp_billable: i64,
+    api_non_billable: i64,
+    api_billable: i64,
+    local_estimated_credits: i64,
+    upstream_actual_credits: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardHourlyRequestWindowView {
+    bucket_seconds: i64,
+    visible_buckets: i64,
+    retained_buckets: i64,
+    buckets: Vec<DashboardHourlyRequestBucketView>,
+    unverified_bucket_starts: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardMonthSeriesPointView {
+    bucket_start: i64,
+    display_bucket_start: Option<i64>,
+    total: Option<i64>,
+    valuable_success: Option<i64>,
+    valuable_failure: Option<i64>,
+    other_success: Option<i64>,
+    other_failure: Option<i64>,
+    unknown: Option<i64>,
+    upstream_exhausted: Option<i64>,
+    new_keys: Option<i64>,
+    new_quarantines: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardMonthSeriesView {
+    current: Vec<DashboardMonthSeriesPointView>,
+    comparison: Vec<DashboardMonthSeriesPointView>,
+}
+
+impl From<tavily_hikari::DashboardHourlyRequestWindow> for DashboardHourlyRequestWindowView {
+    fn from(window: tavily_hikari::DashboardHourlyRequestWindow) -> Self {
+        Self {
+            bucket_seconds: window.bucket_seconds,
+            visible_buckets: window.visible_buckets,
+            retained_buckets: window.retained_buckets,
+            unverified_bucket_starts: window.unverified_bucket_starts,
+            buckets: window
+                .buckets
+                .into_iter()
+                .map(|bucket| DashboardHourlyRequestBucketView {
+                    bucket_start: bucket.bucket_start,
+                    secondary_success: bucket.secondary_success,
+                    primary_success: bucket.primary_success,
+                    secondary_failure: bucket.secondary_failure,
+                    primary_failure_429: bucket.primary_failure_429,
+                    primary_failure_other: bucket.primary_failure_other,
+                    unknown: bucket.unknown,
+                    mcp_non_billable: bucket.mcp_non_billable,
+                    mcp_billable: bucket.mcp_billable,
+                    api_non_billable: bucket.api_non_billable,
+                    api_billable: bucket.api_billable,
+                    local_estimated_credits: bucket.local_estimated_credits,
+                    upstream_actual_credits: bucket.upstream_actual_credits,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<tavily_hikari::DashboardMonthSeriesPoint> for DashboardMonthSeriesPointView {
+    fn from(point: tavily_hikari::DashboardMonthSeriesPoint) -> Self {
+        Self {
+            bucket_start: point.bucket_start,
+            display_bucket_start: point.display_bucket_start,
+            total: point.total,
+            valuable_success: point.valuable_success,
+            valuable_failure: point.valuable_failure,
+            other_success: point.other_success,
+            other_failure: point.other_failure,
+            unknown: point.unknown,
+            upstream_exhausted: point.upstream_exhausted,
+            new_keys: point.new_keys,
+            new_quarantines: point.new_quarantines,
+        }
+    }
+}
+
+impl From<tavily_hikari::DashboardMonthSeries> for DashboardMonthSeriesView {
+    fn from(series: tavily_hikari::DashboardMonthSeries) -> Self {
+        Self {
+            current: series.current.into_iter().map(Into::into).collect(),
+            comparison: series.comparison.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+fn build_user_ranking_row_view(
+    row: tavily_hikari::UserRankingRow,
+    cfg: &LinuxDoOAuthOptions,
+) -> UserRankingRowView {
+    UserRankingRowView {
+        rank: row.rank,
+        value: row.value,
+        user: UserRankingIdentityView {
+            user_id: row.user.user_id,
+            display_name: row.user.display_name,
+            username: row.user.username,
+            avatar_url: resolve_linuxdo_avatar_url(cfg, row.user.avatar_template.as_deref()),
+        },
+    }
+}
+
+fn build_user_ranking_window_view(
+    window: tavily_hikari::UserRankingWindow,
+    cfg: &LinuxDoOAuthOptions,
+) -> UserRankingWindowView {
+    UserRankingWindowView {
+        primary_success_top: window
+            .primary_success_top
+            .into_iter()
+            .map(|row| build_user_ranking_row_view(row, cfg))
+            .collect(),
+        business_credits_top: window
+            .business_credits_top
+            .into_iter()
+            .map(|row| build_user_ranking_row_view(row, cfg))
+            .collect(),
+        unique_ip_top: window
+            .unique_ip_top
+            .into_iter()
+            .map(|row| build_user_ranking_row_view(row, cfg))
+            .collect(),
+    }
+}
+
+fn build_user_rankings_snapshot_view(
+    snapshot: tavily_hikari::UserRankingsSnapshot,
+    stale: bool,
+    cfg: &LinuxDoOAuthOptions,
+) -> UserRankingsSnapshotView {
+    UserRankingsSnapshotView {
+        generated_at: if stale { 0 } else { snapshot.generated_at },
+        refresh_interval_secs: snapshot.refresh_interval_secs,
+        stale,
+        last24h: build_user_ranking_window_view(snapshot.last24h, cfg),
+        last7d: build_user_ranking_window_view(snapshot.last7d, cfg),
+        last30d: build_user_ranking_window_view(snapshot.last30d, cfg),
+    }
 }
 
 async fn fetch_summary_windows(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<SummaryWindowsView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -48,30 +281,83 @@ async fn fetch_summary_windows(
         .proxy
         .summary_windows()
         .await
-        .map(|summary| {
-            let tavily_hikari::SummaryWindows {
-                today,
-                yesterday,
-                month,
-            } = summary;
-            Json(SummaryWindowsView {
-                today: SummaryWindowView::from(today),
-                yesterday: SummaryWindowView::from(yesterday),
-                month: SummaryWindowView::from(month),
-            })
-        })
+        .map(|summary| Json(SummaryWindowsView::from(summary)))
         .map_err(|err| {
             eprintln!("summary windows error: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
 
-async fn get_public_metrics(
+async fn get_user_rankings(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<PublicMetricsView>, StatusCode> {
+    headers: HeaderMap,
+) -> Result<Json<UserRankingsSnapshotView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     state
         .proxy
-        .success_breakdown()
+        .user_rankings_snapshot_with_stale_flag()
+        .await
+        .map(|(snapshot, stale)| Json(build_user_rankings_snapshot_view(snapshot, stale, &state.linuxdo_oauth)))
+        .map_err(|err| {
+            eprintln!("user rankings error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn sse_user_rankings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, axum::http::Error>>>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let state = state.clone();
+
+    let stream = stream! {
+        loop {
+            match state.proxy.user_rankings_snapshot_with_stale_flag().await {
+                Ok((snapshot, stale)) => {
+                    let view =
+                        build_user_rankings_snapshot_view(snapshot, stale, &state.linuxdo_oauth);
+                    match serde_json::to_string(&view) {
+                        Ok(json) => yield Ok(Event::default().event("snapshot").data(json)),
+                        Err(_) => yield Ok(Event::default().event("degraded").data("{}")),
+                    }
+                }
+                Err(_) => yield Ok(Event::default().event("degraded").data("{}")),
+            }
+
+            state.proxy.backend_time().sleep(Duration::from_secs(10)).await;
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("")))
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicTodayWindowQuery {
+    today_start: Option<String>,
+    today_end: Option<String>,
+}
+
+fn parse_public_today_window_query(
+    query: &PublicTodayWindowQuery,
+) -> Result<Option<tavily_hikari::TimeRangeUtc>, (StatusCode, String)> {
+    tavily_hikari::parse_explicit_today_window(query.today_start.as_deref(), query.today_end.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn get_public_metrics(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PublicTodayWindowQuery>,
+) -> Result<Json<PublicMetricsView>, (StatusCode, String)> {
+    let daily_window = parse_public_today_window_query(&query)?;
+    state
+        .proxy
+        .success_breakdown(daily_window)
         .await
         .map(|metrics| {
             Json(PublicMetricsView {
@@ -81,7 +367,10 @@ async fn get_public_metrics(
         })
         .map_err(|err| {
             eprintln!("public metrics error: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load public metrics".to_string(),
+            )
         })
 }
 
@@ -92,9 +381,56 @@ impl From<tavily_hikari::SummaryWindowMetrics> for SummaryWindowView {
             success_count: summary.success_count,
             error_count: summary.error_count,
             quota_exhausted_count: summary.quota_exhausted_count,
+            valuable_success_count: summary.valuable_success_count,
+            valuable_failure_count: summary.valuable_failure_count,
+            other_success_count: summary.other_success_count,
+            other_failure_count: summary.other_failure_count,
+            unknown_count: summary.unknown_count,
             upstream_exhausted_key_count: summary.upstream_exhausted_key_count,
             new_keys: summary.new_keys,
             new_quarantines: summary.new_quarantines,
+            quota_charge: SummaryQuotaChargeView {
+                local_estimated_credits: summary.quota_charge.local_estimated_credits,
+                upstream_actual_credits: summary.quota_charge.upstream_actual_credits,
+                sampled_key_count: summary.quota_charge.sampled_key_count,
+                stale_key_count: summary.quota_charge.stale_key_count,
+                latest_sync_at: summary.quota_charge.latest_sync_at,
+            },
+        }
+    }
+}
+
+impl From<tavily_hikari::SummaryWindows> for SummaryWindowsView {
+    fn from(summary: tavily_hikari::SummaryWindows) -> Self {
+        let tavily_hikari::SummaryWindows {
+            today,
+            yesterday,
+            month,
+            today_start,
+            today_end,
+            today_period_end,
+            yesterday_start,
+            yesterday_end,
+            month_start,
+            month_end,
+            month_period_end,
+            previous_month_start,
+            previous_month_end,
+        } = summary;
+        Self {
+            today: SummaryWindowView::from(today),
+            yesterday: SummaryWindowView::from(yesterday),
+            month: SummaryWindowView::from(month),
+            today_start,
+            today_end,
+            today_period_end,
+            yesterday_start,
+            yesterday_end,
+            month_start,
+            month_end,
+            month_period_end,
+            previous_month_start,
+            previous_month_end,
         }
     }
 }
@@ -117,20 +453,31 @@ struct TokenMetricsView {
 #[derive(Deserialize)]
 struct TokenQuery {
     token: String,
+    today_start: Option<String>,
+    today_end: Option<String>,
 }
 
 async fn get_token_metrics_public(
     State(state): State<Arc<AppState>>,
     Query(q): Query<TokenQuery>,
-) -> Result<Json<TokenMetricsView>, StatusCode> {
+) -> Result<Json<TokenMetricsView>, (StatusCode, String)> {
+    let daily_window = parse_public_today_window_query(&PublicTodayWindowQuery {
+        today_start: q.today_start.clone(),
+        today_end: q.today_end.clone(),
+    })?;
     // Validate token first
     if !state
         .proxy
         .validate_access_token(&q.token)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to validate token".to_string(),
+            )
+        })?
     {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
     }
 
     // Extract id
@@ -138,19 +485,29 @@ async fn get_token_metrics_public(
         .token
         .strip_prefix("th-")
         .and_then(|rest| rest.split_once('-').map(|(id, _)| id))
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid token".to_string()))?;
     let (monthly_success, daily_success, daily_failure) = state
         .proxy
-        .token_success_breakdown(token_id)
+        .token_success_breakdown(token_id, daily_window)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load token metrics".to_string(),
+            )
+        })?;
 
     // Use the same quota snapshot logic as the admin views so numbers stay consistent.
     let quota_verdict = state
         .proxy
         .token_quota_snapshot(token_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load token quota".to_string(),
+            )
+        })?;
     let (
         quota_hourly_used,
         quota_hourly_limit,
@@ -194,6 +551,8 @@ async fn get_token_metrics_public(
 #[derive(Debug, Deserialize)]
 struct TavilyUsageQuery {
     token_id: Option<String>,
+    today_start: Option<String>,
+    today_end: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +569,13 @@ async fn tavily_http_usage(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(q): Query<TavilyUsageQuery>,
-) -> Result<Json<TavilyUsageView>, StatusCode> {
+) -> Result<Json<TavilyUsageView>, (StatusCode, String)> {
+    ensure_ha_allows_basic_business_status(&state, "/api/tavily/usage").await?;
+
+    let daily_window = parse_public_today_window_query(&PublicTodayWindowQuery {
+        today_start: q.today_start.clone(),
+        today_end: q.today_end.clone(),
+    })?;
     // Prefer Authorization: Bearer th-<id>-<secret>.
     let auth_bearer = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -234,11 +599,11 @@ async fn tavily_http_usage(
                 .as_deref()
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
-                .ok_or(StatusCode::UNAUTHORIZED)?;
+                .ok_or_else(|| (StatusCode::UNAUTHORIZED, "unauthorized".to_string()))?;
             format!("th-{id}-dev")
         }
         // Production: usage endpoint always requires an access token.
-        (false, None) => return Err(StatusCode::UNAUTHORIZED),
+        (false, None) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
     };
 
     // Validate token when not in dev-open-admin mode.
@@ -247,9 +612,14 @@ async fn tavily_http_usage(
             .proxy
             .validate_access_token(&token_str)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to validate token".to_string(),
+                )
+            })?;
         if !valid {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
         }
     }
 
@@ -260,34 +630,44 @@ async fn tavily_http_usage(
     let token_id = if let Some(explicit) = q.token_id.as_ref() {
         let trimmed = explicit.trim();
         if trimmed.is_empty() {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err((StatusCode::BAD_REQUEST, "invalid token_id".to_string()));
         }
         if !using_dev_open_admin_fallback
             && token_id_from_token
                 .as_ref()
                 .is_some_and(|from_token| trimmed != from_token)
         {
-            return Err(StatusCode::FORBIDDEN);
+            return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
         }
         trimmed.to_string()
     } else {
-        token_id_from_token.ok_or(StatusCode::BAD_REQUEST)?
+        token_id_from_token.ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid token".to_string()))?
     };
 
     let (monthly_success, daily_success, daily_failure) = state
         .proxy
-        .token_success_breakdown(&token_id)
+        .token_success_breakdown(&token_id, daily_window)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load token usage".to_string(),
+            )
+        })?;
 
-    let now = Utc::now();
+    let now = state.proxy.backend_time().now_utc();
     let month_start = start_of_month_dt(now).timestamp();
     let now_ts = now.timestamp();
     let summary = state
         .proxy
         .token_summary_since(&token_id, month_start, Some(now_ts))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load token summary".to_string(),
+            )
+        })?;
 
     Ok(Json(TavilyUsageView {
         token_id,
@@ -326,6 +706,8 @@ impl From<TokenLogRecord> for PublicTokenLogView {
 
 impl PublicTokenLogView {
     fn from_record(r: TokenLogRecord, language: UiLanguage) -> Self {
+        let result_status =
+            display_result_status_for_request_kind(&r.request_kind_key, &r.result_status);
         Self {
             id: r.id,
             method: r.method,
@@ -333,7 +715,7 @@ impl PublicTokenLogView {
             query: r.query,
             http_status: r.http_status,
             mcp_status: r.mcp_status,
-            result_status: r.result_status,
+            result_status,
             error_message: append_solution_guidance_to_error(
                 r.error_message,
                 r.failure_kind.as_deref(),
@@ -448,85 +830,476 @@ async fn get_public_logs(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-#[derive(Debug, Serialize)]
+const DASHBOARD_EXHAUSTED_KEYS_LIMIT: usize = 5;
+const DASHBOARD_RECENT_LOGS_LIMIT: usize = 5;
+const DASHBOARD_TREND_SOURCE_LIMIT: usize = 64;
+const DASHBOARD_TREND_WINDOW_SIZE: usize = 8;
+const DASHBOARD_RECENT_JOBS_LIMIT: usize = 5;
+const DASHBOARD_OVERVIEW_LOADING_STALE_AFTER: Duration = Duration::from_secs(30);
+const DASHBOARD_OVERVIEW_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const DASHBOARD_OVERVIEW_SAFETY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+const DASHBOARD_OVERVIEW_COLD_BUILD_BUDGET: Duration = Duration::from_secs(1);
+// Startup happens before the listener accepts traffic, so it can safely wait longer
+// for the same singleflight than an externally visible cold request may wait.
+const DASHBOARD_OVERVIEW_STARTUP_PREWARM_BUDGET: Duration = Duration::from_secs(5);
+const DASHBOARD_SSE_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Serialize)]
+struct DashboardTrendView {
+    request: Vec<i64>,
+    error: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DashboardSnapshot {
+struct DashboardOverviewPayload {
     summary: SummaryView,
     #[serde(rename = "summaryWindows")]
     summary_windows: SummaryWindowsView,
+    #[serde(rename = "hourlyRequestWindow")]
+    hourly_request_window: DashboardHourlyRequestWindowView,
+    #[serde(rename = "rollupIntegrity")]
+    rollup_integrity: tavily_hikari::DashboardRollupIntegrityStatus,
+    #[serde(rename = "monthSeries")]
+    month_series: DashboardMonthSeriesView,
     #[serde(rename = "siteStatus")]
     site_status: DashboardSiteStatusView,
     #[serde(rename = "forwardProxy")]
     forward_proxy: DashboardForwardProxyView,
-    keys: Vec<ApiKeyView>,
-    logs: Vec<RequestLogView>,
+    trend: DashboardTrendView,
+    #[serde(rename = "exhaustedKeys")]
+    exhausted_keys: Vec<ApiKeyView>,
+    #[serde(rename = "recentLogs")]
+    recent_logs: Vec<RequestLogView>,
+    #[serde(rename = "recentJobs")]
+    recent_jobs: Vec<JobLogView>,
+    #[serde(rename = "recentAlerts")]
+    recent_alerts: DashboardRecentAlertsView,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardOverviewSnapshot {
+    payload: DashboardOverviewPayload,
+    http_json: Bytes,
+    sse_snapshot_frame: Bytes,
+    freshness: Arc<DashboardOverviewFreshness>,
+}
+
+struct DashboardRecentAlertsSnapshotFields {
+    view: DashboardRecentAlertsView,
+    token: [i64; 4],
+    total_events: i64,
+    grouped_count: i64,
+    counts: Vec<(String, i64)>,
+    top_groups: Vec<(String, i64, i64)>,
+}
+
+impl DashboardRecentAlertsSnapshotFields {
+    fn from_summary(summary: tavily_hikari::RecentAlertsSummary, token: [i64; 4]) -> Self {
+        let counts = summary
+            .counts_by_type
+            .iter()
+            .map(|item| (item.alert_type.clone(), item.count))
+            .collect();
+        let top_groups = summary
+            .top_groups
+            .iter()
+            .map(|group| (group.id.clone(), group.count, group.last_seen))
+            .collect();
+        Self {
+            total_events: summary.total_events,
+            grouped_count: summary.grouped_count,
+            view: DashboardRecentAlertsView::from(summary),
+            token,
+            counts,
+            top_groups,
+        }
+    }
+
+    fn from_last_good(snapshot: &DashboardOverviewSnapshot) -> Self {
+        let freshness = snapshot.freshness.as_ref();
+        Self {
+            view: snapshot.payload.recent_alerts.clone(),
+            token: freshness.recent_alerts_token,
+            total_events: freshness.recent_alerts_total_events,
+            grouped_count: freshness.recent_alerts_grouped_count,
+            counts: freshness.recent_alerts_counts.clone(),
+            top_groups: freshness.recent_alerts_top_groups.clone(),
+        }
+    }
+}
+
+struct DashboardOverviewLoadGuard {
+    state: Arc<Mutex<DashboardOverviewCacheState>>,
+    generation: u64,
+    armed: bool,
+}
+
+impl DashboardOverviewLoadGuard {
+    fn new(state: Arc<Mutex<DashboardOverviewCacheState>>, generation: u64) -> Self {
+        Self {
+            state,
+            generation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DashboardOverviewLoadGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let state = self.state.clone();
+        let generation = self.generation;
+        tokio::spawn(async move {
+            let mut cache = state.lock().await;
+            if cache.loading && cache.loading_generation == generation {
+                cache.loading = false;
+                cache.loading_started_at = None;
+                cache.notify.notify_waiters();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+async fn reset_dashboard_overview_build_count(state: &Arc<AppState>) {
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let mut cache = cache_handle.lock().await;
+    cache.build_count = 0;
+    cache.freshness_probe_count = 0;
+    cache.built_request_stats_generation = None;
+    cache.alert_projection_generation = 0;
+    cache.built_alert_projection_generation = None;
+    cache.last_refresh_requested_at = None;
+    cache.last_freshness_probe_at = None;
+}
+
+#[cfg(test)]
+async fn dashboard_overview_build_count(state: &Arc<AppState>) -> usize {
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let cache = cache_handle.lock().await;
+    cache.build_count
+}
+
+#[cfg(test)]
+async fn dashboard_overview_freshness_probe_count(state: &Arc<AppState>) -> usize {
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let cache = cache_handle.lock().await;
+    cache.freshness_probe_count
+}
+
+#[cfg(test)]
+async fn expire_dashboard_overview_freshness_probe(state: &Arc<AppState>) {
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let mut cache = cache_handle.lock().await;
+    cache.last_freshness_probe_at = Some(
+        tokio::time::Instant::now()
+            .checked_sub(DASHBOARD_OVERVIEW_SAFETY_PROBE_INTERVAL)
+            .expect("dashboard refresh interval fits in the monotonic clock"),
+    );
+}
+
+pub(crate) async fn mark_dashboard_overview_alert_projection_dirty(state: &AppState) {
+    let cache_handle = dashboard_overview_cache_for_state(state);
+    let mut cache = cache_handle.lock().await;
+    cache.alert_projection_generation = cache.alert_projection_generation.wrapping_add(1);
+    cache.last_freshness_probe_at = None;
+    // A completed canonical warm is allowed to rate-limit retries, but a new
+    // projection generation must be eligible for one fresh, fenced publish.
+    cache.admin_alerts_prewarm_not_before = None;
+}
+
+fn acknowledge_dashboard_alert_projection_generation(
+    cache: &mut DashboardOverviewCacheState,
+    expected_generation: u64,
+) {
+    if cache.alert_projection_generation == expected_generation {
+        cache.built_alert_projection_generation = Some(expected_generation);
+    }
+}
+
+fn acknowledge_dashboard_request_stats_generation(
+    cache: &mut DashboardOverviewCacheState,
+    expected_generation: Option<u64>,
+    current_generation: Option<u64>,
+) {
+    if expected_generation == current_generation {
+        cache.built_request_stats_generation = current_generation;
+    }
+}
+
+fn stale_dashboard_recent_alerts_summary(
+    window_hours: i64,
+    reason: &'static str,
+) -> tavily_hikari::RecentAlertsSummary {
+    tavily_hikari::RecentAlertsSummary {
+        window_hours,
+        coverage: "stale".to_string(),
+        stale: true,
+        error: Some(reason.to_string()),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_dashboard_overview_refresh(
+    state: &Arc<AppState>,
+) -> Arc<DashboardOverviewSnapshot> {
+    let waiter = {
+        let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+        let cache = cache_handle.lock().await;
+        cache.loading.then(|| cache.notify.clone().notified_owned())
+    };
+    if let Some(waiter) = waiter {
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("dashboard background refresh should finish");
+    }
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let cache = cache_handle.lock().await;
+    cache
+        .cached
+        .as_ref()
+        .expect("refreshed dashboard snapshot")
+        .snapshot
+        .clone()
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardSnapshot<'a> {
+    #[serde(flatten)]
+    overview: &'a DashboardOverviewPayload,
+    keys: &'a [ApiKeyView],
+    logs: &'a [RequestLogView],
+}
+
+impl DashboardOverviewFreshness {
+    fn differs_only_by_quota_charge(&self, next: &Self) -> bool {
+        if self.dashboard_quota_charge_token[..3] == next.dashboard_quota_charge_token[..3] {
+            return false;
+        }
+        let mut normalized_self = self.clone();
+        let mut normalized_next = next.clone();
+        for freshness in [&mut normalized_self, &mut normalized_next] {
+            freshness.dashboard_quota_charge_token = [0; 5];
+            freshness.dashboard_stale_key_count = 0;
+            freshness.latest_quota_sync_sample_at = None;
+            freshness.summary[8..].fill(0);
+        }
+        normalized_self == normalized_next
+    }
+}
+
+fn patch_dashboard_quota_charge_view(
+    target: &mut SummaryQuotaChargeView,
+    source: &tavily_hikari::SummaryQuotaCharge,
+) {
+    target.upstream_actual_credits = source.upstream_actual_credits;
+    target.sampled_key_count = source.sampled_key_count;
+    target.stale_key_count = source.stale_key_count;
+    target.latest_sync_at = source.latest_sync_at;
+}
+
+fn patch_dashboard_overview_quota_charge(
+    last_good: &DashboardOverviewSnapshot,
+    quota_charge: tavily_hikari::DashboardQuotaChargeSnapshot,
+    mut freshness: DashboardOverviewFreshness,
+    token: [i64; 5],
+) -> Result<DashboardOverviewSnapshot, ProxyError> {
+    let mut payload = last_good.payload.clone();
+    patch_dashboard_quota_charge_view(&mut payload.summary_windows.today.quota_charge, &quota_charge.today);
+    patch_dashboard_quota_charge_view(
+        &mut payload.summary_windows.yesterday.quota_charge,
+        &quota_charge.yesterday,
+    );
+    patch_dashboard_quota_charge_view(&mut payload.summary_windows.month.quota_charge, &quota_charge.month);
+    payload.summary.total_quota_limit = freshness.summary[8];
+    payload.summary.total_quota_remaining = freshness.summary[9];
+    payload.site_status.total_quota_limit = freshness.summary[8];
+    payload.site_status.remaining_quota = freshness.summary[9];
+
+    freshness.dashboard_quota_charge_token = token;
+    freshness.latest_quota_sync_sample_at = (token[0] != 0).then_some(token[1]);
+    let http_json = serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::Other(format!("serialize dashboard quota patch: {error}")))?;
+    let sse_snapshot = DashboardSnapshot {
+        keys: &payload.exhausted_keys,
+        logs: &payload.recent_logs,
+        overview: &payload,
+    };
+    let sse_json = serde_json::to_vec(&sse_snapshot)
+        .map_err(|error| ProxyError::Other(format!("serialize dashboard quota patch SSE: {error}")))?;
+    let mut sse_snapshot_frame = Vec::with_capacity(sse_json.len().saturating_add(24));
+    sse_snapshot_frame.extend_from_slice(b"event: snapshot\ndata: ");
+    sse_snapshot_frame.extend_from_slice(&sse_json);
+    sse_snapshot_frame.extend_from_slice(b"\n\n");
+
+    Ok(DashboardOverviewSnapshot {
+        payload,
+        http_json,
+        sse_snapshot_frame: Bytes::from(sse_snapshot_frame),
+        freshness: Arc::new(freshness),
+    })
+}
+
+fn build_dashboard_trend(logs: &[RequestLogView]) -> DashboardTrendView {
+    let mut sorted: Vec<&RequestLogView> = logs
+        .iter()
+        .filter(|log| log.created_at >= 0)
+        .collect();
+    sorted.sort_by_key(|log| log.created_at);
+
+    let mut request = vec![0_i64; DASHBOARD_TREND_WINDOW_SIZE];
+    let mut error = vec![0_i64; DASHBOARD_TREND_WINDOW_SIZE];
+
+    let Some(first) = sorted.first() else {
+        return DashboardTrendView { request, error };
+    };
+    let Some(last) = sorted.last() else {
+        return DashboardTrendView { request, error };
+    };
+
+    let min_time = first.created_at;
+    let max_time = last.created_at;
+    let span = (max_time - min_time).max(0) + 1;
+
+    for log in sorted {
+        let offset = (log.created_at - min_time).max(0);
+        let index = (((offset as u128) * (DASHBOARD_TREND_WINDOW_SIZE as u128)) / (span as u128))
+            .min((DASHBOARD_TREND_WINDOW_SIZE - 1) as u128) as usize;
+        request[index] += 1;
+        if log.result_status == "error" || log.result_status == "quota_exhausted" {
+            error[index] += 1;
+        }
+    }
+
+    DashboardTrendView { request, error }
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DashboardSiteStatusView {
     remaining_quota: i64,
     total_quota_limit: i64,
     active_keys: i64,
     quarantined_keys: i64,
+    temporary_isolated_keys: i64,
     exhausted_keys: i64,
     available_proxy_nodes: Option<i64>,
     total_proxy_nodes: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DashboardForwardProxyView {
     available_nodes: Option<i64>,
     total_nodes: Option<i64>,
 }
 
+async fn get_dashboard_overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    load_dashboard_overview_snapshot(&state)
+        .await
+        .map(|snapshot| {
+            tavily_hikari::emit_low_memory_protection_decision(
+                "admin_read",
+                tavily_hikari::PerfLogScope {
+                    route: Some("/api/dashboard/overview"),
+                    scope: Some("dashboard"),
+                    degraded: Some("full"),
+                    ..Default::default()
+                },
+            );
+            Response::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(snapshot.http_json.clone()))
+                .expect("static dashboard response is valid")
+        })
+        .map_err(|err| {
+            eprintln!("dashboard overview error: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 async fn sse_dashboard(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, axum::http::Error>>>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+) -> Result<Response<Body>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let state = state.clone();
 
     let stream = stream! {
+        let _dashboard_sse_subscription = state.proxy.subscribe_dashboard_sse();
         let mut last_sig: Option<SummarySig> = None;
         let mut last_log_id: Option<i64> = None;
+        let mut last_snapshot_at: Option<tokio::time::Instant> = None;
 
         loop {
+            // A rolling restart has no last-good overview yet. Let the one
+            // startup singleflight loader own its bounded SQLite reads; every
+            // SSE connection running a freshness probe here would otherwise
+            // consume the three-connection pool before the first snapshot is
+            // available.
+            if dashboard_overview_snapshot_is_loading(&state).await {
+                yield Ok(Bytes::from_static(b"event: degraded\ndata: {}\n\n"));
+                state.proxy.backend_time().sleep(Duration::from_secs(2)).await;
+                continue;
+            }
             match compute_signatures(&state).await {
                 Ok((sig, latest_id)) => {
-                    if last_sig.is_none() || sig != last_sig || latest_id != last_log_id {
-                        if let Some(event) = build_snapshot_event(&state).await {
-                            yield Ok(event);
-                            last_sig = sig;
-                            last_log_id = latest_id;
+                    let snapshot_due = last_snapshot_at.is_none_or(|emitted_at| {
+                        emitted_at.elapsed() >= DASHBOARD_SSE_SNAPSHOT_MIN_INTERVAL
+                    });
+                    if snapshot_due && (last_sig.is_none() || sig != last_sig || latest_id != last_log_id) {
+                        if let Some((frame, emitted_sig)) = build_snapshot_frame(&state).await {
+                            yield Ok::<Bytes, std::convert::Infallible>(frame);
+                            last_log_id = emitted_sig.freshness.latest_request_log_id;
+                            last_sig = Some(emitted_sig);
+                            last_snapshot_at = Some(tokio::time::Instant::now());
                         } else {
-                            let degraded = Event::default().event("degraded").data("{}");
-                            yield Ok(degraded);
+                            yield Ok(Bytes::from_static(b"event: degraded\ndata: {}\n\n"));
                         }
                     } else {
-                        let keep = Event::default().event("ping").data("{}");
-                        yield Ok(keep);
+                        yield Ok(Bytes::from_static(b"event: ping\ndata: {}\n\n"));
                     }
                 }
                 Err(_e) => {
-                    let degraded = Event::default().event("degraded").data("{}");
-                    yield Ok(degraded);
+                    yield Ok(Bytes::from_static(b"event: degraded\ndata: {}\n\n"));
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            state.proxy.backend_time().sleep(Duration::from_secs(2)).await;
         }
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("")))
+    Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize)]
 struct PublicEventsQuery {
     token: Option<String>,
+    today_start: Option<String>,
+    today_end: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -539,21 +1312,29 @@ struct PublicMetricsPayload {
 async fn sse_public(
     State(state): State<Arc<AppState>>,
     Query(q): Query<PublicEventsQuery>,
-) -> Result<Sse<impl Stream<Item = Result<Event, axum::http::Error>>>, StatusCode> {
+) -> Result<Sse<impl Stream<Item = Result<Event, axum::http::Error>>>, (StatusCode, String)> {
     let state = state.clone();
     let token_param = q.token.clone();
+    let daily_window = parse_public_today_window_query(&PublicTodayWindowQuery {
+        today_start: q.today_start.clone(),
+        today_end: q.today_end.clone(),
+    })?;
 
     let stream = stream! {
         type TokenSig = (i64, i64, i64, i64, i64, i64, i64, i64, i64);
         type PublicSig = (i64, i64, Option<TokenSig>);
-        async fn compute(state: &Arc<AppState>, token_param: &Option<String>) -> Option<(PublicMetricsPayload, PublicSig)> {
-            let m = state.proxy.success_breakdown().await.ok()?;
+        async fn compute(
+            state: &Arc<AppState>,
+            token_param: &Option<String>,
+            daily_window: Option<tavily_hikari::TimeRangeUtc>,
+        ) -> Option<(PublicMetricsPayload, PublicSig)> {
+            let m = state.proxy.success_breakdown(daily_window).await.ok()?;
             let public = PublicMetricsView { monthly_success: m.monthly_success, daily_success: m.daily_success };
             let token_sig: Option<TokenSig> = if let Some(token) = token_param.as_ref() {
                 let valid = state.proxy.validate_access_token(token).await.ok()?;
                 if !valid { None } else {
                     let id = token.strip_prefix("th-").and_then(|r| r.split_once('-').map(|(id, _)| id))?;
-                    let (ms, ds, df) = state.proxy.token_success_breakdown(id).await.ok()?;
+                    let (ms, ds, df) = state.proxy.token_success_breakdown(id, daily_window).await.ok()?;
                     let quota_verdict = state.proxy.token_quota_snapshot(id).await.ok()?;
                     let (
                         quota_hourly_used,
@@ -623,13 +1404,13 @@ async fn sse_public(
         }
 
         let mut last_sig: Option<PublicSig> = None;
-        if let Some((payload, sig)) = compute(&state, &token_param).await {
+        if let Some((payload, sig)) = compute(&state, &token_param, daily_window).await {
             let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
             yield Ok(Event::default().event("metrics").data(json));
             last_sig = Some(sig);
         }
         loop {
-            if let Some((payload, sig)) = compute(&state, &token_param).await {
+            if let Some((payload, sig)) = compute(&state, &token_param, daily_window).await {
                 if last_sig != Some(sig) {
                     let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
                     yield Ok(Event::default().event("metrics").data(json));
@@ -638,74 +1419,394 @@ async fn sse_public(
                     yield Ok(Event::default().event("ping").data("{}"));
                 }
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            state.proxy.backend_time().sleep(Duration::from_secs(2)).await;
         }
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("")))
 }
 
-async fn build_snapshot_event(state: &Arc<AppState>) -> Option<Event> {
-    let summary = state.proxy.summary().await.ok()?;
-    let tavily_hikari::SummaryWindows {
-        today,
-        yesterday,
-        month,
-    } = state.proxy.summary_windows().await.ok()?;
-    let forward_proxy = state.proxy.get_forward_proxy_dashboard_summary().await.ok()?;
-    let keys = state.proxy.list_api_key_metrics().await.ok()?;
-    let logs = state
-        .proxy
-        .recent_request_logs(DEFAULT_LOG_LIMIT)
-        .await
-        .ok()?;
+async fn build_dashboard_overview_payload(
+    state: &Arc<AppState>,
+    last_good: Option<&DashboardOverviewSnapshot>,
+    quota_charge_token: Option<[i64; 5]>,
+) -> Result<DashboardOverviewSnapshot, ProxyError> {
+    #[cfg(test)]
+    {
+        let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+        let mut cache = cache_handle.lock().await;
+        cache.build_count = cache.build_count.saturating_add(1);
+    }
 
-    let payload = DashboardSnapshot {
-        summary: summary.clone().into(),
-        summary_windows: SummaryWindowsView {
-            today: SummaryWindowView::from(today),
-            yesterday: SummaryWindowView::from(yesterday),
-            month: SummaryWindowView::from(month),
-        },
-        site_status: DashboardSiteStatusView {
-            remaining_quota: summary.total_quota_remaining,
-            total_quota_limit: summary.total_quota_limit,
-            active_keys: summary.active_keys,
-            quarantined_keys: summary.quarantined_keys,
-            exhausted_keys: summary.exhausted_keys,
-            available_proxy_nodes: Some(forward_proxy.available_nodes),
-            total_proxy_nodes: Some(forward_proxy.total_nodes),
-        },
-        forward_proxy: DashboardForwardProxyView {
-            available_nodes: Some(forward_proxy.available_nodes),
-            total_nodes: Some(forward_proxy.total_nodes),
-        },
-        keys: keys.into_iter().map(ApiKeyView::from_list).collect(),
-        logs: logs.into_iter().map(RequestLogView::from).collect(),
+    let now_local = state.proxy.backend_time().local_now();
+    let now_ts = now_local.with_timezone(&Utc).timestamp();
+    let (
+        summary_windows,
+        summary,
+        hourly_request_window,
+        dashboard_rollup_signature,
+        pending_dashboard_rollup_signature,
+        dashboard_stale_key_count,
+        dashboard_quota_charge_token,
+    ) = state
+        .proxy
+        .dashboard_overview_read_components_with_quota_token_at(now_local, quota_charge_token)
+        .await?;
+    let rollup_integrity = state.proxy.dashboard_rollup_integrity_status().await?;
+    let month_series = state.proxy.dashboard_month_series(&summary_windows).await?;
+    let dashboard_api_key_lifecycle_signature = state
+        .proxy
+        .dashboard_api_key_lifecycle_signature(summary_windows.previous_month_start)
+        .await?;
+    let dashboard_quarantine_lifecycle_signature = state
+        .proxy
+        .dashboard_quarantine_lifecycle_signature(summary_windows.previous_month_start)
+        .await?;
+    let dashboard_exhausted_lifecycle_signature = state
+        .proxy
+        .dashboard_exhausted_lifecycle_signature(
+            summary_windows.previous_month_start,
+            summary_windows.month_period_end,
+        )
+        .await?;
+    let forward_proxy = state.proxy.get_forward_proxy_dashboard_summary().await?;
+    let (request_log_retention_days, retention_since) =
+        dashboard_request_log_retention(state).await?;
+    let exhausted_keys = state
+        .proxy
+        .list_dashboard_exhausted_key_metrics(DASHBOARD_EXHAUSTED_KEYS_LIMIT)
+        .await
+        .unwrap_or_default();
+    let exhausted_key_ids = exhausted_keys
+        .iter()
+        .map(|key| key.id.clone())
+        .collect::<Vec<_>>();
+    let recent_log_views: Vec<RequestLogView> = state
+        .proxy
+        .recent_request_logs(DASHBOARD_TREND_SOURCE_LIMIT)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(RequestLogView::from_summary_record)
+        .collect();
+    let trend_request_logs = recent_log_views
+        .iter()
+        .map(|log| (log.id, log.created_at))
+        .collect::<Vec<_>>();
+    let trend = build_dashboard_trend(&recent_log_views);
+    let recent_logs: Vec<RequestLogView> = recent_log_views
+        .into_iter()
+        .take(DASHBOARD_RECENT_LOGS_LIMIT)
+        .collect();
+    let recent_request_logs = recent_logs
+        .iter()
+        .map(|log| (log.id, log.created_at))
+        .collect::<Vec<_>>();
+    let latest_request_log_id = recent_logs.first().map(|log| log.id);
+    let recent_jobs = state
+        .proxy
+        .list_recent_jobs(DASHBOARD_RECENT_JOBS_LIMIT)
+        .await
+        .unwrap_or_default();
+    let recent_alerts = match state.proxy.dashboard_recent_alerts_summary_with_token(24).await {
+        Ok((summary, token)) => DashboardRecentAlertsSnapshotFields::from_summary(summary, token),
+        Err(_) => {
+            if let Some(last_good) = last_good {
+                DashboardRecentAlertsSnapshotFields::from_last_good(last_good)
+            } else {
+                let (summary, token) = state
+                    .proxy
+                    .dashboard_recent_alerts_summary_for_cold_start_with_token(24)
+                    .await
+                    .unwrap_or_else(|_| {
+                        let summary = stale_dashboard_recent_alerts_summary(
+                            24,
+                            "alert_projection_unavailable",
+                        );
+                        (summary, [0; 4])
+                    });
+                DashboardRecentAlertsSnapshotFields::from_summary(summary, token)
+            }
+        }
     };
 
-    let json = serde_json::to_string(&payload).ok()?;
-    Some(Event::default().event("snapshot").data(json))
+    let hourly_window_anchor = dashboard_hourly_window_anchor(now_ts);
+    let recent_job_signatures = recent_jobs
+        .iter()
+        .map(|job| (job.id, job.status.clone(), job.finished_at))
+        .collect::<Vec<_>>();
+    let payload = DashboardOverviewPayload {
+            summary: summary.clone().into(),
+            summary_windows: SummaryWindowsView::from(summary_windows.clone()),
+            hourly_request_window: DashboardHourlyRequestWindowView::from(hourly_request_window),
+            rollup_integrity: rollup_integrity.clone(),
+            month_series: DashboardMonthSeriesView::from(month_series.clone()),
+            site_status: DashboardSiteStatusView {
+                remaining_quota: summary.total_quota_remaining,
+                total_quota_limit: summary.total_quota_limit,
+                active_keys: summary.active_keys,
+                quarantined_keys: summary.quarantined_keys,
+                temporary_isolated_keys: summary.temporary_isolated_keys,
+                exhausted_keys: summary.exhausted_keys,
+                available_proxy_nodes: Some(forward_proxy.available_nodes),
+                total_proxy_nodes: Some(forward_proxy.total_nodes),
+            },
+            forward_proxy: DashboardForwardProxyView {
+                available_nodes: Some(forward_proxy.available_nodes),
+                total_nodes: Some(forward_proxy.total_nodes),
+            },
+            trend,
+            exhausted_keys: exhausted_keys.into_iter().map(ApiKeyView::from_list).collect(),
+            recent_logs,
+            recent_jobs: recent_jobs.into_iter().map(JobLogView::from).collect(),
+            recent_alerts: recent_alerts.view.clone(),
+        };
+    let http_json = serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::Other(format!("serialize dashboard overview: {error}")))?;
+    let snapshot = DashboardSnapshot {
+        keys: &payload.exhausted_keys,
+        logs: &payload.recent_logs,
+        overview: &payload,
+    };
+    let snapshot_json = serde_json::to_vec(&snapshot)
+        .map_err(|error| ProxyError::Other(format!("serialize dashboard SSE snapshot: {error}")))?;
+    let mut sse_snapshot_frame = Vec::with_capacity(snapshot_json.len().saturating_add(24));
+    sse_snapshot_frame.extend_from_slice(b"event: snapshot\ndata: ");
+    sse_snapshot_frame.extend_from_slice(&snapshot_json);
+    sse_snapshot_frame.extend_from_slice(b"\n\n");
+
+    Ok(DashboardOverviewSnapshot {
+        payload,
+        http_json,
+        sse_snapshot_frame: Bytes::from(sse_snapshot_frame),
+        freshness: Arc::new(DashboardOverviewFreshness {
+            summary: [
+                summary.total_requests,
+                summary.success_count,
+                summary.error_count,
+                summary.quota_exhausted_count,
+                summary.active_keys,
+                summary.exhausted_keys,
+                summary.quarantined_keys,
+                summary.temporary_isolated_keys,
+                summary.total_quota_limit,
+                summary.total_quota_remaining,
+            ],
+            summary_last_activity: summary.last_activity,
+            summary_window_starts: [
+                summary_windows.today_start,
+                summary_windows.yesterday_start,
+                summary_windows.month_start,
+            ],
+            dashboard_rollup_signature,
+            pending_dashboard_rollup_signature,
+            rollup_integrity: (
+                rollup_integrity.state,
+                rollup_integrity.last_verified_at,
+                rollup_integrity.next_attempt_at,
+                rollup_integrity.unverified_bucket_count,
+            ),
+            dashboard_api_key_lifecycle_signature,
+            dashboard_quarantine_lifecycle_signature,
+            dashboard_exhausted_lifecycle_signature,
+            dashboard_quota_charge_token,
+            dashboard_stale_key_count,
+            forward_proxy: Some((forward_proxy.available_nodes, forward_proxy.total_nodes)),
+            exhausted_keys: exhausted_key_ids,
+            latest_quota_sync_sample_at: state.proxy.latest_dashboard_quota_sync_sample_at().await?,
+            latest_request_log_id,
+            recent_request_logs,
+            trend_request_logs,
+            recent_jobs: recent_job_signatures,
+            recent_alerts_token: recent_alerts.token,
+            recent_alerts_total_events: recent_alerts.total_events,
+            recent_alerts_grouped_count: recent_alerts.grouped_count,
+            recent_alerts_counts: recent_alerts.counts,
+            recent_alerts_top_groups: recent_alerts.top_groups,
+            request_log_retention_days,
+            hourly_window_anchor,
+            retention_since,
+        }),
+    })
 }
 
-async fn compute_signatures(
+async fn dashboard_request_log_retention(
     state: &Arc<AppState>,
-) -> Result<(Option<SummarySig>, Option<i64>), ()> {
-    let summary = state.proxy.summary().await.map_err(|_| ())?;
-    let tavily_hikari::SummaryWindows {
-        today,
-        yesterday,
-        month,
-    } = state.proxy.summary_windows().await.map_err(|_| ())?;
-    let forward_proxy = state
+) -> Result<(i64, i64), ProxyError> {
+    let settings = state.proxy.get_system_settings().await?;
+    let retention_days = settings.request_log_retention.max_log_retention_days;
+    let now = state.proxy.backend_time().local_now();
+    Ok((retention_days, dashboard_retention_since(retention_days, now)))
+}
+
+fn dashboard_retention_since(retention_days: i64, now: chrono::DateTime<Local>) -> i64 {
+    let days = retention_days.max(0);
+    if days == 0 {
+        return now.with_timezone(&Utc).timestamp();
+    }
+    let keep_from_date = now
+        .date_naive()
+        .checked_sub_days(chrono::Days::new((days - 1) as u64))
+        .unwrap_or_else(|| now.date_naive());
+    dashboard_local_midnight_utc_ts(keep_from_date, now)
+}
+
+fn dashboard_start_of_local_day_utc_ts(now: chrono::DateTime<Local>) -> i64 {
+    dashboard_local_midnight_utc_ts(now.date_naive(), now)
+}
+
+fn dashboard_previous_local_day_start_utc_ts(now: chrono::DateTime<Local>) -> i64 {
+    let previous_date = now
+        .date_naive()
+        .pred_opt()
+        .unwrap_or_else(|| now.date_naive());
+    dashboard_local_midnight_utc_ts(previous_date, now)
+}
+
+fn dashboard_start_of_local_month_utc_ts(now: chrono::DateTime<Local>) -> i64 {
+    let first_day = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        .expect("valid local month start date");
+    dashboard_local_midnight_utc_ts(first_day, now)
+}
+
+fn dashboard_next_local_day_start_utc_ts(current_day_start_utc_ts: i64) -> i64 {
+    let Some(utc_dt) = Utc.timestamp_opt(current_day_start_utc_ts, 0).single() else {
+        return current_day_start_utc_ts.saturating_add(86_400);
+    };
+    let local_dt = utc_dt.with_timezone(&Local);
+    let next_date = local_dt
+        .date_naive()
+        .succ_opt()
+        .unwrap_or_else(|| local_dt.date_naive());
+    dashboard_local_midnight_utc_ts(next_date, local_dt)
+}
+
+fn dashboard_previous_local_month_start_utc_ts(now: chrono::DateTime<Local>) -> i64 {
+    let (year, month) = if now.month() == 1 {
+        (now.year() - 1, 12)
+    } else {
+        (now.year(), now.month() - 1)
+    };
+    let first_day =
+        chrono::NaiveDate::from_ymd_opt(year, month, 1).expect("valid previous month date");
+    dashboard_local_midnight_utc_ts(first_day, now)
+}
+
+fn dashboard_shift_local_month_start_utc_ts(current_month_start_utc_ts: i64, delta_months: i32) -> i64 {
+    let Some(utc_dt) = Utc.timestamp_opt(current_month_start_utc_ts, 0).single() else {
+        return current_month_start_utc_ts;
+    };
+    let local_dt = utc_dt.with_timezone(&Local);
+    let total_months = local_dt.year() * 12 + local_dt.month0() as i32 + delta_months;
+    let shifted_year = total_months.div_euclid(12);
+    let shifted_month0 = total_months.rem_euclid(12);
+    let shifted_month = (shifted_month0 + 1) as u32;
+    let shifted_day = chrono::NaiveDate::from_ymd_opt(shifted_year, shifted_month, 1)
+        .expect("valid shifted month date");
+    dashboard_local_midnight_utc_ts(shifted_day, local_dt)
+}
+
+fn dashboard_local_midnight_utc_ts(
+    date: chrono::NaiveDate,
+    fallback_now: chrono::DateTime<Local>,
+) -> i64 {
+    let naive = date.and_hms_opt(0, 0, 0).expect("valid local midnight");
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc).timestamp(),
+        chrono::LocalResult::Ambiguous(dt, _) => dt.with_timezone(&Utc).timestamp(),
+        chrono::LocalResult::None => fallback_now.with_timezone(&Utc).timestamp(),
+    }
+}
+
+async fn compute_dashboard_overview_freshness(
+    state: &Arc<AppState>,
+) -> Result<DashboardOverviewFreshness, ProxyError> {
+    #[cfg(test)]
+    {
+        let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+        let mut cache = cache_handle.lock().await;
+        cache.freshness_probe_count = cache.freshness_probe_count.saturating_add(1);
+    }
+    let summary = state.proxy.summary_without_flush().await?;
+    let now_local = state.proxy.backend_time().local_now();
+    let now_utc = now_local.with_timezone(&Utc);
+    let today_start = dashboard_start_of_local_day_utc_ts(now_local);
+    let yesterday_start = dashboard_previous_local_day_start_utc_ts(now_local);
+    let month_start = dashboard_start_of_local_month_utc_ts(now_local);
+    let month_period_end = dashboard_next_local_day_start_utc_ts(today_start)
+        .max(dashboard_shift_local_month_start_utc_ts(month_start, 1));
+    let previous_month_start = dashboard_previous_local_month_start_utc_ts(now_local);
+    let dashboard_rollup_signature = state
         .proxy
-        .get_forward_proxy_dashboard_summary()
+        .dashboard_rollup_freshness_signature_without_flush(previous_month_start)
+        .await?;
+    let pending_dashboard_rollup_signature = state
+        .proxy
+        .pending_dashboard_rollup_freshness_signature()
+        .await;
+    let rollup_integrity = state.proxy.dashboard_rollup_integrity_status().await?;
+    let dashboard_api_key_lifecycle_signature = state
+        .proxy
+        .dashboard_api_key_lifecycle_signature(previous_month_start)
+        .await?;
+    let dashboard_quarantine_lifecycle_signature = state
+        .proxy
+        .dashboard_quarantine_lifecycle_signature(previous_month_start)
+        .await?;
+    let dashboard_exhausted_lifecycle_signature = state
+        .proxy
+        .dashboard_exhausted_lifecycle_signature(previous_month_start, month_period_end)
+        .await?;
+    let now_ts = state.proxy.backend_time().now_ts();
+    let hot_active_since = now_ts.saturating_sub(2 * 60 * 60);
+    let hot_stale_before = now_ts.saturating_sub(15 * 60);
+    let cold_stale_before = now_ts.saturating_sub(24 * 60 * 60);
+    let dashboard_stale_key_count = state
+        .proxy
+        .dashboard_stale_key_count(hot_active_since, hot_stale_before, cold_stale_before)
+        .await?;
+    let dashboard_quota_charge_token = state
+        .proxy
+        .dashboard_quota_charge_token(
+            dashboard_stale_key_count,
+            start_of_month_dt(now_utc).timestamp(),
+            state.proxy.backend_time().now_ts().saturating_add(1),
+        )
+        .await?;
+    let forward_proxy = state.proxy.get_forward_proxy_dashboard_summary().await?;
+    let summary_window_starts = [today_start, yesterday_start, month_start];
+    let (request_log_retention_days, retention_since) =
+        dashboard_request_log_retention(state).await?;
+    let trend_request_logs = state
+        .proxy
+        .recent_request_log_signature(DASHBOARD_TREND_SOURCE_LIMIT, retention_since)
+        .await?;
+    let recent_request_logs = trend_request_logs
+        .iter()
+        .take(DASHBOARD_RECENT_LOGS_LIMIT)
+        .copied()
+        .collect::<Vec<_>>();
+    let latest_request_log_id = trend_request_logs.first().map(|(id, _)| *id);
+    let exhausted_keys = state
+        .proxy
+        .list_dashboard_exhausted_key_ids(DASHBOARD_EXHAUSTED_KEYS_LIMIT)
         .await
-        .map_err(|_| ())?;
-    let logs = state.proxy.recent_request_logs(1).await.map_err(|_| ())?;
-    let latest_id = logs.first().map(|l| l.id);
-    let sig: Option<SummarySig> = Some(SummarySig {
-        summary: (
+        .unwrap_or_default();
+    let recent_jobs = state
+        .proxy
+        .list_recent_job_signatures(DASHBOARD_RECENT_JOBS_LIMIT)
+        .await
+        .unwrap_or_default();
+    // The projected summary and its token must come from one sidecar read. A
+    // second aggregation here would turn the 60-second freshness probe into
+    // duplicate work on the dashboard hot path.
+    let (recent_alerts, recent_alerts_token) = state
+        .proxy
+        .dashboard_recent_alerts_freshness_with_token(24)
+        .await?;
+    Ok(DashboardOverviewFreshness {
+        summary: [
             summary.total_requests,
             summary.success_count,
             summary.error_count,
@@ -713,36 +1814,600 @@ async fn compute_signatures(
             summary.active_keys,
             summary.exhausted_keys,
             summary.quarantined_keys,
-            summary.last_activity,
+            summary.temporary_isolated_keys,
             summary.total_quota_limit,
             summary.total_quota_remaining,
+        ],
+        summary_last_activity: summary.last_activity,
+        summary_window_starts,
+        dashboard_rollup_signature,
+        pending_dashboard_rollup_signature,
+        rollup_integrity: (
+            rollup_integrity.state,
+            rollup_integrity.last_verified_at,
+            rollup_integrity.next_attempt_at,
+            rollup_integrity.unverified_bucket_count,
         ),
-        today: (
-            today.total_requests,
-            today.success_count,
-            today.error_count,
-            today.quota_exhausted_count,
-            today.upstream_exhausted_key_count,
-        ),
-        yesterday: (
-            yesterday.total_requests,
-            yesterday.success_count,
-            yesterday.error_count,
-            yesterday.quota_exhausted_count,
-            yesterday.upstream_exhausted_key_count,
-        ),
-        month: (
-            month.total_requests,
-            month.success_count,
-            month.error_count,
-            month.quota_exhausted_count,
-            month.upstream_exhausted_key_count,
-            month.new_keys,
-            month.new_quarantines,
-        ),
-        proxy: Some((forward_proxy.available_nodes, forward_proxy.total_nodes)),
-    });
-    Ok((sig, latest_id))
+        dashboard_api_key_lifecycle_signature,
+        dashboard_quarantine_lifecycle_signature,
+        dashboard_exhausted_lifecycle_signature,
+        dashboard_quota_charge_token,
+        dashboard_stale_key_count,
+        forward_proxy: Some((forward_proxy.available_nodes, forward_proxy.total_nodes)),
+        exhausted_keys,
+        latest_quota_sync_sample_at: state.proxy.latest_dashboard_quota_sync_sample_at().await?,
+        latest_request_log_id,
+        recent_request_logs,
+        trend_request_logs,
+        recent_jobs,
+        recent_alerts_token,
+        recent_alerts_total_events: recent_alerts.total_events,
+        recent_alerts_grouped_count: recent_alerts.grouped_count,
+        recent_alerts_counts: recent_alerts
+            .counts_by_type
+            .into_iter()
+            .map(|item| (item.alert_type, item.count))
+            .collect(),
+        recent_alerts_top_groups: recent_alerts
+            .top_groups
+            .into_iter()
+            .map(|group| (group.id, group.count, group.last_seen))
+            .collect(),
+        request_log_retention_days,
+        hourly_window_anchor: dashboard_hourly_window_anchor(state.proxy.backend_time().now_ts()),
+        retention_since,
+    })
+}
+
+async fn load_dashboard_overview_snapshot(
+    state: &Arc<AppState>,
+) -> Result<Arc<DashboardOverviewSnapshot>, ProxyError> {
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let request_stats_generation = state.proxy.dashboard_read_generation();
+    let action = {
+        let mut cache = cache_handle.lock().await;
+            if cache.loading {
+                let stale = cache
+                    .loading_started_at
+                    .is_some_and(|started_at| started_at.elapsed() >= DASHBOARD_OVERVIEW_LOADING_STALE_AFTER);
+                if stale {
+                    tracing::warn!(
+                        component = "admin_read",
+                        event = "dashboard_overview_loading_stale",
+                        stale_after_ms = DASHBOARD_OVERVIEW_LOADING_STALE_AFTER.as_millis() as u64,
+                        "dashboard overview shared snapshot loader was stale; allowing a new request to rebuild"
+                    );
+                    cache.loading = false;
+                    cache.loading_started_at = None;
+                    cache.notify.notify_waiters();
+                }
+            }
+            let has_cached = cache.cached.is_some();
+            let generation_dirty = request_stats_generation.is_some()
+                && request_stats_generation != cache.built_request_stats_generation;
+            let alert_projection_dirty = cache.alert_projection_generation
+                != cache.built_alert_projection_generation.unwrap_or_default();
+            let safety_probe_due = cache.last_freshness_probe_at.is_none_or(|last_probe| {
+                last_probe.elapsed() >= DASHBOARD_OVERVIEW_SAFETY_PROBE_INTERVAL
+            });
+            let dirty_refresh_due = (generation_dirty || alert_projection_dirty)
+                && cache.last_refresh_requested_at.is_none_or(|last_refresh| {
+                    last_refresh.elapsed() >= DASHBOARD_OVERVIEW_MIN_REFRESH_INTERVAL
+                });
+            if has_cached && !safety_probe_due && !dirty_refresh_due {
+                DashboardOverviewLoadAction::Return(
+                    cache
+                        .cached
+                        .as_ref()
+                        .expect("checked cached dashboard overview")
+                        .snapshot
+                        .clone(),
+                )
+            } else if cache.loading {
+                if let Some(cached) = cache.cached.as_ref() {
+                    DashboardOverviewLoadAction::Return(cached.snapshot.clone())
+                } else {
+                    DashboardOverviewLoadAction::Wait(cache.notify.clone().notified_owned())
+                }
+            } else {
+                let last_good = cache.cached.as_ref().map(|cached| cached.snapshot.clone());
+                if let Some(reason) = state.proxy.dashboard_overview_refresh_defer_reason()
+                    && let Some(last_good) = last_good
+                {
+                    cache.last_freshness_probe_at = Some(tokio::time::Instant::now());
+                    cache.last_refresh_requested_at = Some(tokio::time::Instant::now());
+                    tracing::debug!(
+                        component = "admin_read",
+                        event = "dashboard_overview_refresh_deferred",
+                        defer_reason = reason,
+                        "serving last-good dashboard overview without a SQLite refresh"
+                    );
+                    DashboardOverviewLoadAction::Return(last_good)
+                } else {
+                    // A cold dashboard has no last-good snapshot to protect. Give its
+                    // singleflight loader one bounded chance even under transient
+                    // foreground pressure; otherwise readiness can remain permanently
+                    // unavailable while startup work is still releasing connections.
+                    cache.loading = true;
+                    cache.loading_generation = cache.loading_generation.wrapping_add(1);
+                    cache.loading_started_at = Some(tokio::time::Instant::now());
+                    cache.last_refresh_requested_at = Some(tokio::time::Instant::now());
+                DashboardOverviewLoadAction::Refresh {
+                    generation: cache.loading_generation,
+                    request_stats_generation,
+                    alert_projection_generation: cache.alert_projection_generation,
+                    reason: if !has_cached {
+                        DashboardBuildReason::Cold
+                    } else if generation_dirty {
+                        DashboardBuildReason::RequestStatsDirty
+                    } else if alert_projection_dirty {
+                        DashboardBuildReason::AlertProjectionDirty
+                    } else {
+                        DashboardBuildReason::SafetyProbeChanged
+                    },
+                    last_good,
+                        cold_waiter: Some(cache.notify.clone().notified_owned()),
+                    }
+                }
+            }
+    };
+
+    match action {
+        DashboardOverviewLoadAction::Return(snapshot) => Ok(snapshot),
+        DashboardOverviewLoadAction::Wait(waiter) => {
+                tavily_hikari::emit_sampled_perf_log(
+                    tavily_hikari::DbLogStatus::Info,
+                    "admin_read",
+                    "dashboard_overview_phase",
+                    Duration::ZERO,
+                    tavily_hikari::PerfLogScope {
+                        route: Some("/api/dashboard/overview"),
+                        scope: Some("dashboard"),
+                        phase: Some("cache_wait"),
+                        degraded: Some("cold_start"),
+                        ..Default::default()
+                    },
+                );
+            wait_for_dashboard_overview_cold_snapshot(cache_handle, waiter).await
+        }
+        DashboardOverviewLoadAction::Refresh {
+            generation,
+        request_stats_generation,
+        alert_projection_generation,
+        reason,
+        last_good,
+            cold_waiter,
+        } => {
+            if let Some(last_good) = last_good {
+                let refresh_state = state.clone();
+                tokio::spawn(async move {
+                    let _ = refresh_dashboard_overview_snapshot_with_reason(
+                        &refresh_state,
+                        cache_handle,
+                        generation,
+                        request_stats_generation,
+                        alert_projection_generation,
+                        reason,
+                    )
+                    .await;
+                });
+                Ok(last_good)
+            } else {
+                let refresh_state = state.clone();
+                let refresh_cache = cache_handle.clone();
+                tokio::spawn(async move {
+                    let _ = refresh_dashboard_overview_snapshot_with_reason(
+                        &refresh_state,
+                        refresh_cache,
+                        generation,
+                        request_stats_generation,
+                        alert_projection_generation,
+                        reason,
+                    )
+                    .await;
+                });
+                wait_for_dashboard_overview_cold_snapshot(
+                    cache_handle,
+                    cold_waiter.expect("cold dashboard refresh always installs a waiter"),
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn prewarm_dashboard_overview_snapshot(state: &Arc<AppState>) {
+    let started = Instant::now();
+    let last_error = loop {
+        match load_dashboard_overview_snapshot(state).await {
+            Ok(_) => {
+                tracing::debug!(
+                    component = "startup",
+                    event = "dashboard_overview_prewarmed",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "dashboard overview singleflight completed before accepting connections"
+                );
+                return;
+            }
+            Err(err) if started.elapsed() >= DASHBOARD_OVERVIEW_STARTUP_PREWARM_BUDGET => {
+                break err;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
+    tracing::warn!(
+        component = "startup",
+        event = "dashboard_overview_prewarm_deferred",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        startup_budget_ms = DASHBOARD_OVERVIEW_STARTUP_PREWARM_BUDGET.as_millis() as u64,
+        err = %last_error,
+        "dashboard overview singleflight did not complete before accepting connections"
+    );
+}
+
+async fn dashboard_overview_snapshot_is_loading(state: &Arc<AppState>) -> bool {
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let cache = cache_handle.lock().await;
+    cache.cached.is_none() && cache.loading
+}
+
+enum DashboardOverviewLoadAction {
+    Return(Arc<DashboardOverviewSnapshot>),
+    Wait(tokio::sync::futures::OwnedNotified),
+    Refresh {
+        generation: u64,
+        request_stats_generation: Option<u64>,
+        alert_projection_generation: u64,
+        reason: DashboardBuildReason,
+        last_good: Option<Arc<DashboardOverviewSnapshot>>,
+        cold_waiter: Option<tokio::sync::futures::OwnedNotified>,
+    },
+}
+
+async fn wait_for_dashboard_overview_cold_snapshot(
+    cache_handle: Arc<Mutex<DashboardOverviewCacheState>>,
+    waiter: tokio::sync::futures::OwnedNotified,
+) -> Result<Arc<DashboardOverviewSnapshot>, ProxyError> {
+    let timed_out = tokio::time::timeout(DASHBOARD_OVERVIEW_COLD_BUILD_BUDGET, waiter)
+        .await
+        .is_err();
+    let cache = cache_handle.lock().await;
+    if let Some(cached) = cache.cached.as_ref() {
+        return Ok(cached.snapshot.clone());
+    }
+    let message = if timed_out {
+        "dashboard overview cold build timed out"
+    } else {
+        "dashboard overview cold build failed"
+    };
+    Err(ProxyError::Other(message.to_string()))
+}
+
+#[cfg(test)]
+async fn refresh_dashboard_overview_snapshot(
+    state: &Arc<AppState>,
+    cache_handle: Arc<Mutex<DashboardOverviewCacheState>>,
+    load_generation: u64,
+    expected_request_stats_generation: Option<u64>,
+    expected_alert_projection_generation: u64,
+) -> Result<Arc<DashboardOverviewSnapshot>, ProxyError> {
+    refresh_dashboard_overview_snapshot_with_reason(
+        state,
+        cache_handle,
+        load_generation,
+        expected_request_stats_generation,
+        expected_alert_projection_generation,
+        DashboardBuildReason::SafetyProbeChanged,
+    )
+    .await
+}
+
+async fn refresh_dashboard_overview_snapshot_with_reason(
+    state: &Arc<AppState>,
+    cache_handle: Arc<Mutex<DashboardOverviewCacheState>>,
+    load_generation: u64,
+    expected_request_stats_generation: Option<u64>,
+    expected_alert_projection_generation: u64,
+    build_reason: DashboardBuildReason,
+) -> Result<Arc<DashboardOverviewSnapshot>, ProxyError> {
+    let perf = tavily_hikari::RuntimePerfScope::start();
+    let mut load_guard = DashboardOverviewLoadGuard::new(cache_handle.clone(), load_generation);
+    tracing::debug!(
+        component = "dashboard",
+        event = "dashboard_build_started",
+        build_reason = build_reason.as_str(),
+        "starting a bounded Dashboard build"
+    );
+    // A cold process has no last-good snapshot to compare against. Build that
+    // snapshot once, instead of paying for a full freshness probe followed by
+    // the same domain reads again. Warm refreshes retain the cheap-token fast
+    // path and can fall back to the existing last-good snapshot on pressure.
+    let has_cached_snapshot = {
+        let cache = cache_handle.lock().await;
+        cache.cached.is_some()
+    };
+    let mut quota_charge_token_for_build = None;
+    if has_cached_snapshot {
+        let freshness_started = Instant::now();
+        let freshness = match compute_dashboard_overview_freshness(state).await {
+            Ok(freshness) => freshness,
+            Err(error) => {
+                let mut cache = cache_handle.lock().await;
+                let last_good = cache.cached.as_ref().map(|cached| cached.snapshot.clone());
+                if cache.loading_generation == load_generation {
+                    cache.loading = false;
+                    cache.loading_started_at = None;
+                    cache.last_freshness_probe_at = Some(tokio::time::Instant::now());
+                    cache.notify.notify_waiters();
+                }
+                load_guard.disarm();
+                return last_good.ok_or(error);
+            }
+        };
+        tavily_hikari::emit_sampled_perf_log(
+            tavily_hikari::DbLogStatus::Info,
+            "admin_read",
+            "dashboard_overview_phase",
+            freshness_started.elapsed(),
+            tavily_hikari::PerfLogScope {
+                route: Some("/api/dashboard/overview"),
+                scope: Some("dashboard"),
+                phase: Some("freshness_probe"),
+                degraded: Some("cheap_token"),
+                ..Default::default()
+            },
+        );
+
+        let mut cache = cache_handle.lock().await;
+        if cache.loading_generation == load_generation {
+            cache.last_freshness_probe_at = Some(tokio::time::Instant::now());
+            acknowledge_dashboard_request_stats_generation(
+                &mut cache,
+                expected_request_stats_generation,
+                state.proxy.dashboard_read_generation(),
+            );
+            acknowledge_dashboard_alert_projection_generation(
+                &mut cache,
+                expected_alert_projection_generation,
+            );
+            if let Some(cached) = cache.cached.as_ref()
+                && cached.freshness.as_ref() == &freshness
+            {
+                let snapshot = cached.snapshot.clone();
+                cache.loading = false;
+                cache.loading_started_at = None;
+                cache.notify.notify_waiters();
+                load_guard.disarm();
+                tavily_hikari::emit_low_memory_protection_decision(
+                    "admin_read",
+                    tavily_hikari::PerfLogScope {
+                        route: Some("dashboard_shared_snapshot"),
+                        scope: Some("dashboard"),
+                        phase: Some("cache_serve"),
+                        degraded: Some("cache_hit"),
+                        ..Default::default()
+                    },
+                );
+                tavily_hikari::emit_sampled_perf_log(
+                    tavily_hikari::DbLogStatus::Info,
+                    "admin_read",
+                    "dashboard_snapshot_cache_hit",
+                    Duration::from_millis(perf.elapsed_ms()),
+                    tavily_hikari::PerfLogScope {
+                        route: Some("dashboard_shared_snapshot"),
+                        scope: Some("dashboard"),
+                        phase: Some("cache_serve"),
+                        degraded: Some("cache_hit"),
+                        ..Default::default()
+                    },
+                );
+                return Ok(snapshot);
+            }
+            if let Some(cached) = cache.cached.as_ref()
+                && cached
+                    .freshness
+                    .differs_only_by_quota_charge(&freshness)
+            {
+                let last_good = cached.snapshot.clone();
+                drop(cache);
+                match state
+                    .proxy
+                    .dashboard_quota_charge_snapshot_for_freshness_at(
+                        state.proxy.backend_time().local_now(),
+                        freshness.dashboard_quota_charge_token,
+                    )
+                    .await
+                {
+                    Ok((quota_charge, token)) => {
+                        let patched = patch_dashboard_overview_quota_charge(
+                            last_good.as_ref(),
+                            quota_charge,
+                            freshness,
+                            token,
+                        )
+                        .map(Arc::new);
+                        let mut cache = cache_handle.lock().await;
+                        if cache.loading_generation == load_generation {
+                            cache.loading = false;
+                            cache.loading_started_at = None;
+                            cache.last_freshness_probe_at = Some(tokio::time::Instant::now());
+                            if let Ok(snapshot) = patched.as_ref() {
+                                cache.cached = Some(CachedDashboardOverviewSnapshot {
+                                    snapshot: snapshot.clone(),
+                                    freshness: snapshot.freshness.clone(),
+                                });
+                            }
+                            cache.notify.notify_waiters();
+                        }
+                        load_guard.disarm();
+                        return patched;
+                    }
+                    Err(error) => {
+                        let mut cache = cache_handle.lock().await;
+                        if cache.loading_generation == load_generation {
+                            cache.loading = false;
+                            cache.loading_started_at = None;
+                            cache.last_freshness_probe_at = Some(tokio::time::Instant::now());
+                            cache.notify.notify_waiters();
+                        }
+                        load_guard.disarm();
+                        tracing::debug!(
+                            component = "admin_read",
+                            event = "dashboard_quota_recovery_deferred",
+                            err = %error,
+                            "serving immutable last-good Dashboard while quota recovery is unavailable"
+                        );
+                        return Ok(last_good);
+                    }
+                }
+            }
+            quota_charge_token_for_build = Some(freshness.dashboard_quota_charge_token);
+        }
+    }
+
+    let payload_started = Instant::now();
+    let last_good_alerts = {
+        let cache = cache_handle.lock().await;
+        cache.cached.as_ref().map(|cached| cached.snapshot.clone())
+    };
+    let result = build_dashboard_overview_payload(
+        state,
+        last_good_alerts.as_deref(),
+        quota_charge_token_for_build,
+    )
+    .await
+    .map(Arc::new);
+    tavily_hikari::emit_sampled_perf_log(
+        tavily_hikari::DbLogStatus::Info,
+        "admin_read",
+        "dashboard_overview_phase",
+        payload_started.elapsed(),
+        tavily_hikari::PerfLogScope {
+            route: Some("/api/dashboard/overview"),
+            scope: Some("dashboard"),
+            phase: Some("overview_payload_build"),
+            degraded: Some("rebuilt"),
+            ..Default::default()
+        },
+    );
+    let mut cache = cache_handle.lock().await;
+    cache.last_build_reason = Some(build_reason);
+    if cache.loading_generation != load_generation {
+        tracing::warn!(
+            component = "admin_read",
+            event = "dashboard_overview_loader_superseded",
+            loader_generation = load_generation,
+            current_generation = cache.loading_generation,
+            "dashboard overview loader finished after a newer loader took ownership"
+        );
+        load_guard.disarm();
+        return cache
+            .cached
+            .as_ref()
+            .map(|cached| Ok(cached.snapshot.clone()))
+            .unwrap_or(result);
+    }
+
+    cache.loading = false;
+    cache.loading_started_at = None;
+    if let Ok(snapshot) = result.as_ref() {
+        cache.cached = Some(CachedDashboardOverviewSnapshot {
+            snapshot: snapshot.clone(),
+            freshness: snapshot.freshness.clone(),
+        });
+        acknowledge_dashboard_request_stats_generation(
+            &mut cache,
+            expected_request_stats_generation,
+            state.proxy.dashboard_read_generation(),
+        );
+        acknowledge_dashboard_alert_projection_generation(
+            &mut cache,
+            expected_alert_projection_generation,
+        );
+        cache.last_freshness_probe_at = Some(tokio::time::Instant::now());
+        tavily_hikari::emit_low_memory_protection_decision(
+            "admin_read",
+            tavily_hikari::PerfLogScope {
+                route: Some("dashboard_shared_snapshot"),
+                scope: Some("dashboard"),
+                phase: Some("cache_serve"),
+                row_count: Some(snapshot.payload.recent_logs.len()),
+                degraded: Some("rebuilt"),
+                ..Default::default()
+            },
+        );
+        tavily_hikari::emit_sampled_perf_log(
+            tavily_hikari::DbLogStatus::Info,
+            "admin_read",
+            "dashboard_snapshot_rebuilt",
+            Duration::from_millis(perf.elapsed_ms()),
+            tavily_hikari::PerfLogScope {
+                route: Some("dashboard_shared_snapshot"),
+                scope: Some("dashboard"),
+                phase: Some("cache_serve"),
+                row_count: Some(snapshot.payload.recent_logs.len()),
+                degraded: Some("rebuilt"),
+                ..Default::default()
+            },
+        );
+    }
+    cache.notify.notify_waiters();
+    load_guard.disarm();
+    result
+}
+
+async fn build_snapshot_frame(state: &Arc<AppState>) -> Option<(Bytes, SummarySig)> {
+    let overview = load_dashboard_overview_snapshot(state).await.ok()?;
+    Some((
+        overview.sse_snapshot_frame.clone(),
+        SummarySig {
+            freshness: overview.freshness.clone(),
+        },
+    ))
+}
+
+#[cfg(test)]
+async fn build_snapshot_event(state: &Arc<AppState>) -> Option<(Event, SummarySig)> {
+    let overview = load_dashboard_overview_snapshot(state).await.ok()?;
+    let payload = DashboardSnapshot {
+        keys: &overview.payload.exhausted_keys,
+        logs: &overview.payload.recent_logs,
+        overview: &overview.payload,
+    };
+
+    let serialize_started = Instant::now();
+    let json = serde_json::to_string(&payload).ok()?;
+    tavily_hikari::emit_sampled_perf_log(
+        tavily_hikari::DbLogStatus::Info,
+        "admin_read",
+        "dashboard_overview_phase",
+        serialize_started.elapsed(),
+        tavily_hikari::PerfLogScope {
+            route: Some("/api/dashboard/overview"),
+            scope: Some("dashboard"),
+            phase: Some("overview_serialize"),
+            row_count: Some(payload.logs.len()),
+            degraded: Some("snapshot_sse"),
+            ..Default::default()
+        },
+    );
+    Some((
+        Event::default().event("snapshot").data(json),
+        SummarySig {
+            freshness: overview.freshness.clone(),
+        },
+    ))
+}
+
+async fn compute_signatures(
+    state: &Arc<AppState>,
+) -> Result<(Option<SummarySig>, Option<i64>), ()> {
+    let snapshot = load_dashboard_overview_snapshot(state).await.map_err(|_| ())?;
+    let freshness = snapshot.freshness.clone();
+    let latest_id = freshness.latest_request_log_id;
+    Ok((Some(SummarySig { freshness }), latest_id))
 }
 
 // ---- Jobs listing ----

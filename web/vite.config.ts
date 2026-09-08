@@ -39,7 +39,10 @@ export default defineConfig(({ mode }) => {
             ) {
               req.url = `/admin.html${parsed.search}`
             }
-            if (pathname === '/console' || pathname === '/console/') {
+            if (
+              (pathname === '/console' || pathname.startsWith('/console/'))
+              && pathname !== '/console.html'
+            ) {
               req.url = `/console.html${parsed.search}`
             }
             if (pathname === '/login' || pathname === '/login/') {
@@ -69,6 +72,7 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: 'dist',
       emptyOutDir: true,
+      manifest: true,
       rollupOptions: {
         input: {
           main: resolve(rootDir, 'index.html'),

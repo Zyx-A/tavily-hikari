@@ -1,0 +1,675 @@
+use crate::store::sqlite_runtime::SqliteCooperativeQueryOutcome;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconciliationProjectionSliceOutcome {
+    Advanced { scanned_rows: i64, completed: bool },
+    Deferred { reason: &'static str },
+    StaleClaim,
+}
+
+#[derive(Clone)]
+struct ReconciliationProjectionAggregate {
+    project_id: String,
+    billing_subject: String,
+    settlement_mode: String,
+    period_start: i64,
+    period_end: i64,
+    scheduling_key_id: String,
+    updated_at: i64,
+    terminal_outcome: Option<String>,
+    source_work_generation: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReconciliationProjectionSourceRow {
+    token_id: String,
+    period_code: String,
+    project_id: String,
+    billing_subject: String,
+    settlement_mode: String,
+    period_start: i64,
+    period_end: i64,
+    scheduling_key_id: String,
+    updated_at: i64,
+    settlement_status: Option<String>,
+    settlement_delta_credits: Option<i64>,
+    source_work_generation: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReconciliationProjectionStateRow {
+    cursor_token_id: String,
+    cursor_key_id: String,
+    cursor_period_code: String,
+    batch_size: i64,
+    fast_slice_streak: i64,
+    completed: i64,
+    tx_hold_le_10: i64,
+    tx_hold_le_25: i64,
+    tx_hold_le_50: i64,
+    tx_hold_le_100: i64,
+    tx_hold_le_250: i64,
+    tx_hold_over_250: i64,
+    identity_repair_generation: i64,
+}
+
+struct ReconciliationProjectionController<'a> {
+    store: &'a KeyStore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconciliationProjectionWriteStatus {
+    Advanced,
+    StaleClaim,
+    CursorConflict,
+}
+
+impl<'a> ReconciliationProjectionController<'a> {
+    const SQLITE_PRESSURE_DEFER_SECS: i64 = 30;
+
+    fn new(store: &'a KeyStore) -> Self {
+        Self { store }
+    }
+
+    async fn advance_slice(
+        &self,
+        claimed_job: Option<(i64, i64)>,
+    ) -> Result<ReconciliationProjectionSliceOutcome, ProxyError> {
+        match self.advance_slice_inner(claimed_job).await {
+            Err(err) if is_transient_sqlite_write_error(&err) => {
+                match self
+                    .record_deferred_slice(claimed_job, "sqlite_pressure")
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(ReconciliationProjectionSliceOutcome::Advanced {
+                            scanned_rows: 0,
+                            completed: true,
+                        });
+                    }
+                    Err(record_err) if is_transient_sqlite_write_error(&record_err) => {}
+                    Err(ProxyError::StaleClaim { .. }) => {
+                        return Ok(ReconciliationProjectionSliceOutcome::StaleClaim);
+                    }
+                    Err(record_err) => return Err(record_err),
+                }
+                Ok(ReconciliationProjectionSliceOutcome::Deferred {
+                    reason: "sqlite_pressure",
+                })
+            }
+            result => result,
+        }
+    }
+
+    /// Preserve the controller-owned delay whenever a short retry window is available. A
+    /// contended writer can prevent this optional observation update too; the caller's atomic
+    /// representative continuation remains the durable recovery path in that case.
+    async fn record_deferred_slice(
+        &self,
+        claimed_job: Option<(i64, i64)>,
+        reason: &'static str,
+    ) -> Result<bool, ProxyError> {
+        let now = self.store.backend_time.now_ts();
+        let mut tx = self
+            .store
+            .sqlite_runtime
+            .begin_immediate(SqliteOperation::ReconciliationProjection)
+            .await?;
+        let write_result = async {
+            if let Some((job_id, claim_generation)) = claimed_job
+                && !Self::claim_is_current(&mut tx, claimed_job).await?
+            {
+                return Err(ProxyError::StaleClaim {
+                    job_id,
+                    claim_generation,
+                });
+            }
+            let updated = sqlx::query(
+                r#"UPDATE upstream_reconciliation_projection_state
+                   SET next_retry_at = ?, last_defer_reason = ?, updated_at = ?
+                   WHERE id = 'local' AND completed = 0"#,
+            )
+            .bind(now.saturating_add(Self::SQLITE_PRESSURE_DEFER_SECS))
+            .bind(reason)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Ok(false);
+            }
+            sqlx::query(
+                "UPDATE upstream_reconciliation_run_observation SET projection_state = 'deferred', cursor_advanced = 0, observed_at = ? WHERE id = 'local'",
+            )
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            Ok(true)
+        }
+        .await;
+        match write_result {
+            Ok(persisted) => {
+                tx.finish(Ok(())).await?;
+                Ok(persisted)
+            }
+            Err(err) => {
+                tx.finish(Err(err)).await?;
+                unreachable!("finishing a failed deferred projection transaction returns the error")
+            }
+        }
+    }
+
+    async fn advance_slice_inner(
+        &self,
+        claimed_job: Option<(i64, i64)>,
+    ) -> Result<ReconciliationProjectionSliceOutcome, ProxyError> {
+        let mut state_connection = self
+            .store
+            .sqlite_runtime
+            .acquire_operation_connection(SqliteOperation::ScheduledJobControl)
+            .await?;
+        let state_result: Result<ReconciliationProjectionStateRow, sqlx::Error> = sqlx::query_as(
+            r#"SELECT cursor_token_id, cursor_key_id, cursor_period_code,
+                  batch_size, fast_slice_streak, completed,
+                  tx_hold_le_10, tx_hold_le_25, tx_hold_le_50,
+                  tx_hold_le_100, tx_hold_le_250, tx_hold_over_250,
+                  identity_repair_generation
+           FROM upstream_reconciliation_projection_state WHERE id = 'local'"#,
+        )
+        .fetch_one(&mut *state_connection)
+        .await;
+        let state = state_connection.complete_query(state_result).await?;
+        if state.completed != 0 {
+            return Ok(ReconciliationProjectionSliceOutcome::Advanced {
+                scanned_rows: 0,
+                completed: true,
+            });
+        }
+        let batch_size = state
+            .batch_size
+            .clamp(RECONCILIATION_PROJECTION_MIN_BATCH, RECONCILIATION_PROJECTION_MAX_BATCH);
+        let mut snapshot = self
+            .store
+            .sqlite_runtime
+            .begin_reconciliation_read(ReconciliationReadKind::HistoricalProjection)
+            .await?;
+        let rows_result = sqlx::query_as(
+            r#"SELECT u.token_id AS token_id, u.period_code AS period_code,
+                      MIN(u.project_id) AS project_id,
+                      MIN(u.billing_subject) AS billing_subject,
+                      MIN(u.settlement_mode) AS settlement_mode,
+                      MIN(u.period_start) AS period_start,
+                      MAX(u.period_end) AS period_end,
+                      MIN(u.key_id) AS scheduling_key_id,
+                      MAX(u.updated_at) AS updated_at,
+                      MIN(s.status) AS settlement_status,
+                      MIN(s.delta_credits) AS settlement_delta_credits,
+                      MAX(w.work_generation) AS source_work_generation
+               FROM upstream_reconciliation_usage u
+               LEFT JOIN upstream_reconciliation_work w
+                 ON w.token_id = u.token_id AND w.period_code = u.period_code
+               LEFT JOIN upstream_reconciliation_settlements s
+                 ON s.settlement_key = 'v1:' || u.token_id || ':' || u.period_code
+               WHERE (u.token_id, u.period_code) > (?, ?)
+               GROUP BY u.token_id, u.period_code
+               ORDER BY u.token_id, u.period_code
+               LIMIT ?"#,
+        )
+        .bind(&state.cursor_token_id)
+        .bind(&state.cursor_period_code)
+        .bind(batch_size)
+        .fetch_all(&mut *snapshot)
+        .await;
+        let rows: Vec<ReconciliationProjectionSourceRow> =
+            match snapshot.complete_query(rows_result).await? {
+                SqliteCooperativeQueryOutcome::Completed(rows) => rows,
+                SqliteCooperativeQueryOutcome::DeadlineExceeded => {
+                    return self.defer_source_read_budget(claimed_job).await;
+                }
+            };
+        let Some(last) = rows
+            .last()
+            .map(|row| {
+                (
+                    row.token_id.clone(),
+                    String::new(),
+                    row.period_code.clone(),
+                )
+            })
+        else {
+            let mut tx = self
+                .store
+                .sqlite_runtime
+                .begin_immediate(SqliteOperation::ReconciliationProjection)
+                .await?;
+            let write_result = async {
+                if !Self::claim_is_current(&mut tx, claimed_job).await? {
+                    return Ok(ReconciliationProjectionWriteStatus::StaleClaim);
+                }
+                if !Self::projection_snapshot_is_current(&mut tx, &state).await? {
+                    return Ok(ReconciliationProjectionWriteStatus::CursorConflict);
+                }
+                let updated = sqlx::query(
+                    r#"UPDATE upstream_reconciliation_projection_state
+                       SET completed = 1, next_retry_at = 0, last_defer_reason = NULL,
+                           updated_at = ?
+                       WHERE id = 'local' AND cursor_token_id = ? AND cursor_key_id = ?
+                         AND cursor_period_code = ? AND completed = 0
+                         AND identity_repair_generation = ?"#,
+                )
+                .bind(self.store.backend_time.now_ts())
+                .bind(&state.cursor_token_id)
+                .bind(&state.cursor_key_id)
+                .bind(&state.cursor_period_code)
+                .bind(state.identity_repair_generation)
+                .execute(&mut *tx)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    return Ok(ReconciliationProjectionWriteStatus::CursorConflict);
+                }
+                sqlx::query("INSERT INTO meta (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+                    .bind(META_KEY_UPSTREAM_RECONCILIATION_WORK_PROJECTION_COMPLETE_V1)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "UPDATE upstream_reconciliation_run_observation SET projection_state = 'complete', cursor_advanced = 0, observed_at = ? WHERE id = 'local'",
+                )
+                .bind(self.store.backend_time.now_ts())
+                .execute(&mut *tx)
+                .await?;
+                Ok(ReconciliationProjectionWriteStatus::Advanced)
+            }
+            .await;
+            return match write_result {
+                Ok(ReconciliationProjectionWriteStatus::Advanced) => {
+                    tx.finish(Ok(())).await?;
+                    Ok(ReconciliationProjectionSliceOutcome::Advanced {
+                        scanned_rows: 0,
+                        completed: true,
+                    })
+                }
+                Ok(ReconciliationProjectionWriteStatus::StaleClaim) => {
+                    tx.rollback().await?;
+                    Ok(ReconciliationProjectionSliceOutcome::StaleClaim)
+                }
+                Ok(ReconciliationProjectionWriteStatus::CursorConflict) => {
+                    tx.rollback().await?;
+                    Ok(ReconciliationProjectionSliceOutcome::Deferred {
+                        reason: "cursor_conflict",
+                    })
+                }
+                Err(err) => {
+                    tx.finish(Err(err)).await?;
+                    unreachable!("finishing a failed projection transaction returns the error")
+                }
+            };
+        };
+
+        let mut aggregates = std::collections::BTreeMap::<
+            (String, String),
+            ReconciliationProjectionAggregate,
+        >::new();
+        for row in &rows {
+            aggregates
+                .entry((row.token_id.clone(), row.period_code.clone()))
+                .or_insert_with(|| ReconciliationProjectionAggregate {
+                    project_id: row.project_id.clone(),
+                    billing_subject: row.billing_subject.clone(),
+                    settlement_mode: row.settlement_mode.clone(),
+                    period_start: row.period_start,
+                    period_end: row.period_end,
+                    scheduling_key_id: row.scheduling_key_id.clone(),
+                    updated_at: row.updated_at,
+                    terminal_outcome: projection_terminal_outcome(
+                        row.settlement_status.as_deref(),
+                        row.settlement_delta_credits,
+                    ),
+                    source_work_generation: row.source_work_generation,
+                });
+        }
+
+        let terminal_repairs = aggregates
+            .iter()
+            .filter_map(|((token_id, period_code), aggregate)| {
+                aggregate.terminal_outcome.as_ref().map(|outcome| {
+                    (token_id.clone(), period_code.clone(), outcome.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = self
+            .store
+            .sqlite_runtime
+            .begin_immediate(SqliteOperation::ReconciliationProjection)
+            .await?;
+        let write_started = std::time::Instant::now();
+        let write_result = async {
+            if !Self::claim_is_current(&mut tx, claimed_job).await? {
+                return Ok(ReconciliationProjectionWriteStatus::StaleClaim);
+            }
+            if !Self::projection_snapshot_is_current(&mut tx, &state).await?
+                || !Self::aggregate_generations_match_current_work(&mut tx, &aggregates).await?
+            {
+                return Ok(ReconciliationProjectionWriteStatus::CursorConflict);
+            }
+            if !aggregates.is_empty() {
+            let mut merge = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                r#"INSERT INTO upstream_reconciliation_work (
+                     token_id, period_code, project_id, billing_subject, settlement_mode,
+                     period_start, period_end, scheduling_key_id, updated_at
+                   ) "#,
+            );
+            merge.push_values(aggregates, |mut values, ((token_id, period_code), aggregate)| {
+                values
+                    .push_bind(token_id)
+                    .push_bind(period_code)
+                    .push_bind(aggregate.project_id)
+                    .push_bind(aggregate.billing_subject)
+                    .push_bind(aggregate.settlement_mode)
+                    .push_bind(aggregate.period_start)
+                    .push_bind(aggregate.period_end)
+                    .push_bind(aggregate.scheduling_key_id)
+                    .push_bind(aggregate.updated_at);
+            });
+            merge.push(
+                r#" ON CONFLICT(token_id, period_code) DO UPDATE SET
+                     project_id = excluded.project_id,
+                     billing_subject = excluded.billing_subject,
+                     settlement_mode = excluded.settlement_mode,
+                     period_start = excluded.period_start,
+                     period_end = excluded.period_end,
+                     scheduling_key_id = excluded.scheduling_key_id,
+                     updated_at = MAX(upstream_reconciliation_work.updated_at, excluded.updated_at),
+                     work_generation = upstream_reconciliation_work.work_generation +
+                       CASE WHEN upstream_reconciliation_work.project_id IS NOT excluded.project_id
+                              OR upstream_reconciliation_work.billing_subject IS NOT excluded.billing_subject
+                              OR upstream_reconciliation_work.settlement_mode IS NOT excluded.settlement_mode
+                              OR upstream_reconciliation_work.period_start IS NOT excluded.period_start
+                              OR upstream_reconciliation_work.period_end IS NOT excluded.period_end
+                              OR upstream_reconciliation_work.scheduling_key_id IS NOT excluded.scheduling_key_id
+                            THEN 1 ELSE 0 END,
+                     next_attempt_at = CASE
+                       WHEN upstream_reconciliation_work.project_id IS NOT excluded.project_id
+                         OR upstream_reconciliation_work.billing_subject IS NOT excluded.billing_subject
+                         OR upstream_reconciliation_work.settlement_mode IS NOT excluded.settlement_mode
+                         OR upstream_reconciliation_work.period_start IS NOT excluded.period_start
+                         OR upstream_reconciliation_work.period_end IS NOT excluded.period_end
+                         OR upstream_reconciliation_work.scheduling_key_id IS NOT excluded.scheduling_key_id
+                       THEN 0 ELSE upstream_reconciliation_work.next_attempt_at END,
+                     last_outcome = CASE
+                       WHEN upstream_reconciliation_work.project_id IS NOT excluded.project_id
+                         OR upstream_reconciliation_work.billing_subject IS NOT excluded.billing_subject
+                         OR upstream_reconciliation_work.settlement_mode IS NOT excluded.settlement_mode
+                         OR upstream_reconciliation_work.period_start IS NOT excluded.period_start
+                         OR upstream_reconciliation_work.period_end IS NOT excluded.period_end
+                         OR upstream_reconciliation_work.scheduling_key_id IS NOT excluded.scheduling_key_id
+                       THEN NULL ELSE upstream_reconciliation_work.last_outcome END"#,
+            );
+                merge.build().execute(&mut *tx).await?;
+            }
+            if !terminal_repairs.is_empty() {
+                let mut repair = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "UPDATE upstream_reconciliation_work SET last_outcome = CASE ",
+                );
+                for (token_id, period_code, outcome) in &terminal_repairs {
+                    repair
+                        .push("WHEN token_id = ")
+                        .push_bind(token_id)
+                        .push(" AND period_code = ")
+                        .push_bind(period_code)
+                        .push(" THEN ")
+                        .push_bind(outcome)
+                        .push(" ");
+                }
+                repair.push(
+                    "ELSE last_outcome END WHERE completed_generation >= work_generation AND (",
+                );
+                for (index, (token_id, period_code, _)) in terminal_repairs.iter().enumerate() {
+                    if index > 0 {
+                        repair.push(" OR ");
+                    }
+                    repair
+                        .push("(token_id = ")
+                        .push_bind(token_id)
+                        .push(" AND period_code = ")
+                        .push_bind(period_code)
+                        .push(")");
+                }
+                repair.push(")");
+                repair.build().execute(&mut *tx).await?;
+            }
+        let write_ms = write_started.elapsed().as_millis() as i64;
+        let mut hold_histogram = [
+            state.tx_hold_le_10,
+            state.tx_hold_le_25,
+            state.tx_hold_le_50,
+            state.tx_hold_le_100,
+            state.tx_hold_le_250,
+            state.tx_hold_over_250,
+        ];
+        let hold_bucket = RECONCILIATION_PROJECTION_HOLD_BUCKETS_MS
+            .iter()
+            .position(|upper| write_ms <= *upper)
+            .unwrap_or(RECONCILIATION_PROJECTION_HOLD_BUCKETS_MS.len() - 1);
+        hold_histogram[hold_bucket] = hold_histogram[hold_bucket].saturating_add(1);
+        let transaction_p95_ms = reconciliation_projection_hold_p95_ms(&hold_histogram);
+        let fast_streak = if write_ms <= 50 {
+            state.fast_slice_streak + 1
+        } else {
+            0
+        };
+        let next_batch = if write_ms > 100 {
+            (batch_size / 2).max(RECONCILIATION_PROJECTION_MIN_BATCH)
+        } else if fast_streak >= 2 {
+            (batch_size + 25).min(RECONCILIATION_PROJECTION_MAX_BATCH)
+        } else {
+            batch_size
+        };
+        let continuation_secs = if self.store.foreground_activity_rps() <= 5 {
+            1
+        } else {
+            5
+        };
+            let updated = sqlx::query(
+            r#"UPDATE upstream_reconciliation_projection_state
+               SET cursor_token_id = ?, cursor_key_id = ?, cursor_period_code = ?,
+                   batch_size = ?, fast_slice_streak = ?, scanned_rows = scanned_rows + ?,
+                   transaction_p95_ms = ?, tx_hold_le_10 = ?, tx_hold_le_25 = ?,
+                   tx_hold_le_50 = ?, tx_hold_le_100 = ?, tx_hold_le_250 = ?,
+                   tx_hold_over_250 = ?,
+                   next_retry_at = ?, last_defer_reason = NULL, updated_at = ?
+               WHERE id = 'local' AND cursor_token_id = ? AND cursor_key_id = ?
+                 AND cursor_period_code = ? AND completed = 0
+                 AND identity_repair_generation = ?"#,
+        )
+        .bind(&last.0)
+        .bind(&last.1)
+        .bind(&last.2)
+        .bind(next_batch)
+        .bind(fast_streak)
+        .bind(rows.len() as i64)
+        .bind(transaction_p95_ms)
+        .bind(hold_histogram[0])
+        .bind(hold_histogram[1])
+        .bind(hold_histogram[2])
+        .bind(hold_histogram[3])
+        .bind(hold_histogram[4])
+        .bind(hold_histogram[5])
+        .bind(
+            self.store
+                .backend_time
+                .now_ts()
+                .saturating_add(continuation_secs),
+        )
+        .bind(self.store.backend_time.now_ts())
+        .bind(&state.cursor_token_id)
+        .bind(&state.cursor_key_id)
+        .bind(&state.cursor_period_code)
+        .bind(state.identity_repair_generation)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Ok(ReconciliationProjectionWriteStatus::CursorConflict);
+            }
+            sqlx::query(
+            "UPDATE upstream_reconciliation_run_observation SET projection_state = 'projecting', cursor_advanced = 1, observed_at = ? WHERE id = 'local'",
+        )
+        .bind(self.store.backend_time.now_ts())
+            .execute(&mut *tx)
+            .await?;
+            Ok(ReconciliationProjectionWriteStatus::Advanced)
+        }
+        .await;
+        match write_result {
+            Ok(ReconciliationProjectionWriteStatus::Advanced) => {
+                tx.finish(Ok(())).await?;
+                Ok(ReconciliationProjectionSliceOutcome::Advanced {
+                    scanned_rows: rows.len() as i64,
+                    completed: false,
+                })
+            }
+            Ok(ReconciliationProjectionWriteStatus::StaleClaim) => {
+                tx.rollback().await?;
+                Ok(ReconciliationProjectionSliceOutcome::StaleClaim)
+            }
+            Ok(ReconciliationProjectionWriteStatus::CursorConflict) => {
+                tx.rollback().await?;
+                Ok(ReconciliationProjectionSliceOutcome::Deferred {
+                    reason: "cursor_conflict",
+                })
+            }
+            Err(err) => {
+                tx.finish(Err(err)).await?;
+                unreachable!("finishing a failed projection transaction returns the error")
+            }
+        }
+    }
+
+    async fn claim_is_current(
+        tx: &mut SqliteImmediateTransaction,
+        claimed_job: Option<(i64, i64)>,
+    ) -> Result<bool, ProxyError> {
+        let Some((job_id, claim_generation)) = claimed_job else {
+            return Ok(true);
+        };
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM scheduled_jobs WHERE id = ? AND status = 'running' AND claim_generation = ?)",
+        )
+        .bind(job_id)
+        .bind(claim_generation)
+        .fetch_one(&mut **tx)
+        .await?
+            != 0)
+    }
+
+    async fn projection_snapshot_is_current(
+        tx: &mut SqliteImmediateTransaction,
+        state: &ReconciliationProjectionStateRow,
+    ) -> Result<bool, ProxyError> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM upstream_reconciliation_projection_state
+                 WHERE id = 'local' AND cursor_token_id = ? AND cursor_key_id = ?
+                   AND cursor_period_code = ? AND completed = 0
+                   AND identity_repair_generation = ?
+               )"#,
+        )
+        .bind(&state.cursor_token_id)
+        .bind(&state.cursor_key_id)
+        .bind(&state.cursor_period_code)
+        .bind(state.identity_repair_generation)
+        .fetch_one(&mut **tx)
+        .await?
+            != 0)
+    }
+
+    async fn aggregate_generations_match_current_work(
+        tx: &mut SqliteImmediateTransaction,
+        aggregates: &std::collections::BTreeMap<
+            (String, String),
+            ReconciliationProjectionAggregate,
+        >,
+    ) -> Result<bool, ProxyError> {
+        if aggregates.is_empty() {
+            return Ok(true);
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "WITH expected(token_id, period_code, work_generation) AS (",
+        );
+        query.push_values(aggregates.iter(), |mut values, ((token_id, period_code), aggregate)| {
+            values
+                .push_bind(token_id)
+                .push_bind(period_code)
+                .push_bind(aggregate.source_work_generation);
+        });
+        query.push(
+            r#") SELECT e.work_generation, w.work_generation
+                  FROM expected e
+             LEFT JOIN upstream_reconciliation_work w
+                    ON w.token_id = e.token_id AND w.period_code = e.period_code"#,
+        );
+        let generations: Vec<(Option<i64>, Option<i64>)> =
+            query.build_query_as().fetch_all(&mut **tx).await?;
+        Ok(generations.len() == aggregates.len()
+            && generations
+                .into_iter()
+                .all(|(expected, current)| expected == current))
+    }
+
+    async fn defer_source_read_budget(
+        &self,
+        claimed_job: Option<(i64, i64)>,
+    ) -> Result<ReconciliationProjectionSliceOutcome, ProxyError> {
+        match self
+            .record_deferred_slice(claimed_job, "projection_read_budget")
+            .await
+        {
+            Ok(true) => Ok(ReconciliationProjectionSliceOutcome::Deferred {
+                reason: "projection_read_budget",
+            }),
+            Ok(false) => Ok(ReconciliationProjectionSliceOutcome::Advanced {
+                scanned_rows: 0,
+                completed: true,
+            }),
+            Err(err) if is_transient_sqlite_write_error(&err) => {
+                Ok(ReconciliationProjectionSliceOutcome::Deferred {
+                    reason: "projection_read_budget",
+                })
+            }
+            Err(ProxyError::StaleClaim { .. }) => Ok(ReconciliationProjectionSliceOutcome::StaleClaim),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+fn projection_terminal_outcome(status: Option<&str>, delta_credits: Option<i64>) -> Option<String> {
+    match status {
+        Some("shadow_settled" | "shadow_degraded") if delta_credits == Some(0) => {
+            Some("no_adjustment".to_string())
+        }
+        Some("shadow_settled" | "shadow_degraded") => Some("observed".to_string()),
+        Some("settled" | "degraded") if delta_credits == Some(0) => {
+            Some("no_adjustment".to_string())
+        }
+        Some("settled" | "degraded") => Some("settled".to_string()),
+        _ => None,
+    }
+}
+
+fn reconciliation_projection_hold_p95_ms(histogram: &[i64; 6]) -> i64 {
+    let samples = histogram
+        .iter()
+        .fold(0_i64, |total, count| total.saturating_add(*count));
+    if samples == 0 {
+        return 0;
+    }
+    let target = samples.saturating_mul(95).saturating_add(99) / 100;
+    let mut cumulative = 0_i64;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative = cumulative.saturating_add(*count);
+        if cumulative >= target {
+            return RECONCILIATION_PROJECTION_HOLD_BUCKETS_MS[index];
+        }
+    }
+    RECONCILIATION_PROJECTION_HOLD_BUCKETS_MS[RECONCILIATION_PROJECTION_HOLD_BUCKETS_MS.len() - 1]
+}

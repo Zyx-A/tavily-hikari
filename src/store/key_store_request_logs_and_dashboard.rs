@@ -1,0 +1,3082 @@
+struct RequestLogCatalogRollupKeyParts<'a> {
+    created_at: i64,
+    request_kind_key: &'a str,
+    request_kind_label: &'a str,
+    result_bucket: &'a str,
+    key_effect_code: &'a str,
+    binding_effect_code: &'a str,
+    selection_effect_code: &'a str,
+    auth_token_id: Option<&'a str>,
+    api_key_id: Option<&'a str>,
+    operational_class: &'a str,
+}
+
+const DASHBOARD_QUOTA_RECOVERY_PAGE_SIZE: i64 = 32;
+const DASHBOARD_QUOTA_RECOVERY_PRE_WINDOW_SECS: i64 = 24 * 60 * 60;
+const DASHBOARD_QUOTA_SOURCE_PAGE_SIZE: i64 = 32;
+const DASHBOARD_QUOTA_SOURCE_MAX_PAGES: usize = 4;
+const DASHBOARD_QUOTA_RECOVERY_MAX_ATTEMPTS: usize = 3;
+
+#[derive(Clone, Debug)]
+struct DashboardQuotaRecoveryCursor {
+    captured_at: i64,
+    key_id: String,
+    id: i64,
+}
+
+impl From<&DashboardQuotaSample> for DashboardQuotaRecoveryCursor {
+    fn from(sample: &DashboardQuotaSample) -> Self {
+        Self {
+            captured_at: sample.captured_at,
+            key_id: sample.key_id.clone(),
+            id: sample.id,
+        }
+    }
+}
+
+impl KeyStore {
+    fn request_log_catalog_rollup_key_from_parts(
+        parts: RequestLogCatalogRollupKeyParts<'_>,
+    ) -> RequestLogCatalogRollupKey {
+        RequestLogCatalogRollupKey {
+            bucket_start: parts.created_at,
+            request_kind_key: parts.request_kind_key.trim().to_string(),
+            request_kind_label: parts.request_kind_label.trim().to_string(),
+            result_bucket: parts.result_bucket.trim().to_string(),
+            key_effect_code: parts.key_effect_code.trim().to_string(),
+            binding_effect_code: parts.binding_effect_code.trim().to_string(),
+            selection_effect_code: parts.selection_effect_code.trim().to_string(),
+            auth_token_id: parts.auth_token_id.unwrap_or_default().trim().to_string(),
+            api_key_id: parts.api_key_id.unwrap_or_default().trim().to_string(),
+            operational_class: parts.operational_class.trim().to_string(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_log_catalog_rollup_key_for_request(
+        created_at: i64,
+        request_kind_key: &str,
+        request_kind_label: &str,
+        counts_business_quota: bool,
+        result_status: &str,
+        failure_kind: Option<&str>,
+        key_effect_code: &str,
+        binding_effect_code: &str,
+        selection_effect_code: &str,
+        auth_token_id: Option<&str>,
+        api_key_id: Option<&str>,
+    ) -> RequestLogCatalogRollupKey {
+        let operational_class = operational_class_for_token_log(
+            request_kind_key,
+            result_status,
+            failure_kind,
+            counts_business_quota,
+        );
+        let result_bucket = match operational_class {
+            OPERATIONAL_CLASS_NEUTRAL => OPERATIONAL_CLASS_NEUTRAL,
+            OUTCOME_QUOTA_EXHAUSTED => OUTCOME_QUOTA_EXHAUSTED,
+            OUTCOME_SUCCESS => OUTCOME_SUCCESS,
+            _ => OUTCOME_ERROR,
+        };
+        Self::request_log_catalog_rollup_key_from_parts(RequestLogCatalogRollupKeyParts {
+            created_at,
+            request_kind_key,
+            request_kind_label,
+            result_bucket,
+            key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
+            auth_token_id,
+            api_key_id,
+            operational_class,
+        })
+    }
+
+    async fn upsert_request_log_catalog_rollup_delta(
+        tx: &mut SqliteConnection,
+        key: &RequestLogCatalogRollupKey,
+        request_count_delta: i64,
+        updated_at: i64,
+    ) -> Result<(), ProxyError> {
+        if request_count_delta == 0 {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO request_log_catalog_rollups (
+                bucket_start,
+                request_kind_key,
+                request_kind_label,
+                result_bucket,
+                key_effect_code,
+                binding_effect_code,
+                selection_effect_code,
+                auth_token_id,
+                api_key_id,
+                operational_class,
+                request_count,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                bucket_start,
+                request_kind_key,
+                request_kind_label,
+                result_bucket,
+                key_effect_code,
+                binding_effect_code,
+                selection_effect_code,
+                auth_token_id,
+                api_key_id,
+                operational_class
+            ) DO UPDATE SET
+                request_count = request_log_catalog_rollups.request_count + excluded.request_count,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(key.bucket_start)
+        .bind(&key.request_kind_key)
+        .bind(&key.request_kind_label)
+        .bind(&key.result_bucket)
+        .bind(&key.key_effect_code)
+        .bind(&key.binding_effect_code)
+        .bind(&key.selection_effect_code)
+        .bind(&key.auth_token_id)
+        .bind(&key.api_key_id)
+        .bind(&key.operational_class)
+        .bind(request_count_delta)
+        .bind(updated_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM request_log_catalog_rollups
+            WHERE bucket_start = ?
+              AND request_kind_key = ?
+              AND request_kind_label = ?
+              AND result_bucket = ?
+              AND key_effect_code = ?
+              AND binding_effect_code = ?
+              AND selection_effect_code = ?
+              AND auth_token_id = ?
+              AND api_key_id = ?
+              AND operational_class = ?
+              AND request_count <= 0
+            "#,
+        )
+        .bind(key.bucket_start)
+        .bind(&key.request_kind_key)
+        .bind(&key.request_kind_label)
+        .bind(&key.result_bucket)
+        .bind(&key.key_effect_code)
+        .bind(&key.binding_effect_code)
+        .bind(&key.selection_effect_code)
+        .bind(&key.auth_token_id)
+        .bind(&key.api_key_id)
+        .bind(&key.operational_class)
+        .execute(tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_api_key_usage_bucket_delta(
+        tx: &mut SqliteConnection,
+        key_id: &str,
+        bucket_start: i64,
+        delta: ApiKeyUsageBucketDelta,
+        updated_at: i64,
+    ) -> Result<(), ProxyError> {
+        if delta.is_zero() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_usage_buckets (
+                api_key_id,
+                bucket_start,
+                bucket_secs,
+                total_requests,
+                success_count,
+                error_count,
+                quota_exhausted_count,
+                valuable_success_count,
+                valuable_failure_count,
+                other_success_count,
+                other_failure_count,
+                unknown_count,
+                updated_at
+            ) VALUES (?, ?, 86400, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(api_key_id, bucket_start, bucket_secs)
+            DO UPDATE SET
+                total_requests = api_key_usage_buckets.total_requests + excluded.total_requests,
+                success_count = api_key_usage_buckets.success_count + excluded.success_count,
+                error_count = api_key_usage_buckets.error_count + excluded.error_count,
+                quota_exhausted_count = api_key_usage_buckets.quota_exhausted_count + excluded.quota_exhausted_count,
+                valuable_success_count = api_key_usage_buckets.valuable_success_count + excluded.valuable_success_count,
+                valuable_failure_count = api_key_usage_buckets.valuable_failure_count + excluded.valuable_failure_count,
+                other_success_count = api_key_usage_buckets.other_success_count + excluded.other_success_count,
+                other_failure_count = api_key_usage_buckets.other_failure_count + excluded.other_failure_count,
+                unknown_count = api_key_usage_buckets.unknown_count + excluded.unknown_count,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(key_id)
+        .bind(bucket_start)
+        .bind(delta.total_requests)
+        .bind(delta.success_count)
+        .bind(delta.error_count)
+        .bind(delta.quota_exhausted_count)
+        .bind(delta.valuable_success_count)
+        .bind(delta.valuable_failure_count)
+        .bind(delta.other_success_count)
+        .bind(delta.other_failure_count)
+        .bind(delta.unknown_count)
+        .bind(updated_at)
+        .execute(tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_auth_token_activity_delta(
+        tx: &mut SqliteConnection,
+        token_id: &str,
+        delta: AuthTokenActivityDelta,
+    ) -> Result<(), ProxyError> {
+        if delta.is_zero() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE auth_tokens
+            SET total_requests = total_requests + ?,
+                last_used_at = CASE
+                    WHEN ? IS NULL THEN last_used_at
+                    WHEN last_used_at IS NULL OR last_used_at < ? THEN ?
+                    ELSE last_used_at
+                END
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+        )
+        .bind(delta.total_requests_delta)
+        .bind(delta.last_used_at)
+        .bind(delta.last_used_at)
+        .bind(delta.last_used_at)
+        .bind(token_id)
+        .execute(tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn log_effect_bucket_migration_needed_for_table(
+        &self,
+        table: &str,
+        target_column: &str,
+        legacy_effect_codes: &[&str],
+    ) -> Result<bool, ProxyError> {
+        let placeholders = std::iter::repeat_n("?", legacy_effect_codes.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT 1 FROM {table}
+             WHERE key_effect_code IN ({placeholders})
+               AND ({target_column} IS NULL OR TRIM({target_column}) = '' OR {target_column} = 'none')
+             LIMIT 1"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for code in legacy_effect_codes {
+            query = query.bind(*code);
+        }
+        Ok(query.fetch_optional(&self.pool).await?.is_some())
+    }
+
+    async fn migrate_log_effect_buckets(&self) -> Result<(), ProxyError> {
+        if self
+            .get_meta_i64(META_KEY_REQUEST_LOG_EFFECT_BUCKET_MIGRATION_V1_DONE)
+            .await?
+            == Some(1)
+        {
+            return Ok(());
+        }
+        let request_logs_table = "observability.request_logs";
+        let binding_codes = [
+            KEY_EFFECT_HTTP_PROJECT_AFFINITY_BOUND,
+            KEY_EFFECT_HTTP_PROJECT_AFFINITY_REUSED,
+            KEY_EFFECT_HTTP_PROJECT_AFFINITY_REBOUND,
+            KEY_EFFECT_API_REBALANCE_ROUTE_BOUND,
+            KEY_EFFECT_API_REBALANCE_ROUTE_REUSED,
+            KEY_EFFECT_API_REBALANCE_ROUTE_REBOUND,
+        ];
+        let selection_codes = [
+            KEY_EFFECT_MCP_SESSION_INIT_COOLDOWN_AVOIDED,
+            KEY_EFFECT_MCP_SESSION_INIT_RATE_LIMIT_AVOIDED,
+            KEY_EFFECT_MCP_SESSION_INIT_PRESSURE_AVOIDED,
+            KEY_EFFECT_HTTP_PROJECT_AFFINITY_COOLDOWN_AVOIDED,
+            KEY_EFFECT_HTTP_PROJECT_AFFINITY_RATE_LIMIT_AVOIDED,
+            KEY_EFFECT_HTTP_PROJECT_AFFINITY_PRESSURE_AVOIDED,
+            KEY_EFFECT_API_REBALANCE_COOLDOWN_AVOIDED,
+            KEY_EFFECT_API_REBALANCE_RATE_LIMIT_AVOIDED,
+            KEY_EFFECT_API_REBALANCE_PRESSURE_AVOIDED,
+        ];
+        debug_assert!(
+            binding_codes
+                .iter()
+                .all(|code| is_binding_effect_code(code))
+        );
+        debug_assert!(
+            selection_codes
+                .iter()
+                .all(|code| is_selection_effect_code(code))
+        );
+        debug_assert!(
+            [
+                KEY_EFFECT_NONE,
+                KEY_EFFECT_QUARANTINED,
+                KEY_EFFECT_MARKED_EXHAUSTED,
+                KEY_EFFECT_RESTORED_ACTIVE,
+                "cleared_quarantine",
+                KEY_EFFECT_MCP_SESSION_INIT_BACKOFF_SET,
+                KEY_EFFECT_MCP_SESSION_RETRY_WAITED,
+                KEY_EFFECT_MCP_SESSION_RETRY_SCHEDULED,
+            ]
+            .iter()
+            .all(|code| is_key_effect_code(code))
+        );
+        let needs_migration = self
+            .log_effect_bucket_migration_needed_for_table(
+                request_logs_table,
+                "binding_effect_code",
+                &binding_codes,
+            )
+            .await?
+            || self
+                .log_effect_bucket_migration_needed_for_table(
+                    request_logs_table,
+                    "selection_effect_code",
+                    &selection_codes,
+                )
+                .await?
+            || self
+                .log_effect_bucket_migration_needed_for_table(
+                    "auth_token_logs",
+                    "binding_effect_code",
+                    &binding_codes,
+                )
+                .await?
+            || self
+                .log_effect_bucket_migration_needed_for_table(
+                    "auth_token_logs",
+                    "selection_effect_code",
+                    &selection_codes,
+                )
+                .await?;
+        if !needs_migration {
+            self.set_meta_i64(META_KEY_REQUEST_LOG_EFFECT_BUCKET_MIGRATION_V1_DONE, 1)
+                .await?;
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for table in [request_logs_table, "auth_token_logs"] {
+            let binding_sql = format!(
+                "UPDATE {table}
+                 SET binding_effect_code = key_effect_code,
+                     binding_effect_summary = key_effect_summary,
+                     key_effect_code = 'none',
+                     key_effect_summary = NULL
+                 WHERE key_effect_code IN (?, ?, ?, ?, ?, ?)
+                   AND (binding_effect_code IS NULL OR TRIM(binding_effect_code) = '' OR binding_effect_code = 'none')"
+            );
+            sqlx::query(&binding_sql)
+                .bind(binding_codes[0])
+                .bind(binding_codes[1])
+                .bind(binding_codes[2])
+                .bind(binding_codes[3])
+                .bind(binding_codes[4])
+                .bind(binding_codes[5])
+                .execute(&mut *tx)
+                .await?;
+
+            let selection_sql = format!(
+                "UPDATE {table}
+                 SET selection_effect_code = key_effect_code,
+                     selection_effect_summary = key_effect_summary,
+                     key_effect_code = 'none',
+                     key_effect_summary = NULL
+                 WHERE key_effect_code IN (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   AND (selection_effect_code IS NULL OR TRIM(selection_effect_code) = '' OR selection_effect_code = 'none')"
+            );
+            sqlx::query(&selection_sql)
+                .bind(selection_codes[0])
+                .bind(selection_codes[1])
+                .bind(selection_codes[2])
+                .bind(selection_codes[3])
+                .bind(selection_codes[4])
+                .bind(selection_codes[5])
+                .bind(selection_codes[6])
+                .bind(selection_codes[7])
+                .bind(selection_codes[8])
+                .execute(&mut *tx)
+                .await?;
+        }
+        set_meta_i64_executor(
+            &mut *tx,
+            META_KEY_REQUEST_LOG_EFFECT_BUCKET_MIGRATION_V1_DONE,
+            1,
+        )
+        .await?;
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn rerun_log_effect_bucket_migration_for_test(
+        &self,
+    ) -> Result<(), ProxyError> {
+        self.migrate_log_effect_buckets().await
+    }
+
+    fn push_request_logs_scope<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        scoped_key_id: Option<&'a str>,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> bool {
+        builder.push(" WHERE visibility = ");
+        builder.push_bind(REQUEST_LOG_VISIBILITY_VISIBLE);
+        let mut has_where = true;
+        if let Some(key_id) = scoped_key_id {
+            builder.push(" AND api_key_id = ");
+            builder.push_bind(key_id);
+            has_where = true;
+        }
+        if let Some(since) = since {
+            builder.push(if has_where {
+                " AND created_at >= "
+            } else {
+                " WHERE created_at >= "
+            });
+            builder.push_bind(since);
+            has_where = true;
+        }
+        if let Some(until) = until {
+            builder.push(if has_where {
+                " AND created_at < "
+            } else {
+                " WHERE created_at < "
+            });
+            builder.push_bind(until);
+            has_where = true;
+        }
+        has_where
+    }
+
+    fn push_request_logs_filters<'a, 'b>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        filters: RequestLogFilterParams<'a, 'b>,
+    ) {
+        let RequestLogFilterParams {
+            request_kinds,
+            result_status,
+            key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
+            request_user_id,
+            auth_token_id,
+            key_id,
+            stored_request_kind_sql,
+            legacy_request_kind_predicate_sql,
+            legacy_request_kind_sql,
+            mut has_where,
+        } = filters;
+        if let Some(result_status) = result_status {
+            builder.push(if has_where {
+                " AND result_status = "
+            } else {
+                " WHERE result_status = "
+            });
+            builder.push_bind(result_status.to_string());
+            has_where = true;
+        }
+        if let Some(key_effect_code) = key_effect_code {
+            builder.push(if has_where {
+                " AND key_effect_code = "
+            } else {
+                " WHERE key_effect_code = "
+            });
+            builder.push_bind(key_effect_code.to_string());
+            has_where = true;
+        }
+        if let Some(binding_effect_code) = binding_effect_code {
+            builder.push(if has_where {
+                " AND binding_effect_code = "
+            } else {
+                " WHERE binding_effect_code = "
+            });
+            builder.push_bind(binding_effect_code.to_string());
+            has_where = true;
+        }
+        if let Some(selection_effect_code) = selection_effect_code {
+            builder.push(if has_where {
+                " AND selection_effect_code = "
+            } else {
+                " WHERE selection_effect_code = "
+            });
+            builder.push_bind(selection_effect_code.to_string());
+            has_where = true;
+        }
+        if let Some(request_user_id) = request_user_id {
+            builder.push(if has_where {
+                " AND request_user_id = "
+            } else {
+                " WHERE request_user_id = "
+            });
+            builder.push_bind(request_user_id.to_string());
+            has_where = true;
+        }
+        if let Some(auth_token_id) = auth_token_id {
+            builder.push(if has_where {
+                " AND auth_token_id = "
+            } else {
+                " WHERE auth_token_id = "
+            });
+            builder.push_bind(auth_token_id.to_string());
+            has_where = true;
+        }
+        if let Some(key_id) = key_id {
+            builder.push(if has_where {
+                " AND api_key_id = "
+            } else {
+                " WHERE api_key_id = "
+            });
+            builder.push_bind(key_id.to_string());
+            has_where = true;
+        }
+        if !request_kinds.is_empty() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            Self::push_request_kind_filter_clause(
+                builder,
+                stored_request_kind_sql,
+                legacy_request_kind_predicate_sql,
+                legacy_request_kind_sql,
+                request_kinds,
+            );
+        }
+    }
+
+    fn push_effective_request_kind_filter_clause<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        effective_request_kind_sql: &str,
+        request_kinds: &[String],
+    ) {
+        builder.push("(");
+        builder.push(effective_request_kind_sql.to_string());
+        builder.push(" IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for request_kind in request_kinds {
+                separated.push_bind(request_kind.clone());
+            }
+            separated.push_unseparated(")");
+        }
+        builder.push(")");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_token_logs_catalog_filters<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        token_id: &'a str,
+        since: i64,
+        until: Option<i64>,
+        filters: TokenLogsCatalogFilters<'a>,
+        stored_request_kind_sql: &'a str,
+        legacy_request_kind_predicate_sql: &'a str,
+        legacy_request_kind_sql: &'a str,
+        stored_operational_class_case_sql: &'a str,
+        legacy_operational_class_case_sql: &'a str,
+        stored_result_bucket_sql: &'a str,
+        legacy_result_bucket_sql: &'a str,
+    ) {
+        let normalized_request_kinds = Self::normalize_request_kind_filters(filters.request_kinds);
+        builder.push(" WHERE auth_token_logs.token_id = ");
+        builder.push_bind(token_id);
+        builder.push(" AND auth_token_logs.created_at >= ");
+        builder.push_bind(since);
+        if let Some(until) = until {
+            builder.push(" AND auth_token_logs.created_at < ");
+            builder.push_bind(until);
+        }
+        if let Some(key_effect_code) = filters.key_effect_code {
+            builder.push(" AND auth_token_logs.key_effect_code = ");
+            builder.push_bind(key_effect_code);
+        }
+        if let Some(binding_effect_code) = filters.binding_effect_code {
+            builder.push(" AND auth_token_logs.binding_effect_code = ");
+            builder.push_bind(binding_effect_code);
+        }
+        if let Some(selection_effect_code) = filters.selection_effect_code {
+            builder.push(" AND auth_token_logs.selection_effect_code = ");
+            builder.push_bind(selection_effect_code);
+        }
+        if let Some(key_id) = filters.key_id {
+            builder.push(" AND auth_token_logs.api_key_id = ");
+            builder.push_bind(key_id);
+        }
+        if !normalized_request_kinds.is_empty() {
+            builder.push(" AND ");
+            Self::push_request_kind_filter_clause(
+                builder,
+                stored_request_kind_sql,
+                legacy_request_kind_predicate_sql,
+                legacy_request_kind_sql,
+                &normalized_request_kinds,
+            );
+        }
+        if let Some(result_status) = filters.result_status {
+            builder.push(" AND ");
+            Self::push_result_bucket_filter_clause(
+                builder,
+                result_status,
+                legacy_request_kind_predicate_sql,
+                stored_result_bucket_sql,
+                legacy_result_bucket_sql,
+            );
+        }
+        if let Some(operational_class) = filters.operational_class {
+            builder.push(" AND ");
+            Self::push_operational_class_filter_clause(
+                builder,
+                operational_class,
+                legacy_request_kind_predicate_sql,
+                stored_operational_class_case_sql,
+                legacy_operational_class_case_sql,
+            );
+        }
+    }
+
+    fn request_log_catalog_bucket_start_sql(created_at_sql: &str) -> String {
+        created_at_sql.to_string()
+    }
+
+    fn clamp_request_logs_rollup_since_at(
+        since: Option<i64>,
+        retention_days: i64,
+        now: chrono::DateTime<Local>,
+    ) -> Option<i64> {
+        let retention_since =
+            configured_request_logs_retention_threshold_utc_ts_at(retention_days, now);
+        Some(since.unwrap_or(retention_since).max(retention_since))
+    }
+
+    fn request_log_catalog_rollup_exprs(prefix: &str) -> Vec<String> {
+        let col = |name: &str| -> String {
+            if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}{name}")
+            }
+        };
+        let stored_request_kind_sql = col("request_kind_key");
+        let effective_request_kind_sql = stored_request_kind_sql.clone();
+        let fallback_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(&effective_request_kind_sql, &col("request_body"));
+        let counts_business_quota_sql = format!(
+            "COALESCE({}, {fallback_counts_business_quota_sql})",
+            col("counts_business_quota")
+        );
+        let operational_class_sql = request_log_operational_class_case_sql(
+            &effective_request_kind_sql,
+            &counts_business_quota_sql,
+            &col("result_status"),
+            &format!("COALESCE({}, '')", col("failure_kind")),
+        );
+        let result_bucket_sql = result_bucket_case_sql(&operational_class_sql, &col("result_status"));
+        let request_kind_label_sql = format!(
+            "COALESCE(NULLIF(TRIM({}), ''), {})",
+            col("request_kind_label"),
+            canonical_request_kind_label_sql(&effective_request_kind_sql)
+        );
+
+        vec![
+            Self::request_log_catalog_bucket_start_sql(&col("created_at")),
+            format!("COALESCE(NULLIF(TRIM({effective_request_kind_sql}), ''), 'unknown')"),
+            format!("COALESCE(NULLIF(TRIM({request_kind_label_sql}), ''), 'Unknown')"),
+            format!("COALESCE(NULLIF(TRIM({result_bucket_sql}), ''), 'unknown')"),
+            format!(
+                "COALESCE(NULLIF(TRIM({}), ''), '{}')",
+                col("key_effect_code"),
+                KEY_EFFECT_NONE
+            ),
+            format!(
+                "COALESCE(NULLIF(TRIM({}), ''), '{}')",
+                col("binding_effect_code"),
+                KEY_EFFECT_NONE
+            ),
+            format!(
+                "COALESCE(NULLIF(TRIM({}), ''), '{}')",
+                col("selection_effect_code"),
+                KEY_EFFECT_NONE
+            ),
+            format!("COALESCE(NULLIF(TRIM({}), ''), '')", col("auth_token_id")),
+            format!("COALESCE(NULLIF(TRIM({}), ''), '')", col("api_key_id")),
+            format!("COALESCE(NULLIF(TRIM({operational_class_sql}), ''), 'other')"),
+        ]
+    }
+
+    fn request_log_catalog_rollup_columns() -> &'static str {
+        "bucket_start, request_kind_key, request_kind_label, result_bucket, key_effect_code, binding_effect_code, selection_effect_code, auth_token_id, api_key_id, operational_class"
+    }
+
+    fn push_request_log_catalog_rollup_filters<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        scoped_key_id: Option<&'a str>,
+        since: Option<i64>,
+        filters: RequestLogsCatalogFilters<'a>,
+    ) {
+        let normalized_request_kinds = Self::normalize_request_kind_filters(filters.request_kinds);
+        builder.push(" WHERE 1 = 1");
+        if let Some(since) = since {
+            builder.push(" AND bucket_start >= ");
+            builder.push_bind(since);
+        }
+        if let Some(scoped_key_id) = scoped_key_id {
+            builder.push(" AND api_key_id = ");
+            builder.push_bind(scoped_key_id);
+        }
+        if let Some(result_status) = filters.result_status {
+            builder.push(" AND result_bucket = ");
+            builder.push_bind(result_status);
+        }
+        if let Some(key_effect_code) = filters.key_effect_code {
+            builder.push(" AND key_effect_code = ");
+            builder.push_bind(key_effect_code);
+        }
+        if let Some(binding_effect_code) = filters.binding_effect_code {
+            builder.push(" AND binding_effect_code = ");
+            builder.push_bind(binding_effect_code);
+        }
+        if let Some(selection_effect_code) = filters.selection_effect_code {
+            builder.push(" AND selection_effect_code = ");
+            builder.push_bind(selection_effect_code);
+        }
+        if let Some(auth_token_id) = filters.auth_token_id {
+            builder.push(" AND auth_token_id = ");
+            builder.push_bind(auth_token_id);
+        }
+        if let Some(key_id) = filters.key_id {
+            builder.push(" AND api_key_id = ");
+            builder.push_bind(key_id);
+        }
+        if let Some(operational_class) = filters.operational_class {
+            builder.push(" AND operational_class = ");
+            builder.push_bind(operational_class);
+        }
+        if !normalized_request_kinds.is_empty() {
+            builder.push(" AND request_kind_key IN (");
+            let mut separated = builder.separated(", ");
+            for request_kind in normalized_request_kinds {
+                separated.push_bind(request_kind);
+            }
+            builder.push(")");
+        }
+    }
+
+    async fn fetch_request_logs_rollup_total(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        filters: RequestLogsCatalogFilters<'_>,
+    ) -> Result<i64, ProxyError> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT COALESCE(SUM(request_count), 0) FROM observability.request_log_catalog_rollups",
+        );
+        Self::push_request_log_catalog_rollup_filters(&mut query, scoped_key_id, since, filters);
+        query
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(ProxyError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_logs_exist_for_filters(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        binding_effect_code: Option<&str>,
+        selection_effect_code: Option<&str>,
+        auth_token_id: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+    ) -> Result<bool, ProxyError> {
+        let normalized_request_kinds = Self::normalize_request_kind_filters(request_kinds);
+        let stored_request_kind_sql = "request_kind_key";
+        let legacy_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
+        let legacy_request_kind_sql =
+            request_log_request_kind_key_sql("path", "request_body", "request_kind_key");
+        let effective_request_kind_sql = format!(
+            "CASE WHEN {legacy_request_kind_predicate_sql} THEN {legacy_request_kind_sql} ELSE {stored_request_kind_sql} END"
+        );
+        let stored_counts_business_quota_sql = format!(
+            "COALESCE(counts_business_quota, {})",
+            request_log_counts_business_quota_sql(stored_request_kind_sql, "request_body")
+        );
+        let stored_operational_class_case_sql = request_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            &stored_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(&legacy_request_kind_sql, "request_body");
+        let legacy_operational_class_case_sql = request_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            &legacy_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
+
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT 1 FROM observability.request_logs");
+        let has_where = Self::push_request_logs_scope(&mut query, scoped_key_id, since, None);
+        let mut has_where = has_where;
+        if let Some(key_effect_code) = key_effect_code {
+            query.push(if has_where {
+                " AND key_effect_code = "
+            } else {
+                " WHERE key_effect_code = "
+            });
+            query.push_bind(key_effect_code.to_string());
+            has_where = true;
+        }
+        if let Some(binding_effect_code) = binding_effect_code {
+            query.push(if has_where {
+                " AND binding_effect_code = "
+            } else {
+                " WHERE binding_effect_code = "
+            });
+            query.push_bind(binding_effect_code.to_string());
+            has_where = true;
+        }
+        if let Some(selection_effect_code) = selection_effect_code {
+            query.push(if has_where {
+                " AND selection_effect_code = "
+            } else {
+                " WHERE selection_effect_code = "
+            });
+            query.push_bind(selection_effect_code.to_string());
+            has_where = true;
+        }
+        if let Some(auth_token_id) = auth_token_id {
+            query.push(if has_where {
+                " AND auth_token_id = "
+            } else {
+                " WHERE auth_token_id = "
+            });
+            query.push_bind(auth_token_id.to_string());
+            has_where = true;
+        }
+        if let Some(key_id) = key_id {
+            query.push(if has_where {
+                " AND api_key_id = "
+            } else {
+                " WHERE api_key_id = "
+            });
+            query.push_bind(key_id.to_string());
+            has_where = true;
+        }
+        if !normalized_request_kinds.is_empty() {
+            query.push(if has_where { " AND " } else { " WHERE " });
+            Self::push_effective_request_kind_filter_clause(
+                &mut query,
+                &effective_request_kind_sql,
+                &normalized_request_kinds,
+            );
+        }
+        if let Some(result_status) = result_status {
+            query.push(" AND ");
+            Self::push_result_bucket_filter_clause(
+                &mut query,
+                result_status,
+                &legacy_request_kind_predicate_sql,
+                &stored_result_bucket_sql,
+                &legacy_result_bucket_sql,
+            );
+        }
+        if let Some(operational_class) = operational_class {
+            query.push(" AND ");
+            Self::push_operational_class_filter_clause(
+                &mut query,
+                operational_class,
+                &legacy_request_kind_predicate_sql,
+                &stored_operational_class_case_sql,
+                &legacy_operational_class_case_sql,
+            );
+        }
+        query.push(" LIMIT 1");
+        Ok(query.build().fetch_optional(&self.pool).await?.is_some())
+    }
+
+    async fn fetch_request_log_request_kind_options(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        filters: RequestLogsCatalogFilters<'_>,
+    ) -> Result<Vec<TokenRequestKindOption>, ProxyError> {
+        type RequestKindOptionRow = (String, String, i64);
+        let mut legacy_query = QueryBuilder::<Sqlite>::new(
+            "SELECT request_kind_key, request_kind_label, SUM(request_count) AS request_count FROM observability.request_log_catalog_rollups",
+        );
+        Self::push_request_log_catalog_rollup_filters(
+            &mut legacy_query,
+            scoped_key_id,
+            since,
+            filters,
+        );
+        legacy_query.push(" GROUP BY 1, 2");
+
+        let rows = legacy_query
+            .build_query_as::<RequestKindOptionRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let mut options_by_key = BTreeMap::<String, (String, i64)>::new();
+        for (key, label, count) in rows {
+            match options_by_key.get_mut(&key) {
+                Some((current_label, current_count))
+                    if prefer_request_kind_label(current_label, &label) =>
+                {
+                    *current_label = label;
+                    *current_count += count;
+                }
+                Some((_, current_count)) => {
+                    *current_count += count;
+                }
+                None => {
+                    options_by_key.insert(key, (label, count));
+                }
+            }
+        }
+
+        Ok(options_by_key
+            .into_iter()
+            .map(|(key, (label, count))| TokenRequestKindOption {
+                protocol_group: token_request_kind_protocol_group(&key).to_string(),
+                billing_group: token_request_kind_billing_group(&key).to_string(),
+                key,
+                label,
+                count,
+            })
+            .collect())
+    }
+
+    async fn fetch_request_log_facet_options(
+        &self,
+        column_expr: &str,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        require_non_empty: bool,
+        filters: RequestLogsCatalogFilters<'_>,
+    ) -> Result<Vec<LogFacetOption>, ProxyError> {
+        let column_expr = match column_expr {
+            "key_effect_code" => "key_effect_code",
+            "binding_effect_code" => "binding_effect_code",
+            "selection_effect_code" => "selection_effect_code",
+            "auth_token_id" => "auth_token_id",
+            "api_key_id" => "api_key_id",
+            _ => unreachable!("unsupported request log rollup facet column"),
+        };
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT {column_expr} AS value, SUM(request_count) AS count FROM observability.request_log_catalog_rollups"
+        ));
+        Self::push_request_log_catalog_rollup_filters(&mut query, scoped_key_id, since, filters);
+        if require_non_empty {
+            query.push(" AND TRIM(");
+            query.push(column_expr);
+            query.push(") <> ''");
+        }
+        query.push(" GROUP BY 1 ORDER BY count DESC, value ASC");
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| -> Result<LogFacetOption, sqlx::Error> {
+                Ok(LogFacetOption {
+                    value: row.try_get("value")?,
+                    count: row.try_get("count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProxyError::from)
+    }
+
+    async fn fetch_request_log_result_facet_options(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        filters: RequestLogsCatalogFilters<'_>,
+    ) -> Result<Vec<LogFacetOption>, ProxyError> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "
+            SELECT
+                result_bucket AS value,
+                SUM(request_count) AS count
+            FROM observability.request_log_catalog_rollups
+            ",
+        );
+        Self::push_request_log_catalog_rollup_filters(&mut query, scoped_key_id, since, filters);
+        query.push(" GROUP BY 1 ORDER BY count DESC, value ASC");
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| -> Result<LogFacetOption, sqlx::Error> {
+                Ok(LogFacetOption {
+                    value: row.try_get("value")?,
+                    count: row.try_get("count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProxyError::from)
+    }
+
+    async fn load_request_logs_catalog(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        retention_days: i64,
+        include_token_facets: bool,
+        include_key_facets: bool,
+        filters: RequestLogsCatalogFilters<'_>,
+    ) -> Result<RequestLogsCatalog, ProxyError> {
+        let since =
+            Self::clamp_request_logs_rollup_since_at(since, retention_days, self.backend_time.local_now());
+        let cache_key = Self::request_logs_catalog_filters_are_empty(filters).then(|| {
+            Self::request_logs_catalog_cache_key(
+                scoped_key_id,
+                since,
+                include_token_facets,
+                include_key_facets,
+            )
+        });
+        if let Some(cache_key) = cache_key.as_deref()
+            && let Some(cached) = self.cached_request_logs_catalog(cache_key).await
+        {
+            return Ok(cached);
+        }
+        let request_kind_options = self
+            .fetch_request_log_request_kind_options(scoped_key_id, since, filters)
+            .await?;
+        let results = self
+            .fetch_request_log_result_facet_options(scoped_key_id, since, filters)
+            .await?;
+        let key_effects = self
+            .fetch_request_log_facet_options(
+                "key_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                filters,
+            )
+            .await?;
+        let binding_effects = self
+            .fetch_request_log_facet_options(
+                "binding_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                filters,
+            )
+            .await?;
+        let selection_effects = self
+            .fetch_request_log_facet_options(
+                "selection_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                filters,
+            )
+            .await?;
+        let tokens = if include_token_facets {
+            self.fetch_request_log_facet_options(
+                "auth_token_id",
+                scoped_key_id,
+                since,
+                true,
+                filters,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        let keys = if include_key_facets {
+            self.fetch_request_log_facet_options("api_key_id", scoped_key_id, since, true, filters)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(RequestLogsCatalog {
+            retention_days,
+            request_kind_options,
+            facets: RequestLogPageFacets {
+                results,
+                key_effects,
+                binding_effects,
+                selection_effects,
+                tokens,
+                keys,
+            },
+        })
+    }
+
+    pub(crate) async fn fetch_request_logs_catalog(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        retention_days: i64,
+        include_token_facets: bool,
+        include_key_facets: bool,
+        filters: RequestLogsCatalogFilters<'_>,
+    ) -> Result<RequestLogsCatalog, ProxyError> {
+        let started = Instant::now();
+        let since = Self::clamp_request_logs_rollup_since_at(
+            since,
+            retention_days,
+            self.backend_time.local_now(),
+        );
+        let cache_key = Self::request_logs_catalog_filters_are_empty(filters).then(|| {
+            Self::request_logs_catalog_cache_key(
+                scoped_key_id,
+                since,
+                include_token_facets,
+                include_key_facets,
+            )
+        });
+        if let Some(cache_key) = cache_key.as_deref()
+            && let Some(cached) = self.cached_request_logs_catalog(cache_key).await
+        {
+            emit_low_memory_protection_decision(
+                "admin_read",
+                PerfLogScope {
+                    route: Some("/api/logs/catalog"),
+                    scope: Some(if scoped_key_id.is_some() { "key" } else { "global" }),
+                    row_count: Some(cached.request_kind_options.len()),
+                    degraded: Some("cache_hit"),
+                    ..Default::default()
+                },
+            );
+            emit_perf_log(
+                DbLogStatus::Info,
+                "admin_read",
+                "request_logs_catalog_completed",
+                started.elapsed(),
+                PerfLogScope {
+                    route: Some("/api/logs/catalog"),
+                    scope: Some(if scoped_key_id.is_some() { "key" } else { "global" }),
+                    row_count: Some(cached.request_kind_options.len()),
+                    degraded: Some("cache_hit"),
+                    ..Default::default()
+                },
+            );
+            return Ok(cached);
+        }
+
+        let mut catalog = self
+            .load_request_logs_catalog(
+                scoped_key_id,
+                since,
+                retention_days,
+                include_token_facets,
+                include_key_facets,
+                filters,
+            )
+            .await?;
+
+        if catalog.request_kind_options.is_empty()
+            && catalog.facets.results.is_empty()
+            && self
+                .request_logs_exist_for_filters(
+                    scoped_key_id,
+                    since,
+                    filters.request_kinds,
+                    filters.result_status,
+                    filters.key_effect_code,
+                    filters.binding_effect_code,
+                    filters.selection_effect_code,
+                    filters.auth_token_id,
+                    filters.key_id,
+                    filters.operational_class,
+                )
+                .await?
+        {
+            self.rebuild_request_log_catalog_rollups().await?;
+            catalog = self
+                .load_request_logs_catalog(
+                    scoped_key_id,
+                    since,
+                    retention_days,
+                    include_token_facets,
+                    include_key_facets,
+                    filters,
+                )
+                .await?;
+        }
+        if let Some(cache_key) = cache_key {
+            self.cache_request_logs_catalog(cache_key, &catalog).await;
+        }
+        emit_low_memory_protection_decision(
+            "admin_read",
+            PerfLogScope {
+                route: Some("/api/logs/catalog"),
+                scope: Some(if scoped_key_id.is_some() { "key" } else { "global" }),
+                degraded: Some("full"),
+                ..Default::default()
+            },
+        );
+        emit_perf_log(
+            DbLogStatus::Info,
+            "admin_read",
+            "request_logs_catalog_completed",
+            started.elapsed(),
+            PerfLogScope {
+                route: Some("/api/logs/catalog"),
+                scope: Some(if scoped_key_id.is_some() { "key" } else { "global" }),
+                row_count: Some(catalog.request_kind_options.len()),
+                degraded: Some("full"),
+                ..Default::default()
+            },
+        );
+        Ok(catalog)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fetch_request_logs_cursor_page(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        until: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        binding_effect_code: Option<&str>,
+        selection_effect_code: Option<&str>,
+        request_user_id: Option<&str>,
+        auth_token_id: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+        cursor: Option<&RequestLogsCursor>,
+        direction: RequestLogsCursorDirection,
+        page_size: i64,
+    ) -> Result<RequestLogsCursorPage, ProxyError> {
+        let started = Instant::now();
+        let retention_days = self
+            .get_system_settings()
+            .await?
+            .request_log_retention
+            .max_log_retention_days;
+        let since =
+            Self::clamp_request_logs_rollup_since_at(since, retention_days, self.backend_time.local_now());
+        let page_size = page_size.clamp(1, 200);
+        let query_limit = page_size + 1;
+        let normalized_request_kinds = Self::normalize_request_kind_filters(request_kinds);
+        let stored_request_kind_sql = "request_kind_key";
+        let legacy_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
+        let legacy_request_kind_sql =
+            request_log_request_kind_key_sql("path", "request_body", "request_kind_key");
+        let effective_request_kind_sql = format!(
+            "CASE WHEN {legacy_request_kind_predicate_sql} THEN {legacy_request_kind_sql} ELSE {stored_request_kind_sql} END"
+        );
+        let effective_request_kind_label_sql =
+            canonical_request_kind_label_sql(&effective_request_kind_sql);
+        let stored_counts_business_quota_sql = format!(
+            "COALESCE(counts_business_quota, {})",
+            request_log_counts_business_quota_sql(stored_request_kind_sql, "request_body")
+        );
+        let stored_operational_class_case_sql = request_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            &stored_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(&legacy_request_kind_sql, "request_body");
+        let legacy_operational_class_case_sql = request_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            &legacy_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
+        let effective_counts_business_quota_sql = format!(
+            "CASE WHEN {legacy_request_kind_predicate_sql} THEN {legacy_counts_business_quota_sql} ELSE {stored_counts_business_quota_sql} END"
+        );
+        let effective_non_billable_mcp_sql =
+            token_request_kind_non_billable_mcp_sql(&effective_request_kind_sql);
+        let effective_request_kind_protocol_group_sql = format!(
+            "CASE WHEN LOWER(TRIM(COALESCE({effective_request_kind_sql}, ''))) LIKE 'mcp:%' THEN 'mcp' ELSE 'api' END"
+        );
+        let effective_request_kind_billing_group_sql = format!(
+            "
+            CASE
+                WHEN LOWER(TRIM(COALESCE({effective_request_kind_sql}, ''))) IN (
+                    'api:research-result',
+                    'api:usage',
+                    'api:unknown-path'
+                ) THEN 'non_billable'
+                WHEN LOWER(TRIM(COALESCE({effective_request_kind_sql}, ''))) = 'mcp:batch'
+                    AND {effective_counts_business_quota_sql} = 0
+                    THEN 'non_billable'
+                WHEN {effective_non_billable_mcp_sql} THEN 'non_billable'
+                ELSE 'billable'
+            END
+            "
+        );
+        let effective_operational_class_sql = format!(
+            "CASE WHEN {legacy_request_kind_predicate_sql} THEN {legacy_operational_class_case_sql} ELSE {stored_operational_class_case_sql} END"
+        );
+
+        let mut items_query = QueryBuilder::<Sqlite>::new(format!(
+            r#"
+            SELECT
+                id,
+                api_key_id,
+                auth_token_id,
+                method,
+                path,
+                query,
+                status_code,
+                tavily_status_code,
+                error_message,
+                result_status,
+                {effective_request_kind_sql} AS request_kind_key,
+                {effective_request_kind_label_sql} AS request_kind_label,
+                request_kind_detail,
+                business_credits,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                binding_effect_code,
+                binding_effect_summary,
+                selection_effect_code,
+                selection_effect_summary,
+                gateway_mode,
+                experiment_variant,
+                proxy_session_id,
+                routing_subject_hash,
+                upstream_operation,
+                fallback_reason,
+                NULL AS request_body,
+                NULL AS response_body,
+                request_body_bytes,
+                response_body_bytes,
+                request_body_sha256,
+                response_body_sha256,
+                body_cleaned_reason,
+                body_cleaned_at,
+                forwarded_headers,
+                dropped_headers,
+                remote_addr,
+                client_ip,
+                client_ip_source,
+                client_ip_trusted,
+                ip_headers,
+                {effective_operational_class_sql} AS operational_class,
+                {effective_request_kind_protocol_group_sql} AS request_kind_protocol_group,
+                {effective_request_kind_billing_group_sql} AS request_kind_billing_group,
+                created_at
+            FROM observability.request_logs
+            "#
+        ));
+        let has_where =
+            Self::push_request_logs_scope(&mut items_query, scoped_key_id, since, until);
+        Self::push_request_logs_filters(
+            &mut items_query,
+            RequestLogFilterParams {
+                request_kinds: &[],
+                result_status: None,
+                key_effect_code,
+                binding_effect_code,
+                selection_effect_code,
+                request_user_id,
+                auth_token_id,
+                key_id,
+                stored_request_kind_sql,
+                legacy_request_kind_predicate_sql: &legacy_request_kind_predicate_sql,
+                legacy_request_kind_sql: &legacy_request_kind_sql,
+                has_where,
+            },
+        );
+        if !normalized_request_kinds.is_empty() {
+            items_query.push(" AND ");
+            Self::push_effective_request_kind_filter_clause(
+                &mut items_query,
+                &effective_request_kind_sql,
+                &normalized_request_kinds,
+            );
+        }
+        if let Some(result_status) = result_status {
+            items_query.push(" AND ");
+            Self::push_result_bucket_filter_clause(
+                &mut items_query,
+                result_status,
+                &legacy_request_kind_predicate_sql,
+                &stored_result_bucket_sql,
+                &legacy_result_bucket_sql,
+            );
+        }
+        if let Some(operational_class) = operational_class {
+            items_query.push(" AND ");
+            Self::push_operational_class_filter_clause(
+                &mut items_query,
+                operational_class,
+                &legacy_request_kind_predicate_sql,
+                &stored_operational_class_case_sql,
+                &legacy_operational_class_case_sql,
+            );
+        }
+        Self::push_desc_cursor_clause(
+            &mut items_query,
+            "created_at",
+            "id",
+            cursor,
+            direction,
+            true,
+        );
+        match direction {
+            RequestLogsCursorDirection::Older => {
+                items_query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+            }
+            RequestLogsCursorDirection::Newer => {
+                items_query.push(" ORDER BY created_at ASC, id ASC LIMIT ");
+            }
+        }
+        items_query.push_bind(query_limit);
+
+        let mut rows = items_query.build().fetch_all(&self.pool).await?;
+        let has_more = rows.len() as i64 > page_size;
+        if has_more {
+            rows.truncate(page_size as usize);
+        }
+        if matches!(direction, RequestLogsCursorDirection::Newer) {
+            rows.reverse();
+        }
+        let items = rows
+            .into_iter()
+            .map(Self::map_request_log_row)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let has_older = match direction {
+            RequestLogsCursorDirection::Older => has_more,
+            RequestLogsCursorDirection::Newer => cursor.is_some(),
+        };
+        let has_newer = match direction {
+            RequestLogsCursorDirection::Older => cursor.is_some(),
+            RequestLogsCursorDirection::Newer => has_more,
+        };
+        let recovery_cursor = cursor.cloned();
+
+        let result = RequestLogsCursorPage {
+            next_cursor: has_older
+                .then(|| {
+                    items
+                        .last()
+                        .map(Self::request_logs_cursor_for_record)
+                        .or_else(|| {
+                            matches!(direction, RequestLogsCursorDirection::Newer)
+                                .then(|| recovery_cursor.clone())
+                                .flatten()
+                        })
+                })
+                .flatten(),
+            prev_cursor: has_newer
+                .then(|| {
+                    items
+                        .first()
+                        .map(Self::request_logs_cursor_for_record)
+                        .or_else(|| {
+                            matches!(direction, RequestLogsCursorDirection::Older)
+                                .then(|| recovery_cursor.clone())
+                                .flatten()
+                        })
+                })
+                .flatten(),
+            items,
+            page_size,
+            has_older,
+            has_newer,
+        };
+        emit_low_memory_protection_decision(
+            "admin_read",
+            PerfLogScope {
+                route: Some("/api/logs/list"),
+                scope: Some(if scoped_key_id.is_some() { "key" } else { "global" }),
+                page_size: Some(page_size),
+                degraded: Some("full"),
+                ..Default::default()
+            },
+        );
+        emit_perf_log(
+            DbLogStatus::Info,
+            "admin_read",
+            "request_logs_list_completed",
+            started.elapsed(),
+            PerfLogScope {
+                route: Some("/api/logs/list"),
+                scope: Some(if scoped_key_id.is_some() { "key" } else { "global" }),
+                page_size: Some(page_size),
+                row_count: Some(result.items.len()),
+                degraded: Some("full"),
+                ..Default::default()
+            },
+        );
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fetch_request_logs_page(
+        &self,
+        scoped_key_id: Option<&str>,
+        since: Option<i64>,
+        request_kinds: &[String],
+        result_status: Option<&str>,
+        key_effect_code: Option<&str>,
+        binding_effect_code: Option<&str>,
+        selection_effect_code: Option<&str>,
+        request_user_id: Option<&str>,
+        auth_token_id: Option<&str>,
+        key_id: Option<&str>,
+        operational_class: Option<&str>,
+        page: i64,
+        per_page: i64,
+        include_token_facets: bool,
+        include_key_facets: bool,
+        include_bodies: bool,
+    ) -> Result<RequestLogsPage, ProxyError> {
+        let retention_days = self
+            .get_system_settings()
+            .await?
+            .request_log_retention
+            .max_log_retention_days;
+        let since =
+            Self::clamp_request_logs_rollup_since_at(since, retention_days, self.backend_time.local_now());
+        let page = page.max(1);
+        let per_page = per_page.clamp(1, 200);
+        let offset = (page - 1) * per_page;
+        let _permit = self
+            .admin_heavy_read_semaphore
+            .acquire()
+            .await
+            .expect("admin heavy read semaphore is never closed");
+        let normalized_request_kinds = Self::normalize_request_kind_filters(request_kinds);
+        let stored_request_kind_sql = "request_kind_key";
+        let legacy_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql(stored_request_kind_sql);
+        let legacy_request_kind_sql =
+            request_log_request_kind_key_sql("path", "request_body", "request_kind_key");
+        let effective_request_kind_sql = format!(
+            "CASE WHEN {legacy_request_kind_predicate_sql} THEN {legacy_request_kind_sql} ELSE {stored_request_kind_sql} END"
+        );
+        let effective_request_kind_label_sql =
+            canonical_request_kind_label_sql(&effective_request_kind_sql);
+        let stored_counts_business_quota_sql = format!(
+            "COALESCE(counts_business_quota, {})",
+            request_log_counts_business_quota_sql(stored_request_kind_sql, "request_body")
+        );
+        let stored_operational_class_case_sql = request_log_operational_class_case_sql(
+            stored_request_kind_sql,
+            &stored_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let legacy_counts_business_quota_sql =
+            request_log_counts_business_quota_sql(&legacy_request_kind_sql, "request_body");
+        let legacy_operational_class_case_sql = request_log_operational_class_case_sql(
+            &legacy_request_kind_sql,
+            &legacy_counts_business_quota_sql,
+            "result_status",
+            "COALESCE(failure_kind, '')",
+        );
+        let stored_result_bucket_sql =
+            result_bucket_case_sql(&stored_operational_class_case_sql, "result_status");
+        let legacy_result_bucket_sql =
+            result_bucket_case_sql(&legacy_operational_class_case_sql, "result_status");
+        let effective_counts_business_quota_sql = format!(
+            "CASE WHEN {legacy_request_kind_predicate_sql} THEN {legacy_counts_business_quota_sql} ELSE {stored_counts_business_quota_sql} END"
+        );
+        let effective_non_billable_mcp_sql =
+            token_request_kind_non_billable_mcp_sql(&effective_request_kind_sql);
+        let effective_request_kind_protocol_group_sql = format!(
+            "CASE WHEN LOWER(TRIM(COALESCE({effective_request_kind_sql}, ''))) LIKE 'mcp:%' THEN 'mcp' ELSE 'api' END"
+        );
+        let effective_request_kind_billing_group_sql = format!(
+            "
+            CASE
+                WHEN LOWER(TRIM(COALESCE({effective_request_kind_sql}, ''))) IN (
+                    'api:research-result',
+                    'api:usage',
+                    'api:unknown-path'
+                ) THEN 'non_billable'
+                WHEN LOWER(TRIM(COALESCE({effective_request_kind_sql}, ''))) = 'mcp:batch'
+                    AND {effective_counts_business_quota_sql} = 0
+                    THEN 'non_billable'
+                WHEN {effective_non_billable_mcp_sql} THEN 'non_billable'
+                ELSE 'billable'
+            END
+            "
+        );
+        let effective_operational_class_sql = format!(
+            "CASE WHEN {legacy_request_kind_predicate_sql} THEN {legacy_operational_class_case_sql} ELSE {stored_operational_class_case_sql} END"
+        );
+
+        let total_filters = RequestLogsCatalogFilters {
+            request_kinds,
+            result_status,
+            key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
+            auth_token_id,
+            key_id,
+            operational_class,
+        };
+        let total = self
+            .fetch_request_logs_rollup_total(scoped_key_id, since, total_filters)
+            .await?;
+
+        let request_body_select = if include_bodies {
+            "request_body"
+        } else {
+            "NULL AS request_body"
+        };
+        let response_body_select = if include_bodies {
+            "response_body"
+        } else {
+            "NULL AS response_body"
+        };
+        let mut items_query = QueryBuilder::<Sqlite>::new(format!(
+            r#"
+            SELECT
+                id,
+                api_key_id,
+                auth_token_id,
+                method,
+                path,
+                query,
+                status_code,
+                tavily_status_code,
+                error_message,
+                result_status,
+                {effective_request_kind_sql} AS request_kind_key,
+                {effective_request_kind_label_sql} AS request_kind_label,
+                request_kind_detail,
+                business_credits,
+                failure_kind,
+                key_effect_code,
+                key_effect_summary,
+                binding_effect_code,
+                binding_effect_summary,
+                selection_effect_code,
+                selection_effect_summary,
+                gateway_mode,
+                experiment_variant,
+                proxy_session_id,
+                routing_subject_hash,
+                upstream_operation,
+                fallback_reason,
+                {request_body_select},
+                {response_body_select},
+                request_body_bytes,
+                response_body_bytes,
+                request_body_sha256,
+                response_body_sha256,
+                body_cleaned_reason,
+                body_cleaned_at,
+                forwarded_headers,
+                dropped_headers,
+                remote_addr,
+                client_ip,
+                client_ip_source,
+                client_ip_trusted,
+                ip_headers,
+                {effective_operational_class_sql} AS operational_class,
+                {effective_request_kind_protocol_group_sql} AS request_kind_protocol_group,
+                {effective_request_kind_billing_group_sql} AS request_kind_billing_group,
+                created_at
+            FROM observability.request_logs
+            "#
+        ));
+        let has_where = Self::push_request_logs_scope(&mut items_query, scoped_key_id, since, None);
+        Self::push_request_logs_filters(
+            &mut items_query,
+            RequestLogFilterParams {
+                request_kinds: &[],
+                result_status: None,
+                key_effect_code,
+                binding_effect_code,
+                selection_effect_code,
+                request_user_id,
+                auth_token_id,
+                key_id,
+                stored_request_kind_sql,
+                legacy_request_kind_predicate_sql: &legacy_request_kind_predicate_sql,
+                legacy_request_kind_sql: &legacy_request_kind_sql,
+                has_where,
+            },
+        );
+        if !normalized_request_kinds.is_empty() {
+            items_query.push(" AND ");
+            Self::push_effective_request_kind_filter_clause(
+                &mut items_query,
+                &effective_request_kind_sql,
+                &normalized_request_kinds,
+            );
+        }
+        if let Some(result_status) = result_status {
+            items_query.push(" AND ");
+            Self::push_result_bucket_filter_clause(
+                &mut items_query,
+                result_status,
+                &legacy_request_kind_predicate_sql,
+                &stored_result_bucket_sql,
+                &legacy_result_bucket_sql,
+            );
+        }
+        if let Some(operational_class) = operational_class {
+            items_query.push(" AND ");
+            Self::push_operational_class_filter_clause(
+                &mut items_query,
+                operational_class,
+                &legacy_request_kind_predicate_sql,
+                &stored_operational_class_case_sql,
+                &legacy_operational_class_case_sql,
+            );
+        }
+        items_query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+        items_query.push_bind(per_page);
+        items_query.push(" OFFSET ");
+        items_query.push_bind(offset);
+        let rows = items_query.build().fetch_all(&self.pool).await?;
+        let items = rows
+            .into_iter()
+            .map(Self::map_request_log_row)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let empty_filters = RequestLogsCatalogFilters {
+            request_kinds: &[],
+            result_status: None,
+            key_effect_code: None,
+            binding_effect_code: None,
+            selection_effect_code: None,
+            auth_token_id: None,
+            key_id: None,
+            operational_class: None,
+        };
+        let request_kind_options = self
+            .fetch_request_log_request_kind_options(scoped_key_id, since, empty_filters)
+            .await?;
+        let results = self
+            .fetch_request_log_result_facet_options(scoped_key_id, since, empty_filters)
+            .await?;
+        let key_effects = self
+            .fetch_request_log_facet_options(
+                "key_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                empty_filters,
+            )
+            .await?;
+        let binding_effects = self
+            .fetch_request_log_facet_options(
+                "binding_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                empty_filters,
+            )
+            .await?;
+        let selection_effects = self
+            .fetch_request_log_facet_options(
+                "selection_effect_code",
+                scoped_key_id,
+                since,
+                false,
+                empty_filters,
+            )
+            .await?;
+        let tokens = if include_token_facets {
+            self.fetch_request_log_facet_options(
+                "auth_token_id",
+                scoped_key_id,
+                since,
+                true,
+                empty_filters,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        let keys = if include_key_facets {
+            self.fetch_request_log_facet_options(
+                "api_key_id",
+                scoped_key_id,
+                since,
+                true,
+                empty_filters,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(RequestLogsPage {
+            items,
+            total,
+            request_kind_options,
+            facets: RequestLogPageFacets {
+                results,
+                key_effects,
+                binding_effects,
+                selection_effects,
+                tokens,
+                keys,
+            },
+        })
+    }
+
+    pub(crate) async fn ensure_request_log_catalog_rollup_schema(
+        &self,
+    ) -> Result<(), ProxyError> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS observability.request_log_catalog_rollups (
+                bucket_start INTEGER NOT NULL,
+                request_kind_key TEXT NOT NULL,
+                request_kind_label TEXT NOT NULL,
+                result_bucket TEXT NOT NULL,
+                key_effect_code TEXT NOT NULL,
+                binding_effect_code TEXT NOT NULL,
+                selection_effect_code TEXT NOT NULL,
+                auth_token_id TEXT NOT NULL,
+                api_key_id TEXT NOT NULL,
+                operational_class TEXT NOT NULL,
+                request_count INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (
+                    bucket_start,
+                    request_kind_key,
+                    request_kind_label,
+                    result_bucket,
+                    key_effect_code,
+                    binding_effect_code,
+                    selection_effect_code,
+                    auth_token_id,
+                    api_key_id,
+                    operational_class
+                )
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        for sql in [
+            r#"CREATE INDEX IF NOT EXISTS observability.idx_request_log_catalog_rollups_kind_time
+               ON request_log_catalog_rollups(request_kind_key, bucket_start DESC)"#,
+            r#"CREATE INDEX IF NOT EXISTS observability.idx_request_log_catalog_rollups_result_time
+               ON request_log_catalog_rollups(result_bucket, bucket_start DESC)"#,
+            r#"CREATE INDEX IF NOT EXISTS observability.idx_request_log_catalog_rollups_token_time
+               ON request_log_catalog_rollups(auth_token_id, bucket_start DESC)"#,
+            r#"CREATE INDEX IF NOT EXISTS observability.idx_request_log_catalog_rollups_key_time
+               ON request_log_catalog_rollups(api_key_id, bucket_start DESC)"#,
+            r#"CREATE INDEX IF NOT EXISTS observability.idx_request_log_catalog_rollups_operational_time
+               ON request_log_catalog_rollups(operational_class, bucket_start DESC)"#,
+        ] {
+            sqlx::query(sql).execute(&self.pool).await?;
+        }
+
+        let canonical_new_request_kind_sql =
+            request_log_request_kind_key_sql("NEW.path", "NEW.request_body", "NEW.request_kind_key");
+        let canonical_new_request_kind_label_sql =
+            canonical_request_kind_label_sql(&canonical_new_request_kind_sql);
+        let canonical_new_request_kind_detail_sql = format!(
+            "
+            CASE
+                WHEN LOWER(COALESCE(NEW.path, '')) LIKE '/mcp/%' THEN NEW.path
+                WHEN LOWER(TRIM(COALESCE(NEW.request_kind_key, ''))) LIKE 'mcp:tool:%'
+                    THEN SUBSTR(TRIM(NEW.request_kind_key), 10)
+                WHEN {canonical_new_request_kind_sql} = 'mcp:unknown-payload' THEN NEW.path
+                ELSE NULL
+            END
+            "
+        );
+        let legacy_new_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql("NEW.request_kind_key");
+        let legacy_row_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql("request_kind_key");
+        let canonical_insert_trigger = format!(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS observability.trg_request_logs_canonical_request_kind_insert
+            AFTER INSERT ON request_logs
+            WHEN {legacy_new_request_kind_predicate_sql}
+            BEGIN
+                UPDATE request_logs
+                SET request_kind_key = COALESCE(NULLIF(TRIM({canonical_new_request_kind_sql}), ''), 'api:unknown-path'),
+                    request_kind_label = COALESCE(NULLIF(TRIM({canonical_new_request_kind_label_sql}), ''), 'Unknown'),
+                    request_kind_detail = COALESCE(NULLIF(TRIM(NEW.request_kind_detail), ''), {canonical_new_request_kind_detail_sql})
+                WHERE id = NEW.id
+                  AND {legacy_row_request_kind_predicate_sql};
+            END
+            "#
+        );
+        sqlx::query(&canonical_insert_trigger)
+            .execute(&self.pool)
+            .await?;
+
+        let canonical_update_trigger = format!(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS observability.trg_request_logs_canonical_request_kind_update
+            AFTER UPDATE OF path, request_body, request_kind_key ON request_logs
+            WHEN {legacy_new_request_kind_predicate_sql}
+            BEGIN
+                UPDATE request_logs
+                SET request_kind_key = COALESCE(NULLIF(TRIM({canonical_new_request_kind_sql}), ''), 'api:unknown-path'),
+                    request_kind_label = COALESCE(NULLIF(TRIM({canonical_new_request_kind_label_sql}), ''), 'Unknown'),
+                    request_kind_detail = COALESCE(NULLIF(TRIM(NEW.request_kind_detail), ''), {canonical_new_request_kind_detail_sql})
+                WHERE id = NEW.id
+                  AND {legacy_row_request_kind_predicate_sql};
+            END
+            "#
+        );
+        sqlx::query(&canonical_update_trigger)
+            .execute(&self.pool)
+            .await?;
+
+        for trigger in [
+            "trg_request_logs_catalog_rollup_insert",
+            "trg_request_logs_catalog_rollup_delete",
+            "trg_request_logs_catalog_rollup_update_old",
+            "trg_request_logs_catalog_rollup_update_new",
+        ] {
+            sqlx::query(&format!("DROP TRIGGER IF EXISTS observability.{trigger}"))
+                .execute(&self.pool)
+                .await?;
+            sqlx::query(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn rebuild_request_log_catalog_rollups(&self) -> Result<(), ProxyError> {
+        let retention_days = self
+            .get_system_settings()
+            .await?
+            .request_log_retention
+            .max_log_retention_days;
+        let since = configured_request_logs_retention_threshold_utc_ts_at(
+            retention_days,
+            self.backend_time.local_now(),
+        );
+        let exprs = Self::request_log_catalog_rollup_exprs("");
+        let canonical_request_kind_predicate_sql =
+            canonical_request_kind_stored_predicate_sql("request_kind_key");
+        let legacy_request_kind_predicate_sql =
+            legacy_request_kind_stored_predicate_sql("request_kind_key");
+        let canonicalize_legacy_rows_sql = format!(
+            r#"
+            UPDATE observability.request_logs
+            SET request_kind_key = request_kind_key
+            WHERE visibility = 'visible'
+              AND created_at >= ?
+              AND {legacy_request_kind_predicate_sql}
+            "#
+        );
+        sqlx::query(&canonicalize_legacy_rows_sql)
+            .bind(since)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM observability.request_log_catalog_rollups")
+            .execute(&self.pool)
+            .await?;
+        let rebuild_sql = format!(
+            r#"
+            INSERT INTO observability.request_log_catalog_rollups (
+                {},
+                request_count,
+                updated_at
+            )
+            SELECT
+                {},
+                COUNT(*) AS request_count,
+                CAST(strftime('%s', 'now') AS INTEGER) AS updated_at
+            FROM observability.request_logs
+            WHERE visibility = 'visible'
+              AND created_at >= ?
+              AND {canonical_request_kind_predicate_sql}
+            GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+            "#,
+            Self::request_log_catalog_rollup_columns(),
+            exprs.join(", "),
+        );
+        sqlx::query(&rebuild_sql)
+            .bind(since)
+            .execute(&self.pool)
+            .await?;
+        self.invalidate_request_logs_catalog_cache().await;
+        Ok(())
+    }
+
+    pub(crate) async fn fetch_api_key_secret(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<String>, ProxyError> {
+        let secret =
+            sqlx::query_scalar::<_, String>("SELECT api_key FROM api_keys WHERE id = ? LIMIT 1")
+                .bind(key_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(secret.filter(|value| !value.trim().is_empty()))
+    }
+
+    pub(crate) async fn fetch_api_key_id_by_secret(
+        &self,
+        secret: &str,
+    ) -> Result<Option<String>, ProxyError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM api_keys WHERE api_key = ? AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(secret)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(ProxyError::from)
+    }
+
+    pub(crate) async fn fetch_key_state_snapshot(
+        &self,
+        key_id: &str,
+    ) -> Result<KeyStateSnapshot, ProxyError> {
+        let status = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT status FROM api_keys WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        let quarantined = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT 1
+            FROM api_key_quarantines
+            WHERE key_id = ? AND cleared_at IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        Ok(KeyStateSnapshot {
+            status,
+            quarantined,
+        })
+    }
+
+    pub(crate) async fn insert_api_key_maintenance_record(
+        &self,
+        record: ApiKeyMaintenanceRecord,
+    ) -> Result<(), ProxyError> {
+        let auth_token_id = if let Some(auth_token_id) = record.auth_token_id.as_deref() {
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM auth_tokens WHERE id = ? LIMIT 1")
+                .bind(auth_token_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|_| auth_token_id.to_string())
+        } else {
+            None
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_maintenance_records (
+                id,
+                key_id,
+                source,
+                operation_code,
+                operation_summary,
+                reason_code,
+                reason_summary,
+                reason_detail,
+                request_log_id,
+                auth_token_log_id,
+                auth_token_id,
+                actor_user_id,
+                actor_display_name,
+                status_before,
+                status_after,
+                quarantine_before,
+                quarantine_after,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(record.id)
+        .bind(record.key_id)
+        .bind(record.source)
+        .bind(record.operation_code)
+        .bind(record.operation_summary)
+        .bind(record.reason_code)
+        .bind(record.reason_summary)
+        .bind(record.reason_detail)
+        .bind(record.request_log_id)
+        .bind(record.auth_token_log_id)
+        .bind(auth_token_id)
+        .bind(record.actor_user_id)
+        .bind(record.actor_display_name)
+        .bind(record.status_before)
+        .bind(record.status_after)
+        .bind(i64::from(record.quarantine_before))
+        .bind(i64::from(record.quarantine_after))
+        .bind(record.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn update_quota_for_key(
+        &self,
+        key_id: &str,
+        limit: i64,
+        remaining: i64,
+        synced_at: i64,
+    ) -> Result<(), ProxyError> {
+        sqlx::query(
+            r#"UPDATE api_keys
+               SET quota_limit = ?, quota_remaining = ?, quota_synced_at = ?
+             WHERE id = ?"#,
+        )
+        .bind(limit)
+        .bind(remaining)
+        .bind(synced_at)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await?;
+        self.request_stats_coalescer.mark_dashboard_read_dirty().await;
+        Ok(())
+    }
+
+    pub(crate) async fn record_quota_sync_sample(
+        &self,
+        key_id: &str,
+        limit: i64,
+        remaining: i64,
+        synced_at: i64,
+        source: &str,
+    ) -> Result<(), ProxyError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_quota_sync_samples (
+                key_id,
+                quota_limit,
+                quota_remaining,
+                captured_at,
+                source
+            ) VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(key_id)
+        .bind(limit)
+        .bind(remaining)
+        .bind(synced_at)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE api_keys
+               SET quota_limit = ?, quota_remaining = ?, quota_synced_at = ?
+             WHERE id = ?"#,
+        )
+        .bind(limit)
+        .bind(remaining)
+        .bind(synced_at)
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.request_stats_coalescer.mark_dashboard_read_dirty().await;
+        Ok(())
+    }
+
+    pub(crate) async fn fetch_dashboard_quota_sample_watermark(
+        &self,
+        today_end: i64,
+    ) -> Result<DashboardQuotaSampleWatermark, ProxyError> {
+        let source_id = self.fetch_dashboard_quota_source_id(today_end).await?;
+        let source_captured_at = self
+            .fetch_dashboard_quota_source_captured_at(today_end)
+            .await?;
+        Ok(DashboardQuotaSampleWatermark {
+            source_id,
+            source_captured_at,
+            // This is the append-only source revision used by hydration. It
+            // deliberately keeps the existing private token shape without a
+            // table-wide aggregate read on a Dashboard freshness probe.
+            source_count: source_id,
+        })
+    }
+
+    fn dashboard_quota_read_budget_deferred(&self) -> ProxyError {
+        self.sqlite_runtime.record_deferred(
+            SqliteOperation::DashboardQuotaRead,
+            SqliteAdmissionDeferReason::QueryDeadline,
+        );
+        ProxyError::Deferred {
+            operation: "dashboard_quota_read",
+            reason: "read_budget".to_string(),
+        }
+    }
+
+    async fn fetch_dashboard_quota_source_id(&self, today_end: i64) -> Result<i64, ProxyError> {
+        let mut before_id = None;
+        for _ in 0..DASHBOARD_QUOTA_SOURCE_MAX_PAGES {
+            let mut session = self
+                .begin_admin_alerts_read_session_for_operation(SqliteOperation::DashboardQuotaRead)
+                .await?;
+            let query_result = match before_id {
+                Some(before_id) => sqlx::query(
+                    r#"
+                    SELECT id, captured_at
+                    FROM api_key_quota_sync_samples
+                    WHERE id > 0 AND id < ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(before_id)
+                .bind(DASHBOARD_QUOTA_SOURCE_PAGE_SIZE)
+                .fetch_all(&mut *session)
+                .await,
+                None => sqlx::query(
+                    r#"
+                    SELECT id, captured_at
+                    FROM api_key_quota_sync_samples
+                    WHERE id > 0
+                    ORDER BY id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(DASHBOARD_QUOTA_SOURCE_PAGE_SIZE)
+                .fetch_all(&mut *session)
+                .await,
+            };
+            let rows = session.query(query_result).await;
+            let finish = session.finish().await;
+            finish?;
+            let samples = rows?
+                .into_iter()
+                .map(|row| Ok::<_, sqlx::Error>((row.try_get("id")?, row.try_get("captured_at")?)))
+                .collect::<Result<Vec<(i64, i64)>, _>>()?;
+
+            if let Some((id, _)) = samples
+                .iter()
+                .copied()
+                .find(|(_, captured_at)| *captured_at < today_end)
+            {
+                return Ok(id);
+            }
+            let Some((last_id, _)) = samples.last().copied() else {
+                return Ok(0);
+            };
+            if samples.len() < DASHBOARD_QUOTA_SOURCE_PAGE_SIZE as usize {
+                return Ok(0);
+            }
+            before_id = Some(last_id);
+        }
+        Err(self.dashboard_quota_read_budget_deferred())
+    }
+
+    async fn fetch_dashboard_quota_source_captured_at(
+        &self,
+        today_end: i64,
+    ) -> Result<i64, ProxyError> {
+        let mut session = self
+            .begin_admin_alerts_read_session_for_operation(SqliteOperation::DashboardQuotaRead)
+            .await?;
+        let query_result = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT captured_at
+            FROM api_key_quota_sync_samples INDEXED BY idx_api_key_quota_sync_samples_captured
+            WHERE captured_at < ?
+            ORDER BY captured_at DESC, key_id ASC, id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(today_end)
+        .bind(1_i64)
+        .fetch_optional(&mut *session)
+        .await;
+        let source_captured_at = session.query(query_result).await;
+        let finish = session.finish().await;
+        finish?;
+        Ok(source_captured_at?.unwrap_or_default())
+    }
+
+    pub(crate) async fn fetch_dashboard_quota_charge_read_model(
+        &self,
+        bounds: SummaryWindowBounds,
+        stale_key_count: i64,
+    ) -> Result<DashboardQuotaChargeReadModel, ProxyError> {
+        let SummaryWindowBounds {
+            today_end,
+            yesterday_start,
+            month_quota_charge_start,
+            ..
+        } = bounds;
+        let sample_window_start = yesterday_start.min(month_quota_charge_start);
+        for _ in 0..DASHBOARD_QUOTA_RECOVERY_MAX_ATTEMPTS {
+            let target = self.fetch_dashboard_quota_sample_watermark(today_end).await?;
+            let mut model = DashboardQuotaChargeReadModel::empty(bounds, stale_key_count, target);
+            let mut cursor = None;
+            let mut staged_key_ids = std::collections::HashSet::new();
+
+            loop {
+                let samples = self
+                    .fetch_dashboard_quota_recovery_page(
+                        sample_window_start,
+                        today_end,
+                        target.source_id,
+                        cursor.as_ref(),
+                        DASHBOARD_QUOTA_RECOVERY_PAGE_SIZE,
+                    )
+                    .await?;
+                let baselines = self
+                    .fetch_dashboard_quota_recovery_baselines(
+                        sample_window_start,
+                        target.source_id,
+                        &samples,
+                        &mut staged_key_ids,
+                    )
+                    .await?;
+
+                model.stage_recovery_page_desc(&baselines, &samples);
+                #[cfg(debug_assertions)]
+                self.wait_for_dashboard_overview_read_pause_if_installed()
+                    .await;
+                if self.fetch_dashboard_quota_sample_watermark(today_end).await? != target {
+                    break;
+                }
+                if samples.len() < DASHBOARD_QUOTA_RECOVERY_PAGE_SIZE as usize {
+                    model.finish_recovery();
+                    if self.fetch_dashboard_quota_sample_watermark(today_end).await? == target {
+                        return Ok(model);
+                    }
+                    break;
+                }
+                cursor = samples.last().map(DashboardQuotaRecoveryCursor::from);
+            }
+        }
+        Err(self.dashboard_quota_read_budget_deferred())
+    }
+
+    pub(crate) async fn fetch_dashboard_quota_incremental_samples(
+        &self,
+        after: DashboardQuotaSampleWatermark,
+        today_end: i64,
+        limit: i64,
+    ) -> Result<(DashboardQuotaSampleWatermark, Vec<DashboardQuotaSample>), ProxyError> {
+        let watermark = self.fetch_dashboard_quota_sample_watermark(today_end).await?;
+        if watermark == after || watermark.source_id <= after.source_id {
+            return Ok((watermark, Vec::new()));
+        }
+
+        let mut session = self
+            .begin_admin_alerts_read_session_for_operation(SqliteOperation::DashboardQuotaRead)
+            .await?;
+        let query_result = sqlx::query(
+            r#"
+            WITH pending AS (
+                SELECT id, key_id, quota_remaining, captured_at
+                FROM api_key_quota_sync_samples
+                WHERE id > ?
+                  AND captured_at < ?
+                ORDER BY id ASC
+                LIMIT ?
+            )
+            SELECT
+                pending.id,
+                pending.key_id,
+                pending.quota_remaining,
+                pending.captured_at,
+                previous.quota_remaining AS previous_quota_remaining
+            FROM pending
+            LEFT JOIN api_key_quota_sync_samples previous
+                ON previous.id = (
+                    SELECT id
+                    FROM api_key_quota_sync_samples candidate
+                    WHERE candidate.key_id = pending.key_id
+                      AND candidate.id < pending.id
+                      AND candidate.captured_at < ?
+                    ORDER BY candidate.captured_at DESC, candidate.id DESC
+                    LIMIT 1
+                )
+            ORDER BY pending.id ASC
+            "#,
+        )
+        .bind(after.source_id)
+        .bind(today_end)
+        .bind(limit.max(1))
+        .bind(today_end)
+        .fetch_all(&mut *session)
+        .await;
+        let rows = session.query(query_result).await;
+        let finish = session.finish().await;
+        finish?;
+        let samples = rows?
+            .into_iter()
+            .map(|row| {
+                Ok::<_, sqlx::Error>(DashboardQuotaSample {
+                    id: row.try_get("id")?,
+                    key_id: row.try_get("key_id")?,
+                    quota_remaining: row.try_get("quota_remaining")?,
+                    captured_at: row.try_get("captured_at")?,
+                    previous_quota_remaining: row.try_get("previous_quota_remaining")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((watermark, samples))
+    }
+
+    async fn fetch_dashboard_quota_recovery_page(
+        &self,
+        sample_window_start: i64,
+        today_end: i64,
+        target_source_id: i64,
+        cursor: Option<&DashboardQuotaRecoveryCursor>,
+        page_size: i64,
+    ) -> Result<Vec<DashboardQuotaSample>, ProxyError> {
+        let mut session = self
+            .begin_admin_alerts_read_session_for_operation(SqliteOperation::DashboardQuotaRead)
+            .await?;
+        let page_size = page_size.max(1);
+        let query_result = match cursor {
+            Some(cursor) => sqlx::query(
+                r#"
+                SELECT id, key_id, quota_remaining, captured_at
+                FROM api_key_quota_sync_samples INDEXED BY idx_api_key_quota_sync_samples_captured
+                WHERE captured_at >= ?
+                  AND captured_at < ?
+                  AND id <= ?
+                  AND (
+                    captured_at < ?
+                    OR (
+                        captured_at = ?
+                        AND (
+                            key_id > ?
+                            OR (key_id = ? AND id > ?)
+                        )
+                    )
+                  )
+                ORDER BY captured_at DESC, key_id ASC, id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(sample_window_start)
+            .bind(today_end)
+            .bind(target_source_id)
+            .bind(cursor.captured_at)
+            .bind(cursor.captured_at)
+            .bind(&cursor.key_id)
+            .bind(&cursor.key_id)
+            .bind(cursor.id)
+            .bind(page_size)
+            .fetch_all(&mut *session)
+            .await,
+            None => sqlx::query(
+                r#"
+                SELECT id, key_id, quota_remaining, captured_at
+                FROM api_key_quota_sync_samples INDEXED BY idx_api_key_quota_sync_samples_captured
+                WHERE captured_at >= ?
+                  AND captured_at < ?
+                  AND id <= ?
+                ORDER BY captured_at DESC, key_id ASC, id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(sample_window_start)
+            .bind(today_end)
+            .bind(target_source_id)
+            .bind(page_size)
+            .fetch_all(&mut *session)
+            .await,
+        };
+        let rows = session.query(query_result).await;
+        let finish = session.finish().await;
+        finish?;
+        rows?
+            .into_iter()
+            .map(|row| {
+                Ok::<_, sqlx::Error>(DashboardQuotaSample {
+                    id: row.try_get("id")?,
+                    key_id: row.try_get("key_id")?,
+                    quota_remaining: row.try_get("quota_remaining")?,
+                    captured_at: row.try_get("captured_at")?,
+                    previous_quota_remaining: None,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProxyError::Database)
+    }
+
+    async fn fetch_dashboard_quota_recovery_baselines(
+        &self,
+        sample_window_start: i64,
+        target_source_id: i64,
+        samples: &[DashboardQuotaSample],
+        staged_key_ids: &mut std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, Option<DashboardQuotaSample>)>, ProxyError> {
+        let key_ids = samples
+            .iter()
+            .filter_map(|sample| {
+                staged_key_ids
+                    .insert(sample.key_id.clone())
+                    .then_some(sample.key_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut baselines = Vec::with_capacity(key_ids.len());
+        for key_id in key_ids {
+            let baseline = match self
+                .fetch_dashboard_quota_recovery_pre_window_baseline(
+                    &key_id,
+                    sample_window_start,
+                    target_source_id,
+                )
+                .await?
+            {
+                Some(baseline) => Some(baseline),
+                None => {
+                    self.fetch_dashboard_quota_recovery_historical_baseline(
+                        &key_id,
+                        sample_window_start,
+                        target_source_id,
+                    )
+                    .await?
+                }
+            };
+            baselines.push((key_id, baseline));
+        }
+        Ok(baselines)
+    }
+
+    async fn fetch_dashboard_quota_recovery_pre_window_baseline(
+        &self,
+        key_id: &str,
+        sample_window_start: i64,
+        target_source_id: i64,
+    ) -> Result<Option<DashboardQuotaSample>, ProxyError> {
+        self.fetch_dashboard_quota_recovery_baseline_since(
+            key_id,
+            sample_window_start,
+            target_source_id,
+            sample_window_start.saturating_sub(DASHBOARD_QUOTA_RECOVERY_PRE_WINDOW_SECS),
+        )
+        .await
+    }
+
+    /// The normal recovery probe only searches a bounded pre-window. Keys
+    /// whose immediate history is older than that range retry once against the
+    /// full indexed history before the recovery draft records an empty
+    /// predecessor.
+    async fn fetch_dashboard_quota_recovery_historical_baseline(
+        &self,
+        key_id: &str,
+        sample_window_start: i64,
+        target_source_id: i64,
+    ) -> Result<Option<DashboardQuotaSample>, ProxyError> {
+        self.fetch_dashboard_quota_recovery_baseline_since(
+            key_id,
+            sample_window_start,
+            target_source_id,
+            i64::MIN,
+        )
+        .await
+    }
+
+    async fn fetch_dashboard_quota_recovery_baseline_since(
+        &self,
+        key_id: &str,
+        sample_window_start: i64,
+        target_source_id: i64,
+        lower_bound: i64,
+    ) -> Result<Option<DashboardQuotaSample>, ProxyError> {
+        let mut session = self
+            .begin_admin_alerts_read_session_for_operation(SqliteOperation::DashboardQuotaRead)
+            .await?;
+        let query_result = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT captured_at
+            FROM api_key_quota_sync_samples INDEXED BY idx_api_key_quota_sync_samples_key_captured
+            WHERE key_id = ?
+              AND captured_at >= ?
+              AND captured_at < ?
+              AND id <= ?
+            ORDER BY captured_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(key_id)
+        .bind(lower_bound)
+        .bind(sample_window_start)
+        .bind(target_source_id)
+        .bind(1_i64)
+        .fetch_optional(&mut *session)
+        .await;
+        let captured_at = session.query(query_result).await;
+        let finish = session.finish().await;
+        finish?;
+        let Some(captured_at) = captured_at? else {
+            return Ok(None);
+        };
+
+        let mut after_id = 0_i64;
+        let mut baseline = None;
+        loop {
+            let mut session = self
+                .begin_admin_alerts_read_session_for_operation(SqliteOperation::DashboardQuotaRead)
+                .await?;
+            let query_result = sqlx::query(
+                r#"
+                SELECT id, key_id, quota_remaining, captured_at
+                FROM api_key_quota_sync_samples INDEXED BY idx_api_key_quota_sync_samples_key_captured
+                WHERE key_id = ?
+                  AND captured_at = ?
+                  AND id > ?
+                  AND id <= ?
+                ORDER BY id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(key_id)
+            .bind(captured_at)
+            .bind(after_id)
+            .bind(target_source_id)
+            .bind(DASHBOARD_QUOTA_RECOVERY_PAGE_SIZE)
+            .fetch_all(&mut *session)
+            .await;
+            let rows = session.query(query_result).await;
+            let finish = session.finish().await;
+            finish?;
+            let samples = rows?
+                .into_iter()
+                .map(|row| {
+                    Ok::<_, sqlx::Error>(DashboardQuotaSample {
+                        id: row.try_get("id")?,
+                        key_id: row.try_get("key_id")?,
+                        quota_remaining: row.try_get("quota_remaining")?,
+                        captured_at: row.try_get("captured_at")?,
+                        previous_quota_remaining: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let Some(last_sample) = samples.last().cloned() else {
+                return Ok(baseline);
+            };
+            after_id = last_sample.id;
+            baseline = Some(last_sample);
+            if samples.len() < DASHBOARD_QUOTA_RECOVERY_PAGE_SIZE as usize {
+                return Ok(baseline);
+            }
+        }
+    }
+
+
+    async fn fetch_visible_request_log_floor_since(
+        &self,
+        since: i64,
+    ) -> Result<Option<i64>, ProxyError> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+            SELECT MIN(created_at)
+            FROM observability.request_logs
+            WHERE visibility = ?
+              AND created_at >= ?
+            "#,
+        )
+        .bind(REQUEST_LOG_VISIBILITY_VISIBLE)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(ProxyError::Database)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    async fn fetch_visible_request_log_window_metrics(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> Result<SummaryWindowMetrics, ProxyError> {
+        if start >= end {
+            return Ok(SummaryWindowMetrics::default());
+        }
+
+        let request_kind_sql =
+            request_log_request_kind_key_sql("path", "request_body", "request_kind_key");
+        let request_value_bucket_case_sql =
+            request_value_bucket_sql(&request_kind_sql, "request_body");
+        let query = format!(
+            r#"
+            WITH scoped_logs AS (
+                SELECT
+                    result_status,
+                    ({request_value_bucket_case_sql}) AS request_value_bucket
+                FROM observability.request_logs
+                WHERE visibility = ?
+                  AND created_at >= ?
+                  AND created_at < ?
+            )
+            SELECT
+                COUNT(*) AS total_requests,
+                COALESCE(SUM(CASE WHEN result_status = ? THEN 1 ELSE 0 END), 0) AS success_count,
+                COALESCE(SUM(CASE WHEN result_status = ? THEN 1 ELSE 0 END), 0) AS error_count,
+                COALESCE(SUM(CASE WHEN result_status = ? THEN 1 ELSE 0 END), 0) AS quota_exhausted_count,
+                COALESCE(SUM(CASE WHEN request_value_bucket = 'valuable' AND result_status = ? THEN 1 ELSE 0 END), 0) AS valuable_success_count,
+                COALESCE(SUM(CASE WHEN request_value_bucket = 'valuable' AND result_status IN (?, ?) THEN 1 ELSE 0 END), 0) AS valuable_failure_count,
+                COALESCE(SUM(CASE WHEN request_value_bucket = 'other' AND result_status = ? THEN 1 ELSE 0 END), 0) AS other_success_count,
+                COALESCE(SUM(CASE WHEN request_value_bucket = 'other' AND result_status IN (?, ?) THEN 1 ELSE 0 END), 0) AS other_failure_count,
+                COALESCE(SUM(CASE WHEN request_value_bucket = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_count
+            FROM scoped_logs
+            "#,
+        );
+        let row = sqlx::query(&query)
+            .bind(REQUEST_LOG_VISIBILITY_VISIBLE)
+            .bind(start)
+            .bind(end)
+            .bind(OUTCOME_SUCCESS)
+            .bind(OUTCOME_ERROR)
+            .bind(OUTCOME_QUOTA_EXHAUSTED)
+            .bind(OUTCOME_SUCCESS)
+            .bind(OUTCOME_ERROR)
+            .bind(OUTCOME_QUOTA_EXHAUSTED)
+            .bind(OUTCOME_SUCCESS)
+            .bind(OUTCOME_ERROR)
+            .bind(OUTCOME_QUOTA_EXHAUSTED)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(SummaryWindowMetrics {
+            total_requests: row.try_get("total_requests")?,
+            success_count: row.try_get("success_count")?,
+            error_count: row.try_get("error_count")?,
+            quota_exhausted_count: row.try_get("quota_exhausted_count")?,
+            valuable_success_count: row.try_get("valuable_success_count")?,
+            valuable_failure_count: row.try_get("valuable_failure_count")?,
+            other_success_count: row.try_get("other_success_count")?,
+            other_failure_count: row.try_get("other_failure_count")?,
+            unknown_count: row.try_get("unknown_count")?,
+            upstream_exhausted_key_count: 0,
+            new_keys: 0,
+            new_quarantines: 0,
+            quota_charge: SummaryQuotaCharge::default(),
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    async fn fetch_api_key_usage_bucket_window_metrics(
+        &self,
+        bucket_start_at_least: i64,
+        bucket_start_before: Option<i64>,
+    ) -> Result<SummaryWindowMetrics, ProxyError> {
+        let row = if let Some(bucket_start_before) = bucket_start_before {
+            sqlx::query(
+                r#"
+                SELECT
+                    COALESCE(SUM(total_requests), 0) AS total_requests,
+                    COALESCE(SUM(success_count), 0) AS success_count,
+                    COALESCE(SUM(error_count), 0) AS error_count,
+                    COALESCE(SUM(quota_exhausted_count), 0) AS quota_exhausted_count,
+                    COALESCE(SUM(valuable_success_count), 0) AS valuable_success_count,
+                    COALESCE(SUM(valuable_failure_count), 0) AS valuable_failure_count,
+                    COALESCE(SUM(other_success_count), 0) AS other_success_count,
+                    COALESCE(SUM(other_failure_count), 0) AS other_failure_count,
+                    COALESCE(SUM(unknown_count), 0) AS unknown_count
+                FROM api_key_usage_buckets
+                WHERE bucket_secs = 86400
+                  AND bucket_start >= ?
+                  AND bucket_start < ?
+                "#,
+            )
+            .bind(bucket_start_at_least)
+            .bind(bucket_start_before)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    COALESCE(SUM(total_requests), 0) AS total_requests,
+                    COALESCE(SUM(success_count), 0) AS success_count,
+                    COALESCE(SUM(error_count), 0) AS error_count,
+                    COALESCE(SUM(quota_exhausted_count), 0) AS quota_exhausted_count,
+                    COALESCE(SUM(valuable_success_count), 0) AS valuable_success_count,
+                    COALESCE(SUM(valuable_failure_count), 0) AS valuable_failure_count,
+                    COALESCE(SUM(other_success_count), 0) AS other_success_count,
+                    COALESCE(SUM(other_failure_count), 0) AS other_failure_count,
+                    COALESCE(SUM(unknown_count), 0) AS unknown_count
+                FROM api_key_usage_buckets
+                WHERE bucket_secs = 86400
+                  AND bucket_start >= ?
+                "#,
+            )
+            .bind(bucket_start_at_least)
+            .fetch_one(&self.pool)
+            .await?
+        };
+
+        Ok(SummaryWindowMetrics {
+            total_requests: row.try_get("total_requests")?,
+            success_count: row.try_get("success_count")?,
+            error_count: row.try_get("error_count")?,
+            quota_exhausted_count: row.try_get("quota_exhausted_count")?,
+            valuable_success_count: row.try_get("valuable_success_count")?,
+            valuable_failure_count: row.try_get("valuable_failure_count")?,
+            other_success_count: row.try_get("other_success_count")?,
+            other_failure_count: row.try_get("other_failure_count")?,
+            unknown_count: row.try_get("unknown_count")?,
+            upstream_exhausted_key_count: 0,
+            new_keys: 0,
+            new_quarantines: 0,
+            quota_charge: SummaryQuotaCharge::default(),
+        })
+    }
+
+
+    async fn fetch_dashboard_rollup_success_count_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        bucket_secs: i64,
+        bucket_start_at_least: i64,
+        bucket_start_before: i64,
+    ) -> Result<i64, ProxyError> {
+        if bucket_start_at_least >= bucket_start_before {
+            return Ok(0);
+        }
+
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COALESCE(SUM(success_count), 0)
+            FROM dashboard_request_rollup_buckets
+            WHERE bucket_secs = ?
+              AND bucket_start >= ?
+              AND bucket_start < ?
+            "#,
+        )
+        .bind(bucket_secs)
+        .bind(bucket_start_at_least)
+        .bind(bucket_start_before)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(ProxyError::Database)
+    }
+
+    async fn fetch_dashboard_rollup_success_count_for_range_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        start: i64,
+        end: i64,
+    ) -> Result<i64, ProxyError> {
+        if start >= end {
+            return Ok(0);
+        }
+
+        let start_day = local_day_bucket_start_utc_ts(start);
+        let first_full_day_start = if start_day == start {
+            start
+        } else {
+            next_local_day_start_utc_ts(start_day)
+        };
+        let end_day = local_day_bucket_start_utc_ts(end);
+        let full_day_end = if end_day == end { end } else { end_day };
+
+        let mut cursor = start;
+        let mut success_count = 0;
+
+        let leading_minute_end = end.min(first_full_day_start);
+        if cursor < leading_minute_end {
+            success_count += Self::fetch_dashboard_rollup_success_count_tx(
+                tx,
+                SECS_PER_MINUTE,
+                cursor,
+                leading_minute_end,
+            )
+            .await?;
+            cursor = leading_minute_end;
+        }
+
+        if cursor < full_day_end {
+            success_count += Self::fetch_dashboard_rollup_success_count_tx(
+                tx,
+                SECS_PER_DAY,
+                cursor,
+                full_day_end,
+            )
+            .await?;
+            cursor = full_day_end;
+        }
+
+        if cursor < end {
+            success_count += Self::fetch_dashboard_rollup_success_count_tx(
+                tx,
+                SECS_PER_MINUTE,
+                cursor,
+                end,
+            )
+            .await?;
+        }
+
+        Ok(success_count)
+    }
+
+    async fn fetch_visible_request_log_success_count_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        start: i64,
+        end: i64,
+    ) -> Result<i64, ProxyError> {
+        if start >= end {
+            return Ok(0);
+        }
+
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COALESCE(SUM(CASE WHEN result_status = ? THEN 1 ELSE 0 END), 0)
+            FROM observability.request_logs
+            WHERE visibility = ?
+              AND created_at >= ?
+              AND created_at < ?
+            "#,
+        )
+        .bind(OUTCOME_SUCCESS)
+        .bind(REQUEST_LOG_VISIBILITY_VISIBLE)
+        .bind(start)
+        .bind(end)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(ProxyError::Database)
+    }
+
+    pub(crate) async fn fetch_success_breakdown_from_dashboard_rollups(
+        &self,
+        month_start: i64,
+        day_start: i64,
+        day_end: i64,
+    ) -> Result<SuccessBreakdown, ProxyError> {
+        let now = self.backend_time.now_ts();
+        let month_request_log_floor = self
+            .fetch_visible_request_log_floor_since(month_start)
+            .await?;
+        let historical_month_success = self
+            .fetch_utc_month_gap_success_count(month_start, month_request_log_floor, now)
+            .await?;
+        let mut tx = self.pool.begin().await?;
+        let (retained_partial_minute_success, dashboard_month_start) =
+            match month_request_log_floor {
+                Some(floor) if floor > month_start => {
+                    let minute_start = floor.div_euclid(SECS_PER_MINUTE) * SECS_PER_MINUTE;
+                    if floor == minute_start {
+                        (0, floor)
+                    } else {
+                        let next_minute_start = minute_start.saturating_add(SECS_PER_MINUTE);
+                        let partial_minute_success = Self::fetch_visible_request_log_success_count_tx(
+                            &mut tx,
+                            floor,
+                            next_minute_start.min(now.saturating_add(1)),
+                        )
+                        .await?;
+                        (partial_minute_success, next_minute_start)
+                    }
+                }
+                Some(_) => (0, month_start),
+                None => (0, now.saturating_add(1)),
+            };
+        let dashboard_month_success = Self::fetch_dashboard_rollup_success_count_for_range_tx(
+            &mut tx,
+            dashboard_month_start,
+            now.saturating_add(1),
+        )
+        .await?;
+        let daily_success =
+            Self::fetch_dashboard_rollup_success_count_for_range_tx(&mut tx, day_start, day_end)
+                .await?;
+        tx.commit().await?;
+
+        Ok(SuccessBreakdown {
+            monthly_success: historical_month_success
+                + retained_partial_minute_success
+                + dashboard_month_success,
+            daily_success,
+        })
+    }
+
+    async fn fetch_dashboard_rollup_month_metrics_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        month_start: i64,
+        today_start: i64,
+        today_end: i64,
+    ) -> Result<SummaryWindowMetrics, ProxyError> {
+        let mut month_metrics = SummaryWindowMetrics::default();
+        let month_partial_bucket_start = local_day_bucket_start_utc_ts(month_start);
+        let month_full_day_start = if month_partial_bucket_start == month_start {
+            month_start
+        } else {
+            next_local_day_start_utc_ts(month_partial_bucket_start)
+        };
+        if month_start < month_full_day_start.min(today_start) {
+            add_summary_window_metrics(
+                &mut month_metrics,
+                &Self::fetch_dashboard_rollup_window_metrics_tx(
+                    tx,
+                    SECS_PER_MINUTE,
+                    month_start,
+                    Some(month_full_day_start.min(today_start)),
+                )
+                .await?,
+            );
+        }
+        if month_full_day_start < today_start {
+            add_summary_window_metrics(
+                &mut month_metrics,
+                &Self::fetch_dashboard_rollup_window_metrics_tx(
+                    tx,
+                    SECS_PER_DAY,
+                    month_full_day_start,
+                    Some(today_start),
+                )
+                .await?,
+            );
+        }
+        add_summary_window_metrics(
+            &mut month_metrics,
+            &Self::fetch_dashboard_rollup_window_metrics_tx(
+                tx,
+                SECS_PER_MINUTE,
+                today_start,
+                Some(today_end),
+            )
+            .await?,
+        );
+
+        Ok(month_metrics)
+    }
+
+}

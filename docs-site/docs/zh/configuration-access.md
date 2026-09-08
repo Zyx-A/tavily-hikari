@@ -31,6 +31,7 @@ Tavily Hikari 至少有两层访问要分清：
 | `--bind` / `PROXY_BIND`           | 是             | 监听地址                       |
 | `--port` / `PROXY_PORT`           | 是             | 监听端口                       |
 | `--db-path` / `PROXY_DB_PATH`     | 是             | SQLite 数据库路径              |
+| `LOW_QUOTA_DEPLETION_THRESHOLD`   | 可选           | 低余额 432 key 阈值            |
 | `--static-dir` / `WEB_STATIC_DIR` | 视情况         | 静态前端目录                   |
 | `--keys` / `TAVILY_API_KEYS`      | 可选           | 启动时一次性导入 key           |
 
@@ -38,6 +39,9 @@ Tavily Hikari 至少有两层访问要分清：
 
 - `TAVILY_UPSTREAM` 有默认值，通常不需要在本地额外指定；但如果你要接 mock、sandbox 或自建上游，就必须改掉它。
 - `TAVILY_USAGE_BASE` 默认是 `https://api.tavily.com`，它影响 usage / 配额同步相关能力。
+- `TAVILY_UPSTREAM` 按完整的 MCP 端点解释；如果你的反代保留了 path prefix，配置值里需要包含最终的 `/mcp` 路径。
+- `TAVILY_USAGE_BASE` 也可以带 path prefix；Hikari 会在这个 prefix 后继续追加 `/search`、`/extract`、`/crawl`、`/map`、`/research`、`/research/{id}` 与 `/usage`。
+- `LOW_QUOTA_DEPLETION_THRESHOLD` 默认是 `15`。当上游 key 返回 432，且最新已知剩余额度小于等于这个值时，Hikari 会在当前 UTC 月把它排除出正常 key 池，但仍允许作为最终兜底。
 - `WEB_STATIC_DIR` 不配置时，会自动尝试使用当前仓库下的 `web/dist`。
 - `TAVILY_API_KEYS` 只是引导启动时导入 key 的助手，不适合长期运维；长期管理还是用管理员后台或管理员 API。
 
@@ -129,6 +133,30 @@ export FORWARD_AUTH_NICKNAME_HEADER=Remote-Name
 echo -n 'change-me' | cargo run --quiet --bin admin_password_hash
 ```
 
+### HA 下的本节点 Passkey
+
+Passkey 凭据、reset token、WebAuthn challenge 与 Passkey session 都只保存在本节点。每个节点都要
+有稳定的节点标识和 HTTPS 域名：
+
+```bash
+export ADMIN_AUTH_PASSKEY_ENABLED=true
+export NODE_ID=tavily-node-a
+export NODE_PUBLIC_SCHEME=https
+export NODE_PUBLIC_HOST=tavily-node-a.example.com
+```
+
+`ADMIN_PASSKEY_RP_ID` 和 `ADMIN_PASSKEY_RP_ORIGIN` 可以显式覆盖自动推导；未覆盖时，Hikari 优先
+使用 `NODE_PUBLIC_*`，只有缺少节点公网 host 才回退到 `EDGEONE_DOMAIN`。在目标节点本地用相同
+origin 生成 bootstrap URL：
+
+```bash
+tavily-hikari admin passkey reset-url --base-url https://tavily-node-a.example.com
+```
+
+命令会拒绝 origin 与实际 RP origin 不一致的 URL。其他节点或其他 RP scope 的凭据只会临时禁用，不会
+删除；恢复完全相同的节点/RP 配置后会自动恢复。升级时先升级当前 `full_master`，再滚动升级 standby 与
+recovery 节点，并在每个节点各自完成一次本地登记。历史全局 Passkey 记录需要在每个节点重新登记。
+
 ### `DEV_OPEN_ADMIN`
 
 这是开发快捷通道：
@@ -177,6 +205,40 @@ export LINUXDO_OAUTH_REDIRECT_URL='https://<your-host>/auth/linuxdo/callback'
 
 如果你不启用 Linux DO OAuth，也不影响管理员自己发 token 给客户端使用。
 
+## Linux.do Credit 充值支付
+
+Linux.do Credit 充值让已登录的 Linux DO 用户在用户控制台购买额外自然月额度。它依赖 Linux DO OAuth，因为每一笔充值订单都会绑定到当前登录的本地用户账户。
+
+最小支付配置：
+
+```bash
+export LINUXDO_CREDIT_ENABLED=true
+export LINUXDO_CREDIT_CLIENT_ID='<linuxdo-credit-client-id>'
+export LINUXDO_CREDIT_CLIENT_SECRET='<linuxdo-credit-client-secret>'
+export LINUXDO_CREDIT_MERCHANT_PRIVATE_KEY='<ed25519-private-key>'
+export LINUXDO_CREDIT_NOTIFY_URL='https://<your-host>/api/linuxdo-credit/notify'
+export LINUXDO_CREDIT_RETURN_URL='https://<your-host>/console/dashboard'
+```
+
+必填值：
+
+- `LINUXDO_CREDIT_ENABLED`
+- `LINUXDO_CREDIT_CLIENT_ID`
+- `LINUXDO_CREDIT_CLIENT_SECRET`
+- `LINUXDO_CREDIT_MERCHANT_PRIVATE_KEY`
+
+商户私钥用于签名官方 LDC 创建订单请求。后端接受 Ed25519 私钥的 base64、base64url、hex seed，或 PKCS#8 DER/PEM。
+
+回调和浏览器返回地址：
+
+- `LINUXDO_CREDIT_NOTIFY_URL` 通常指向 `https://<your-host>/api/linuxdo-credit/notify`，并且必须能被 Linux.do Credit 公网访问。
+- `LINUXDO_CREDIT_RETURN_URL` 通常指回用户控制台，例如 `https://<your-host>/console/dashboard`。
+- `LINUXDO_CREDIT_SUBMIT_URL` 默认指向官方 Linux.do Credit LDC 提交端点，通常不需要修改。
+
+进程带有效支付凭据启动后，进入管理端系统设置并打开“启用充值功能”。调试支付链路时先保持“开放非管理员充值”关闭，用管理员会话验证；确认无误后再打开给普通用户。关闭“启用充值功能”时，用户控制台会隐藏充值入口，后端也会拒绝创建新订单，但仍会继续接收已支付订单的回调。
+
+沙盒检查可设置 `LINUXDO_CREDIT_TEST_PRICE_ENABLED=true`，开放 `1 LDC` 购买 `1` 个自然月积分的测试档位。正式收费时保持关闭。
+
 ## 客户端到底该拿什么 token
 
 这点要分清楚：
@@ -223,6 +285,7 @@ th-<id>-<secret>
 - 单机自托管：`ADMIN_AUTH_BUILTIN_ENABLED=true` + `ADMIN_AUTH_BUILTIN_PASSWORD_HASH`
 - 网关接入：`ADMIN_AUTH_FORWARD_ENABLED=true` + `FORWARD_AUTH_HEADER` + `FORWARD_AUTH_ADMIN_VALUE`
 - 终端用户网页登录：再额外启用 `LINUXDO_OAUTH_ENABLED=true`
+- 用户充值支付：再额外启用 `LINUXDO_CREDIT_ENABLED=true`，并配置 Linux.do Credit 凭据和 notify 回调地址
 - 客户端接入：始终使用 `th-<id>-<secret>`，不要直接发 Tavily 官方 key
 
 ## 继续阅读

@@ -1,4 +1,4 @@
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiKeyQuarantineView {
     source: String,
@@ -9,7 +9,7 @@ struct ApiKeyQuarantineView {
     created_at: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ApiKeyView {
     id: String,
     status: String,
@@ -27,6 +27,16 @@ struct ApiKeyView {
     error_count: i64,
     quota_exhausted_count: i64,
     quarantine: Option<ApiKeyQuarantineView>,
+    transient_backoff: Option<ApiKeyTransientBackoffView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiKeyTransientBackoffView {
+    reason_code: String,
+    cooldown_until: i64,
+    retry_after_secs: i64,
+    scopes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,7 +198,7 @@ struct StickyNodesView {
     nodes: Vec<StickyNodeView>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RequestLogView {
     id: i64,
     key_id: Option<String>,
@@ -208,10 +218,31 @@ struct RequestLogView {
     failure_kind: Option<String>,
     key_effect_code: String,
     key_effect_summary: Option<String>,
+    binding_effect_code: String,
+    binding_effect_summary: Option<String>,
+    selection_effect_code: String,
+    selection_effect_summary: Option<String>,
+    gateway_mode: Option<String>,
+    experiment_variant: Option<String>,
+    proxy_session_id: Option<String>,
+    routing_subject_hash: Option<String>,
+    upstream_operation: Option<String>,
+    fallback_reason: Option<String>,
     request_body: Option<String>,
     response_body: Option<String>,
+    request_body_bytes: Option<i64>,
+    response_body_bytes: Option<i64>,
+    request_body_sha256: Option<String>,
+    response_body_sha256: Option<String>,
+    body_cleaned_reason: Option<String>,
+    body_cleaned_at: Option<i64>,
     forwarded_headers: Vec<String>,
     dropped_headers: Vec<String>,
+    remote_addr: Option<String>,
+    client_ip: Option<String>,
+    client_ip_source: Option<String>,
+    client_ip_trusted: bool,
+    ip_headers: Vec<tavily_hikari::ClientIpHeaderValue>,
     #[serde(rename = "operationalClass")]
     operational_class: String,
     #[serde(rename = "requestKindProtocolGroup")]
@@ -224,6 +255,12 @@ struct RequestLogView {
 struct RequestLogBodiesView {
     request_body: Option<String>,
     response_body: Option<String>,
+    request_body_bytes: Option<i64>,
+    response_body_bytes: Option<i64>,
+    request_body_sha256: Option<String>,
+    response_body_sha256: Option<String>,
+    body_cleaned_reason: Option<String>,
+    body_cleaned_at: Option<i64>,
 }
 
 impl From<RequestLogBodiesRecord> for RequestLogBodiesView {
@@ -231,25 +268,33 @@ impl From<RequestLogBodiesRecord> for RequestLogBodiesView {
         Self {
             request_body: value.request_body.as_deref().and_then(decode_body),
             response_body: value.response_body.as_deref().and_then(decode_body),
+            request_body_bytes: value.request_body_bytes,
+            response_body_bytes: value.response_body_bytes,
+            request_body_sha256: value.request_body_sha256,
+            response_body_sha256: value.response_body_sha256,
+            body_cleaned_reason: value.body_cleaned_reason,
+            body_cleaned_at: value.body_cleaned_at,
         }
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JobLogView {
     id: i64,
     job_type: String,
+    trigger_source: String,
     key_id: Option<String>,
     key_group: Option<String>,
     status: String,
     attempt: i64,
     message: Option<String>,
-    started_at: i64,
+    queued_at: i64,
+    started_at: Option<i64>,
     finished_at: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SummaryView {
     total_requests: i64,
     success_count: i64,
@@ -258,6 +303,7 @@ struct SummaryView {
     active_keys: i64,
     exhausted_keys: i64,
     quarantined_keys: i64,
+    temporary_isolated_keys: i64,
     last_activity: Option<i64>,
     total_quota_limit: i64,
     total_quota_remaining: i64,
@@ -271,7 +317,7 @@ struct PublicMetricsView {
 }
 
 // ---- Access Token views ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TokenOwnerView {
     user_id: String,
@@ -289,7 +335,7 @@ impl From<&tavily_hikari::AdminUserIdentity> for TokenOwnerView {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AuthTokenView {
     id: String,
     enabled: bool,
@@ -419,6 +465,10 @@ struct TokenLogView {
     failure_kind: Option<String>,
     key_effect_code: String,
     key_effect_summary: Option<String>,
+    binding_effect_code: String,
+    binding_effect_summary: Option<String>,
+    selection_effect_code: String,
+    selection_effect_summary: Option<String>,
     created_at: i64,
     #[serde(rename = "operationalClass")]
     operational_class: String,
@@ -442,6 +492,8 @@ impl From<TokenLogRecord> for TokenLogView {
             r.failure_kind.as_deref(),
             r.counts_business_quota,
         );
+        let result_status =
+            display_result_status_for_request_kind(&r.request_kind_key, &r.result_status);
         Self {
             id: r.id,
             key_id: r.key_id,
@@ -454,11 +506,15 @@ impl From<TokenLogRecord> for TokenLogView {
             request_kind_key: r.request_kind_key,
             request_kind_label: r.request_kind_label,
             request_kind_detail: r.request_kind_detail,
-            result_status: r.result_status,
+            result_status,
             error_message: r.error_message,
             failure_kind: r.failure_kind,
             key_effect_code: r.key_effect_code,
             key_effect_summary: r.key_effect_summary,
+            binding_effect_code: r.binding_effect_code,
+            binding_effect_summary: r.binding_effect_summary,
+            selection_effect_code: r.selection_effect_code,
+            selection_effect_summary: r.selection_effect_summary,
             created_at: r.created_at,
             operational_class: operational_class.to_string(),
             request_kind_protocol_group: request_kind_protocol_group.to_string(),
@@ -467,7 +523,7 @@ impl From<TokenLogRecord> for TokenLogView {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct TokenRequestKindOptionView {
     key: String,
     label: String,
@@ -499,13 +555,110 @@ struct LogsQuery {
     per_page: Option<i64>,
     result: Option<String>,
     key_effect: Option<String>,
+    binding_effect: Option<String>,
+    selection_effect: Option<String>,
     auth_token_id: Option<String>,
     key_id: Option<String>,
     operational_class: Option<String>,
     include_bodies: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize)]
+struct CursorLogsQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+    direction: Option<String>,
+    result: Option<String>,
+    key_effect: Option<String>,
+    binding_effect: Option<String>,
+    selection_effect: Option<String>,
+    request_user_id: Option<String>,
+    auth_token_id: Option<String>,
+    key_id: Option<String>,
+    operational_class: Option<String>,
+    since: Option<i64>,
+    until: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenCursorLogsQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+    direction: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    result: Option<String>,
+    key_effect: Option<String>,
+    binding_effect: Option<String>,
+    selection_effect: Option<String>,
+    key_id: Option<String>,
+    operational_class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlertsQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+    #[serde(rename = "type")]
+    alert_type: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    user_id: Option<String>,
+    token_id: Option<String>,
+    key_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnouncementMutationRequest {
+    content: String,
+    display_kind: String,
+}
+
+impl From<AnnouncementMutationRequest> for tavily_hikari::AnnouncementMutation {
+    fn from(value: AnnouncementMutationRequest) -> Self {
+        Self {
+            content: value.content,
+            display_kind: value.display_kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnouncementView {
+    id: String,
+    content: String,
+    display_kind: String,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+    published_at: Option<i64>,
+    archived_at: Option<i64>,
+}
+
+impl From<tavily_hikari::Announcement> for AnnouncementView {
+    fn from(value: tavily_hikari::Announcement) -> Self {
+        Self {
+            id: value.id,
+            content: value.content,
+            display_kind: value.display_kind,
+            status: value.status,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            published_at: value.published_at,
+            archived_at: value.archived_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnouncementsResponse {
+    items: Vec<AnnouncementView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LogFacetOptionView {
     value: String,
@@ -526,14 +679,631 @@ impl From<LogFacetOption> for LogFacetOptionView {
 struct RequestLogFacetsView {
     results: Vec<LogFacetOptionView>,
     key_effects: Vec<LogFacetOptionView>,
+    binding_effects: Vec<LogFacetOptionView>,
+    selection_effects: Vec<LogFacetOptionView>,
     tokens: Vec<LogFacetOptionView>,
     keys: Vec<LogFacetOptionView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestLogsCursorPageView {
+    items: Vec<RequestLogView>,
+    page_size: i64,
+    next_cursor: Option<String>,
+    prev_cursor: Option<String>,
+    has_older: bool,
+    has_newer: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestLogsCatalogView {
+    retention_days: i64,
+    request_kind_options: Vec<TokenRequestKindOptionView>,
+    facets: RequestLogFacetsView,
+}
+
+impl From<RequestLogsCatalog> for RequestLogsCatalogView {
+    fn from(value: RequestLogsCatalog) -> Self {
+        Self {
+            retention_days: value.retention_days,
+            request_kind_options: value
+                .request_kind_options
+                .into_iter()
+                .map(TokenRequestKindOptionView::from)
+                .collect(),
+            facets: RequestLogFacetsView {
+                results: value
+                    .facets
+                    .results
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                key_effects: value
+                    .facets
+                    .key_effects
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                binding_effects: value
+                    .facets
+                    .binding_effects
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                selection_effects: value
+                    .facets
+                    .selection_effects
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                tokens: value
+                    .facets
+                    .tokens
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+                keys: value
+                    .facets
+                    .keys
+                    .into_iter()
+                    .map(LogFacetOptionView::from)
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertFacetOptionView {
+    value: String,
+    label: String,
+    count: i64,
+}
+
+impl From<tavily_hikari::AlertFacetOption> for AlertFacetOptionView {
+    fn from(value: tavily_hikari::AlertFacetOption) -> Self {
+        Self {
+            value: value.value,
+            label: value.label,
+            count: value.count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertEntityRefView {
+    id: String,
+    label: String,
+}
+
+impl From<tavily_hikari::AlertEntityRef> for AlertEntityRefView {
+    fn from(value: tavily_hikari::AlertEntityRef) -> Self {
+        Self {
+            id: value.id,
+            label: value.label,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertUserView {
+    user_id: String,
+    display_name: Option<String>,
+    username: Option<String>,
+}
+
+impl From<tavily_hikari::AlertUserRef> for AlertUserView {
+    fn from(value: tavily_hikari::AlertUserRef) -> Self {
+        Self {
+            user_id: value.user_id,
+            display_name: value.display_name,
+            username: value.username,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertRequestRefView {
+    id: i64,
+    method: String,
+    path: String,
+    query: Option<String>,
+}
+
+impl From<tavily_hikari::AlertRequestRef> for AlertRequestRefView {
+    fn from(value: tavily_hikari::AlertRequestRef) -> Self {
+        Self {
+            id: value.id,
+            method: value.method,
+            path: value.path,
+            query: value.query,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertSourceView {
+    kind: String,
+    id: String,
+}
+
+impl From<tavily_hikari::AlertSourceRef> for AlertSourceView {
+    fn from(value: tavily_hikari::AlertSourceRef) -> Self {
+        Self {
+            kind: value.kind,
+            id: value.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertTypeCountView {
+    #[serde(rename = "type")]
+    alert_type: String,
+    count: i64,
+}
+
+impl From<tavily_hikari::AlertTypeCount> for AlertTypeCountView {
+    fn from(value: tavily_hikari::AlertTypeCount) -> Self {
+        Self {
+            alert_type: value.alert_type,
+            count: value.count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertRequestKindView {
+    key: String,
+    label: String,
+    detail: Option<String>,
+}
+
+impl From<tavily_hikari::TokenRequestKind> for AlertRequestKindView {
+    fn from(value: tavily_hikari::TokenRequestKind) -> Self {
+        Self {
+            key: value.key,
+            label: value.label,
+            detail: value.detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertJobView {
+    id: i64,
+    job_type: String,
+    trigger_source: String,
+    status: String,
+    attempt: i64,
+    message: Option<String>,
+    queued_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+impl From<tavily_hikari::AlertJobRef> for AlertJobView {
+    fn from(value: tavily_hikari::AlertJobRef) -> Self {
+        Self {
+            id: value.id,
+            job_type: value.job_type,
+            trigger_source: value.trigger_source,
+            status: value.status,
+            attempt: value.attempt,
+            message: value.message,
+            queued_at: value.queued_at,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertEventView {
+    id: String,
+    #[serde(rename = "type")]
+    alert_type: String,
+    title: String,
+    summary: String,
+    occurred_at: i64,
+    subject_kind: String,
+    subject_id: String,
+    subject_label: String,
+    user: Option<AlertUserView>,
+    token: Option<AlertEntityRefView>,
+    key: Option<AlertEntityRefView>,
+    job: Option<AlertJobView>,
+    request: Option<AlertRequestRefView>,
+    request_kind: Option<AlertRequestKindView>,
+    failure_kind: Option<String>,
+    result_status: Option<String>,
+    error_message: Option<String>,
+    reason_code: Option<String>,
+    reason_summary: Option<String>,
+    reason_detail: Option<String>,
+    source: AlertSourceView,
+    semantic_window: Option<AlertSemanticWindowView>,
+}
+
+impl From<tavily_hikari::AlertEventRecord> for AlertEventView {
+    fn from(value: tavily_hikari::AlertEventRecord) -> Self {
+        Self {
+            id: value.id,
+            alert_type: value.alert_type,
+            title: value.title,
+            summary: value.summary,
+            occurred_at: value.occurred_at,
+            subject_kind: value.subject_kind,
+            subject_id: value.subject_id,
+            subject_label: value.subject_label,
+            user: value.user.map(AlertUserView::from),
+            token: value.token.map(AlertEntityRefView::from),
+            key: value.key.map(AlertEntityRefView::from),
+            job: value.job.map(AlertJobView::from),
+            request: value.request.map(AlertRequestRefView::from),
+            request_kind: value.request_kind.map(AlertRequestKindView::from),
+            failure_kind: value.failure_kind,
+            result_status: value.result_status,
+            error_message: value.error_message,
+            reason_code: value.reason_code,
+            reason_summary: value.reason_summary,
+            reason_detail: value.reason_detail,
+            source: AlertSourceView::from(value.source),
+            semantic_window: value.semantic_window.map(AlertSemanticWindowView::from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertSemanticWindowView {
+    kind: String,
+    window_minutes: Option<i64>,
+    window_start: Option<i64>,
+    window_end: Option<i64>,
+    window_key: Option<String>,
+}
+
+impl From<tavily_hikari::AlertSemanticWindow> for AlertSemanticWindowView {
+    fn from(value: tavily_hikari::AlertSemanticWindow) -> Self {
+        Self {
+            kind: value.kind.as_str().to_string(),
+            window_minutes: value.window_minutes,
+            window_start: value.window_start,
+            window_end: value.window_end,
+            window_key: value.window_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertGroupView {
+    id: String,
+    #[serde(rename = "type")]
+    alert_type: String,
+    subject_kind: String,
+    subject_id: String,
+    subject_label: String,
+    user: Option<AlertUserView>,
+    token: Option<AlertEntityRefView>,
+    key: Option<AlertEntityRefView>,
+    job: Option<AlertJobView>,
+    request_kind: Option<AlertRequestKindView>,
+    count: i64,
+    first_seen: i64,
+    last_seen: i64,
+    latest_event: AlertEventView,
+    grouping_kind: String,
+    semantic_window_kind: Option<String>,
+    semantic_window_minutes: Option<i64>,
+    semantic_window_start: Option<i64>,
+    semantic_window_end: Option<i64>,
+    semantic_window_key: Option<String>,
+    child_count: i64,
+    event_count: i64,
+    children: Vec<AlertGroupView>,
+    child_events: Vec<AlertEventView>,
+}
+
+impl From<tavily_hikari::AlertGroupRecord> for AlertGroupView {
+    fn from(value: tavily_hikari::AlertGroupRecord) -> Self {
+        Self {
+            id: value.id,
+            alert_type: value.alert_type,
+            subject_kind: value.subject_kind,
+            subject_id: value.subject_id,
+            subject_label: value.subject_label,
+            user: value.user.map(AlertUserView::from),
+            token: value.token.map(AlertEntityRefView::from),
+            key: value.key.map(AlertEntityRefView::from),
+            job: value.job.map(AlertJobView::from),
+            request_kind: value.request_kind.map(AlertRequestKindView::from),
+            count: value.count,
+            first_seen: value.first_seen,
+            last_seen: value.last_seen,
+            latest_event: AlertEventView::from(value.latest_event),
+            grouping_kind: value.grouping_kind,
+            semantic_window_kind: value.semantic_window_kind,
+            semantic_window_minutes: value.semantic_window_minutes,
+            semantic_window_start: value.semantic_window_start,
+            semantic_window_end: value.semantic_window_end,
+            semantic_window_key: value.semantic_window_key,
+            child_count: value.child_count,
+            event_count: value.event_count,
+            children: value.children.into_iter().map(AlertGroupView::from).collect(),
+            child_events: value
+                .child_events
+                .into_iter()
+                .map(AlertEventView::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaginatedAlertEventsView {
+    items: Vec<AlertEventView>,
+    total: i64,
+    page: i64,
+    per_page: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale_reason: Option<String>,
+}
+
+impl From<tavily_hikari::PaginatedAlertEvents> for PaginatedAlertEventsView {
+    fn from(value: tavily_hikari::PaginatedAlertEvents) -> Self {
+        Self {
+            items: value.items.into_iter().map(AlertEventView::from).collect(),
+            total: value.total,
+            page: value.page,
+            per_page: value.per_page,
+            coverage: None,
+            observed_at: None,
+            stale_reason: None,
+        }
+    }
+}
+
+impl PaginatedAlertEventsView {
+    fn stale(self, observed_at: i64) -> Self {
+        self.stale_with_reason(observed_at, "sqlite_pressure")
+    }
+
+    fn stale_with_reason(mut self, observed_at: i64, reason: &str) -> Self {
+        self.coverage = Some("stale".to_string());
+        self.observed_at = Some(observed_at);
+        self.stale_reason = Some(reason.to_string());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaginatedAlertGroupsView {
+    items: Vec<AlertGroupView>,
+    total: i64,
+    page: i64,
+    per_page: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale_reason: Option<String>,
+}
+
+impl From<tavily_hikari::PaginatedAlertGroups> for PaginatedAlertGroupsView {
+    fn from(value: tavily_hikari::PaginatedAlertGroups) -> Self {
+        Self {
+            items: value.items.into_iter().map(AlertGroupView::from).collect(),
+            total: value.total,
+            page: value.page,
+            per_page: value.per_page,
+            coverage: None,
+            observed_at: None,
+            stale_reason: None,
+        }
+    }
+}
+
+impl PaginatedAlertGroupsView {
+    fn stale(self, observed_at: i64) -> Self {
+        self.stale_with_reason(observed_at, "sqlite_pressure")
+    }
+
+    fn stale_with_reason(mut self, observed_at: i64, reason: &str) -> Self {
+        self.coverage = Some("stale".to_string());
+        self.observed_at = Some(observed_at);
+        self.stale_reason = Some(reason.to_string());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertCatalogView {
+    retention_days: i64,
+    types: Vec<LogFacetOptionView>,
+    request_kind_options: Vec<TokenRequestKindOptionView>,
+    users: Vec<AlertFacetOptionView>,
+    tokens: Vec<AlertFacetOptionView>,
+    keys: Vec<AlertFacetOptionView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale_reason: Option<String>,
+}
+
+impl From<tavily_hikari::AlertCatalog> for AlertCatalogView {
+    fn from(value: tavily_hikari::AlertCatalog) -> Self {
+        Self {
+            retention_days: value.retention_days,
+            types: value.types.into_iter().map(LogFacetOptionView::from).collect(),
+            request_kind_options: value
+                .request_kind_options
+                .into_iter()
+                .map(TokenRequestKindOptionView::from)
+                .collect(),
+            users: value.users.into_iter().map(AlertFacetOptionView::from).collect(),
+            tokens: value.tokens.into_iter().map(AlertFacetOptionView::from).collect(),
+            keys: value.keys.into_iter().map(AlertFacetOptionView::from).collect(),
+            coverage: None,
+            observed_at: None,
+            stale_reason: None,
+        }
+    }
+}
+
+impl AlertCatalogView {
+    fn stale_with_reason(mut self, observed_at: i64, reason: &str) -> Self {
+        self.coverage = Some("stale".to_string());
+        self.observed_at = Some(observed_at);
+        self.stale_reason = Some(reason.to_string());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardRecentAlertsGroupedWindowCountView {
+    window_hours: i64,
+    grouped_count: i64,
+}
+
+impl From<tavily_hikari::RecentAlertsGroupedWindowCount> for DashboardRecentAlertsGroupedWindowCountView {
+    fn from(value: tavily_hikari::RecentAlertsGroupedWindowCount) -> Self {
+        Self {
+            window_hours: value.window_hours,
+            grouped_count: value.grouped_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardRecentAlertsView {
+    window_hours: i64,
+    total_events: i64,
+    grouped_count: i64,
+    grouped_count_windows: Vec<DashboardRecentAlertsGroupedWindowCountView>,
+    counts_by_type: Vec<AlertTypeCountView>,
+    top_groups: Vec<AlertGroupView>,
+}
+
+impl From<tavily_hikari::RecentAlertsSummary> for DashboardRecentAlertsView {
+    fn from(value: tavily_hikari::RecentAlertsSummary) -> Self {
+        Self {
+            window_hours: value.window_hours,
+            total_events: value.total_events,
+            grouped_count: value.grouped_count,
+            grouped_count_windows: value
+                .grouped_count_windows
+                .into_iter()
+                .map(DashboardRecentAlertsGroupedWindowCountView::from)
+                .collect(),
+            counts_by_type: value
+                .counts_by_type
+                .into_iter()
+                .map(AlertTypeCountView::from)
+                .collect(),
+            top_groups: value.top_groups.into_iter().map(AlertGroupView::from).collect(),
+        }
+    }
+}
+
+fn build_request_logs_cursor_page_view(page: RequestLogsCursorPage) -> RequestLogsCursorPageView {
+    RequestLogsCursorPageView {
+        items: page
+            .items
+            .into_iter()
+            .map(RequestLogView::from_summary_record)
+            .collect(),
+        page_size: page.page_size,
+        next_cursor: page.next_cursor.as_ref().map(encode_request_logs_cursor),
+        prev_cursor: page.prev_cursor.as_ref().map(encode_request_logs_cursor),
+        has_older: page.has_older,
+        has_newer: page.has_newer,
+    }
+}
+
+fn build_token_logs_cursor_page_view(page: TokenLogsCursorPage, token_id: &str) -> RequestLogsCursorPageView {
+    RequestLogsCursorPageView {
+        items: page
+            .items
+            .into_iter()
+            .map(|record| RequestLogView::from_token_record(record, token_id))
+            .map(|mut view| {
+                if let Some(err) = view.error_message.as_ref() {
+                    view.error_message = Some(redact_sensitive(err));
+                }
+                view
+            })
+            .collect(),
+        page_size: page.page_size,
+        next_cursor: page.next_cursor.as_ref().map(encode_request_logs_cursor),
+        prev_cursor: page.prev_cursor.as_ref().map(encode_request_logs_cursor),
+        has_older: page.has_older,
+        has_newer: page.has_newer,
+    }
+}
+
+fn encode_request_logs_cursor(cursor: &RequestLogsCursor) -> String {
+    format!("{}:{}", cursor.created_at, cursor.id)
+}
+
+fn parse_request_logs_cursor(value: Option<&str>) -> Result<Option<RequestLogsCursor>, StatusCode> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((created_at_raw, id_raw)) = raw.split_once(':') else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let created_at = created_at_raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = id_raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Some(RequestLogsCursor { created_at, id }))
+}
+
+fn normalize_request_logs_cursor_direction(
+    value: Option<&str>,
+) -> Result<RequestLogsCursorDirection, StatusCode> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(RequestLogsCursorDirection::Older),
+        Some(value) if value.eq_ignore_ascii_case("older") => Ok(RequestLogsCursorDirection::Older),
+        Some(value) if value.eq_ignore_ascii_case("newer") => Ok(RequestLogsCursorDirection::Newer),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 fn normalize_result_status_filter(value: Option<&str>) -> Option<&'static str> {
     match value.map(str::trim) {
         Some(v) if v.eq_ignore_ascii_case("success") => Some("success"),
         Some(v) if v.eq_ignore_ascii_case("error") => Some("error"),
+        Some(v) if v.eq_ignore_ascii_case("neutral") => Some("neutral"),
         Some(v) if v.eq_ignore_ascii_case("quota_exhausted") || v.eq_ignore_ascii_case("quota") => {
             Some("quota_exhausted")
         }
@@ -548,8 +1318,78 @@ fn normalize_key_effect_filter(value: Option<&str>) -> Option<&'static str> {
         Some(v) if v.eq_ignore_ascii_case("marked_exhausted") => Some("marked_exhausted"),
         Some(v) if v.eq_ignore_ascii_case("restored_active") => Some("restored_active"),
         Some(v) if v.eq_ignore_ascii_case("cleared_quarantine") => Some("cleared_quarantine"),
+        Some(v) if v.eq_ignore_ascii_case("mcp_session_init_backoff_set") => {
+            Some("mcp_session_init_backoff_set")
+        }
+        Some(v) if v.eq_ignore_ascii_case("mcp_session_retry_waited") => {
+            Some("mcp_session_retry_waited")
+        }
+        Some(v) if v.eq_ignore_ascii_case("mcp_session_retry_scheduled") => {
+            Some("mcp_session_retry_scheduled")
+        }
         _ => None,
     }
+}
+
+fn normalize_binding_effect_filter(value: Option<&str>) -> Option<&'static str> {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("none") => Some("none"),
+        Some(v) if v.eq_ignore_ascii_case("http_project_affinity_bound") => {
+            Some("http_project_affinity_bound")
+        }
+        Some(v) if v.eq_ignore_ascii_case("http_project_affinity_reused") => {
+            Some("http_project_affinity_reused")
+        }
+        Some(v) if v.eq_ignore_ascii_case("http_project_affinity_rebound") => {
+            Some("http_project_affinity_rebound")
+        }
+        _ => None,
+    }
+}
+
+fn normalize_selection_effect_filter(value: Option<&str>) -> Option<&'static str> {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("none") => Some("none"),
+        Some(v) if v.eq_ignore_ascii_case("mcp_session_init_cooldown_avoided") => {
+            Some("mcp_session_init_cooldown_avoided")
+        }
+        Some(v) if v.eq_ignore_ascii_case("mcp_session_init_rate_limit_avoided") => {
+            Some("mcp_session_init_rate_limit_avoided")
+        }
+        Some(v) if v.eq_ignore_ascii_case("mcp_session_init_pressure_avoided") => {
+            Some("mcp_session_init_pressure_avoided")
+        }
+        Some(v) if v.eq_ignore_ascii_case("http_project_affinity_cooldown_avoided") => {
+            Some("http_project_affinity_cooldown_avoided")
+        }
+        Some(v) if v.eq_ignore_ascii_case("http_project_affinity_rate_limit_avoided") => {
+            Some("http_project_affinity_rate_limit_avoided")
+        }
+        Some(v) if v.eq_ignore_ascii_case("http_project_affinity_pressure_avoided") => {
+            Some("http_project_affinity_pressure_avoided")
+        }
+        _ => None,
+    }
+}
+
+fn validate_logs_effect_filters(
+    result_status: Option<&str>,
+    key_effect_code: Option<&str>,
+    binding_effect_code: Option<&str>,
+    selection_effect_code: Option<&str>,
+) -> Result<(), StatusCode> {
+    let key_effect_active = key_effect_code.is_some();
+    let binding_effect_active = binding_effect_code.is_some();
+    let selection_effect_active = selection_effect_code.is_some();
+    if key_effect_active && (binding_effect_active || selection_effect_active) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if result_status.is_some()
+        && (key_effect_active || binding_effect_active || selection_effect_active)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
 }
 
 fn normalize_optional_filter(value: Option<&str>) -> Option<&str> {
@@ -588,14 +1428,14 @@ async fn get_key_metrics(
     Path(id): Path<String>,
     Query(q): Query<KeyMetricsQuery>,
 ) -> Result<Json<SummaryView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let since = if let Some(since) = q.since {
         since
     } else {
         // fallback by period
-        let now = chrono::Local::now();
+        let now = state.proxy.backend_time().local_now();
         let local_midnight_ts = |date: chrono::NaiveDate| -> i64 {
             let naive = date.and_hms_opt(0, 0, 0).expect("valid midnight");
             match chrono::Local.from_local_datetime(&naive) {
@@ -641,6 +1481,8 @@ struct KeyLogsPageQuery {
     since: Option<i64>,
     result: Option<String>,
     key_effect: Option<String>,
+    binding_effect: Option<String>,
+    selection_effect: Option<String>,
     auth_token_id: Option<String>,
 }
 
@@ -650,7 +1492,7 @@ async fn get_key_logs(
     Path(id): Path<String>,
     Query(q): Query<KeyLogsQuery>,
 ) -> Result<Json<Vec<RequestLogView>>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, 500);
@@ -667,7 +1509,7 @@ async fn get_key_log_details(
     headers: HeaderMap,
     Path((id, log_id)): Path<(String, i64)>,
 ) -> Result<Json<RequestLogBodiesView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -699,7 +1541,7 @@ async fn get_key_logs_page(
     RawQuery(raw_query): RawQuery,
     Query(q): Query<KeyLogsPageQuery>,
 ) -> Result<Json<KeyLogsPageView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let page = q.page.unwrap_or(1).max(1);
@@ -707,9 +1549,14 @@ async fn get_key_logs_page(
     let request_kinds = parse_request_kind_filters(raw_query.as_deref());
     let result_status = normalize_result_status_filter(q.result.as_deref());
     let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
-    if result_status.is_some() && key_effect_code.is_some() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let binding_effect_code = normalize_binding_effect_filter(q.binding_effect.as_deref());
+    let selection_effect_code = normalize_selection_effect_filter(q.selection_effect.as_deref());
+    validate_logs_effect_filters(
+        result_status,
+        key_effect_code,
+        binding_effect_code,
+        selection_effect_code,
+    )?;
     let auth_token_id = normalize_optional_filter(q.auth_token_id.as_deref());
 
     state
@@ -720,6 +1567,8 @@ async fn get_key_logs_page(
             &request_kinds,
             result_status,
             key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
             auth_token_id,
             page,
             per_page,
@@ -753,6 +1602,18 @@ async fn get_key_logs_page(
                         .into_iter()
                         .map(LogFacetOptionView::from)
                         .collect(),
+                    binding_effects: logs
+                        .facets
+                        .binding_effects
+                        .into_iter()
+                        .map(LogFacetOptionView::from)
+                        .collect(),
+                    selection_effects: logs
+                        .facets
+                        .selection_effects
+                        .into_iter()
+                        .map(LogFacetOptionView::from)
+                        .collect(),
                     tokens: logs
                         .facets
                         .tokens
@@ -771,6 +1632,114 @@ async fn get_key_logs_page(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn get_key_logs_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<CursorLogsQuery>,
+) -> Result<Json<RequestLogsCursorPageView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let page_size = q.limit.unwrap_or(20).clamp(1, 200);
+    let cursor = parse_request_logs_cursor(q.cursor.as_deref())?;
+    let direction = normalize_request_logs_cursor_direction(q.direction.as_deref())?;
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    let binding_effect_code = normalize_binding_effect_filter(q.binding_effect.as_deref());
+    let selection_effect_code = normalize_selection_effect_filter(q.selection_effect.as_deref());
+    validate_logs_effect_filters(
+        result_status,
+        key_effect_code,
+        binding_effect_code,
+        selection_effect_code,
+    )?;
+    let auth_token_id = normalize_optional_filter(q.auth_token_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .key_logs_list(
+            &id,
+            q.since,
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
+            auth_token_id,
+            operational_class,
+            cursor.as_ref(),
+            direction,
+            page_size,
+        )
+        .await
+        .map(build_request_logs_cursor_page_view)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_key_logs_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<CursorLogsQuery>,
+) -> Result<Json<RequestLogsCatalogView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    let binding_effect_code = normalize_binding_effect_filter(q.binding_effect.as_deref());
+    let selection_effect_code = normalize_selection_effect_filter(q.selection_effect.as_deref());
+    validate_logs_effect_filters(
+        result_status,
+        key_effect_code,
+        binding_effect_code,
+        selection_effect_code,
+    )?;
+    let auth_token_id = normalize_optional_filter(q.auth_token_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .key_logs_catalog(
+            &id,
+            q.since,
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
+            auth_token_id,
+            operational_class,
+        )
+        .await
+        .map(RequestLogsCatalogView::from)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 #[derive(Debug, Deserialize)]
 struct StickyUsersQuery {
     page: Option<i64>,
@@ -783,7 +1752,7 @@ async fn get_key_sticky_users(
     Path(id): Path<String>,
     Query(q): Query<StickyUsersQuery>,
 ) -> Result<Json<PaginatedStickyUsersView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     state
@@ -806,7 +1775,7 @@ async fn get_key_sticky_nodes(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<StickyNodesView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     state
@@ -839,19 +1808,20 @@ async fn get_token_metrics(
     headers: HeaderMap,
     Query(q): Query<TokenMetricsQuery>,
 ) -> Result<Json<TokenSummaryView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
+    let now = state.proxy.backend_time().now_utc();
     let since = q
         .since
         .as_deref()
         .and_then(parse_iso_timestamp)
-        .unwrap_or_else(|| default_since(q.period.as_deref()));
+        .unwrap_or_else(|| default_since_at(now, q.period.as_deref()));
     let until = q
         .until
         .as_deref()
         .and_then(parse_iso_timestamp)
-        .unwrap_or_else(|| default_until(q.period.as_deref(), since));
+        .unwrap_or_else(|| default_until_at(now, q.period.as_deref(), since));
 
     state
         .proxy
@@ -878,7 +1848,7 @@ async fn get_token_logs(
     headers: HeaderMap,
     Query(q): Query<TokenLogsQuery>,
 ) -> Result<Json<Vec<TokenLogView>>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, 500);
@@ -910,6 +1880,8 @@ struct TokenLogsPageQuery {
     until: Option<String>,
     result: Option<String>,
     key_effect: Option<String>,
+    binding_effect: Option<String>,
+    selection_effect: Option<String>,
     key_id: Option<String>,
     operational_class: Option<String>,
 }
@@ -956,6 +1928,7 @@ struct TokenLeaderboardItemView {
     total_requests: i64,
     last_used_at: Option<i64>,
     quota_state: String,
+    request_rate: tavily_hikari::RequestRateView,
     // Business quota windows (tools/call)
     quota_hourly_used: i64,
     quota_hourly_limit: i64,
@@ -984,32 +1957,46 @@ async fn get_token_logs_page(
     RawQuery(raw_query): RawQuery,
     Query(q): Query<TokenLogsPageQuery>,
 ) -> Result<Json<TokenLogsPageView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(20).clamp(1, 200);
+    let now = state.proxy.backend_time().now_utc();
     let since = q
         .since
         .as_deref()
         .and_then(parse_iso_timestamp)
-        .unwrap_or_else(|| default_since(Some("month")));
+        .unwrap_or_else(|| default_since_at(now, Some("month")));
     let until = q
         .until
         .as_deref()
         .and_then(parse_iso_timestamp)
-        .unwrap_or_else(|| default_until(Some("month"), since));
+        .unwrap_or_else(|| default_until_at(now, Some("month"), since));
     if until <= since {
         return Err(StatusCode::BAD_REQUEST);
     }
     let request_kinds = parse_request_kind_filters(raw_query.as_deref());
     let result_status = normalize_result_status_filter(q.result.as_deref());
     let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
-    if result_status.is_some() && key_effect_code.is_some() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let binding_effect_code = normalize_binding_effect_filter(q.binding_effect.as_deref());
+    let selection_effect_code = normalize_selection_effect_filter(q.selection_effect.as_deref());
+    validate_logs_effect_filters(
+        result_status,
+        key_effect_code,
+        binding_effect_code,
+        selection_effect_code,
+    )?;
     let key_id = normalize_optional_filter(q.key_id.as_deref());
     let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     state
         .proxy
         .token_logs_page(
@@ -1021,6 +2008,8 @@ async fn get_token_logs_page(
             &request_kinds,
             result_status,
             key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
             key_id,
             operational_class,
         )
@@ -1060,6 +2049,18 @@ async fn get_token_logs_page(
                         .into_iter()
                         .map(LogFacetOptionView::from)
                         .collect(),
+                    binding_effects: logs
+                        .facets
+                        .binding_effects
+                        .into_iter()
+                        .map(LogFacetOptionView::from)
+                        .collect(),
+                    selection_effects: logs
+                        .facets
+                        .selection_effects
+                        .into_iter()
+                        .map(LogFacetOptionView::from)
+                        .collect(),
                     tokens: logs
                         .facets
                         .tokens
@@ -1078,12 +2079,150 @@ async fn get_token_logs_page(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn get_token_logs_list(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<TokenCursorLogsQuery>,
+) -> Result<Json<RequestLogsCursorPageView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let page_size = q.limit.unwrap_or(20).clamp(1, 200);
+    let now = state.proxy.backend_time().now_utc();
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_since_at(now, Some("month")));
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_until_at(now, Some("month"), since));
+    if until <= since {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let cursor = parse_request_logs_cursor(q.cursor.as_deref())?;
+    let direction = normalize_request_logs_cursor_direction(q.direction.as_deref())?;
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    let binding_effect_code = normalize_binding_effect_filter(q.binding_effect.as_deref());
+    let selection_effect_code = normalize_selection_effect_filter(q.selection_effect.as_deref());
+    validate_logs_effect_filters(
+        result_status,
+        key_effect_code,
+        binding_effect_code,
+        selection_effect_code,
+    )?;
+    let key_id = normalize_optional_filter(q.key_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .token_logs_list(
+            &id,
+            page_size,
+            since,
+            Some(until),
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
+            key_id,
+            operational_class,
+            cursor.as_ref(),
+            direction,
+        )
+        .await
+        .map(|page| build_token_logs_cursor_page_view(page, &id))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_token_logs_catalog(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(q): Query<TokenCursorLogsQuery>,
+) -> Result<Json<RequestLogsCatalogView>, StatusCode> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let now = state.proxy.backend_time().now_utc();
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_since_at(now, Some("month")));
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_iso_timestamp)
+        .unwrap_or_else(|| default_until_at(now, Some("month"), since));
+    if until <= since {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let request_kinds = parse_request_kind_filters(raw_query.as_deref());
+    let result_status = normalize_result_status_filter(q.result.as_deref());
+    let key_effect_code = normalize_key_effect_filter(q.key_effect.as_deref());
+    let binding_effect_code = normalize_binding_effect_filter(q.binding_effect.as_deref());
+    let selection_effect_code = normalize_selection_effect_filter(q.selection_effect.as_deref());
+    validate_logs_effect_filters(
+        result_status,
+        key_effect_code,
+        binding_effect_code,
+        selection_effect_code,
+    )?;
+    let key_id = normalize_optional_filter(q.key_id.as_deref());
+    let operational_class = normalize_operational_class_filter(q.operational_class.as_deref());
+    if q
+        .operational_class
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && operational_class.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .proxy
+        .token_logs_catalog(
+            &id,
+            since,
+            Some(until),
+            &request_kinds,
+            result_status,
+            key_effect_code,
+            binding_effect_code,
+            selection_effect_code,
+            key_id,
+            operational_class,
+        )
+        .await
+        .map(RequestLogsCatalogView::from)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn get_log_details(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(log_id): Path<i64>,
 ) -> Result<Json<RequestLogBodiesView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1102,7 +2241,7 @@ async fn get_token_log_details(
     Path((id, log_id)): Path<(String, i64)>,
     headers: HeaderMap,
 ) -> Result<Json<RequestLogBodiesView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1122,7 +2261,7 @@ async fn get_token_hourly_breakdown(
     headers: HeaderMap,
     Query(q): Query<TokenHourlyQuery>,
 ) -> Result<Json<Vec<TokenHourlyBucketView>>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let hours = q.hours.unwrap_or(25);
@@ -1166,10 +2305,10 @@ async fn get_token_usage_series(
     headers: HeaderMap,
     Query(q): Query<UsageSeriesQuery>,
 ) -> Result<Json<Vec<TokenUsageBucketView>>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
-    let now = Utc::now().timestamp();
+    let now = state.proxy.backend_time().now_ts();
     let until = q
         .until
         .as_deref()
@@ -1222,11 +2361,11 @@ async fn get_token_leaderboard(
     headers: HeaderMap,
     Query(q): Query<TokenLeaderboardQuery>,
 ) -> Result<Json<Vec<TokenLeaderboardItemView>>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let now = Utc::now();
+    let now = state.proxy.backend_time().now_utc();
     let day_since = start_of_day_dt(now).timestamp();
     let month_since = start_of_month_dt(now).timestamp();
 
@@ -1330,10 +2469,16 @@ async fn get_token_leaderboard(
             .map(|w| w.as_str().to_string())
             .unwrap_or_else(|| "normal".to_string());
 
-        let (hourly_any_used, hourly_any_limit) = hourly_any_map
+        let request_rate = hourly_any_map
             .get(&token.id)
-            .map(|v| (v.hourly_used, v.hourly_limit))
-            .unwrap_or((0, effective_token_hourly_request_limit()));
+            .cloned()
+            .unwrap_or_else(|| {
+                state
+                    .proxy
+                    .default_request_rate_verdict(tavily_hikari::RequestRateScope::Token)
+            });
+        let (hourly_any_used, hourly_any_limit) =
+            (request_rate.hourly_used, request_rate.hourly_limit);
         let has_monthly_broken_record = monthly_broken_subjects.contains(&token.id);
         let monthly_broken_count = has_monthly_broken_record.then(|| {
             monthly_broken_counts
@@ -1356,6 +2501,7 @@ async fn get_token_leaderboard(
             total_requests: all.total_requests,
             last_used_at: all.last_activity,
             quota_state,
+            request_rate: request_rate.request_rate(),
             quota_hourly_used: hour_used,
             quota_hourly_limit: hour_limit,
             quota_daily_used: day_used,
@@ -1409,7 +2555,7 @@ async fn get_token_monthly_broken_keys(
     headers: HeaderMap,
     Query(q): Query<BrokenKeysPageQuery>,
 ) -> Result<Json<PaginatedMonthlyBrokenKeysView>, StatusCode> {
-    if !is_admin_request(state.as_ref(), &headers) {
+    if !is_admin_request(state.as_ref(), &headers).await {
         return Err(StatusCode::FORBIDDEN);
     }
     let exists = state
@@ -1428,4 +2574,57 @@ async fn get_token_monthly_broken_keys(
         .map(build_monthly_broken_keys_view)
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[cfg(test)]
+mod dto_tests {
+    use super::validate_logs_effect_filters;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn validate_logs_effect_filters_allows_binding_and_selection_together() {
+        assert_eq!(
+            validate_logs_effect_filters(
+                None,
+                None,
+                Some("http_project_affinity_rebound"),
+                Some("http_project_affinity_cooldown_avoided"),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_logs_effect_filters_rejects_key_plus_binding() {
+        assert_eq!(
+            validate_logs_effect_filters(
+                None,
+                Some("quarantined"),
+                Some("http_project_affinity_rebound"),
+                None,
+            ),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn validate_logs_effect_filters_rejects_result_plus_key_effect() {
+        assert_eq!(
+            validate_logs_effect_filters(Some("success"), Some("quarantined"), None, None),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn validate_logs_effect_filters_rejects_result_plus_binding_effect() {
+        assert_eq!(
+            validate_logs_effect_filters(
+                Some("success"),
+                None,
+                Some("http_project_affinity_rebound"),
+                None,
+            ),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
 }

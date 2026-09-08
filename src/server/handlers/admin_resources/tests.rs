@@ -1,0 +1,552 @@
+#[cfg(test)]
+mod admin_resources_tests {
+    use super::*;
+
+    fn mock_user(user_id: &str, last_login_at: Option<i64>) -> tavily_hikari::AdminUserIdentity {
+        tavily_hikari::AdminUserIdentity {
+            user_id: user_id.to_string(),
+            display_name: Some(user_id.to_string()),
+            username: Some(user_id.to_string()),
+            active: true,
+            last_login_at,
+            token_count: 1,
+        }
+    }
+
+    fn mock_summary() -> tavily_hikari::UserDashboardSummary {
+        tavily_hikari::UserDashboardSummary {
+            debug_info_shared: false,
+            request_rate: default_request_rate_view(tavily_hikari::RequestRateScope::User),
+            business_calls_1h: tavily_hikari::BusinessCalls1hSummary {
+                window_minutes: 60,
+                ..tavily_hikari::BusinessCalls1hSummary::default()
+            },
+            daily_credits_used: 0,
+            daily_credits_limit: 0,
+            monthly_credits_used: 0,
+            monthly_credits_limit: 0,
+            daily_success: 0,
+            daily_failure: 0,
+            monthly_success: 0,
+            monthly_failure: 0,
+            last_activity: None,
+            recharge: tavily_hikari::LinuxDoCreditRechargeSummary::default(),
+        }
+    }
+
+    fn mock_row(
+        user_id: &str,
+        last_login_at: Option<i64>,
+        configure: impl FnOnce(&mut tavily_hikari::UserDashboardSummary),
+    ) -> AdminUserSummaryRow {
+        let mut summary = mock_summary();
+        configure(&mut summary);
+        AdminUserSummaryRow {
+            user: mock_user(user_id, last_login_at),
+            summary,
+            monthly_broken_count: 0,
+            monthly_broken_limit: USER_MONTHLY_BROKEN_LIMIT_DEFAULT,
+            recent_ip_count_7d: 0,
+        }
+    }
+
+    fn admin_test_db_path(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}.db", nanoid!(8)))
+    }
+
+    fn admin_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forward-user", HeaderValue::from_static("admin"));
+        headers
+    }
+
+    #[test]
+    fn alert_read_cache_key_preserves_optional_time_filter_presence() {
+        let request_kinds = vec!["proxy".to_string()];
+        let unbounded = AlertReadCacheQuery {
+            alert_type: None,
+            since: None,
+            until: None,
+            user_id: None,
+            token_id: None,
+            key_id: None,
+            request_kinds: &request_kinds,
+            page: 1,
+            per_page: 20,
+        };
+        let epoch_bounded = AlertReadCacheQuery {
+            alert_type: unbounded.alert_type,
+            since: Some(0),
+            until: unbounded.until,
+            user_id: unbounded.user_id,
+            token_id: unbounded.token_id,
+            key_id: unbounded.key_id,
+            request_kinds: unbounded.request_kinds,
+            page: unbounded.page,
+            per_page: unbounded.per_page,
+        };
+
+        assert_ne!(
+            alert_read_cache_key("events", &unbounded),
+            alert_read_cache_key("events", &epoch_bounded),
+        );
+    }
+
+    async fn totp_test_state(prefix: &str) -> (Arc<AppState>, PathBuf) {
+        totp_test_state_with_builtin_admin(
+            prefix,
+            BuiltinAdminAuth::new(false, None, None),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_api_key_returns_retryable_response_under_sqlite_contention() {
+        let (state, db_path) = totp_test_state("admin-api-key-mutation-contention").await;
+        use sqlx::Connection;
+
+        let lock_options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(false)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let mut lock_conn = sqlx::SqliteConnection::connect_with(&lock_options)
+            .await
+            .expect("open writer lock connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock_conn)
+            .await
+            .expect("hold SQLite writer lock");
+
+        let started = std::time::Instant::now();
+        let response = create_api_key(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateKeyRequest {
+                api_key: "tvly-admin-api-key-contention".to_string(),
+                group: None,
+                registration_ip: None,
+                assigned_proxy_key: None,
+            }),
+        )
+        .await
+        .expect("SQLite contention is an HTTP response, not a handler failure");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("retry-after").and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "admin API key create must not inherit SQLite's default five-second wait"
+        );
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut lock_conn)
+            .await
+            .expect("release SQLite writer lock");
+        drop(lock_conn);
+        let created = create_api_key(
+            State(state),
+            admin_headers(),
+            Json(CreateKeyRequest {
+                api_key: "tvly-admin-api-key-contention".to_string(),
+                group: None,
+                registration_ip: None,
+                assigned_proxy_key: None,
+            }),
+        )
+        .await
+        .expect("API key create recovers after the writer lock releases");
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    }
+
+    async fn totp_test_state_with_builtin_admin(
+        prefix: &str,
+        builtin_admin: BuiltinAdminAuth,
+    ) -> (Arc<AppState>, PathBuf) {
+        let db_path = admin_test_db_path(prefix);
+        let db_str = db_path.to_string_lossy().to_string();
+        let proxy = TavilyProxy::with_endpoint(Vec::<String>::new(), tavily_hikari::DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+        let forward_auth = ForwardAuthConfig::new(
+            Some(HeaderName::from_static("x-forward-user")),
+            Some("admin".to_string()),
+            None,
+            None,
+        );
+        let state = Arc::new(AppState {
+            proxy,
+            static_dir: None,
+            forward_auth,
+            forward_auth_enabled: true,
+            builtin_admin,
+            admin_passkey: AdminPasskeyOptions::disabled(),
+            linuxdo_oauth: LinuxDoOAuthOptions {
+                enabled: true,
+                client_id: Some("linuxdo-test-client-id".to_string()),
+                client_secret: Some("linuxdo-test-client-secret".to_string()),
+                authorize_url: "https://connect.linux.do/oauth2/authorize".to_string(),
+                token_url: "https://connect.linux.do/oauth2/token".to_string(),
+                userinfo_url: "https://connect.linux.do/api/user".to_string(),
+                scope: "user".to_string(),
+                redirect_url: Some("http://127.0.0.1/auth/linuxdo/callback".to_string()),
+                refresh_token_crypt_key: Some(*b"0123456789abcdef0123456789abcdef"),
+                user_sync_enabled: true,
+                user_sync_at: (6, 20),
+                session_max_age_secs: 3600,
+                login_state_ttl_secs: 600,
+            },
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+            dev_open_admin: false,
+            usage_base: "http://127.0.0.1:58088".to_string(),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+        });
+        (state, db_path)
+    }
+
+    #[test]
+    fn linuxdo_credit_refund_url_refuses_unknown_submit_url() {
+        assert_eq!(
+            linuxdo_credit_refund_url("https://credit.linux.do/epay/pay/submit.php")
+                .expect("official URL derives"),
+            "https://credit.linux.do/epay/api.php"
+        );
+        let err = linuxdo_credit_refund_url("http://127.0.0.1:9/linuxdo-credit/submit")
+            .expect_err("unknown sandbox URL is refused");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn linuxdo_credit_refund_params_select_refund_action() {
+        let params = linuxdo_credit_refund_params(
+            "client-id",
+            "client-secret",
+            "trade-123",
+            "out-trade-123",
+            "50.00",
+        );
+        assert_eq!(params[0], ("act", "refund".to_string()));
+        assert!(params.contains(&("pid", "client-id".to_string())));
+        assert!(params.contains(&("key", "client-secret".to_string())));
+        assert!(params.contains(&("trade_no", "trade-123".to_string())));
+        assert!(params.contains(&("out_trade_no", "out-trade-123".to_string())));
+        assert!(params.contains(&("money", "50.00".to_string())));
+    }
+
+    #[tokio::test]
+    async fn admin_totp_setup_is_available_without_recharge_feature() {
+        let (state, db_path) = totp_test_state("admin-totp-login-only").await;
+
+        let status = get_admin_totp_status(State(state.clone()), admin_headers())
+            .await
+            .expect("status loads")
+            .0;
+        assert!(!status.recharge_feature_enabled);
+        assert!(status.available);
+
+        let setup = post_admin_totp_setup(State(state), admin_headers())
+            .await
+            .expect("setup works without recharge")
+            .0;
+        assert!(!setup.secret.is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_totp_confirm_rejects_existing_binding() {
+        let (state, db_path) = totp_test_state("admin-totp-confirm-existing").await;
+        let first_secret = generate_totp_secret();
+        let first_code = build_totp(&first_secret)
+            .expect("build first totp")
+            .generate_current()
+            .expect("first code");
+        let _ = post_admin_totp_confirm(
+            State(state.clone()),
+            admin_headers(),
+            Json(AdminTotpConfirmPayload {
+                secret: first_secret,
+                code: first_code,
+            }),
+        )
+        .await
+        .expect("first bind succeeds");
+
+        let next_secret = generate_totp_secret();
+        let next_code = build_totp(&next_secret)
+            .expect("build next totp")
+            .generate_current()
+            .expect("next code");
+        let err = post_admin_totp_confirm(
+            State(state),
+            admin_headers(),
+            Json(AdminTotpConfirmPayload {
+                secret: next_secret,
+                code: next_code,
+            }),
+        )
+        .await
+        .expect_err("confirm cannot overwrite existing binding");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn builtin_admin_login_requires_totp_when_enabled() {
+        let (state, db_path) = totp_test_state_with_builtin_admin(
+            "builtin-admin-login-totp",
+            BuiltinAdminAuth::new(true, Some("pw-123".to_string()), None),
+        )
+        .await;
+        let secret = generate_totp_secret();
+        let bind_code = build_totp(&secret)
+            .expect("build bind totp")
+            .generate_current()
+            .expect("bind code");
+        let _ = post_admin_totp_confirm(
+            State(state.clone()),
+            admin_headers(),
+            Json(AdminTotpConfirmPayload {
+                secret: secret.clone(),
+                code: bind_code,
+            }),
+        )
+        .await
+        .expect("bind TOTP succeeds");
+        state.builtin_admin.set_login_totp_required(true, Some(1));
+
+        let missing_totp = post_admin_login(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(AdminLoginRequest {
+                password: "pw-123".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect_err("missing TOTP is rejected");
+        assert_eq!(missing_totp, StatusCode::FORBIDDEN);
+
+        let login_code = build_totp(&secret)
+            .expect("build login totp")
+            .generate_current()
+            .expect("login code");
+        let response = post_admin_login(
+            State(state),
+            HeaderMap::new(),
+            Json(AdminLoginRequest {
+                password: "pw-123".to_string(),
+                totp_code: Some(login_code),
+            }),
+        )
+        .await
+        .expect("login succeeds with TOTP");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(SET_COOKIE));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn admin_totp_disable_clears_login_totp_requirement() {
+        let (state, db_path) = totp_test_state_with_builtin_admin(
+            "admin-totp-disable-login-requirement",
+            BuiltinAdminAuth::new(true, Some("pw-123".to_string()), None),
+        )
+        .await;
+        let secret = generate_totp_secret();
+        let bind_code = build_totp(&secret)
+            .expect("build bind totp")
+            .generate_current()
+            .expect("bind code");
+        let _ = post_admin_totp_confirm(
+            State(state.clone()),
+            admin_headers(),
+            Json(AdminTotpConfirmPayload {
+                secret: secret.clone(),
+                code: bind_code,
+            }),
+        )
+        .await
+        .expect("bind TOTP succeeds");
+        let settings = state
+            .proxy
+            .set_admin_login_totp_required(true)
+            .await
+            .expect("persist login TOTP requirement");
+        state
+            .builtin_admin
+            .set_login_totp_required(settings.login_totp_required, Some(settings.updated_at));
+
+        let disable_code = build_totp(&secret)
+            .expect("build disable totp")
+            .generate_current()
+            .expect("disable code");
+        let status = post_admin_totp_disable(
+            State(state.clone()),
+            admin_headers(),
+            Json(AdminTotpCodePayload {
+                totp_code: disable_code,
+            }),
+        )
+        .await
+        .expect("disable TOTP succeeds")
+        .0;
+        assert!(!status.enabled);
+
+        let persisted = state
+            .proxy
+            .get_admin_password_settings()
+            .await
+            .expect("password settings load")
+            .expect("password settings row exists");
+        assert!(!persisted.login_totp_required);
+        assert!(!state.builtin_admin.login_totp_required());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn build_forward_proxy_validation_view_preserves_readable_display_name() {
+        let view = build_forward_proxy_validation_view(tavily_hikari::ForwardProxyValidationResponse {
+            ok: true,
+            normalized_values: vec![
+                "vless://user@example.com:443?encryption=none#%E9%A6%99%E6%B8%AF%20%F0%9F%87%AD%F0%9F%87%B0"
+                    .to_string(),
+            ],
+            discovered_nodes: 1,
+            latency_ms: Some(42.0),
+            results: vec![tavily_hikari::ForwardProxyValidationProbeResult {
+                value: "subscription".to_string(),
+                normalized_value: Some(
+                    "vless://user@example.com:443?encryption=none#%E9%A6%99%E6%B8%AF%20%F0%9F%87%AD%F0%9F%87%B0"
+                        .to_string(),
+                ),
+                ok: true,
+                discovered_nodes: Some(1),
+                latency_ms: Some(42.0),
+                error_code: None,
+                message: "subscription validation succeeded".to_string(),
+                nodes: vec![tavily_hikari::ForwardProxyValidationNodeResult {
+                    display_name: "香港 🇭🇰".to_string(),
+                    protocol: "vless".to_string(),
+                    ok: true,
+                    latency_ms: Some(42.0),
+                    ip: Some("203.0.113.8".to_string()),
+                    location: Some("HK / HKG".to_string()),
+                    message: None,
+                }],
+            }],
+            first_error: None,
+        });
+
+        let payload = serde_json::to_value(&view).expect("serialize view");
+        assert_eq!(payload["nodes"][0]["displayName"].as_str(), Some("香港 🇭🇰"));
+    }
+
+    #[test]
+    fn admin_user_rows_default_to_last_login_desc_with_nulls_last() {
+        let mut rows = [
+            mock_row("usr_none", None, |_| {}),
+            mock_row("usr_old", Some(10), |_| {}),
+            mock_row("usr_new", Some(20), |_| {}),
+        ];
+
+        rows.sort_by(|left, right| compare_admin_user_rows(left, right, None, None));
+
+        let ordered_ids: Vec<&str> = rows.iter().map(|row| row.user.user_id.as_str()).collect();
+        assert_eq!(ordered_ids, vec!["usr_new", "usr_old", "usr_none"]);
+    }
+
+    #[test]
+    fn success_rate_sort_keeps_zero_sample_rows_last() {
+        let mut rows = [
+            mock_row("usr_zero", Some(10), |summary| {
+                summary.daily_success = 0;
+                summary.daily_failure = 0;
+            }),
+            mock_row("usr_mid", Some(11), |summary| {
+                summary.daily_success = 6;
+                summary.daily_failure = 2;
+            }),
+            mock_row("usr_best", Some(12), |summary| {
+                summary.daily_success = 9;
+                summary.daily_failure = 1;
+            }),
+        ];
+
+        rows.sort_by(|left, right| {
+            compare_admin_user_rows(
+                left,
+                right,
+                Some(AdminUsersSortField::DailySuccessRate),
+                Some(AdminUsersSortDirection::Desc),
+            )
+        });
+
+        let ordered_ids: Vec<&str> = rows.iter().map(|row| row.user.user_id.as_str()).collect();
+        assert_eq!(ordered_ids, vec!["usr_best", "usr_mid", "usr_zero"]);
+    }
+
+    #[test]
+    fn success_rate_sort_uses_failure_count_as_ascending_tiebreaker() {
+        let mut rows = [
+            mock_row("usr_many_failures", Some(10), |summary| {
+                summary.daily_success = 9;
+                summary.daily_failure = 9;
+            }),
+            mock_row("usr_few_failures", Some(11), |summary| {
+                summary.daily_success = 1;
+                summary.daily_failure = 1;
+            }),
+        ];
+
+        rows.sort_by(|left, right| {
+            compare_admin_user_rows(
+                left,
+                right,
+                Some(AdminUsersSortField::DailySuccessRate),
+                Some(AdminUsersSortDirection::Desc),
+            )
+        });
+
+        let ordered_ids: Vec<&str> = rows.iter().map(|row| row.user.user_id.as_str()).collect();
+        assert_eq!(ordered_ids, vec!["usr_few_failures", "usr_many_failures"]);
+    }
+
+    #[test]
+    fn business_calls_1h_sort_ignores_quota_limit() {
+        let mut rows = [
+            mock_row("usr_z", Some(10), |summary| {
+                summary.business_calls_1h.total_count = 40;
+                summary.business_calls_1h.limit = 100;
+            }),
+            mock_row("usr_a", Some(12), |summary| {
+                summary.business_calls_1h.total_count = 40;
+                summary.business_calls_1h.limit = 200;
+            }),
+        ];
+
+        rows.sort_by(|left, right| {
+            compare_admin_user_rows(
+                left,
+                right,
+                Some(AdminUsersSortField::BusinessCalls1hUsed),
+                Some(AdminUsersSortDirection::Asc),
+            )
+        });
+
+        let ordered_ids: Vec<&str> = rows.iter().map(|row| row.user.user_id.as_str()).collect();
+        assert_eq!(ordered_ids, vec!["usr_a", "usr_z"]);
+    }
+}

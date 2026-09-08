@@ -1,10 +1,12 @@
 import type { Meta, StoryObj } from '@storybook/react-vite'
 
-import DashboardOverview from './DashboardOverview'
+import type { DashboardMonthSeries, RecentAlertsSummary, SummaryWindowsResponse } from '../api'
+import DashboardOverview, { type DashboardMetricCard, type DashboardQuotaChargeCardData } from './DashboardOverview'
 import {
   createDashboardMonthMetrics,
   createDashboardTodayMetrics,
 } from './dashboardTodayMetrics'
+import { buildDashboardHourlyRequestWindowFixture } from './dashboardHourlyCharts'
 
 const storyNumberFormatter = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
@@ -31,7 +33,7 @@ const meta = {
     docs: {
       description: {
         component:
-          'Dashboard overview shell with today/month/status summary cards. Success and error deltas use rate shifts, while upstream exhaustion cards count distinct auto-exhausted keys instead of request volume.',
+          'Dashboard overview shell with fixed summary rows. Today and month both render the total card on the first row, a dedicated quota-charge card on the second row, then the remaining taxonomy cards in the grid.',
       },
     },
   },
@@ -42,18 +44,17 @@ export default meta
 type Story = StoryObj<typeof meta>
 
 const strings = {
-  title: 'Operations Dashboard',
-  description: 'Global health, risk signals, and actionable activity in one place.',
   loading: 'Loading dashboard data…',
   summaryUnavailable: 'Unable to load the summary windows right now.',
   statusUnavailable: 'Unable to load the current site status right now.',
   todayTitle: 'Today',
-  todayDescription: 'Core request signals up to now, directly compared with yesterday.',
+  todayDescription: 'Request-value signals up to now, compared with the same time yesterday.',
   monthTitle: 'This Month',
-  monthDescription: 'Month-to-date request totals in one compact view.',
+  monthDescription: 'Month-to-date request taxonomy and lifecycle totals in one compact view.',
+  monthComparisonEmpty: 'No retained previous-month comparison data.',
   currentStatusTitle: 'Current Site Status',
   currentStatusDescription: 'Live quota, active keys, and pool health right now.',
-  deltaFromYesterday: 'vs yesterday',
+  deltaFromYesterday: 'vs same time yesterday',
   deltaNoBaseline: 'No yesterday baseline',
   percentagePointUnit: 'pp',
   asOfNow: 'Up to now',
@@ -62,51 +63,236 @@ const strings = {
   monthToDate: 'Month to date',
   monthAdded: 'Added this month',
   monthShare: 'Month share',
+  valuableTag: 'Valuable',
+  otherTag: 'Other',
+  unknownTag: 'Unknown',
   trendsTitle: 'Traffic Trends',
-  trendsDescription: 'Recent request and error changes from latest logs.',
+  trendsDescription: 'Compare requests and credits across 24 complete hours plus the current partial hour, or inspect the latest 6 hours at 5-minute resolution.',
   requestTrend: 'Request volume',
   errorTrend: 'Error volume',
-  riskTitle: 'Risk Watchlist',
-  riskDescription: 'Items that may require operator action soon.',
-  riskEmpty: 'No active risk signals detected.',
+  chartModeResults: 'Results',
+  chartModeTypes: 'Types',
+  chartModeCredits: 'Credits',
+  chartModeResultsArea: 'Area · Results',
+  chartModeTypesArea: 'Area · Types',
+  chartModeCreditsArea: 'Area · Credits',
+  chartVisibleSeries: 'Visible series',
+  chartEmpty: 'No visible chart series for the current selection.',
+  chartUtcWindow: 'Local time axis · 24 full hours + current hour ({count} slots)',
+  chartRollingWindow: 'Local time axis · Last {range} · {bucket} buckets ({count} current buckets)',
+  chartIntegrityHealthy: 'Verified',
+  chartIntegrityRepairing: 'Repairing statistics',
+  chartIntegrityDegraded: 'Statistics repair delayed',
+  chartIntegrityLastVerified: 'Last verified {time}',
+  chartResultSecondarySuccess: 'Secondary success',
+  chartResultPrimarySuccess: 'Primary success',
+  chartResultSecondaryFailure: 'Secondary failure',
+  chartResultPrimaryFailure429: 'Primary failure · 429',
+  chartResultPrimaryFailureOther: 'Primary failure · other',
+  chartResultUnknown: 'Unknown',
+  chartTypeMcpNonBillable: 'MCP non-billable',
+  chartTypeMcpBillable: 'MCP billable',
+  chartTypeApiNonBillable: 'API non-billable',
+  chartTypeApiBillable: 'API billable',
+  chartCreditLocalEstimate: 'Local estimate',
+  chartCreditUpstreamActual: 'Upstream actual',
   actionsTitle: 'Action Center',
   actionsDescription: 'Recent events you can jump into quickly.',
   recentRequests: 'Recent requests',
   recentJobs: 'Recent jobs',
-  openModule: 'Open',
-  openToken: 'Open token',
-  openKey: 'Open key',
-  disabledTokenRisk: 'Token {id} is disabled',
-  exhaustedKeyRisk: 'API key {id} is exhausted',
-  failedJobRisk: 'Job #{id} status: {status}',
-  tokenCoverageTruncated: 'Token scope is truncated.',
-  tokenCoverageError: 'Token scope failed to load.',
+  recentAlertsTitle: 'Recent alerts',
+  recentAlertsDescription: 'Grouped alerts from the last 24 hours, sorted by latest activity.',
+  recentAlertsOverviewTitle: '24-hour queue',
+  recentAlertsOverviewSummary: 'The list below stays pinned to the current 24-hour grouped-alert window. Use 1 hour and 7 days for context.',
+  recentAlertsCurrentWindow: 'Queue below',
+  recentAlertsWindowLabels: {
+    hour1: 'Last 1 hour',
+    hour24: 'Last 24 hours',
+    day7: 'Last 7 days',
+  },
+  recentAlertsColumns: {
+    alert: 'Alert',
+    requestKind: 'Request kind',
+    timeRange: 'Alert window',
+    hits: 'Hits',
+    review: 'Review',
+  },
+  recentAlertsHits: 'Grouped alerts',
+  recentAlertsTimeRange: 'Alert window',
+  recentAlertsEmpty: 'No alert events were recorded in the current 24-hour window.',
+  recentAlertsOpen: 'Review alerts',
+  recentAlertsOpenGroup: 'Review group',
+  recentAlertsOpenUser: 'Open user',
+  recentAlertsTypeLabels: {
+    upstream_rate_limited_429: 'Upstream 429',
+    upstream_usage_limit_432: 'Upstream usage limit 432',
+    upstream_key_blocked: 'Upstream key blocked',
+    user_request_rate_limited: 'User request rate limited',
+    user_quota_exhausted: 'User quota exhausted',
+    api_key_exhausted: 'API key exhausted',
+    job_failed: 'Job failed',
+  },
+}
+
+const recentAlerts: RecentAlertsSummary = {
+  windowHours: 24,
+  totalEvents: 19,
+  groupedCount: 6,
+  groupedCountWindows: [
+    { windowHours: 1, groupedCount: 2 },
+    { windowHours: 24, groupedCount: 6 },
+    { windowHours: 168, groupedCount: 9 },
+  ],
+  countsByType: [
+    { type: 'upstream_rate_limited_429', count: 7 },
+    { type: 'upstream_usage_limit_432', count: 4 },
+    { type: 'upstream_key_blocked', count: 2 },
+    { type: 'user_request_rate_limited', count: 5 },
+    { type: 'user_quota_exhausted', count: 1 },
+  ],
+  topGroups: [
+    {
+      id: 'group:user_request_rate_limited:user:usr_001:tavily_search',
+      type: 'user_request_rate_limited',
+      subjectKind: 'user',
+      subjectId: 'usr_001',
+      subjectLabel: 'Alice Wang',
+      user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+      token: { id: 'tok_ops_01', label: 'tok_ops_01' },
+      key: { id: 'key_001', label: 'key_001' },
+      requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: 'POST /api/tavily/search' },
+      count: 5,
+      firstSeen: 1_762_373_400,
+      lastSeen: 1_762_379_200,
+      latestEvent: {
+        id: 'alert_evt_001',
+        type: 'user_request_rate_limited',
+        title: 'Local request-rate limit',
+        summary: 'Token tok_ops_01 was rate limited by the local rolling 5m request-rate window for Tavily Search.',
+        occurredAt: 1_762_379_200,
+        subjectKind: 'user',
+        subjectId: 'usr_001',
+        subjectLabel: 'Alice Wang',
+        user: { userId: 'usr_001', displayName: 'Alice Wang', username: 'alice' },
+        token: { id: 'tok_ops_01', label: 'tok_ops_01' },
+        key: { id: 'key_001', label: 'key_001' },
+        request: { id: 401, method: 'POST', path: '/api/tavily/search', query: null },
+        requestKind: { key: 'tavily_search', label: 'Tavily Search', detail: 'POST /api/tavily/search' },
+        failureKind: null,
+        resultStatus: 'rate_limited',
+        errorMessage: 'local request-rate limit exceeded: window=5m',
+        reasonCode: null,
+        reasonSummary: null,
+        reasonDetail: null,
+        source: { kind: 'auth_token_log', id: 'log_401' },
+      },
+    },
+    {
+      id: 'group:upstream_key_blocked:key:key_001:mcp_search',
+      type: 'upstream_key_blocked',
+      subjectKind: 'key',
+      subjectId: 'key_001',
+      subjectLabel: 'key_001',
+      user: null,
+      token: null,
+      key: { id: 'key_001', label: 'key_001' },
+      requestKind: { key: 'mcp_search', label: 'MCP Search', detail: 'POST /mcp' },
+      count: 2,
+      firstSeen: 1_762_375_000,
+      lastSeen: 1_762_378_100,
+      latestEvent: {
+        id: 'alert_evt_002',
+        type: 'upstream_key_blocked',
+        title: 'Upstream key blocked',
+        summary: 'key_001 was disabled upstream and quarantined locally.',
+        occurredAt: 1_762_378_100,
+        subjectKind: 'key',
+        subjectId: 'key_001',
+        subjectLabel: 'key_001',
+        user: null,
+        token: null,
+        key: { id: 'key_001', label: 'key_001' },
+        request: null,
+        requestKind: { key: 'mcp_search', label: 'MCP Search', detail: 'POST /mcp' },
+        failureKind: null,
+        resultStatus: null,
+        errorMessage: null,
+        reasonCode: 'account_deactivated',
+        reasonSummary: 'Upstream account deactivated',
+        reasonDetail: 'Tavily rejected the key with a deactivated account response.',
+        source: { kind: 'api_key_maintenance_record', id: 'maint_002' },
+      },
+    },
+  ],
+}
+
+const recentAlertsBusinessHourWindow: RecentAlertsSummary = {
+  ...recentAlerts,
+  topGroups: recentAlerts.topGroups.map((group, index) => {
+    if (index !== 0) {
+      return group
+    }
+
+    return {
+      ...group,
+      semanticWindowMinutes: 5,
+      latestEvent: {
+        ...group.latestEvent,
+        summary:
+          'Token tok_ops_01 was rate limited by the local rolling 60m request-rate window for MCP Search.',
+        errorMessage:
+          'business request count cap exceeded on rolling 60m window (limit 300, used 302)',
+        requestKind: { key: 'mcp_search', label: 'MCP Search', detail: 'search' },
+        semanticWindow: {
+          kind: 'request_rate',
+          windowMinutes: 60,
+          windowStart: 1_762_375_600,
+          windowEnd: 1_762_379_200,
+          windowKey: null,
+        },
+      },
+    }
+  }),
 }
 
 const todayMetrics = createDashboardTodayMetrics({
   today: {
     total_requests: 4_812,
-    success_count: 4_192,
-    error_count: 451,
-    quota_exhausted_count: 169,
+    success_count: 0,
+    error_count: 0,
+    quota_exhausted_count: 0,
+    valuable_success_count: 3_442,
+    valuable_failure_count: 604,
+    other_success_count: 498,
+    other_failure_count: 176,
+    unknown_count: 92,
     upstream_exhausted_key_count: 7,
     new_keys: 0,
     new_quarantines: 0,
   },
   yesterday: {
     total_requests: 4_386,
-    success_count: 3_694,
-    error_count: 527,
-    quota_exhausted_count: 19,
+    success_count: 0,
+    error_count: 0,
+    quota_exhausted_count: 0,
+    valuable_success_count: 3_118,
+    valuable_failure_count: 582,
+    other_success_count: 454,
+    other_failure_count: 161,
+    unknown_count: 71,
     upstream_exhausted_key_count: 3,
     new_keys: 0,
     new_quarantines: 0,
   },
   labels: {
     total: 'Total Requests',
-    success: 'Successful',
-    errors: 'Errors',
+    success: 'Success',
+    failure: 'Failure',
+    unknownCalls: 'Unknown Calls',
     upstreamExhausted: 'Upstream Keys Exhausted',
+    valuableTag: 'Primary',
+    otherTag: 'Secondary',
+    unknownTag: 'Unknown',
   },
   strings,
   formatters: {
@@ -119,18 +305,27 @@ const todayMetrics = createDashboardTodayMetrics({
 const monthMetrics = createDashboardMonthMetrics({
   month: {
     total_requests: 105_041,
-    success_count: 86_279,
-    error_count: 2_368,
-    quota_exhausted_count: 401,
+    success_count: 0,
+    error_count: 0,
+    quota_exhausted_count: 0,
+    valuable_success_count: 70_211,
+    valuable_failure_count: 12_440,
+    other_success_count: 10_062,
+    other_failure_count: 4_083,
+    unknown_count: 1_844,
     upstream_exhausted_key_count: 12,
     new_keys: 3,
     new_quarantines: 0,
   },
   labels: {
     total: 'Total Requests',
-    success: 'Successful',
-    errors: 'Errors',
+    success: 'Success',
+    failure: 'Failure',
+    unknownCalls: 'Unknown Calls',
     upstreamExhausted: 'Upstream Keys Exhausted',
+    valuableTag: 'Primary',
+    otherTag: 'Secondary',
+    unknownTag: 'Unknown',
     newKeys: 'New Keys',
     newQuarantines: 'New Quarantines',
   },
@@ -146,25 +341,193 @@ const monthMetrics = createDashboardMonthMetrics({
   },
 })
 
+const todayQuotaCharge: DashboardQuotaChargeCardData = {
+  title: 'Quota Charges',
+  localLabel: 'Local estimate',
+  localValue: '4,768',
+  upstreamLabel: 'Upstream actual',
+  upstreamValue: '4,721',
+  deltaLabel: 'Delta',
+  deltaValue: '+47',
+  deltaTone: 'negative',
+  coverage: 'Sampled 24 · Stale 3',
+  freshness: 'Latest sync · 2 minutes ago · 14:28',
+}
+
+const monthQuotaCharge: DashboardQuotaChargeCardData = {
+  title: 'Quota Charges',
+  localLabel: 'Local estimate',
+  localValue: '104,881',
+  upstreamLabel: 'Upstream actual',
+  upstreamValue: '104,744',
+  deltaLabel: 'Delta',
+  deltaValue: '+137',
+  deltaTone: 'negative',
+  coverage: 'Sampled 68 · Stale 5',
+  freshness: 'Latest sync · 2 minutes ago · 14:28',
+}
+
+const summaryWindows: SummaryWindowsResponse = {
+  today: {
+    total_requests: 4_812,
+    success_count: 0,
+    error_count: 0,
+    quota_exhausted_count: 0,
+    valuable_success_count: 3_442,
+    valuable_failure_count: 604,
+    other_success_count: 498,
+    other_failure_count: 176,
+    unknown_count: 92,
+    upstream_exhausted_key_count: 7,
+    new_keys: 0,
+    new_quarantines: 0,
+  },
+  yesterday: {
+    total_requests: 4_386,
+    success_count: 0,
+    error_count: 0,
+    quota_exhausted_count: 0,
+    valuable_success_count: 3_118,
+    valuable_failure_count: 582,
+    other_success_count: 454,
+    other_failure_count: 161,
+    unknown_count: 71,
+    upstream_exhausted_key_count: 3,
+    new_keys: 0,
+    new_quarantines: 0,
+  },
+  month: {
+    total_requests: 105_041,
+    success_count: 0,
+    error_count: 0,
+    quota_exhausted_count: 0,
+    valuable_success_count: 70_211,
+    valuable_failure_count: 12_440,
+    other_success_count: 10_062,
+    other_failure_count: 4_083,
+    unknown_count: 1_844,
+    upstream_exhausted_key_count: 12,
+    new_keys: 3,
+    new_quarantines: 0,
+  },
+  today_start: Date.UTC(2026, 3, 7, 0, 0, 0) / 1000,
+  today_end: Date.UTC(2026, 3, 7, 12, 0, 0) / 1000 + 1,
+  today_period_end: Date.UTC(2026, 3, 8, 0, 0, 0) / 1000,
+  yesterday_start: Date.UTC(2026, 3, 6, 0, 0, 0) / 1000,
+  yesterday_end: Date.UTC(2026, 3, 6, 12, 0, 0) / 1000 + 1,
+  month_start: Date.UTC(2026, 3, 1, 0, 0, 0) / 1000,
+  month_end: Date.UTC(2026, 3, 7, 12, 0, 0) / 1000 + 1,
+  month_period_end: Date.UTC(2026, 4, 1, 0, 0, 0) / 1000,
+  previous_month_start: Date.UTC(2026, 2, 1, 0, 0, 0) / 1000,
+  previous_month_end: Date.UTC(2026, 3, 1, 0, 0, 0) / 1000,
+}
+
+const monthSeries: DashboardMonthSeries = {
+  current: Array.from({ length: 31 }, (_, index) => {
+    const day = index + 1
+    const visible = day <= 7
+    const total = visible ? [12_600, 24_120, 39_880, 55_140, 71_420, 88_090, 105_041][index] ?? null : null
+    return {
+      bucketStart: summaryWindows.month_start + index * 24 * 3600,
+      displayBucketStart: summaryWindows.month_start + index * 24 * 3600,
+      total,
+      valuableSuccess: total == null ? null : Math.round(total * 0.668),
+      valuableFailure: total == null ? null : Math.round(total * 0.118),
+      otherSuccess: total == null ? null : Math.round(total * 0.096),
+      otherFailure: total == null ? null : Math.round(total * 0.039),
+      unknown: total == null ? null : Math.round(total * 0.018),
+      upstreamExhausted: total == null ? null : Math.max(0, Math.floor(day / 3)),
+      newKeys: total == null ? null : Math.max(0, Math.floor(day / 2)),
+      newQuarantines: total == null ? null : Math.max(0, Math.floor(day / 6)),
+    }
+  }),
+  comparison: Array.from({ length: 31 }, (_, index) => {
+    const previousMonthStart = summaryWindows.previous_month_start ?? summaryWindows.month_start
+    const total = [
+      10_880, 22_100, 34_560, 46_930, 58_240, 69_700, 81_240, 92_440, 103_020, 114_530,
+      125_900, 137_210, 148_040, 158_830, 169_240, 179_980, 190_640, 201_240, 212_320, 223_510,
+      234_410, 245_190, 255_840, 266_300, 277_120, 287_940, 298_310, 308_730, 318_990, 329_420,
+      339_860,
+    ][index]
+    return {
+      bucketStart: previousMonthStart + index * 24 * 3600,
+      displayBucketStart: summaryWindows.month_start + index * 24 * 3600,
+      total,
+      valuableSuccess: Math.round(total * 0.661),
+      valuableFailure: Math.round(total * 0.115),
+      otherSuccess: Math.round(total * 0.101),
+      otherFailure: Math.round(total * 0.041),
+      unknown: Math.round(total * 0.019),
+      upstreamExhausted: Math.max(0, Math.floor((index + 1) / 4)),
+      newKeys: Math.max(0, Math.floor(index / 5)),
+      newQuarantines: index === 11 ? null : Math.max(0, Math.floor(index / 9)),
+    }
+  }),
+}
+
+const monthSeriesWithoutComparison: DashboardMonthSeries = {
+  current: monthSeries.current,
+  comparison: [],
+}
+
+const defaultHourlyRequestWindow = buildDashboardHourlyRequestWindowFixture({
+  mapBucket: ({ index, bucket }) => ({
+    secondarySuccess: (index % 5) + 2,
+    primarySuccess: bucket.primarySuccess + (index % 3),
+    secondaryFailure: index % 4,
+    primaryFailure429: index % 8 === 0 ? 2 : bucket.primaryFailure429,
+    primaryFailureOther: index % 6 === 0 ? 2 : bucket.primaryFailureOther,
+    unknown: index % 11 === 0 ? 1 : 0,
+    mcpNonBillable: index % 3,
+    mcpBillable: (index % 5) + 3,
+    apiNonBillable: index % 2,
+    apiBillable: (index % 6) + 4,
+  }),
+})
+
+const areaEvidenceHourlyRequestWindow = buildDashboardHourlyRequestWindowFixture({
+  currentHourStart: Date.UTC(2026, 3, 7, 12, 0, 0) / 1000,
+  mapBucket: ({ index, bucket }) => ({
+    secondarySuccess: (index % 4) + 2,
+    primarySuccess: bucket.primarySuccess + 5 + (index % 3),
+    secondaryFailure: index % 3,
+    primaryFailure429: index % 6 === 0 ? 2 : index % 4 === 0 ? 1 : 0,
+    primaryFailureOther: index % 5 === 0 ? 2 : index % 3 === 0 ? 1 : 0,
+    unknown: index % 9 === 0 ? 1 : 0,
+    mcpNonBillable: (index % 2) + 1,
+    mcpBillable: (index % 4) + 2,
+    apiNonBillable: (index % 3) + 1,
+    apiBillable: (index % 5) + 4,
+  }),
+})
+
+const noUpstreamSamplesHourlyRequestWindow = {
+  ...areaEvidenceHourlyRequestWindow,
+  buckets: areaEvidenceHourlyRequestWindow.buckets.map((bucket) => ({
+    ...bucket,
+    upstreamActualCredits: null,
+  })),
+}
+
 const statusMetrics = [
   { id: 'remaining', label: 'Remaining', value: '49,482', subtitle: 'Current snapshot · 88.4%' },
   { id: 'keys', label: 'Active Keys', value: '57', subtitle: 'Current snapshot' },
   { id: 'quarantined', label: 'Quarantined', value: '59', subtitle: 'Needs manual review' },
+  { id: 'temporary-isolated', label: 'Temporarily Isolated', value: '3', subtitle: '3 temporarily isolated' },
   { id: 'exhausted', label: 'Exhausted', value: '0', subtitle: '0 exhausted' },
   { id: 'proxy-available', label: 'Available Proxy Nodes', value: '12', subtitle: 'Current snapshot · 85.7%' },
   { id: 'proxy-total', label: 'Proxy Nodes Total', value: '14', subtitle: 'Current snapshot' },
 ]
 
 const zhStrings = {
-  title: '管理总览',
-  description: '把全站运行、风险信号和可执行动作收在同一个面板里。',
   loading: '正在加载仪表盘数据…',
   summaryUnavailable: '暂时无法加载期间摘要。',
   statusUnavailable: '暂时无法加载站点当前状态。',
   todayTitle: '今日',
-  todayDescription: '截至当前的核心请求指标，并与昨日同一时刻直接对比。',
+  todayDescription: '按调用价值查看截至当前的请求表现，并直接对比昨日同刻。',
   monthTitle: '本月',
-  monthDescription: '按月累计的请求表现，方便快速判断整体趋势。',
+  monthDescription: '把本月累计的请求价值分类与生命周期指标压缩到同一组卡片里。',
+  monthComparisonEmpty: '上月暂无可用对比数据。',
   currentStatusTitle: '站点当前状态',
   currentStatusDescription: '当前额度、活跃密钥和代理池健康度快照。',
   deltaFromYesterday: '较昨日同刻',
@@ -176,82 +539,180 @@ const zhStrings = {
   monthToDate: '本月累计',
   monthAdded: '本月新增',
   monthShare: '本月占比',
+  valuableTag: '主要',
+  otherTag: '次要',
+  unknownTag: '未知',
   trendsTitle: '流量趋势',
-  trendsDescription: '根据近期请求观察流量和错误变化。',
+  trendsDescription: '对比最近 24 个完整小时 + 当前未满小时的请求与积分，或查看最近 6 小时的 5 分钟趋势。',
   requestTrend: '请求量',
   errorTrend: '错误量',
-  riskTitle: '风险观察',
-  riskDescription: '优先查看需要运维动作的项目。',
-  riskEmpty: '当前没有需要处理的风险信号。',
+  chartModeResults: '调用结果',
+  chartModeTypes: '调用类型',
+  chartModeCredits: '积分',
+  chartModeResultsArea: '面积图 · 调用结果',
+  chartModeTypesArea: '面积图 · 调用类型',
+  chartModeCreditsArea: '面积图 · 积分',
+  chartVisibleSeries: '显示系列',
+  chartEmpty: '当前选择下没有可显示的图表系列。',
+  chartUtcWindow: '本地时间横轴 · 24 个完整小时 + 当前小时（{count} 槽）',
+  chartRollingWindow: '本地时间横轴 · 最近 {range} · {bucket} 粒度（当前 {count} 组）',
+  chartIntegrityHealthy: '统计已验证',
+  chartIntegrityRepairing: '统计修复中',
+  chartIntegrityDegraded: '统计修复延迟',
+  chartIntegrityLastVerified: '最后验证 {time}',
+  chartResultSecondarySuccess: '次要成功',
+  chartResultPrimarySuccess: '主要成功',
+  chartResultSecondaryFailure: '次要失败',
+  chartResultPrimaryFailure429: '主要失败 · 429',
+  chartResultPrimaryFailureOther: '主要失败 · 其他',
+  chartResultUnknown: '未知',
+  chartTypeMcpNonBillable: 'MCP 非计费',
+  chartTypeMcpBillable: 'MCP 计费',
+  chartTypeApiNonBillable: 'API 非计费',
+  chartTypeApiBillable: 'API 计费',
+  chartCreditLocalEstimate: '本地估算',
+  chartCreditUpstreamActual: '上游实扣',
   actionsTitle: '快捷入口',
   actionsDescription: '最近事件可直接跳转处理。',
   recentRequests: '近期请求',
   recentJobs: '近期任务',
-  openModule: '打开',
-  openToken: '打开令牌',
-  openKey: '打开密钥',
-  disabledTokenRisk: '令牌 {id} 已停用',
-  exhaustedKeyRisk: '密钥 {id} 已耗尽',
-  failedJobRisk: '任务 #{id} 状态：{status}',
-  tokenCoverageTruncated: '令牌范围数据被截断。',
-  tokenCoverageError: '令牌范围数据加载失败。',
+  recentAlertsTitle: '近期告警',
+  recentAlertsDescription: '按最近 24 小时展示聚合告警，并按最新告警时间排序。',
+  recentAlertsOverviewTitle: '24 小时队列',
+  recentAlertsOverviewSummary: '下方列表固定对应当前 24 小时聚合告警窗口，1 小时和 7 天数字只用来提供上下文。',
+  recentAlertsCurrentWindow: '下方列表',
+  recentAlertsWindowLabels: {
+    hour1: '最近 1 小时',
+    hour24: '最近 24 小时',
+    day7: '最近 7 天',
+  },
+  recentAlertsColumns: {
+    alert: '告警',
+    requestKind: '请求类型',
+    timeRange: '告警区间',
+    hits: '命中',
+    review: '查看',
+  },
+  recentAlertsHits: '聚合告警',
+  recentAlertsTimeRange: '告警区间',
+  recentAlertsEmpty: '当前 24 小时窗口内没有记录到告警事件。',
+  recentAlertsOpen: '查看告警',
+  recentAlertsOpenGroup: '查看分组',
+  recentAlertsOpenUser: '查看用户',
+  recentAlertsTypeLabels: {
+    upstream_rate_limited_429: '上游 429',
+    upstream_usage_limit_432: '上游用量限制 432',
+    upstream_key_blocked: '上游 Key 封禁',
+    user_request_rate_limited: '用户请求限流',
+    user_quota_exhausted: '用户额度耗尽',
+    api_key_exhausted: 'API Key 耗尽',
+    job_failed: '任务失败',
+  },
 }
 
-const zhDarkEvidenceTodayMetrics = [
+const zhDarkEvidenceTodayMetrics: DashboardMetricCard[] = [
   {
     id: 'today-total',
     label: '总请求数',
     value: '10,683',
     subtitle: '截至当前',
+    fullWidth: true,
     comparison: {
       label: '较昨日同刻',
       value: '+226 (2.2%)',
-      direction: 'up' as const,
-      tone: 'positive' as const,
+      direction: 'up',
+      tone: 'positive',
     },
   },
   {
-    id: 'today-success',
+    id: 'today-valuable-success',
     label: '成功',
-    value: '8,762',
-    subtitle: '今日占比 · 82%',
+    marker: '主要',
+    markerTone: 'primary',
+    value: '6,831',
+    valueMeta: '今日占比 · 63.9%',
     comparison: {
       label: '较昨日同刻',
-      value: '-2.0 个百分点',
-      direction: 'down' as const,
-      tone: 'negative' as const,
+      value: '+542 (8.6%)',
+      direction: 'up',
+      tone: 'positive',
     },
   },
   {
-    id: 'today-errors',
-    label: '错误',
-    value: '681',
-    subtitle: '今日占比 · 6.4%',
+    id: 'today-valuable-failure',
+    label: '失败',
+    marker: '主要',
+    markerTone: 'primary',
+    value: '1,144',
+    valueMeta: '今日占比 · 10.7%',
     comparison: {
       label: '较昨日同刻',
-      value: '昨日无基线',
-      direction: 'flat' as const,
-      tone: 'neutral' as const,
+      value: '-126 (-9.9%)',
+      direction: 'down',
+      tone: 'positive',
+    },
+  },
+  {
+    id: 'today-other-success',
+    label: '成功',
+    marker: '次要',
+    markerTone: 'secondary',
+    value: '1,882',
+    valueMeta: '今日占比 · 17.6%',
+    comparison: {
+      label: '较昨日同刻',
+      value: '+94 (5.3%)',
+      direction: 'up',
+      tone: 'positive',
+    },
+  },
+  {
+    id: 'today-other-failure',
+    label: '失败',
+    marker: '次要',
+    markerTone: 'secondary',
+    value: '552',
+    valueMeta: '今日占比 · 5.2%',
+    comparison: {
+      label: '较昨日同刻',
+      value: '+41 (8%)',
+      direction: 'up',
+      tone: 'negative',
+    },
+  },
+  {
+    id: 'today-unknown',
+    label: '未知调用',
+    value: '274',
+    valueMeta: '今日占比 · 2.6%',
+    comparison: {
+      label: '较昨日同刻',
+      value: '+18 · 昨日无基线',
+      direction: 'up',
+      tone: 'negative',
     },
   },
   {
     id: 'today-upstream-exhausted',
     label: '上游 Key 耗尽',
     value: '42',
-    subtitle: '今日新增',
+    valueMeta: '今日新增',
     comparison: {
       label: '较昨日同刻',
       value: '+38 (950%)',
-      direction: 'up' as const,
-      tone: 'negative' as const,
+      direction: 'up',
+      tone: 'negative',
     },
   },
 ]
 
-const zhDarkEvidenceMonthMetrics = [
+const zhDarkEvidenceMonthMetrics: DashboardMetricCard[] = [
   { id: 'month-total', label: '总请求数', value: '237,587', subtitle: '本月累计' },
-  { id: 'month-success', label: '成功', value: '204,203', subtitle: '本月占比 · 85.9%' },
-  { id: 'month-errors', label: '错误', value: '4,399', subtitle: '本月占比 · 1.9%' },
+  { id: 'month-valuable-success', label: '成功', marker: '主要', markerTone: 'primary', value: '152,204', subtitle: '本月占比 · 64%' },
+  { id: 'month-valuable-failure', label: '失败', marker: '主要', markerTone: 'primary', value: '25,881', subtitle: '本月占比 · 10.9%' },
+  { id: 'month-other-success', label: '成功', marker: '次要', markerTone: 'secondary', value: '39,118', subtitle: '本月占比 · 16.5%' },
+  { id: 'month-other-failure', label: '失败', marker: '次要', markerTone: 'secondary', value: '8,960', subtitle: '本月占比 · 3.8%' },
+  { id: 'month-unknown', label: '未知调用', value: '3,654', subtitle: '本月占比 · 1.5%' },
   { id: 'month-upstream-exhausted', label: '上游 Key 耗尽', value: '73', subtitle: '本月新增' },
   { id: 'month-new-keys', label: '新增密钥', value: '256', subtitle: '本月新增' },
   { id: 'month-new-quarantines', label: '新增隔离密钥', value: '66', subtitle: '本月新增' },
@@ -261,10 +722,37 @@ const zhDarkEvidenceStatusMetrics = [
   { id: 'remaining', label: '剩余可用', value: '150,801', subtitle: '当前快照 · 79.4%' },
   { id: 'keys', label: '活跃密钥', value: '173', subtitle: '当前快照' },
   { id: 'quarantined', label: '隔离中', value: '66', subtitle: '隔离中' },
+  { id: 'temporary-isolated', label: '临时隔离', value: '4', subtitle: '4 个临时隔离' },
   { id: 'exhausted', label: '已耗尽', value: '17', subtitle: '17 个耗尽' },
   { id: 'proxy-available', label: '可用代理节点', value: '74', subtitle: '当前快照 · 98.7%' },
   { id: 'proxy-total', label: '代理节点总数', value: '75', subtitle: '当前快照' },
 ]
+
+const zhDarkTodayQuotaCharge: DashboardQuotaChargeCardData = {
+  title: '额度扣减',
+  localLabel: '本地估算',
+  localValue: '10,622',
+  upstreamLabel: '上游 Key 实扣',
+  upstreamValue: '10,587',
+  deltaLabel: '差值',
+  deltaValue: '+35',
+  deltaTone: 'negative',
+  coverage: '已采样 31 · 滞后 4',
+  freshness: '最新同步 · 2 分钟前 · 14:28',
+}
+
+const zhDarkMonthQuotaCharge: DashboardQuotaChargeCardData = {
+  title: '额度扣减',
+  localLabel: '本地估算',
+  localValue: '236,901',
+  upstreamLabel: '上游 Key 实扣',
+  upstreamValue: '236,744',
+  deltaLabel: '差值',
+  deltaValue: '+157',
+  deltaTone: 'negative',
+  coverage: '已采样 73 · 滞后 6',
+  freshness: '最新同步 · 2 分钟前 · 14:28',
+}
 
 export const Default: Story = {
   args: {
@@ -272,66 +760,74 @@ export const Default: Story = {
     overviewReady: true,
     statusLoading: false,
     todayMetrics,
+    todayQuotaCharge,
     monthMetrics,
+    monthQuotaCharge,
     statusMetrics,
-    trend: {
-      request: [4, 7, 8, 5, 9, 11, 12, 10],
-      error: [1, 1, 2, 1, 2, 3, 2, 1],
+    summaryWindows,
+    hourlyRequestWindow: defaultHourlyRequestWindow,
+    rollupIntegrity: {
+      state: 'healthy',
+      lastVerifiedAt: 1_775_535_700,
+      nextAttemptAt: 1_775_535_715,
+      unverifiedBucketCount: 0,
     },
-    tokenCoverage: 'ok',
-    tokens: [
-      {
-        id: '9vsN',
-        enabled: false,
-        note: 'ops',
-        group: 'ops',
-        total_requests: 42,
-        created_at: 0,
-        last_used_at: 0,
-        quota_state: 'normal',
-        quota_hourly_used: 1,
-        quota_hourly_limit: 100,
-        quota_daily_used: 5,
-        quota_daily_limit: 1000,
-        quota_monthly_used: 20,
-        quota_monthly_limit: 5000,
-        quota_hourly_reset_at: null,
-        quota_daily_reset_at: null,
-        quota_monthly_reset_at: null,
-      },
-    ],
-    keys: [
-      {
-        id: 'MZli',
-        status: 'exhausted',
-        group: 'ops',
-        registration_ip: '8.8.8.8',
-        registration_region: 'US',
-        status_changed_at: 0,
-        last_used_at: 0,
-        deleted_at: null,
-        quota_limit: 1000,
-        quota_remaining: 0,
-        quota_synced_at: 0,
-        total_requests: 111,
-        success_count: 88,
-        error_count: 23,
-        quota_exhausted_count: 11,
-        quarantine: null,
-      },
-    ],
+    monthSeries,
+    chartLabelTimeZone: 'Asia/Shanghai',
     logs: [
       { id: 1, key_id: 'MZli', auth_token_id: '9vsN', method: 'POST', path: '/mcp', query: null, http_status: 200, mcp_status: 0, result_status: 'success', created_at: 1, error_message: null, request_body: null, response_body: null, forwarded_headers: [], dropped_headers: [], operationalClass: 'success', requestKindProtocolGroup: 'mcp', requestKindBillingGroup: 'billable' },
       { id: 2, key_id: 'MZli', auth_token_id: '9vsN', method: 'POST', path: '/mcp', query: null, http_status: 429, mcp_status: -1, result_status: 'quota_exhausted', created_at: 2, error_message: 'quota', request_body: null, response_body: null, forwarded_headers: [], dropped_headers: [], operationalClass: 'quota_exhausted', requestKindProtocolGroup: 'mcp', requestKindBillingGroup: 'billable' },
     ],
     jobs: [
-      { id: 3, job_type: 'forward_proxy_geo_refresh', key_id: null, key_group: null, status: 'success', attempt: 1, message: 'refreshed_candidates=9', started_at: 5, finished_at: 6 },
-      { id: 1, job_type: 'quota_sync', key_id: 'MZli', key_group: 'ops', status: 'error', attempt: 2, message: 'rate limit', started_at: 1, finished_at: 2 },
-      { id: 2, job_type: 'quota_sync', key_id: 'MZli', key_group: 'ops', status: 'success', attempt: 1, message: null, started_at: 3, finished_at: 4 },
+      { id: 4, job_type: 'linuxdo_user_status_sync', trigger_source: 'scheduler', key_id: null, key_group: null, status: 'error', attempt: 1, message: 'attempted=18 success=17 skipped=0 failure=1 first_failure=hhf0517: token upstream status 400: {\"error\":\"invalid_grant\"}', queued_at: 7, started_at: 7, finished_at: 8 },
+      { id: 3, job_type: 'forward_proxy_geo_refresh', trigger_source: 'manual', key_id: null, key_group: null, status: 'success', attempt: 1, message: 'refreshed_candidates=9', queued_at: 5, started_at: 5, finished_at: 6 },
+      { id: 1, job_type: 'quota_sync', trigger_source: 'manual', key_id: 'MZli', key_group: 'ops', status: 'error', attempt: 2, message: 'rate limit', queued_at: 1, started_at: 1, finished_at: 2 },
+      { id: 2, job_type: 'quota_sync', trigger_source: 'scheduler', key_id: 'MZli', key_group: 'ops', status: 'success', attempt: 1, message: null, queued_at: 3, started_at: 3, finished_at: 4 },
     ],
-    onOpenModule: () => {},
-    onOpenToken: () => {},
-    onOpenKey: () => {},
+    recentAlerts,
+    onOpenRecentAlerts: () => {},
+    onOpenUser: () => {},
+  },
+}
+
+export const IntegrityRepairing: Story = {
+  args: {
+    ...Default.args,
+    hourlyRequestWindow: buildDashboardHourlyRequestWindowFixture({
+      currentHourStart: Date.UTC(2026, 3, 7, 12, 0, 0) / 1000,
+      unverifiedBucketStarts: [
+        Date.UTC(2026, 3, 7, 10, 10, 0) / 1000,
+        Date.UTC(2026, 3, 7, 10, 15, 0) / 1000,
+      ],
+    }),
+    rollupIntegrity: {
+      state: 'repairing',
+      lastVerifiedAt: Date.UTC(2026, 3, 7, 10, 5, 0) / 1000,
+      nextAttemptAt: Date.UTC(2026, 3, 7, 12, 0, 15) / 1000,
+      unverifiedBucketCount: 2,
+    },
+  },
+}
+
+export const NoPreviousMonthComparison: Story = {
+  args: {
+    ...Default.args,
+    monthSeries: monthSeriesWithoutComparison,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Explicit empty-state proof for the month comparison backdrop when no retained previous-month data is available.',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    const text = canvasElement.ownerDocument.body.textContent ?? ''
+    if (!text.includes(strings.monthComparisonEmpty)) {
+      throw new Error(`Expected missing previous-month story to contain: ${strings.monthComparisonEmpty}`)
+    }
   },
 }
 
@@ -342,42 +838,18 @@ export const QuarantineState: Story = {
       { id: 'remaining', label: 'Remaining', value: '3,120', subtitle: 'Current snapshot · 78.0%' },
       { id: 'keys', label: 'Active Keys', value: '5', subtitle: 'Current snapshot' },
       { id: 'quarantined', label: 'Quarantined', value: '1', subtitle: 'Needs manual review' },
+      { id: 'temporary-isolated', label: 'Temporarily Isolated', value: '1', subtitle: '1 temporarily isolated' },
       { id: 'exhausted', label: 'Exhausted', value: '1', subtitle: '1 exhausted' },
       { id: 'proxy-available', label: 'Available Proxy Nodes', value: '2', subtitle: 'Current snapshot · 50.0%' },
       { id: 'proxy-total', label: 'Proxy Nodes Total', value: '4', subtitle: 'Current snapshot' },
-    ],
-    keys: [
-      {
-        id: 'Qn8R',
-        status: 'active',
-        group: 'ops',
-        registration_ip: '1.1.1.1',
-        registration_region: null,
-        status_changed_at: 0,
-        last_used_at: 0,
-        deleted_at: null,
-        quota_limit: 1000,
-        quota_remaining: 0,
-        quota_synced_at: 0,
-        total_requests: 111,
-        success_count: 88,
-        error_count: 23,
-        quota_exhausted_count: 11,
-        quarantine: {
-          source: '/api/tavily/search',
-          reasonCode: 'account_deactivated',
-          reasonSummary: 'Tavily account deactivated (HTTP 401)',
-          reasonDetail: 'The account associated with this API key has been deactivated.',
-          createdAt: 0,
-        },
-      },
     ],
     logs: [
       { id: 1, key_id: 'Qn8R', auth_token_id: '9vsN', method: 'POST', path: '/mcp', query: null, http_status: 401, mcp_status: -1, result_status: 'error', created_at: 1, error_message: 'account deactivated', request_body: null, response_body: null, forwarded_headers: [], dropped_headers: [], operationalClass: 'upstream_error', requestKindProtocolGroup: 'mcp', requestKindBillingGroup: 'billable' },
     ],
     jobs: [
-      { id: 2, job_type: 'forward_proxy_geo_refresh', key_id: null, key_group: null, status: 'success', attempt: 1, message: 'refreshed_candidates=4', started_at: 3, finished_at: 4 },
-      { id: 1, job_type: 'quota_sync', key_id: 'Qn8R', key_group: 'ops', status: 'error', attempt: 1, message: 'account deactivated', started_at: 1, finished_at: 2 },
+      { id: 3, job_type: 'linuxdo_user_status_sync', trigger_source: 'scheduler', key_id: null, key_group: null, status: 'success', attempt: 1, message: 'attempted=4 success=4 skipped=0 failure=0', queued_at: 5, started_at: 5, finished_at: 6 },
+      { id: 2, job_type: 'forward_proxy_geo_refresh', trigger_source: 'manual', key_id: null, key_group: null, status: 'success', attempt: 1, message: 'refreshed_candidates=4', queued_at: 3, started_at: 3, finished_at: 4 },
+      { id: 1, job_type: 'quota_sync', trigger_source: 'manual', key_id: 'Qn8R', key_group: 'ops', status: 'error', attempt: 1, message: 'account deactivated', queued_at: 1, started_at: 1, finished_at: 2 },
     ],
   },
 }
@@ -385,18 +857,61 @@ export const QuarantineState: Story = {
 export const LargeNumbers: Story = {
   args: {
     ...Default.args,
-    monthMetrics: [
-      { id: 'month-total', label: 'Total Requests', value: '1,205,420', subtitle: 'Month to date' },
-      { id: 'month-success', label: 'Successful', value: '1,084,031', subtitle: 'Month share · 89.9%' },
-      { id: 'month-errors', label: 'Errors', value: '88,247', subtitle: 'Month share · 7.3%' },
-      { id: 'month-upstream-exhausted', label: 'Upstream Keys Exhausted', value: '418', subtitle: 'Added this month' },
-      { id: 'month-new-keys', label: 'New Keys', value: '1,248', subtitle: 'Added this month' },
-      { id: 'month-new-quarantines', label: 'New Quarantines', value: '108', subtitle: 'Added this month' },
-    ],
+    monthQuotaCharge: {
+      title: 'Quota Charges',
+      localLabel: 'Local estimate',
+      localValue: '1,204,880',
+      upstreamLabel: 'Upstream actual',
+      upstreamValue: '1,204,441',
+      deltaLabel: 'Delta',
+      deltaValue: '+439',
+      deltaTone: 'negative',
+      coverage: 'Sampled 418 · Stale 9',
+      freshness: 'Latest sync · 1 minute ago · 14:28',
+    },
+    monthMetrics: createDashboardMonthMetrics({
+      month: {
+        total_requests: 1_205_420,
+        success_count: 0,
+        error_count: 0,
+        quota_exhausted_count: 0,
+        valuable_success_count: 784_031,
+        valuable_failure_count: 121_247,
+        other_success_count: 214_500,
+        other_failure_count: 58_420,
+        unknown_count: 27_222,
+        upstream_exhausted_key_count: 418,
+        new_keys: 1_248,
+        new_quarantines: 108,
+      },
+      labels: {
+        total: 'Total Requests',
+        success: 'Success',
+        failure: 'Failure',
+        unknownCalls: 'Unknown Calls',
+        upstreamExhausted: 'Upstream Keys Exhausted',
+        valuableTag: 'Valuable',
+        otherTag: 'Other',
+        unknownTag: 'Unknown',
+        newKeys: 'New Keys',
+        newQuarantines: 'New Quarantines',
+      },
+      strings: {
+        monthToDate: 'Month to date',
+        monthShare: 'Month share',
+        monthAdded: 'Added this month',
+      },
+      formatters: {
+        formatNumber: (value) => storyNumberFormatter.format(value),
+        formatPercent: (numerator, denominator) =>
+          denominator === 0 ? '—' : storyPercentageFormatter.format(numerator / denominator),
+      },
+    }),
     statusMetrics: [
       { id: 'remaining', label: 'Remaining', value: '149,482', subtitle: 'Current snapshot · 12.5%' },
       { id: 'keys', label: 'Active Keys', value: '1,231', subtitle: 'Current snapshot' },
       { id: 'quarantined', label: 'Quarantined', value: '29', subtitle: 'Needs manual review' },
+      { id: 'temporary-isolated', label: 'Temporarily Isolated', value: '37', subtitle: '37 temporarily isolated' },
       { id: 'exhausted', label: 'Exhausted', value: '402', subtitle: '402 exhausted' },
       { id: 'proxy-available', label: 'Available Proxy Nodes', value: '128', subtitle: 'Current snapshot · 84.8%' },
       { id: 'proxy-total', label: 'Proxy Nodes Total', value: '151', subtitle: 'Current snapshot' },
@@ -410,9 +925,14 @@ export const ZeroBaseline: Story = {
     todayMetrics: createDashboardTodayMetrics({
       today: {
         total_requests: 24,
-        success_count: 18,
-        error_count: 6,
+        success_count: 0,
+        error_count: 0,
         quota_exhausted_count: 0,
+        valuable_success_count: 12,
+        valuable_failure_count: 6,
+        other_success_count: 4,
+        other_failure_count: 2,
+        unknown_count: 0,
         upstream_exhausted_key_count: 0,
         new_keys: 0,
         new_quarantines: 0,
@@ -422,15 +942,24 @@ export const ZeroBaseline: Story = {
         success_count: 0,
         error_count: 0,
         quota_exhausted_count: 0,
+        valuable_success_count: 0,
+        valuable_failure_count: 0,
+        other_success_count: 0,
+        other_failure_count: 0,
+        unknown_count: 0,
         upstream_exhausted_key_count: 0,
         new_keys: 0,
         new_quarantines: 0,
       },
       labels: {
         total: 'Total Requests',
-        success: 'Successful',
-        errors: 'Errors',
+        success: 'Success',
+        failure: 'Failure',
+        unknownCalls: 'Unknown Calls',
         upstreamExhausted: 'Upstream Keys Exhausted',
+        valuableTag: 'Valuable',
+        otherTag: 'Other',
+        unknownTag: 'Unknown',
       },
       strings,
       formatters: {
@@ -443,10 +972,268 @@ export const ZeroBaseline: Story = {
   play: async ({ canvasElement }) => {
     await new Promise((resolve) => window.setTimeout(resolve, 50))
     const text = canvasElement.ownerDocument.body.textContent ?? ''
-    for (const expected of ['No yesterday baseline', '75%', '25%']) {
+    for (const expected of ['No yesterday baseline', '50%', '25%', '17%']) {
       if (!text.includes(expected)) {
         throw new Error(`Expected dashboard overview zero-baseline story to contain: ${expected}`)
       }
+    }
+  },
+}
+
+export const TypesMode: Story = {
+  args: {
+    ...Default.args,
+    initialChartMode: 'types',
+  },
+}
+
+export const CreditsMode: Story = {
+  args: {
+    ...Default.args,
+    initialChartMode: 'credits',
+  },
+}
+
+export const CreditsAreaMode: Story = {
+  args: {
+    ...Default.args,
+    initialChartMode: 'creditsArea',
+    hourlyRequestWindow: areaEvidenceHourlyRequestWindow,
+  },
+}
+
+export const ResultsAreaMode: Story = {
+  args: {
+    ...Default.args,
+    initialChartMode: 'resultsArea',
+    hourlyRequestWindow: areaEvidenceHourlyRequestWindow,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Results area chart proof. The datasets use a true stacked fill sequence, first layer to origin and every later visible layer to the previous visible layer.',
+      },
+    },
+  },
+}
+
+export const TypesAreaMode: Story = {
+  args: {
+    ...Default.args,
+    initialChartMode: 'typesArea',
+    hourlyRequestWindow: areaEvidenceHourlyRequestWindow,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Types area chart proof. The top contour remains absolute request volume while each type renders as a non-overlapping stacked band.',
+      },
+    },
+  },
+}
+
+export const TypesAreaHiddenMiddleSeries: Story = {
+  args: {
+    ...Default.args,
+    initialChartMode: 'typesArea',
+    hourlyRequestWindow: areaEvidenceHourlyRequestWindow,
+    initialVisibleTypeSeries: ['mcpNonBillable', 'apiNonBillable', 'apiBillable'],
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Regression proof for hidden middle layers: MCP billable is hidden, so the remaining type series must rebuild into a continuous stacked area with no reserved gap.',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    const chips = Array.from(canvasElement.querySelectorAll<HTMLButtonElement>('.dashboard-chart-series-chip'))
+    const mcpBillable = chips.find((chip) => chip.textContent?.includes('MCP billable'))
+    const apiNonBillable = chips.find((chip) => chip.textContent?.includes('API non-billable'))
+    if (mcpBillable?.getAttribute('aria-pressed') !== 'false') {
+      throw new Error('Expected hidden middle type series to be inactive in the stacked area story.')
+    }
+    if (apiNonBillable?.getAttribute('aria-pressed') !== 'true') {
+      throw new Error('Expected later visible type series to stay active after the middle series is hidden.')
+    }
+    if (canvasElement.querySelector('.dashboard-chart-canvas canvas') == null) {
+      throw new Error('Expected hidden-middle stacked area story to render the chart canvas.')
+    }
+  },
+}
+
+export const HiddenSeriesEmpty: Story = {
+  args: {
+    ...Default.args,
+    initialVisibleResultSeries: [],
+  },
+}
+
+export const CreditsAreaLocalOnly: Story = {
+  args: {
+    ...Default.args,
+    hourlyRequestWindow: areaEvidenceHourlyRequestWindow,
+    initialChartMode: 'creditsArea',
+    initialVisibleCreditSeries: ['localEstimate'],
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Credit-series visibility proof. Local estimate remains visible while upstream actual is hidden in both credit modes.',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    if (canvasElement.querySelector('.dashboard-chart-canvas canvas') == null) {
+      throw new Error('Expected local-only credit story to render the dashboard chart canvas')
+    }
+    const chips = Array.from(canvasElement.querySelectorAll<HTMLButtonElement>('.dashboard-chart-series-chip'))
+    const local = chips.find((chip) => chip.textContent?.includes('Local estimate'))
+    const upstream = chips.find((chip) => chip.textContent?.includes('Upstream actual'))
+    if (local?.getAttribute('aria-pressed') !== 'true' || upstream?.getAttribute('aria-pressed') !== 'false') {
+      throw new Error('Expected credit visibility controls to keep only the local estimate active')
+    }
+
+    const creditMode = Array.from(canvasElement.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.trim() === 'Credits')
+    creditMode?.click()
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    const updatedChips = Array.from(canvasElement.querySelectorAll<HTMLButtonElement>('.dashboard-chart-series-chip'))
+    const updatedUpstream = updatedChips.find((chip) => chip.textContent?.includes('Upstream actual'))
+    if (updatedUpstream?.getAttribute('aria-pressed') !== 'false') {
+      throw new Error('Expected credit visibility to stay shared when switching from area to bar mode')
+    }
+  },
+}
+
+export const CreditsAreaNoUpstreamSamples: Story = {
+  args: {
+    ...Default.args,
+    hourlyRequestWindow: noUpstreamSamplesHourlyRequestWindow,
+    initialChartMode: 'creditsArea',
+  },
+  parameters: {
+    docs: {
+      description: {
+        story: 'No-sample proof. Upstream actual remains null across the window instead of rendering false zeroes.',
+      },
+    },
+  },
+}
+
+export const CreditsEmptyData: Story = {
+  args: {
+    ...Default.args,
+    hourlyRequestWindow: {
+      ...areaEvidenceHourlyRequestWindow,
+      buckets: [],
+    },
+    initialChartMode: 'credits',
+  },
+}
+
+export const RecentAlertsDesktopEvidence: Story = {
+  render: (args) => (
+    <div className="dashboard-recent-alerts-evidence" style={{ width: '1320px', maxWidth: '1320px', margin: '0 auto' }}>
+      <style>{`
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__overview {
+          grid-template-columns: minmax(240px, 1fr) minmax(0, 1.7fr) !important;
+        }
+
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__metrics {
+          grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+        }
+
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__metric-chip + .dashboard-alerts-summary__metric-chip {
+          border-top: 0 !important;
+          border-left: 1px solid hsl(var(--border) / 0.72) !important;
+        }
+
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__table-head {
+          display: grid !important;
+        }
+
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__field-label {
+          display: none !important;
+        }
+
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__identity-head {
+          flex-direction: row !important;
+        }
+
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__row {
+          grid-template-columns: minmax(0, 2.75fr) minmax(220px, 1.35fr) 140px !important;
+          gap: 16px !important;
+        }
+
+        .dashboard-recent-alerts-evidence .dashboard-alerts-summary__action {
+          justify-items: end !important;
+          text-align: right !important;
+        }
+      `}</style>
+      <DashboardOverview {...args} />
+    </div>
+  ),
+  args: {
+    ...Default.args,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Stable desktop-width canvas proof for the compact grouped alerts summary: top time-window counters and a queue-style 24-hour grouped list.',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+
+    const alertsSummary = canvasElement.querySelector<HTMLElement>('.dashboard-alerts-summary')
+    if (alertsSummary == null) {
+      throw new Error('Expected recent alerts summary to render')
+    }
+
+    const metricChips = alertsSummary.querySelectorAll('.dashboard-alerts-summary__metric-chip')
+    if (metricChips.length !== 3) {
+      throw new Error(`Expected three alert window metric chips, received: ${metricChips.length}`)
+    }
+
+    const rows = alertsSummary.querySelectorAll('.dashboard-alerts-summary__row')
+    if (rows.length === 0) {
+      throw new Error('Expected grouped alert rows to render')
+    }
+  },
+}
+
+export const RecentAlertsBusinessHourWindow: Story = {
+  render: RecentAlertsDesktopEvidence.render,
+  args: {
+    ...Default.args,
+    recentAlerts: recentAlertsBusinessHourWindow,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Regression proof for grouped alerts that really belong to the rolling 60-minute business-call cap even when a stale 5-minute group value leaks through.',
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+
+    const text = canvasElement.textContent ?? ''
+    if (!text.includes('User request rate limited') || !text.includes('60m window')) {
+      throw new Error(`Expected the grouped alert badge to surface the real 60m window, received: ${text}`)
+    }
+    if (text.includes('User request rate limited · 5m window')) {
+      throw new Error('Expected the grouped alert badge to avoid the stale 5m label.')
     }
   },
 }
@@ -461,7 +1248,7 @@ export const ZhDarkEvidence: Story = {
     docs: {
       description: {
         story:
-          '用于验收“去掉外层卡片壳 + 去渐变 + 高对比度胶囊”的稳定中文暗色画布。',
+          '用于验收“总请求数独占第一行 + 额度扣减卡独占第二行 + 其余卡片回到网格”的稳定中文暗色画布。',
       },
     },
   },
@@ -469,11 +1256,17 @@ export const ZhDarkEvidence: Story = {
     ...Default.args,
     strings: zhStrings,
     todayMetrics: zhDarkEvidenceTodayMetrics,
+    todayQuotaCharge: zhDarkTodayQuotaCharge,
     monthMetrics: zhDarkEvidenceMonthMetrics,
+    monthQuotaCharge: zhDarkMonthQuotaCharge,
     statusMetrics: zhDarkEvidenceStatusMetrics,
   },
   play: async ({ canvasElement }) => {
     await new Promise((resolve) => window.setTimeout(resolve, 50))
+
+    if (canvasElement.querySelector('.dashboard-hero-panel') != null) {
+      throw new Error('Expected dashboard hero panel to be removed')
+    }
 
     const summaryPanel = canvasElement.querySelector<HTMLElement>('.dashboard-summary-panel')
     if (summaryPanel == null) {
@@ -482,14 +1275,45 @@ export const ZhDarkEvidence: Story = {
     if (summaryPanel.classList.contains('surface') || summaryPanel.classList.contains('panel')) {
       throw new Error('Expected dashboard summary panel to render without the legacy outer shell')
     }
-    for (const selector of ['.metric-delta-positive', '.metric-delta-negative', '.metric-delta-neutral']) {
+
+    const todayCards = canvasElement.querySelectorAll('.dashboard-today-grid .dashboard-summary-card')
+    if (todayCards.length !== 6) {
+      throw new Error(`Expected 6 today grid cards, received ${todayCards.length}`)
+    }
+    const monthCards = canvasElement.querySelectorAll('.dashboard-summary-metrics-month .dashboard-summary-card')
+    if (monthCards.length !== 8) {
+      throw new Error(`Expected 8 month grid cards, received ${monthCards.length}`)
+    }
+    if (canvasElement.querySelector('.dashboard-today-comparisons') != null) {
+      throw new Error('Expected legacy today comparison tray to be removed')
+    }
+    if (canvasElement.querySelector('.dashboard-summary-card-full-width') == null) {
+      throw new Error('Expected the today total card to occupy its own row')
+    }
+    if (canvasElement.querySelectorAll('.dashboard-quota-charge-card').length < 2) {
+      throw new Error('Expected both today and month quota charge cards to render')
+    }
+    const cardBackdropCanvases = canvasElement.querySelectorAll('.dashboard-summary-card-backdrop canvas')
+    if (cardBackdropCanvases.length !== 16) {
+      throw new Error(`Expected 16 card backdrop charts, received ${cardBackdropCanvases.length}`)
+    }
+    const blockBackdropCanvases = canvasElement.querySelectorAll('.dashboard-summary-block-backdrop canvas')
+    if (blockBackdropCanvases.length !== 0) {
+      throw new Error(`Expected no block backdrop charts, received ${blockBackdropCanvases.length}`)
+    }
+    for (const selector of ['.metric-delta-positive', '.metric-delta-negative']) {
       if (canvasElement.querySelector(selector) == null) {
         throw new Error(`Expected dashboard evidence story to render ${selector}`)
       }
     }
 
     const text = canvasElement.ownerDocument.body.textContent ?? ''
-    for (const expected of ['今日', '本月', '站点当前状态', '较昨日同刻', '昨日无基线']) {
+    for (const forbidden of ['管理总览', '把全站运行、风险信号和可执行动作收在同一个面板里。']) {
+      if (text.includes(forbidden)) {
+        throw new Error(`Expected dashboard overview evidence story to exclude removed hero copy: ${forbidden}`)
+      }
+    }
+    for (const expected of ['今日', '本月', '站点当前状态', '较昨日同刻', '未知调用', '主要', '次要']) {
       if (!text.includes(expected)) {
         throw new Error(`Expected dashboard overview evidence story to contain: ${expected}`)
       }

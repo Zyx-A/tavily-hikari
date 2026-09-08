@@ -25,12 +25,14 @@ interface PublicHomeStoryArgs {
 
 const guideProofLabels = [
   { id: 'codex', label: 'Codex CLI' },
+  { id: 'hikariCli', label: 'CLI + Skills' },
   { id: 'claude', label: 'Claude Code' },
   { id: 'vscode', label: 'VS Code' },
 ] as const
 
 const publicGuideTabs = [
   { id: 'codex', label: 'Codex CLI' },
+  { id: 'hikariCli', label: 'CLI + Skills' },
   { id: 'claude', label: 'Claude Code CLI' },
   { id: 'vscode', label: 'VS Code / Copilot' },
   { id: 'claudeDesktop', label: 'Claude Desktop' },
@@ -64,7 +66,8 @@ function PublicHomeTokenModalStory(args: PublicHomeStoryArgs): JSX.Element {
     <main className="app-shell public-home">
       <PublicHomeHeroCard
         publicStrings={strings}
-        loading={false}
+        metricsLoading={false}
+        summaryLoading={false}
         metrics={{ monthlySuccess: 1240, dailySuccess: 87 }}
         availableKeys={7}
         totalKeys={12}
@@ -318,6 +321,24 @@ export const TokenModalOpen: Story = {
   },
 }
 
+export const TokenModalOpenDark: Story = {
+  args: {
+    showAdminAction: true,
+  },
+  globals: {
+    themeMode: 'dark',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story:
+          'Dark-theme public-home proof for the repaired low-light clay hero, token modal, controls, and warning surfaces.',
+      },
+    },
+  },
+}
+
 export const TokenModalOpenWithAdminAction: Story = {
   args: {
     showAdminAction: true,
@@ -346,5 +367,26 @@ export const GuideTokenRevealed: Story = {
   parameters: {
     layout: 'fullscreen',
     viewport: { defaultViewport: '1440-device-desktop' },
+  },
+}
+
+export const GuideTokenRevealedDarkMobile: Story = {
+  args: {
+    showAdminAction: false,
+  },
+  globals: {
+    language: 'zh',
+    themeMode: 'dark',
+  },
+  render: () => <PublicHomeGuideTokenRevealedProof />,
+  parameters: {
+    layout: 'fullscreen',
+    viewport: { defaultViewport: '0390-device-iphone-14' },
+    docs: {
+      description: {
+        story:
+          'Mobile dark-theme public guide proof for the repaired recessed code blocks, guide tabs, and clay surface contrast.',
+      },
+    },
   },
 }

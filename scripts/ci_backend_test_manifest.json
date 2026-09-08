@@ -1,0 +1,1072 @@
+{
+  "coverage_targets": {
+    "lib": {
+      "list_args": [
+        "--lib"
+      ]
+    },
+    "bin-main": {
+      "list_args": [
+        "--bin",
+        "tavily-hikari"
+      ]
+    },
+    "bin-support": {
+      "list_args": [
+        "--bin",
+        "admin_password_hash",
+        "--bin",
+        "billing_ledger_audit",
+        "--bin",
+        "mcp_request_log_retry_repair",
+        "--bin",
+        "mcp_search_billing_repair",
+        "--bin",
+        "mcp_session_delete_neutral_repair",
+        "--bin",
+        "mock_mcp_client",
+        "--bin",
+        "mock_tavily",
+        "--bin",
+        "mock_upstream",
+        "--bin",
+        "monthly_quota_rebase",
+        "--bin",
+        "request_kind_canonical_backfill",
+        "--bin",
+        "request_logs_gc_once",
+        "--bin",
+        "request_user_id_backfill"
+      ]
+    },
+    "integration:mcp_billing_regression": {
+      "list_args": [
+        "--test",
+        "mcp_billing_regression"
+      ]
+    },
+    "integration:mcp_session_affinity_e2e": {
+      "list_args": [
+        "--test",
+        "mcp_session_affinity_e2e"
+      ]
+    },
+    "integration:request_kind_canonical_backfill": {
+      "list_args": [
+        "--test",
+        "request_kind_canonical_backfill"
+      ]
+    },
+    "integration:rust_source_line_budgets": {
+      "list_args": [
+        "--test",
+        "rust_source_line_budgets"
+      ]
+    },
+    "integration:server_http_contract": {
+      "list_args": [
+        "--test",
+        "server_http_contract"
+      ]
+    }
+  },
+  "shards": [
+    {
+      "id": "lib-core",
+      "kind": "lib",
+      "name": "Lib Core",
+      "estimated_seconds": 49,
+      "coverage_target": "lib",
+      "run_args": [
+        "--lib"
+      ],
+      "serial_prefixes": [
+        "tavily_proxy::tests::"
+      ],
+      "include_prefixes": [
+        "affinity_tests::",
+        "analysis::tests::",
+        "ha::tests::",
+        "models::client_ip_tests::",
+        "runtime_logging::tests::",
+        "store::admin_passkey_store_tests::",
+        "store::alert_grouping_tests::",
+        "store::sqlite_runtime::tests::",
+        "store::sqlite_runtime::metrics_tests::",
+        "store::tests::",
+        "tavily_proxy::observability_deferred_writer_tests::",
+        "tavily_proxy::privacy_status_phase_budget_tests::",
+        "tavily_proxy::scheduler_step_tests::",
+        "tavily_proxy::tests::",
+        "tests::request_kind_and_core::parse_",
+        "tests::proxy_affinity_and_summary::extract_",
+        "tests::request_kind_and_core::extract_",
+        "tests::proxy_affinity_and_summary::classify_",
+        "tests::request_kind_and_core::classify_",
+        "tests::proxy_affinity_and_summary::analyze_",
+        "tests::request_kind_and_core::analyze_",
+        "tests::request_kind_and_core::sanitize_",
+        "tests::request_kind_and_core::map_",
+        "tests::request_kind_and_core::operational_"
+      ]
+    },
+    {
+      "id": "lib-forward-proxy",
+      "kind": "lib",
+      "name": "Lib Forward Proxy",
+      "estimated_seconds": 35,
+      "coverage_target": "lib",
+      "run_args": [
+        "--lib"
+      ],
+      "serial_prefixes": [
+        "forward_proxy::tests::"
+      ],
+      "include_prefixes": [
+        "forward_proxy::tests::"
+      ]
+    },
+    {
+      "id": "lib-request-rollup-storage",
+      "kind": "lib",
+      "name": "Lib Request Rollup Storage",
+      "estimated_seconds": 37,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "serial_prefixes": [
+        "tests::observability_and_lifecycle::request_",
+        "tests::request_kind_and_core::request_",
+        "tests::request_rollup::request_",
+        "tests::usage_series_and_backfills::request_",
+        "tests::user_tokens_and_pending_billing::request_"
+      ],
+      "include_prefixes": [
+        "tests::observability_and_lifecycle::request_",
+        "tests::request_kind_and_core::request_",
+        "tests::request_rollup::request_",
+        "tests::usage_series_and_backfills::request_",
+        "tests::user_tokens_and_pending_billing::request_",
+        "tests::request_kind_and_core::startup_",
+        "tests::request_rollup::startup_",
+        "tests::request_rollup::quota_",
+        "tests::ha_outbox_and_compaction::standalone_ha_outbox_gc_",
+        "tests::request_kind_and_core::successful_",
+        "tests::request_rollup::suppressed_"
+      ]
+    },
+    {
+      "id": "lib-request-log-retention-maintenance",
+      "kind": "lib",
+      "name": "Lib Request Log Retention Maintenance",
+      "estimated_seconds": 32,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "tests::jobs_and_request_log_retention::standalone_request_logs_gc_"
+      ]
+    },
+    {
+      "id": "lib-request-log-retention-policy",
+      "kind": "lib",
+      "name": "Lib Request Log Retention Policy",
+      "estimated_seconds": 62,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "serial_prefixes": [
+        "tests::jobs_and_request_log_retention::request_"
+      ],
+      "include_prefixes": [
+        "tests::jobs_and_request_log_retention::request_"
+      ]
+    },
+    {
+      "id": "lib-scheduled-request-maintenance",
+      "kind": "lib",
+      "name": "Lib Scheduled Request Maintenance",
+      "estimated_seconds": 13,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "exclude_prefixes": [
+        "tests::jobs_and_request_log_retention::scheduled_job_claim_serializes_concurrent_duplicate_triggers"
+      ],
+      "include_prefixes": [
+        "tests::jobs_and_request_log_retention::startup_",
+        "tests::jobs_and_request_log_retention::quota_",
+        "tests::jobs_and_request_log_retention::scheduled_"
+      ]
+    },
+    {
+      "id": "lib-scheduled-request-maintenance-claim",
+      "kind": "lib",
+      "name": "Lib Scheduled Request Maintenance Claim",
+      "estimated_seconds": 6,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_process_workers": 1,
+      "filtered_test_threads": 1,
+      "serial_prefixes": [
+        "tests::jobs_and_request_log_retention::scheduled_job_claim_serializes_concurrent_duplicate_triggers"
+      ],
+      "include_prefixes": [
+        "tests::jobs_and_request_log_retention::scheduled_job_claim_serializes_concurrent_duplicate_triggers"
+      ]
+    },
+    {
+      "id": "lib-request-rollup-integrity",
+      "kind": "lib",
+      "name": "Lib Request Rollup Integrity",
+      "estimated_seconds": 38,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "serial_prefixes": ["tests::dashboard_rollup_integrity::"],
+      "include_prefixes": ["tests::dashboard_rollup_integrity::"]
+    },
+    {
+      "id": "lib-request-rollup-reporting",
+      "kind": "lib",
+      "name": "Lib Request Rollup Reporting",
+      "estimated_seconds": 48,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "isolated_prefixes": ["tests::request_rollup_public_metrics::admin_"],
+      "exclude_prefixes": [
+        "tests::request_rollup_public_metrics::request_stats_background_slice_bounds_work_and_requeues_the_tail",
+        "tests::request_rollup_public_metrics::admitted_flush_drains_followup_batches_before_reporting_fresh"
+      ],
+      "include_prefixes": [
+        "tests::proxy_affinity_and_summary::summary_",
+        "tests::request_rollup::summary_",
+        "tests::dashboard_month_series::dashboard_",
+        "tests::dashboard_hourly_credits::",
+        "tests::request_rollup::dashboard_",
+        "tests::request_rollup::rollup_",
+        "tests::request_rollup_public_metrics::admin_",
+        "tests::request_rollup_public_metrics::analysis_",
+        "tests::request_rollup_public_metrics::public_",
+        "tests::request_rollup_public_metrics::request_stats_",
+        "tests::request_rollup_public_metrics::admitted_flush_",
+        "tests::request_rollup_public_metrics::expired_flush_",
+        "tests::request_rollup::public_"
+      ]
+    },
+    {
+      "id": "lib-request-rollup-reporting-slice",
+      "kind": "lib",
+      "name": "Lib Request Rollup Reporting Slice",
+      "estimated_seconds": 6,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_process_workers": 1,
+      "filtered_test_threads": 1,
+      "serial_prefixes": [
+        "tests::request_rollup_public_metrics::request_stats_background_slice_bounds_work_and_requeues_the_tail"
+      ],
+      "include_prefixes": [
+        "tests::request_rollup_public_metrics::request_stats_background_slice_bounds_work_and_requeues_the_tail"
+      ]
+    },
+    {
+      "id": "lib-request-rollup-reporting-admitted-flush",
+      "kind": "lib",
+      "name": "Lib Request Rollup Reporting Admitted Flush",
+      "estimated_seconds": 6,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_process_workers": 1,
+      "filtered_test_threads": 1,
+      "serial_prefixes": [
+        "tests::request_rollup_public_metrics::admitted_flush_drains_followup_batches_before_reporting_fresh"
+      ],
+      "include_prefixes": [
+        "tests::request_rollup_public_metrics::admitted_flush_drains_followup_batches_before_reporting_fresh"
+      ]
+    },
+    {
+      "id": "lib-request-rollup-lifecycle",
+      "kind": "lib",
+      "name": "Lib Request Rollup Lifecycle",
+      "estimated_seconds": 80,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "tests::account_quota_and_billing::startup_",
+        "tests::account_quota_schema_migration::startup_",
+        "tests::usage_series_and_backfills::startup_",
+        "tests::account_usage_rollup_request_days::startup_",
+        "tests::user_tokens_and_pending_billing::startup_",
+        "tests::user_tokens_and_pending_billing::effect_",
+        "tests::user_tokens_and_pending_billing::pending_",
+        "tests::proxy_affinity_and_summary::proxy_",
+        "tests::request_rollup::proxy_",
+        "tests::observability_and_lifecycle::observability_",
+        "tests::request_rollup::observability_",
+        "tests::maintenance_and_mcp_affinity::mcp_",
+        "tests::observability_and_lifecycle::large_",
+        "tests::maintenance_and_mcp_affinity::successful_",
+        "tests::proxy_affinity_and_summary::redact_",
+        "tests::proxy_affinity_runtime_geo::record_",
+        "tests::proxy_affinity_runtime_geo::persist_",
+        "tests::observability_and_lifecycle::small_"
+      ]
+    },
+    {
+      "id": "lib-affinity-domain",
+      "kind": "lib",
+      "name": "Lib Affinity Domain",
+      "estimated_seconds": 49,
+      "coverage_target": "lib",
+      "run_args": [
+        "--lib"
+      ],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "tests::proxy_affinity_and_summary::add_",
+        "tests::proxy_affinity_runtime_geo::add_",
+        "tests::proxy_affinity_and_summary::select_",
+        "tests::proxy_affinity_runtime_geo::select_",
+        "tests::maintenance_and_mcp_affinity::http_",
+        "tests::maintenance_and_mcp_affinity::research_",
+        "tests::proxy_affinity_and_summary::research_",
+        "tests::request_rollup::research_",
+        "tests::proxy_affinity_runtime_geo::forward_",
+        "tests::maintenance_and_mcp_affinity::reconcile_",
+        "tests::maintenance_and_mcp_affinity::unknown_",
+        "tests::proxy_affinity_and_summary::unknown_",
+        "tests::account_quota_and_billing::build_",
+        "tests::proxy_affinity_and_summary::build_",
+        "tests::proxy_affinity_runtime_geo::force_",
+        "tests::user_tokens_and_pending_billing::force_",
+        "tests::user_tokens_and_pending_billing::get_",
+        "tests::maintenance_and_mcp_affinity::api_"
+      ]
+    },
+    {
+      "id": "lib-account-linuxdo-identity",
+      "kind": "lib",
+      "name": "Lib Account LinuxDo Identity",
+      "estimated_seconds": 70,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "tests::account_quota_and_billing::account_",
+        "tests::account_usage_rollup_request_days::account_",
+        "tests::account_usage_rollup_request_days::lowering_",
+        "tests::usage_series_and_backfills::account_",
+        "tests::user_tokens_and_pending_billing::account_",
+        "tests::account_quota_and_billing::linuxdo_",
+        "tests::jobs_and_request_log_retention::linuxdo_",
+        "tests::linuxdo_credit_recharge::account_entitlements_",
+        "tests::linuxdo_credit_recharge::linuxdo_",
+        "tests::linuxdo_credit_recharge::user_"
+      ]
+    },
+    {
+      "id": "lib-user-token-identity",
+      "kind": "lib",
+      "name": "Lib User Token Identity",
+      "estimated_seconds": 17,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "tests::proxy_affinity_and_summary::token_",
+        "tests::request_kind_and_core::token_",
+        "tests::user_tokens_and_pending_billing::token_",
+        "tests::jobs_and_request_log_retention::user_",
+        "tests::proxy_affinity_and_summary::user_",
+        "tests::request_kind_and_core::user_",
+        "tests::usage_series_and_backfills::user_",
+        "tests::user_tokens_and_pending_billing::user_"
+      ]
+    },
+    {
+      "id": "lib-user-business-calls",
+      "kind": "lib",
+      "name": "Lib User Business Calls",
+      "estimated_seconds": 36,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "serial_prefixes": ["tests::user_business_calls_1h::user_"],
+      "include_prefixes": [
+        "tests::user_business_calls_1h::user_",
+        "store::user_business_call_event_write_tests::",
+        "tavily_proxy::user_business_calls_memory::out_of_order_tests::"
+      ]
+    },
+    {
+      "id": "lib-account-legacy-identity",
+      "kind": "lib",
+      "name": "Lib Account Legacy Identity",
+      "estimated_seconds": 56,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "tests::usage_series_and_backfills::admin_",
+        "tests::user_tokens_and_pending_billing::ensure_",
+        "tests::account_quota_and_billing::manual_",
+        "tests::account_quota_and_billing::list_",
+        "tests::proxy_affinity_and_summary::list_",
+        "tests::observability_and_lifecycle::oauth_",
+        "tests::account_quota_and_billing::new_",
+        "tests::account_quota_and_billing::legacy_",
+        "tests::observability_and_lifecycle::legacy_",
+        "tests::request_rollup::legacy_",
+        "tests::user_tokens_and_pending_billing::legacy_",
+        "tests::user_tokens_and_pending_billing::shared_"
+      ]
+    },
+    {
+      "id": "lib-account-user-lifecycle",
+      "kind": "lib",
+      "name": "Lib Account User Lifecycle",
+      "estimated_seconds": 65,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "tests::request_rollup::hourly_",
+        "tests::maintenance_and_mcp_affinity::low_",
+        "tests::account_quota_and_billing::custom_",
+        "tests::user_tokens_and_pending_billing::business_",
+        "tests::user_tokens_and_pending_billing::bound_",
+        "tests::account_quota_and_billing::block_",
+        "tests::observability_and_lifecycle::active_",
+        "tests::account_quota_and_billing::auto_",
+        "tests::request_rollup::delete_",
+        "tests::observability_and_lifecycle::heal_",
+        "tests::observability_and_lifecycle::announcements_",
+        "tests::observability_and_lifecycle::modal_",
+        "tests::account_quota_and_billing::historical_",
+        "tests::proxy_affinity_runtime_geo::key_",
+        "tests::user_tokens_and_pending_billing::lock_",
+        "tests::user_tokens_and_pending_billing::locked_",
+        "tests::account_quota_and_billing::restored_",
+        "tests::user_tokens_and_pending_billing::settle_",
+        "tests::user_tokens_and_pending_billing::settling_",
+        "tests::request_rollup::sync_",
+        "tests::user_pressure_analysis::analysis_",
+        "tests::user_pressure_analysis::observability_",
+        "tests::user_pressure_analysis::rebalance_",
+        "tests::usage_series_and_backfills::system_",
+        "tests::observability_and_lifecycle::ticker_",
+        "tests::proxy_affinity_runtime_geo::update_",
+        "tests::maintenance_and_mcp_affinity::usage_"
+      ]
+    },
+    {
+      "id": "lib-operational-maintenance",
+      "kind": "lib",
+      "name": "Lib Operational Maintenance",
+      "estimated_seconds": 110,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_process_workers": 4,
+      "include_prefixes": [
+        "ha_perf_sampling_tests::",
+        "tests::jobs_and_request_log_retention::abandon_",
+        "tests::jobs_and_request_log_retention::abandoned_",
+        "tests::jobs_and_request_log_retention::auth_",
+        "tests::account_quota_and_billing::begin_",
+        "tests::account_quota_and_billing::billing_",
+        "tests::account_quota_and_billing::dropped_",
+        "tests::ha_baseline_streaming_and_sessions::",
+        "tests::ha_outbox_and_compaction::ha_outbox_",
+        "tests::ha_outbox_and_compaction::ha_events_cursor_",
+        "tests::ha_outbox_and_compaction::ha_peer_health_",
+        "tests::ha_outbox_and_compaction::online_ha_gc_",
+        "tests::ha_outbox_and_compaction::online_gc_",
+        "tests::ha_outbox_and_compaction::db_",
+        "tests::maintenance_control_admission::",
+        "tests::request_logs_gc_admission::",
+        "tests::account_quota_and_billing::monthly_",
+        "tests::usage_series_and_backfills::monthly_",
+        "tests::proxy_affinity_and_summary::quarantine_",
+        "tests::proxy_affinity_and_summary::quarantined_",
+        "tests::ha_outbox_and_compaction::sqlite_",
+        "tests::observability_and_lifecycle::published_"
+      ]
+    },
+    {
+      "id": "lib-alert-projection",
+      "kind": "lib",
+      "name": "Lib Alert Projection",
+      "estimated_seconds": 64,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "include_prefixes": ["tests::alert_projection::"]
+    },
+    {
+      "id": "lib-reconciliation-maintenance",
+      "kind": "lib",
+      "name": "Lib Reconciliation Maintenance",
+      "estimated_seconds": 41,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "include_prefixes": [
+        "tests::maintenance_queue_performance::",
+        "tests::schema_migrations::",
+        "tests::reconciliation_controller::"
+      ]
+    },
+    {
+      "id": "lib-upstream-reconciliation",
+      "kind": "lib",
+      "name": "Lib Upstream Reconciliation",
+      "estimated_seconds": 20,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "filtered_process_workers": 4,
+      "filtered_test_threads": 1,
+      "include_prefixes": [
+        "tests::upstream_reconciliation::claimed_reconciliation_backoff_requeues_the_same_generation_fenced_job",
+        "tests::upstream_reconciliation::daily_reconciliation_progress_includes_actual_mode_windows",
+        "tests::upstream_reconciliation::local_reconciliation_pressure_is_separate_from_upstream_backoff",
+        "tests::upstream_reconciliation::next_upstream_reconciliation_candidates_interleave_recent_keys_before_limiting",
+        "tests::upstream_reconciliation::next_upstream_reconciliation_candidates_keep_recent_refill_ahead_of_backlog",
+        "tests::upstream_reconciliation::next_upstream_reconciliation_candidates_page_logical_windows_before_limiting",
+        "tests::upstream_reconciliation::next_upstream_reconciliation_candidates_skip_pending_recent_rows_before_limiting",
+        "tests::upstream_reconciliation::next_upstream_reconciliation_candidates_treat_midnight_closing_s3_as_recent",
+        "tests::upstream_reconciliation::reconciliation_global_backoff_counts_only_attempted_candidates",
+        "tests::upstream_reconciliation::reconciliation_key_429_does_not_stop_other_key_research",
+        "tests::upstream_reconciliation::reconciliation_all_key_cooldowns_defer_to_earliest_retry",
+        "tests::upstream_reconciliation::reconciliation_fresh_429_mixed_key_allows_healthy_sibling",
+        "tests::upstream_reconciliation::reconciliation_no_adjustment_completes_only_the_current_usage_generation",
+        "tests::upstream_reconciliation_observation::reconciliation_observation_reports_due_window_without_queue_count",
+        "tests::upstream_reconciliation::reconciliation_rejects_reclaimed_claim_after_remote_fetch",
+        "tests::upstream_reconciliation::reconciliation_rejects_reclaimed_scheduled_job_claim",
+        "tests::upstream_reconciliation::reconciliation_rejects_usage_generation_changed_during_remote_fetch",
+        "tests::upstream_reconciliation::reconciliation_request_cap_never_settles_partially_observed_candidate",
+        "tests::upstream_reconciliation::reconciliation_startup_resume_keeps_one_pending_representative_job",
+        "tests::upstream_reconciliation::reconciliation_status_reports_observation_and_unknown_estimates",
+        "tests::upstream_reconciliation::reconciliation_waits_for_a_complete_eligible_period",
+        "tests::upstream_reconciliation::run_upstream_reconciliation_once_applies_key_scoped_backoff_for_429",
+        "tests::upstream_reconciliation::run_upstream_reconciliation_once_prioritizes_recent_windows_over_old_backlog",
+        "tests::upstream_reconciliation::run_upstream_reconciliation_once_updates_runtime_markers",
+        "tests::upstream_reconciliation::s3_next_day_settlement_does_not_restore_current_hour_quota",
+        "tests::upstream_reconciliation::shadow_reconciliation_keeps_zero_delta_usage_and_updates_runtime_markers",
+        "tests::upstream_reconciliation::shadow_usage_records_even_when_active_upstream_mcp_sessions_block_precise_cutover",
+        "tests::upstream_reconciliation::signed_reconciliation_adjustment_is_idempotent_and_restores_quota",
+        "tests::upstream_reconciliation::upstream_429_backoff_escalates_persists_across_restart_and_resets"
+      ]
+    },
+    {
+      "id": "lib-reconciliation-projection",
+      "kind": "lib",
+      "name": "Lib Reconciliation Projection",
+      "estimated_seconds": 74,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "include_prefixes": [
+        "remote_attempt_admission::tests::",
+        "tests::upstream_reconciliation_continuation::",
+        "tests::upstream_reconciliation_engine::",
+        "tests::upstream_reconciliation_key_observations::",
+        "tests::upstream_reconciliation_fencing::",
+        "tests::upstream_reconciliation_projection::",
+        "tests::upstream_reconciliation_source_identity::",
+        "tests::upstream_reconciliation::reconciliation_controlled_retry_advances_the_claim_attempt_before_success",
+        "tavily_proxy::reconciliation_engine_tests::",
+        "tavily_proxy::user_business_calls_memory::memory_window_regression_tests::",
+        "upstream_privacy::tests::"
+      ]
+    },
+    {
+      "id": "bin-support",
+      "kind": "bin",
+      "name": "Bin Support",
+      "estimated_seconds": 11,
+      "coverage_target": "bin-support",
+      "run_args": [
+        "--bin",
+        "admin_password_hash",
+        "--bin",
+        "billing_ledger_audit",
+        "--bin",
+        "mcp_request_log_retry_repair",
+        "--bin",
+        "mcp_search_billing_repair",
+        "--bin",
+        "mcp_session_delete_neutral_repair",
+        "--bin",
+        "mock_mcp_client",
+        "--bin",
+        "mock_tavily",
+        "--bin",
+        "mock_upstream",
+        "--bin",
+        "monthly_quota_rebase",
+        "--bin",
+        "request_kind_canonical_backfill",
+        "--bin",
+        "request_logs_gc_once",
+        "--bin",
+        "request_user_id_backfill"
+      ]
+    },
+    {
+      "id": "bin-admin-api-identity",
+      "kind": "bin",
+      "name": "Bin Admin API Identity",
+      "estimated_seconds": 62,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "filtered_process_workers": 2,
+      "exclude_prefixes": [
+        "server::tests::admin_users_and_tokens::admin_dashboard_sse_snapshot_refreshes_when_recent_alerts_change"
+      ],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "server::tests::admin_token_filters_and_maintenance::admin_",
+        "server::tests::admin_analysis_pressure::analysis_",
+        "server::tests::admin_token_owner_summary::admin_",
+        "server::tests::admin_users_and_tokens::account_",
+        "server::tests::admin_users_and_tokens::admin_",
+        "server::tests::admin_users_shadow_daily_projection::list_",
+        "server::tests::api_keys_and_registration::api_",
+        "server::tests::linuxdo_oauth_and_admin_keys::api_"
+      ]
+    },
+    {
+      "id": "bin-admin-api-sse",
+      "kind": "bin",
+      "name": "Bin Admin API SSE",
+      "estimated_seconds": 14,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "filtered_process_workers": 1,
+      "filtered_test_threads": 1,
+      "include_prefixes": [
+        "server::tests::admin_users_and_tokens::admin_dashboard_sse_snapshot_refreshes_when_recent_alerts_change"
+      ]
+    },
+    {
+      "id": "bin-admin-api-observability",
+      "kind": "bin",
+      "name": "Bin Admin API Observability",
+      "estimated_seconds": 45,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "filtered_process_workers": 2,
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "server::admin_alerts_prewarm_tests::",
+        "server::tests::admin_logs_and_summary::admin_",
+        "server::tests::dashboard_overview_snapshot::admin_",
+        "server::tests::log_catalog_and_dashboard_sse::admin_",
+        "server::tests::tavily_http_search::admin_",
+        "server::tests::admin_logs_and_summary::api_",
+        "server::tests::branded_assets_contract::",
+        "server::pwa_cache_tests::",
+        "server::tests::log_catalog_and_dashboard_sse::api_",
+        "server::admin_resources_tests::",
+        "server::dto_tests::"
+      ]
+    },
+    {
+      "id": "bin-admin-api-settings",
+      "kind": "bin",
+      "name": "Bin Admin API Settings",
+      "estimated_seconds": 55,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "filtered_process_workers": 2,
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "server::tests::system_settings_and_forward_proxy::admin_",
+        "server::tests::system_settings_reconciliation_status::admin_"
+      ]
+    },
+    {
+      "id": "bin-admin-api-lifecycle",
+      "kind": "bin",
+      "name": "Bin Admin API Lifecycle",
+      "estimated_seconds": 34,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "filtered_process_workers": 2,
+      "serial_prefixes": [
+        "server::tests::token_log_details::token_",
+        "server::tests::alerts_and_ha_dashboard_defaults::admin_alerts_pressure_uses_same_key_last_good_and_reports_cold_misses"
+      ],
+      "include_prefixes": [
+        "server::manual_trigger_tests::",
+        "server::privacy_status_prewarm_logging_tests::",
+        "server::db_maintenance_gate_tests::",
+        "server::version_detection_tests::",
+        "server::tests::api_keys_and_registration::user_",
+        "server::tests::api_keys_and_registration::profile_",
+        "server::admin_auth_last_login_method_tests::",
+        "server::builtin_admin_auth_tests::",
+        "server::tests::token_log_details::token_",
+        "server::tests::log_catalog_and_dashboard_sse::log_",
+        "server::tests::admin_logs_and_summary::public_",
+        "server::tests::admin_token_filters_and_maintenance::public_",
+        "server::tests::api_keys_and_registration::announcement_",
+        "server::tests::alerts_and_ha_dashboard_defaults::alerts_",
+        "server::tests::alerts_and_ha_dashboard_defaults::admin_alerts_",
+        "server::tests::alerts_and_ha_dashboard_defaults::admin_privacy_",
+        "server::tests::alerts_and_ha_source_and_recovery::compute_",
+        "server::tests::dashboard_overview_snapshot::compute_",
+        "server::tests::log_catalog_and_dashboard_sse::compute_"
+      ]
+    },
+    {
+      "id": "bin-tavily-http",
+      "kind": "bin",
+      "name": "Bin Tavily HTTP",
+      "estimated_seconds": 68,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "isolated_prefixes": [
+        "server::tests::tavily_http_search::tavily_"
+      ],
+      "isolated_process_workers": 4,
+      "filtered_process_workers": 4,
+      "include_prefixes": [
+        "server::avatar_url_tests::",
+        "server::spa_404_tests::",
+        "server::linuxdo_credit_key_tests::",
+        "server::tests::linuxdo_oauth_and_admin_keys::tavily_",
+        "server::tests::research_result_and_mcp_subpath::tavily_",
+        "server::tests::tavily_http_free_account_boundary::tavily_",
+        "server::tests::tavily_http_search::tavily_",
+        "server::tests::system_settings_and_forward_proxy::extract_"
+      ]
+    },
+    {
+      "id": "bin-mcp-billing",
+      "kind": "bin",
+      "name": "Bin MCP Billing",
+      "estimated_seconds": 81,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "isolated_prefixes": [
+        "server::tests::mcp_billing_and_sessions::mcp_"
+      ],
+      "isolated_process_workers": 4,
+      "include_prefixes": [
+        "server::tests::mcp_billing_and_sessions::mcp_"
+      ]
+    },
+    {
+      "id": "bin-mcp-rebalance-session",
+      "kind": "bin",
+      "name": "Bin MCP Rebalance Session",
+      "estimated_seconds": 16,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "include_prefixes": [
+        "server::tests::mcp_rebalance_and_follow_up::mcp_primary_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_session_affinity_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_session_gc_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_follow_up_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_initialized_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_initialize_"
+      ]
+    },
+    {
+      "id": "bin-mcp-rebalance-control",
+      "kind": "bin",
+      "name": "Bin MCP Rebalance Control",
+      "estimated_seconds": 38,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "include_prefixes": [
+        "server::tests::mcp_rebalance_and_follow_up::mcp_rebalance_",
+        "server::tests::mcp_rebalance_and_follow_up::observed_client_ip_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_tools_call_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_response_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_rejects_",
+        "server::tests::mcp_rebalance_and_follow_up::mcp_query_",
+        "server::tests::mcp_rebalance_and_follow_up::admin_forward_"
+      ]
+    },
+    {
+      "id": "bin-mcp-research-protocol",
+      "kind": "bin",
+      "name": "Bin MCP Research Protocol",
+      "estimated_seconds": 28,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "exclude_prefixes": [
+        "server::tests::research_result_and_mcp_subpath::mcp_batch_"
+      ],
+      "serial_prefixes": [
+        "server::tests::research_result_and_mcp_subpath::mcp_"
+      ],
+      "include_prefixes": [
+        "server::tests::research_result_and_mcp_subpath::mcp_"
+      ]
+    },
+    {
+      "id": "bin-mcp-research-batch",
+      "kind": "bin",
+      "name": "Bin MCP Research Batch",
+      "estimated_seconds": 44,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "serial_prefixes": [
+        "server::tests::research_result_and_mcp_subpath::mcp_batch_"
+      ],
+      "include_prefixes": [
+        "server::tests::research_result_and_mcp_subpath::mcp_batch_"
+      ]
+    },
+    {
+      "id": "bin-mcp-system",
+      "kind": "bin",
+      "name": "Bin MCP System",
+      "estimated_seconds": 11,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "serial_prefixes": [
+        "server::tests::system_settings_and_forward_proxy::mcp_"
+      ],
+      "include_prefixes": [
+        "server::tests::system_settings_and_forward_proxy::mcp_"
+      ]
+    },
+    {
+      "id": "bin-linuxdo-forward",
+      "kind": "bin",
+      "name": "Bin LinuxDo Forward",
+      "estimated_seconds": 41,
+      "coverage_target": "bin-main",
+      "run_args": [
+        "--bin",
+        "tavily-hikari"
+      ],
+      "serial_prefixes": [
+        "server::tests::api_keys_and_registration::post_",
+        "server::tests::admin_token_filters_and_maintenance::builtin_",
+        "server::tests::api_keys_and_registration::builtin_"
+      ],
+      "exclude_prefixes": [
+        "server::tests::dashboard_overview_snapshot::dashboard_"
+      ],
+      "include_prefixes": [
+        "server::tests::api_keys_and_registration::linuxdo_",
+        "server::tests::linuxdo_oauth_and_admin_keys::legacy_",
+        "server::tests::linuxdo_oauth_and_admin_keys::linuxdo_",
+        "server::tests::upstream_support_and_manual_jobs::linuxdo_",
+        "server::tests::api_keys_and_registration::forward_",
+        "server::tests::log_catalog_and_dashboard_sse::request_",
+        "server::tests::dashboard_overview_snapshot::dashboard_",
+        "server::tests::dashboard_overview_snapshot::unavailable_",
+        "server::tests::admin_logs_and_summary::dashboard_",
+        "server::tests::api_keys_and_registration::dashboard_",
+        "server::tests::api_keys_and_registration::console_",
+        "server::tests::api_keys_and_registration::registration_",
+        "server::tests::api_keys_and_registration::post_",
+        "server::tests::admin_token_filters_and_maintenance::builtin_",
+        "server::tests::api_keys_and_registration::builtin_",
+        "server::tests::admin_token_filters_and_maintenance::re",
+        "server::tests::admin_logs_and_summary::session_",
+        "main_tests::",
+        "tests::parse_"
+      ]
+    },
+    {
+      "id": "bin-linuxdo-dashboard-overview",
+      "kind": "bin",
+      "name": "Bin LinuxDo Dashboard Overview",
+      "estimated_seconds": 51,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "filtered_test_threads": 2,
+      "include_prefixes": [
+        "server::tests::dashboard_overview_snapshot::dashboard_"
+      ]
+    },
+    {
+      "id": "bin-ha-rest-lifecycle",
+      "kind": "bin",
+      "name": "Bin HA Rest Lifecycle",
+      "estimated_seconds": 80,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "include_prefixes": [
+        "server::tests::linuxdo_oauth_and_admin_keys::manual_",
+        "server::tests::admin_token_filters_and_maintenance::manual_",
+        "server::tests::upstream_support_and_manual_jobs::manual_",
+        "server::tests::alerts_and_ha::admin_",
+        "server::tests::alerts_and_ha_node_detail::admin_",
+        "server::tests::alerts_and_ha::dual_active_",
+        "server::tests::alerts_and_ha_source_and_recovery::ha_",
+        "server::tests::alerts_and_ha_source_and_recovery::request_logs_gc_",
+        "server::tests::alerts_and_ha_source_and_recovery::aged_",
+        "server::tests::alerts_and_ha_source_and_recovery::non_aged_research_",
+        "server::tests::alerts_and_ha_source_and_recovery::remote_attempt_",
+        "server::tests::alerts_and_ha_source_and_recovery::reconciliation_",
+        "server::tests::alerts_and_ha_source_and_recovery::research_",
+        "server::tests::alerts_and_ha_sync_recovery::ha_",
+        "server::tests::alerts_and_ha_sync_recovery::dual_active_",
+        "server::tests::alerts_and_ha_node_state::redundant_",
+        "server::tests::alerts_and_ha_node_state::dual_active_",
+        "server::tests::alerts_and_ha_startup_roles::post_ready_",
+        "server::tests::alerts_and_ha_startup_roles::persist_"
+      ]
+    },
+    {
+      "id": "bin-ha-rest-lifecycle-state-base",
+      "kind": "bin",
+      "name": "Bin HA Rest Lifecycle State Base",
+      "estimated_seconds": 9,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "include_prefixes": [
+        "server::tests::alerts_and_ha_startup_roles::startup_",
+        "server::tests::alerts_and_ha_startup_roles::standby_",
+        "server::tests::alerts_and_ha_startup_roles::dual_active_",
+        "server::tests::alerts_and_ha_event_exports::ha_",
+        "server::tests::alerts_and_ha_event_exports::legacy_",
+        "server::tests::alerts_and_ha_event_exports::dual_active_",
+        "server::tests::alerts_and_ha_serving_modes::ha_"
+      ]
+    },
+    {
+      "id": "bin-ha-rest-lifecycle-ha-events",
+      "kind": "bin",
+      "name": "Bin HA Rest Lifecycle HA Events",
+      "estimated_seconds": 14,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "include_prefixes": [
+        "server::tests::alerts_and_ha::ha_apply_",
+        "server::tests::alerts_and_ha::ha_baseline_",
+        "server::tests::alerts_and_ha::ha_billing_",
+        "server::tests::alerts_and_ha::ha_endpoints_",
+        "server::tests::alerts_and_ha::ha_event_apply_",
+        "server::tests::alerts_and_ha::ha_events_"
+      ]
+    },
+    {
+      "id": "bin-ha-rest-lifecycle-ha-recovery",
+      "kind": "bin",
+      "name": "Bin HA Rest Lifecycle HA Recovery",
+      "estimated_seconds": 20,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "include_prefixes": [
+        "server::tests::alerts_and_ha::ha_finalize_",
+        "server::tests::alerts_and_ha::ha_promote_",
+        "server::tests::alerts_and_ha::ha_repair_",
+        "server::tests::alerts_and_ha::ha_single_",
+        "server::tests::alerts_and_ha::ha_snapshot_",
+        "server::tests::alerts_and_ha::ha_standby_",
+        "server::tests::alerts_and_ha::ha_startup_",
+        "server::tests::alerts_and_ha::ha_switching_",
+        "server::tests::alerts_and_ha::ha_sync_"
+      ]
+    },
+    {
+      "id": "bin-ha-rest-serving",
+      "kind": "bin",
+      "name": "Bin HA Rest Serving",
+      "estimated_seconds": 64,
+      "coverage_target": "bin-main",
+      "run_args": ["--bin", "tavily-hikari"],
+      "include_prefixes": [
+        "server::channel_health_tests::",
+        "server::upstream_reconciliation_does_not_wait_for_db_execution_gate",
+        "server::serve_tests::",
+        "server::tests::system_settings_and_forward_proxy::startup_",
+        "server::tests::admin_token_filters_and_maintenance::maintenance_",
+        "server::tests::admin_logs_and_summary::summary_",
+        "server::tests::system_settings_and_forward_proxy::active_",
+        "server::tests::system_settings_and_forward_proxy::concurrent_",
+        "server::tests::system_settings_and_forward_proxy::serving_health_",
+        "server::tests::system_settings_and_forward_proxy::standby_",
+        "server::tests::log_catalog_and_dashboard_sse::key_",
+        "server::tests::research_result_and_mcp_subpath::db_",
+        "server::tests::system_settings_and_forward_proxy::proxy_"
+      ]
+    },
+    {
+      "id": "integration-mcp-billing-regression",
+      "kind": "integration",
+      "name": "Integration MCP Billing Regression",
+      "estimated_seconds": 16,
+      "coverage_target": "integration:mcp_billing_regression",
+      "run_args": [
+        "--test",
+        "mcp_billing_regression"
+      ]
+    },
+    {
+      "id": "integration-mcp-session-affinity",
+      "kind": "integration",
+      "name": "Integration MCP Session Affinity",
+      "estimated_seconds": 17,
+      "coverage_target": "integration:mcp_session_affinity_e2e",
+      "run_args": [
+        "--test",
+        "mcp_session_affinity_e2e"
+      ]
+    },
+    {
+      "id": "integration-request-kind-backfill",
+      "kind": "integration",
+      "name": "Integration Request Kind Backfill",
+      "estimated_seconds": 8,
+      "coverage_target": "integration:request_kind_canonical_backfill",
+      "run_args": [
+        "--test",
+        "request_kind_canonical_backfill"
+      ]
+    },
+    {
+      "id": "integration-rust-source-line-budgets",
+      "kind": "integration",
+      "name": "Integration Rust Source Line Budgets",
+      "estimated_seconds": 1,
+      "coverage_target": "integration:rust_source_line_budgets",
+      "run_args": [
+        "--test",
+        "rust_source_line_budgets"
+      ]
+    },
+    {
+      "id": "integration-server-http-contract",
+      "kind": "integration",
+      "name": "Integration Server HTTP Contract",
+      "estimated_seconds": 44,
+      "coverage_target": "integration:server_http_contract",
+      "run_args": [
+        "--test",
+        "server_http_contract"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,195 @@
+# Implementation：性能诊断日志与低内存稳定运行合同（#m2p6k）
+
+## 当前状态
+
+- 状态：渐进实现中（SQLite containment slice 待最终验证）
+
+## 已落地实现
+
+- `sqlite_workload_window` now aggregates workload class, operation, admission decisions and defer
+  reason, pool/begin waits, transaction hold time, rows, busy/timeout outcomes, acquire waiters,
+  minimum idle capacity, connection-scoped `CACHE_WRITE` pages, and cooperative read deadlines.
+  Process/cgroup write-byte deltas remain explicitly aggregate labels. Normal operations stay DEBUG;
+  the window emits at most one INFO record per minute, while sustained pressure and recovery use
+  state transitions.
+- The runtime reads `/proc` and cgroup I/O only for a window emission, slow/error path, or state
+  transition. The aggregation never includes SQL, parameters, request bodies, or credentials.
+- A low-pressure GC slice may request allocator trimming only after the connection closes, and the
+  process-wide request is rate-limited to one attempt per five minutes. The trim duration is DEBUG
+  diagnostic data, so debt recovery cannot turn allocator maintenance into a per-slice CPU cost.
+
+- 默认 runtime logging 继续沿用现有 JSON stderr 与 `RUNTIME_LOG_FORMAT=text` fallback，
+  没有引入第二套 telemetry。
+- 新增 `RuntimeMemorySnapshot` 与 `RuntimePerfScope`，默认事件可采集：
+  - `memory_current_bytes`
+  - `memory_limit_bytes`
+  - `headroom_bytes`
+  - `process_rss_bytes`
+  - `child_process_rss_bytes`
+  - `process_group_rss_bytes`
+  - `process_hwm_bytes`
+  - `process_swap_bytes`
+- HA 读写链路已补结构化 perf 事件：
+  - baseline/events export
+  - baseline/events import
+  - standby baseline/events sync
+  - 三路 channel 的 `outbox_row_count / oldest_age / ack_lag` 只读观测
+- HA perf events now use per-`(event, channel)` sampling: ordinary completions are DEBUG with a
+  once-per-minute INFO sample, while outbox aggregation plus full runtime-memory capture is
+  limited to once per channel every five minutes or occurs immediately for slow work. This keeps
+  the diagnostic fields available without adding read pressure on each polling pass. DEBUG samples
+  retain source, peer, watermark, cursor, and detail fields so an operator can still trace normal
+  synchronization progress without enabling the expensive aggregate collection.
+- HA cleanup timing keeps command wall-clock distinct from active cleanup time and the slowest
+  cleanup batch. The offline command excludes configured yields and post-cleanup overhead from its
+  batch metrics, so its diagnostics remain comparable to the online slice contract.
+- SQLx slow-statement emission uses DEBUG instead of WARN. Default runtime logs retain structured
+  operation timing/errors without complete statement text; an explicit `sqlx::query=debug` filter
+  restores SQL-level diagnostics.
+- owner-facing 重读路径已补结构化 perf 事件：
+  - dashboard overview
+  - startup dashboard overview prewarm / deferred
+  - dashboard shared snapshot cache-hit / rebuild
+  - dashboard phase-level 事件：`freshness_probe` / `cache_wait` / `quota_charge_rebuild` / `recent_alerts_rebuild` / `overview_payload_build` / `overview_serialize`
+  - alerts phase-level 事件：`alerts_projection` / `alerts_grouping`
+  - global/key request logs catalog / list
+  - token request logs catalog / list
+- forward-proxy/xray 启动关键阶段已补结构化 perf 事件：
+  - runtime begin
+  - snapshot persisted
+  - store synced
+- owner-facing 重读路径新增默认 `low_memory_protection_decision` 事件，用来记录当前判定
+  verdict；PR1 阶段先记录既有 `full/cache_hit/rebuilt` 语义，不改变业务响应。
+- `low_memory_protection_decision` 已增加 30 秒重复采样抑制，相同 verdict 不再连续刷默认 INFO。
+- request logs / token logs 的 perf 完成事件默认走 `INFO` 级别，避免把正常诊断事件误打成
+  `WARN`。
+- 新增日志单测，直接断言 perf 事件包含稳定字段、phase/outbox 字段与内存预算字段，并确认 `INFO` 级输出可解析。
+- `RuntimePerfScope` 延迟到真正输出日志时才读取 footprint；INFO 采样五分钟复用快照，slow/error
+  立即采集。cgroup anon/file/swap 与进程 RssAnon/RssFile/VmSwap 分开输出。
+- 在线 HA GC、对账和调度恢复现已由结构化状态跃迁日志覆盖；普通切片、phase、逐 key 429 与
+  enqueue reuse 不再逐次输出 INFO/WARN。
+- `SqliteRuntime` 使用 60 秒有界 operation/class window 汇总 pool/begin wait、transaction hold、
+  affected rows、错误和丢弃连接，并仅在窗口边界读取 process/cgroup write bytes。普通成功和重试不
+  逐次输出，连接污染与最终错误立即可见。
+- The workload window includes bounded derived-observability flushes. Server-pressure and rebalance
+  audit defer/retry events stay DEBUG, while stale/recovered coverage changes and fixed transport
+  categories are safe owner-facing diagnostics without SQL, request bodies, endpoints, or tokens.
+- Administrator privacy status uses an AppState-owned immutable last-good controller with one
+  refresh flight. Ready startup schedules a non-blocking retrying prewarm; requests copy cached
+  data rather than building the status synchronously. An expired cached value returns fixed-reason
+  stale coverage while the controller refreshes or defers, and a true cold miss returns
+  `503 Retry-After: 1`. Administrator alert Events, Groups, and Catalog use a normalized
+  exact-query cache with a five-minute cap; a bounded read may return the matching stale entry,
+  while a cold key returns `503 Retry-After: 1` rather than waiting for a raw alert CTE.
+- Server-pressure rebuilds are source-fenced and hysteretic: ordinary deferred deltas do not start
+  a rebuild, while overflow, lost coverage, or five minutes of continuous stale state may start at
+  most one generation every five minutes. Rebuild slices remain bounded and replayable from the
+  request-log source.
+- Privacy status refresh acquires one dedicated read snapshot within 100ms and constructs its full
+  immutable result on that connection outside the HTTP path. Its `BEGIN` uses the connection-local
+  100ms busy timeout rather than task cancellation, restoring the connection to the pool on
+  contention. The refresh closes explicitly before its result is published, so request timeouts
+  never discard an open read snapshot. It bypasses
+  maintenance-bulk admission; cached reads return stale coverage during pressure or refresh, while
+  true cold reads return `503 Retry-After: 1`.
+- Server-pressure recovery allocates a staged generation, aggregates fixed-fence 500-row keyset
+  slices, publishes once, and removes obsolete buckets in 25-row cleanup slices. Direct deltas and
+  buffered tail replay always write the active generation, so source rebuilds do not amplify normal
+  business writes or expose a partial live series.
+- Schema migration emits fixed `component/event/outcome/elapsed_ms` fields for baseline adoption and warm verification. GC and reconciliation keep normal work at DEBUG, aggregate INFO to one-minute windows, and reserve WARN/INFO for state transitions.
+
+## 已完成验证
+
+- `cargo fmt`
+- `cargo check`
+- `cargo test --lib runtime_logging::tests::runtime_memory_helpers_parse_status_and_cgroup_values -- --nocapture`
+- `cargo test --lib runtime_logging::tests::runtime_perf_scope_exposes_elapsed_and_memory_fields -- --nocapture`
+- `cargo test --lib store::tests::perf_logs_are_info_level_and_include_memory_budget_fields -- --nocapture`
+- `cargo test --lib store::tests::low_memory_protection_duplicate_logs_are_sampled -- --nocapture`
+- `cargo test --bin tavily-hikari ha_baseline_uses_zstd_and_excludes_call_records -- --nocapture`
+- `cargo test dashboard_overview_snapshot_is_reused_within_the_same_freshness_wave -- --nocapture`
+- `cargo test admin_logs_cursor_and_catalog_endpoints_expose_retention_without_blocking_page_counts -- --nocapture`
+- `cargo test alerts_and_ha -- --nocapture`
+- `cargo test log_catalog_and_dashboard_sse -- --nocapture`
+- `cargo clippy -- -D warnings`
+
+## 剩余缺口
+
+- 需要在当前最终 SHA 运行全量验证，并补齐管理员 HA/对账 Storybook 的新视觉证据。
+- HA outbox 观测现已覆盖在线 self-healing 的累计与最慢 cleanup micro-batch SQL 耗时、续片延迟、累计删除、高水位增量与
+  ingress-minus-delete 估算；后置状态 probe 不参与批次耗时。它们不能替代精确库存统计，但可低成本确认过期债务是否持续前移。
+- Deferred-continuation diagnostics share one durable transaction with the selected channel's
+  pending-debt bit. A cleared global mask therefore cannot suppress the watchdog signal for a
+  failed continuation write, while normal clean-state polling remains quiet.
+- HA export/sync 的低频样本使用 `outbox_sequence_span_estimate` 和 `outbox_high_watermark`，不再对每个通道
+  执行 `COUNT(*)` 或把近似 span 标成精确 `outbox_row_count`。
+
+## 相关文件
+
+- `src/runtime_logging.rs`
+- `src/store/mod.rs`
+- `src/store/key_store_ha.rs`
+- `src/store/key_store_request_logs_and_dashboard.rs`
+- `src/store/key_store_token_logs.rs`
+- `src/server/handlers/admin_resources/ha.rs`
+- `src/server/handlers/public.rs`
+- `src/server/serve.rs`
+- `src/tavily_proxy/proxy_core.rs`
+- HA perf events retain stable structured fields while avoiding false ACK lag: outbox stats only
+  compute lag when a peer watermark is supplied, and the admin health path uses watermark plus
+  indexed `EXISTS` checks instead of row counts.
+
+## Reconciliation pressure telemetry
+
+- Reconciliation persists cooldown state per `period_reconciliation` Key. A real upstream 429 uses
+  the `5/10/20/30` minute ladder (honoring `Retry-After`) only for the affected Key; other Keys
+  remain eligible, and an all-Key cooldown defers to the earliest retry time. Legacy global-backoff
+  meta remains readable for rolling compatibility but is not a live gate or representative wake
+  source. Normal per-Key cooldown logs are DEBUG; only Key state transitions are summarized at WARN.
+
+## Low-cost memory and transition telemetry
+
+- INFO memory collection is cached for five minutes; slow and error paths bypass the cache.
+- cgroup anon/file/swap and process RssAnon/RssFile/VmSwap are reported separately.
+- Normal HA slices, dashboard phases, and per-key rate limits are DEBUG; actionable states emit only
+  enter, escalation, and recovery transitions.
+
+## Current diagnostics contract
+
+- Online HA GC emits a channel-scoped aggregate INFO at most once per 60 seconds; slow slices and writer conflicts bypass that window. The aggregate reports deletion progress and age, while sequence span remains explicitly an estimate.
+- The GC aggregate and administrator channel view now expose controller-owned `next_wake`,
+  eligibility, batch size, ingress delta, net-row estimate, deletion rate, last progress and defer
+  reason. Normal slices and duplicate continuation attempts remain DEBUG; only state transitions,
+  SLO breach/recovery, busy defers and real errors are elevated.
+- Reconciliation local-budget pressure is stored and logged independently from upstream 429 backoff, preventing a local query-budget exhaustion from generating a remote-rate-limit alert.
+- Reconciliation aggregates include main-settlement and research timing plus typed outcome counts,
+  including `no_adjustment`. The status view keeps unknown coverage nullable instead of publishing a
+  zero queue or zero adjustment count before its first durable observation.
+- Main settlement and Research now use separate durable jobs. The Research drain aggregates one
+  poll at a time, while its outcome and exact cursor share one claim-fenced write. HA metadata carries local pressure across
+  takeover without increasing normal log volume.
+- Research drain observations now separate `pollable` pending rows from `unavailable` 404 rows and
+  expose credential-cooling Key counts with the earliest retry in the existing bounded status
+  projection. Credential cooldown is independent of per-Key 429 cooldown; raw request identifiers,
+  keys, URLs, bodies, and secrets remain excluded.
+- Research runtime diagnostics additionally aggregate accepted-continuation reasons
+  (`foreground_pressure`, `remote_lease`, `read_budget`, and `control_defer`), the bounded lease
+  wait signal, longest eligible wait, and last accepted poll. They do not turn a defer or stale
+  claim into progress, terminal, cursor, or Key-state evidence.
+
+## Visual Evidence
+
+PR: include
+
+![Historical system status reconciliation pressure fixture](./assets/system-status-global-reconciliation-backoff.png)
+
+- Storybook canvas: `Admin/Modules/SystemStatusModule/GlobalBackoff`
+- evidence_note: Historical mock-only system-status fixture retained for compatibility documentation;
+  it is not a live reconciliation gate. Current runtime status uses per-Key cooldown and an earliest
+  retry time.
+
+## 状态
+
+- Status: active
+- Created: 2026-06-23
+- Last: 2026-08-02

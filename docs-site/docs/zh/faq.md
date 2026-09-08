@@ -28,6 +28,25 @@ Tavily Hikari 不是 Tavily 官方服务的替代品，而是部署在你自己�
 
 如果你的客户端配置界面只要求 `Base URL + API key`，通常就是走 `/api/tavily/*`。
 
+### 如何通过 Hikari 使用 Tavily CLI 或 Agent Skills
+
+安装 Release wrapper：
+
+```bash
+curl -fsSL "https://github.com/IvanLi-CN/tavily-hikari/releases/latest/download/install-tvly-hikari.sh" | bash -s -- \
+  --base-url "https://<your-host>" \
+  --token "th-<id>-<secret>"
+```
+
+之后运行 `tvly-hikari search "query" --json`。Agent Skills 是可选安装：
+
+```bash
+npx skills add https://github.com/IvanLi-CN/tavily-hikari --global
+```
+
+wrapper 会在本地保存 Hikari token，并把官方 `tvly` 命令路由到
+`https://<your-host>/api/tavily`。
+
 ### 一定要启用 ForwardAuth 吗
 
 不一定，但你至少需要一种管理员访问策略。

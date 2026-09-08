@@ -1,0 +1,2593 @@
+use super::*;
+use super::core_support_and_parsing::*;
+use super::linuxdo_oauth_and_admin_keys::*;
+use super::upstream_support_and_manual_jobs::*;
+
+async fn load_dashboard_overview_after_background_refresh(
+    state: &Arc<AppState>,
+) -> Arc<DashboardOverviewSnapshot> {
+    let _last_good = load_dashboard_overview_snapshot(state)
+        .await
+        .expect("warm overview snapshot");
+    wait_for_dashboard_overview_refresh(state).await
+}
+
+#[test]
+fn dashboard_alert_dirty_generation_survives_an_older_refresh_completion() {
+    let mut cache = DashboardOverviewCacheState {
+        alert_projection_generation: 1,
+        ..Default::default()
+    };
+
+    // The projection advances after a loader captured generation 1 but before
+    // that loader can publish. Its completion must not erase generation 2.
+    cache.alert_projection_generation = 2;
+    acknowledge_dashboard_alert_projection_generation(&mut cache, 1);
+    assert_eq!(cache.built_alert_projection_generation, None);
+
+    acknowledge_dashboard_alert_projection_generation(&mut cache, 2);
+    assert_eq!(cache.built_alert_projection_generation, Some(2));
+}
+
+#[test]
+fn dashboard_request_stats_dirty_generation_survives_an_older_refresh_completion() {
+    let mut cache = DashboardOverviewCacheState {
+        built_request_stats_generation: Some(1),
+        ..Default::default()
+    };
+
+    // Request stats changed after the loader captured generation 1. The old
+    // loader may publish a snapshot, but it must leave generation 2 dirty.
+    acknowledge_dashboard_request_stats_generation(&mut cache, Some(1), Some(2));
+    assert_eq!(cache.built_request_stats_generation, Some(1));
+
+    acknowledge_dashboard_request_stats_generation(&mut cache, Some(2), Some(2));
+    assert_eq!(cache.built_request_stats_generation, Some(2));
+}
+
+#[test]
+fn unavailable_dashboard_alert_summary_is_explicitly_stale() {
+    let summary = stale_dashboard_recent_alerts_summary(24, "alert_projection_unavailable");
+
+    assert_eq!(summary.coverage, "stale");
+    assert!(summary.stale);
+    assert_eq!(
+        summary.error.as_deref(),
+        Some("alert_projection_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn compute_signatures_reuses_dashboard_boundary_contract() {
+    let db_path = temp_db_path("summary-signatures-dashboard-boundaries");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-signature-boundaries".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    let snapshot = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("overview snapshot");
+    let (sig, latest_id) = compute_signatures(&state)
+        .await
+        .expect("compute signatures");
+    let sig = sig.expect("summary signature");
+
+    assert_eq!(
+        sig.freshness.summary_window_starts,
+        snapshot.freshness.summary_window_starts,
+        "SSE freshness probe should reuse the same cheap local day/month boundary contract as the cached overview snapshot",
+    );
+    assert_eq!(
+        sig.freshness.latest_request_log_id,
+        snapshot.freshness.latest_request_log_id,
+        "SSE freshness probe should stay aligned with the retention-filtered request-log visibility contract",
+    );
+    assert_eq!(
+        sig.freshness.recent_request_logs,
+        snapshot.freshness.recent_request_logs,
+        "SSE freshness probe should track the same displayed recent-log signature as the shared overview snapshot",
+    );
+    assert_eq!(
+        sig.freshness.trend_request_logs,
+        snapshot.freshness.trend_request_logs,
+        "SSE freshness probe should also track the full trend source window used by the shared overview snapshot",
+    );
+    assert_eq!(
+        sig.freshness.pending_dashboard_rollup_signature,
+        snapshot.freshness.pending_dashboard_rollup_signature,
+        "SSE freshness should inherit the same pending dashboard rollup signature that the rebuilt snapshot stores",
+    );
+    assert_eq!(latest_id, snapshot.freshness.latest_request_log_id);
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_caches_rebuilt_freshness_after_emitted_snapshot() {
+    let db_path = temp_db_path("dashboard-overview-cache-key-freshness");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-cache-key-freshness".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    let initial = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("initial overview snapshot");
+    reset_dashboard_overview_build_count(&state).await;
+
+    let created_at = Utc::now().timestamp();
+    state
+        .proxy
+        .debug_enqueue_dashboard_credit_rollups(created_at, 7)
+        .await;
+
+    let probe_freshness = compute_dashboard_overview_freshness(&state)
+        .await
+        .expect("compute expected freshness after pending rollup");
+    assert_ne!(
+        probe_freshness.pending_dashboard_rollup_signature,
+        initial.freshness.pending_dashboard_rollup_signature,
+        "cheap freshness should notice pending rollup work before the shared snapshot is rebuilt",
+    );
+
+    let (_stale_event, _) = build_snapshot_event(&state)
+        .await
+        .expect("snapshot event after pending rollup");
+    let _refreshed = load_dashboard_overview_after_background_refresh(&state).await;
+    let (_event, emitted_sig) = build_snapshot_event(&state)
+        .await
+        .expect("snapshot event after background refresh");
+
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let cache = cache_handle.lock().await;
+    let cached = cache.cached.as_ref().expect("cached overview snapshot");
+    assert_eq!(
+        cached.freshness, emitted_sig.freshness,
+        "shared overview cache should advance to the rebuilt freshness emitted to SSE clients"
+    );
+    assert_eq!(
+        cached.snapshot.freshness, emitted_sig.freshness,
+        "cached snapshot payload should keep the rebuilt freshness emitted to SSE clients"
+    );
+    assert_eq!(
+        cached.freshness, cached.snapshot.freshness,
+        "cache key freshness should stay aligned with the durable snapshot while rollups remain pending"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_keeps_summary_totals_in_sync_with_flushed_windows() {
+    let db_path = temp_db_path("dashboard-overview-summary-sync");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-summary-sync".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("list key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+    proxy
+        .debug_enqueue_request_stats_rollup_for_test(
+            Some(&key_id),
+            proxy.backend_time().now_ts().saturating_sub(60),
+            "success",
+        )
+        .await;
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    state.proxy.nudge_request_stats_flush().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if state
+                .proxy
+                .summary_without_flush()
+                .await
+                .expect("durable summary")
+                .total_requests
+                == 1
+            {
+                break;
+            }
+            // Poll the durable result without repeatedly reacquiring the
+            // three-connection SQLite pool. A tight raw-read loop can become
+            // the contention that prevents the background bulk flush this
+            // test is meant to observe.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background flush before overview read");
+
+    let snapshot = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("overview snapshot after pending rollup");
+
+    assert_eq!(
+        snapshot.payload.summary.total_requests, 1,
+        "overview summary totals should include the request-stats batch after the background flush",
+    );
+    assert_eq!(
+        snapshot.payload.summary.success_count, 1,
+        "overview summary success totals should stay aligned with the flushed request-stats batch",
+    );
+    assert_eq!(
+        snapshot.payload.summary_windows.today.total_requests, 1,
+        "today summary window should reflect the same flushed request-stats batch",
+    );
+    assert_eq!(
+        snapshot.payload.summary_windows.today.success_count, 1,
+        "today summary window success totals should stay aligned with the overview summary",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_is_reused_within_the_same_freshness_wave() {
+    let db_path = temp_db_path("dashboard-overview-shared-snapshot");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-shared-snapshot".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    let (_snapshot_event, emitted_sig) = build_snapshot_event(&state)
+        .await
+        .expect("snapshot event");
+
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        0,
+        "SSE snapshot should reuse the shared overview cache instead of rebuilding within the same refresh wave",
+    );
+    assert!(
+        !first.payload.month_series.current.is_empty(),
+        "snapshot should still expose the expected month series payload",
+    );
+    assert_eq!(
+        emitted_sig.freshness,
+        first.freshness,
+        "SSE should remember the emitted snapshot freshness instead of the pre-rebuild probe state",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_serves_last_good_while_quota_recovery_runs() {
+    let db_path = temp_db_path("dashboard-overview-last-good-refresh");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-last-good-refresh".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    let key_id = state
+        .proxy
+        .list_api_key_metrics()
+        .await
+        .expect("list seeded keys")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id, quota_limit, quota_remaining, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(1_000_i64)
+    .bind(999_i64)
+    .bind(now - 20)
+    .bind("test")
+    .execute(&pool)
+    .await
+    .expect("insert initial quota sample");
+
+    let initial = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("initial overview snapshot");
+    reset_dashboard_overview_build_count(&state).await;
+    let pause = state
+        .proxy
+        .install_dashboard_overview_read_pause_for_test()
+        .await;
+    for offset in 0..34_i64 {
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_quota_sync_samples (
+                key_id, quota_limit, quota_remaining, captured_at, source
+            ) VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&key_id)
+        .bind(1_000_i64)
+        .bind(999 - offset)
+        .bind(now - 100 + offset)
+        .bind("test")
+        .execute(&pool)
+        .await
+        .expect("record quota sample");
+    }
+    state.proxy.mark_dashboard_read_dirty_for_test().await;
+    expire_dashboard_overview_freshness_probe(&state).await;
+
+    let freshness = compute_dashboard_overview_freshness(&state)
+        .await
+        .expect("read quota-change freshness");
+    assert!(
+        initial.freshness.differs_only_by_quota_charge(&freshness),
+        "the controlled refresh must enter the quota-only recovery path"
+    );
+    let mut non_quota_change = freshness.clone();
+    non_quota_change.request_log_retention_days += 1;
+    assert!(
+        !initial
+            .freshness
+            .differs_only_by_quota_charge(&non_quota_change),
+        "a non-quota freshness change must not use the quota-only path"
+    );
+    let expected_freshness_probe_count = dashboard_overview_freshness_probe_count(&state).await + 1;
+
+    let served = tokio::time::timeout(
+        Duration::from_millis(250),
+        load_dashboard_overview_snapshot(&state),
+    )
+    .await
+    .expect("warm overview must not wait for a refresh")
+    .expect("last-good overview snapshot");
+    assert!(
+        Arc::ptr_eq(&served, &initial),
+        "warm refresh should serve the existing immutable snapshot",
+    );
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let cache = cache_handle.lock().await;
+    assert!(
+        cache.loading,
+        "quota-only change must start a background refresh; request_generation={:?}, built_generation={:?}, last_probe={:?}",
+        state.proxy.dashboard_read_generation(),
+        cache.built_request_stats_generation,
+        cache.last_freshness_probe_at,
+    );
+    drop(cache);
+
+    tokio::time::timeout(Duration::from_secs(2), pause.wait_until_arrived())
+        .await
+        .expect("background overview refresh reached the controlled pause");
+    expire_dashboard_overview_freshness_probe(&state).await;
+    let signature_reads = (0..20).map(|_| compute_signatures(&state));
+    let signatures = tokio::time::timeout(
+        Duration::from_millis(250),
+        futures_util::future::join_all(signature_reads),
+    )
+    .await
+    .expect("SSE signature reads must not wait for or duplicate the active refresh");
+    assert!(signatures.iter().all(Result::is_ok));
+    assert_eq!(
+        dashboard_overview_freshness_probe_count(&state).await,
+        expected_freshness_probe_count,
+        "subscriber count must not multiply the background freshness probe",
+    );
+    pause.release();
+
+    let recovered = wait_for_dashboard_overview_refresh(&state).await;
+    assert!(
+        !Arc::ptr_eq(&recovered, &initial),
+        "the completed recovery must replace last-good only after the staged model is ready",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_releases_loading_after_quota_recovery_restart_budget() {
+    const QUOTA_RECOVERY_ATTEMPTS: usize = 3;
+
+    let db_path = temp_db_path("dashboard-overview-quota-recovery-restart-budget");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-quota-recovery-restart-budget".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    let key_id = state
+        .proxy
+        .list_api_key_metrics()
+        .await
+        .expect("list seeded keys")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id, quota_limit, quota_remaining, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(1_000_i64)
+    .bind(999_i64)
+    .bind(now - 20)
+    .bind("test")
+    .execute(&pool)
+    .await
+    .expect("insert initial quota sample");
+
+    let initial = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("initial overview snapshot");
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id, quota_limit, quota_remaining, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(1_000_i64)
+    .bind(998_i64)
+    .bind(now - 100)
+    .bind("test")
+    .execute(&pool)
+    .await
+    .expect("insert out-of-order quota sample");
+    state.proxy.mark_dashboard_read_dirty_for_test().await;
+    expire_dashboard_overview_freshness_probe(&state).await;
+
+    let freshness = compute_dashboard_overview_freshness(&state)
+        .await
+        .expect("read quota-change freshness");
+    assert!(
+        initial.freshness.differs_only_by_quota_charge(&freshness),
+        "the controlled refresh must enter quota recovery"
+    );
+
+    let mut next_pause = Some(
+        state
+            .proxy
+            .install_dashboard_overview_read_pause_for_test()
+            .await,
+    );
+    let served = tokio::time::timeout(
+        Duration::from_millis(250),
+        load_dashboard_overview_snapshot(&state),
+    )
+    .await
+    .expect("warm overview must not wait for a refresh")
+    .expect("last-good overview snapshot");
+    assert!(
+        Arc::ptr_eq(&served, &initial),
+        "the initial request must retain immutable last-good while recovery stages",
+    );
+
+    for attempt in 0..QUOTA_RECOVERY_ATTEMPTS {
+        let pause = next_pause
+            .take()
+            .expect("every restarted recovery stages a page");
+        tokio::time::timeout(Duration::from_secs(2), pause.wait_until_arrived())
+            .await
+            .expect("background recovery staged a page");
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_quota_sync_samples (
+                key_id, quota_limit, quota_remaining, captured_at, source
+            ) VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&key_id)
+        .bind(1_000_i64)
+        .bind(997_i64 - attempt as i64)
+        .bind(now - 101 - attempt as i64)
+        .bind("test")
+        .execute(&pool)
+        .await
+        .expect("advance source after each staged page");
+        pause.release();
+        if attempt + 1 < QUOTA_RECOVERY_ATTEMPTS {
+            next_pause = Some(
+                state
+                    .proxy
+                    .install_dashboard_overview_read_pause_for_test()
+                    .await,
+            );
+        }
+    }
+
+    let settled = wait_for_dashboard_overview_refresh(&state).await;
+    assert!(
+        Arc::ptr_eq(&settled, &initial),
+        "a deferred recovery must leave immutable last-good published",
+    );
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let cache = cache_handle.lock().await;
+    assert!(
+        !cache.loading,
+        "a bounded deferred recovery must release the overview singleflight loader",
+    );
+    assert!(
+        Arc::ptr_eq(
+            &cache
+                .cached
+                .as_ref()
+                .expect("last-good cache entry")
+                .snapshot,
+            &initial
+        ),
+        "the cache must not publish a partial or mixed recovery model",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_pressure_returns_last_good_without_refresh() {
+    let db_path = temp_db_path("dashboard-overview-pressure-last-good");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-pressure-last-good".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    let generation = {
+        let mut cache = cache_handle.lock().await;
+        cache.loading = true;
+        cache.loading_generation = cache.loading_generation.wrapping_add(1);
+        cache.loading_started_at = Some(tokio::time::Instant::now());
+        cache.loading_generation
+    };
+    let initial = refresh_dashboard_overview_snapshot(&state, cache_handle, generation, None, 0)
+        .await
+        .expect("build an initial last-good overview snapshot for pressure containment");
+    reset_dashboard_overview_build_count(&state).await;
+    expire_dashboard_overview_freshness_probe(&state).await;
+    for _ in 0..6 {
+        state.proxy.record_foreground_activity();
+    }
+
+    let served = tokio::time::timeout(
+        Duration::from_millis(250),
+        load_dashboard_overview_snapshot(&state),
+    )
+    .await
+    .expect("last-good snapshot must return inside the foreground budget")
+    .expect("last-good overview snapshot");
+    assert!(
+        Arc::ptr_eq(&served, &initial),
+        "admission pressure must return the immutable last-good snapshot"
+    );
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        0,
+        "pressure containment must not start a freshness or payload rebuild"
+    );
+    assert_eq!(
+        dashboard_overview_freshness_probe_count(&state).await,
+        0,
+        "pressure containment must not issue a freshness query"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_pressure_allows_one_bounded_cold_build() {
+    let db_path = temp_db_path("dashboard-overview-pressure-cold-build");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-pressure-cold-build".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    for _ in 0..6 {
+        state.proxy.record_foreground_activity();
+    }
+
+    let snapshot = tokio::time::timeout(
+        DASHBOARD_OVERVIEW_COLD_BUILD_BUDGET,
+        load_dashboard_overview_snapshot(&state),
+    )
+    .await
+    .expect("cold dashboard build stays within its budget")
+    .expect("cold dashboard has no last-good snapshot to defer to");
+    assert!(snapshot.payload.summary_windows.today_start > 0);
+    assert_eq!(dashboard_overview_build_count(&state).await, 1);
+    assert_eq!(
+        dashboard_overview_freshness_probe_count(&state).await,
+        0,
+        "a cold snapshot must not duplicate the payload reads with a separate freshness probe",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_startup_prewarm_reuses_the_first_snapshot_loader() {
+    let db_path = temp_db_path("dashboard-overview-startup-prewarm");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-startup-prewarm".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    tokio::time::timeout(
+        DASHBOARD_OVERVIEW_COLD_BUILD_BUDGET,
+        prewarm_dashboard_overview_snapshot(&state),
+    )
+    .await
+    .expect("startup prewarm uses the cold snapshot budget");
+    let snapshot = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("the first HTTP reader receives the prewarmed snapshot");
+    assert!(snapshot.payload.summary_windows.today_start > 0);
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        1,
+        "startup prewarm and the first HTTP request share one singleflight loader",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_startup_prewarm_waits_past_the_request_budget_before_listening() {
+    let db_path = temp_db_path("dashboard-overview-startup-prewarm-retry");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-startup-prewarm-retry".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pause = state
+        .proxy
+        .install_dashboard_overview_read_pause_for_test()
+        .await;
+    let prewarm_state = state.clone();
+    let prewarm = tokio::spawn(async move { prewarm_dashboard_overview_snapshot(&prewarm_state).await });
+
+    tokio::time::timeout(Duration::from_secs(2), pause.wait_until_arrived())
+        .await
+        .expect("startup prewarm reached the controlled read pause");
+    tokio::time::sleep(DASHBOARD_OVERVIEW_COLD_BUILD_BUDGET + Duration::from_millis(50)).await;
+    assert!(
+        !prewarm.is_finished(),
+        "startup prewarm must keep the listener closed while its singleflight continues"
+    );
+
+    pause.release();
+    tokio::time::timeout(DASHBOARD_OVERVIEW_STARTUP_PREWARM_BUDGET, prewarm)
+        .await
+        .expect("startup prewarm finishes within its separate startup budget")
+        .expect("startup prewarm task joins");
+    let snapshot = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("the first HTTP reader receives the completed startup snapshot");
+    assert!(snapshot.payload.summary_windows.today_start > 0);
+    assert_eq!(dashboard_overview_build_count(&state).await, 1);
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_sse_defers_freshness_while_the_cold_loader_is_active() {
+    let db_path = temp_db_path("dashboard-overview-sse-cold-loader");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-sse-cold-loader".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: true,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+    {
+        let mut cache = cache_handle.lock().await;
+        cache.loading = true;
+        cache.loading_started_at = Some(tokio::time::Instant::now());
+    }
+
+    let response = sse_dashboard(State(state.clone()), HeaderMap::new())
+        .await
+        .expect("open dashboard SSE stream while the cold loader is active");
+    let mut frames = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_millis(100), futures_util::StreamExt::next(&mut frames))
+        .await
+        .expect("cold SSE should immediately report its degraded state")
+        .expect("cold SSE stream must produce one frame")
+        .expect("cold SSE frame must be valid");
+    assert_eq!(first.as_ref(), b"event: degraded\ndata: {}\n\n");
+    assert_eq!(
+        dashboard_overview_freshness_probe_count(&state).await,
+        0,
+        "a cold loader must not require SSE clients to run freshness probes"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_cold_build_continues_after_the_first_request_times_out() {
+    let db_path = temp_db_path("dashboard-overview-cold-build-continues");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-cold-build-continues".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pause = state
+        .proxy
+        .install_dashboard_overview_read_pause_for_test()
+        .await;
+    let loading_state = state.clone();
+    let loading = tokio::spawn(async move { load_dashboard_overview_snapshot(&loading_state).await });
+
+    tokio::time::timeout(Duration::from_secs(2), pause.wait_until_arrived())
+        .await
+        .expect("background cold build reached the controlled pause");
+    let first_result = tokio::time::timeout(Duration::from_secs(2), loading)
+        .await
+        .expect("first cold read respects its one-second budget")
+        .expect("cold loader task joins");
+    assert!(first_result.is_err(), "the first request may time out without a cache");
+
+    pause.release();
+    let rebuilt = wait_for_dashboard_overview_refresh(&state).await;
+    assert!(rebuilt.payload.summary_windows.today_start > 0);
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        1,
+        "a timed-out reader must not cancel or duplicate the shared cold build",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_recovers_from_stale_loading_flag() {
+    let db_path = temp_db_path("dashboard-overview-stale-loading-flag");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-stale-loading-flag".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    {
+        let cache_handle = dashboard_overview_cache_for_state(state.as_ref());
+        let mut cache = cache_handle.lock().await;
+        cache.loading = true;
+        cache.loading_started_at =
+            Some(tokio::time::Instant::now() - DASHBOARD_OVERVIEW_LOADING_STALE_AFTER - Duration::from_secs(1));
+    }
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(5),
+        load_dashboard_overview_snapshot(&state),
+    )
+    .await
+    .expect("stale loading flag should not block forever")
+    .expect("overview snapshot should rebuild after stale loading flag");
+
+    assert!(
+        !snapshot.payload.month_series.current.is_empty(),
+        "recovered overview should still include normal dashboard data",
+    );
+    assert!(
+        dashboard_overview_build_count(&state).await >= 1,
+        "stale loading recovery should take over and rebuild the shared snapshot",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_load_guard_does_not_clear_newer_loader_generation() {
+    let cache_handle = new_dashboard_overview_cache();
+    {
+        let mut cache = cache_handle.lock().await;
+        cache.loading = true;
+        cache.loading_generation = 1;
+        cache.loading_started_at = Some(tokio::time::Instant::now());
+    }
+
+    let guard = DashboardOverviewLoadGuard::new(cache_handle.clone(), 1);
+
+    {
+        let mut cache = cache_handle.lock().await;
+        cache.loading = true;
+        cache.loading_generation = 2;
+        cache.loading_started_at = Some(tokio::time::Instant::now());
+    }
+
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let cache = cache_handle.lock().await;
+    assert!(cache.loading, "old loader guard must not clear a newer loader");
+    assert_eq!(
+        cache.loading_generation, 2,
+        "old loader guard must preserve the newer loader generation",
+    );
+    assert!(
+        cache.loading_started_at.is_some(),
+        "old loader guard must not erase newer loader start time",
+    );
+}
+
+#[tokio::test]
+async fn dashboard_overview_freshness_advances_on_five_minute_window_anchor() {
+    let first_anchor = dashboard_hourly_window_anchor(1_774_070_520);
+    let second_anchor = dashboard_hourly_window_anchor(1_774_070_700);
+
+    assert_eq!(first_anchor, 1_774_070_400);
+    assert_eq!(second_anchor, 1_774_070_700);
+    assert_ne!(
+        second_anchor, first_anchor,
+        "dashboard overview cache must advance with the 5 minute realtime window, not wait for the next hour",
+    );
+    assert_eq!(
+        dashboard_hourly_window_anchor(1_774_073_999),
+        1_774_073_700,
+        "freshness anchor should stay on five minute boundaries within the same hour",
+    );
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_event_uses_rebuilt_freshness_after_pending_rollups() {
+    let db_path = temp_db_path("dashboard-overview-emitted-freshness");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-emitted-freshness".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy: proxy.clone(),
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    let initial = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("initial overview snapshot");
+    reset_dashboard_overview_build_count(&state).await;
+
+    let created_at = Utc::now().timestamp();
+    state
+        .proxy
+        .debug_enqueue_dashboard_credit_rollups(created_at, 7)
+        .await;
+
+    let probe_freshness = compute_dashboard_overview_freshness(&state)
+        .await
+        .expect("compute expected freshness after pending rollup");
+    assert_ne!(
+        probe_freshness.pending_dashboard_rollup_signature,
+        initial.freshness.pending_dashboard_rollup_signature,
+        "cheap freshness should notice pending rollup work before the shared snapshot is rebuilt",
+    );
+
+    let (_stale_event, _) = build_snapshot_event(&state)
+        .await
+        .expect("snapshot event after pending rollup");
+    let _refreshed = load_dashboard_overview_after_background_refresh(&state).await;
+    let (_event, emitted_sig) = build_snapshot_event(&state)
+        .await
+        .expect("snapshot event after background refresh");
+
+    assert!(
+        dashboard_overview_build_count(&state).await >= 1,
+        "pending rollup drift should trigger a shared snapshot rebuild",
+    );
+    assert_eq!(
+        emitted_sig.freshness.pending_dashboard_rollup_signature,
+        probe_freshness.pending_dashboard_rollup_signature,
+        "a Dashboard rebuild must preserve pending freshness instead of flushing from the read path",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_event_emits_latest_log_cursor_from_rebuilt_snapshot() {
+    let db_path = temp_db_path("dashboard-overview-emitted-log-cursor");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-emitted-log-cursor".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+
+    let (probe_sig, stale_latest_id) = compute_signatures(&state)
+        .await
+        .expect("compute signatures before new log");
+    let probe_sig = probe_sig.expect("summary signature before new log");
+    assert_eq!(
+        stale_latest_id, None,
+        "fresh probe should start without a visible request-log cursor",
+    );
+
+    let new_created_at = Utc::now().timestamp();
+    let new_log_id = sqlx::query(
+        r#"
+        INSERT INTO observability.request_logs (
+            api_key_id, auth_token_id, method, path, query, status_code, tavily_status_code,
+            error_message, result_status, request_body, response_body, forwarded_headers,
+            dropped_headers, created_at
+        ) VALUES (NULL, NULL, 'POST', '/search', NULL, 200, 200, NULL, 'success', NULL, NULL, '', '', ?)
+        "#,
+    )
+    .bind(new_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert new visible request log")
+    .last_insert_rowid();
+
+    expire_dashboard_overview_freshness_probe(&state).await;
+    let (_stale_event, _) = build_snapshot_event(&state)
+        .await
+        .expect("snapshot event after new log");
+    let _refreshed = wait_for_dashboard_overview_refresh(&state).await;
+    let (_event, emitted_sig) = build_snapshot_event(&state)
+        .await
+        .expect("snapshot event after request-log refresh");
+
+    assert_eq!(
+        emitted_sig.freshness.latest_request_log_id,
+        Some(new_log_id),
+        "emitted snapshot freshness should carry the rebuilt latest visible request-log id",
+    );
+    assert_ne!(
+        stale_latest_id,
+        emitted_sig.freshness.latest_request_log_id,
+        "probe cursor should be allowed to go stale while the snapshot rebuild catches up",
+    );
+
+    let (next_sig, next_latest_id) = compute_signatures(&state)
+        .await
+        .expect("compute signatures after snapshot emit");
+    let next_sig = next_sig.expect("summary signature after snapshot emit");
+    assert_eq!(
+        next_sig,
+        emitted_sig,
+        "the next SSE probe should match the freshness that was just emitted",
+    );
+    assert_eq!(
+        next_latest_id,
+        emitted_sig.freshness.latest_request_log_id,
+        "SSE cursor should advance to the emitted snapshot freshness to avoid duplicate snapshots on the next poll",
+    );
+    assert_ne!(
+        probe_sig.freshness.latest_request_log_id,
+        emitted_sig.freshness.latest_request_log_id,
+        "the regression only shows up when a request log lands after the probe but before snapshot emission",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_ignores_retained_out_request_logs_in_freshness_probe() {
+    let db_path = temp_db_path("dashboard-overview-retained-log-freshness");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-retained-log-freshness".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    assert!(
+        first.freshness.latest_request_log_id.is_none(),
+        "fresh snapshot should start without recent request logs",
+    );
+
+    let retention_days = effective_request_logs_retention_days();
+    let retained_out_created_at = Utc::now()
+        .checked_sub_signed(ChronoDuration::days(retention_days + 1))
+        .expect("retained-out timestamp")
+        .timestamp();
+    sqlx::query(
+        r#"
+        INSERT INTO observability.request_logs (
+            api_key_id, auth_token_id, method, path, query, status_code, tavily_status_code,
+            error_message, result_status, request_body, response_body, forwarded_headers,
+            dropped_headers, created_at
+        ) VALUES (NULL, NULL, 'POST', '/search', NULL, 200, 200, NULL, 'success', NULL, NULL, '', '', ?)
+        "#,
+    )
+    .bind(retained_out_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert retained-out request log");
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    let second = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("second overview snapshot");
+
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        0,
+        "retained-out request logs should not make the shared snapshot freshness diverge and force rebuilds",
+    );
+    assert_eq!(
+        second.freshness.latest_request_log_id, None,
+        "freshness probe should stay aligned with retention-filtered payload semantics",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_freshness_notices_same_second_rollup_updates() {
+    let db_path = temp_db_path("dashboard-overview-rollup-same-second-update");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-rollup-same-second-update".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+
+    let initial = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("initial overview snapshot");
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let summary_windows = state.proxy.summary_windows().await.expect("summary windows");
+    let bucket_start = summary_windows.today_start;
+    let updated_at = Utc::now().timestamp();
+
+    sqlx::query(
+        r#"
+        INSERT INTO dashboard_request_rollup_buckets (
+            bucket_start,
+            bucket_secs,
+            total_requests,
+            success_count,
+            error_count,
+            quota_exhausted_count,
+            valuable_success_count,
+            valuable_failure_count,
+            valuable_failure_429_count,
+            other_success_count,
+            other_failure_count,
+            unknown_count,
+            mcp_non_billable,
+            mcp_billable,
+            api_non_billable,
+            api_billable,
+            local_estimated_credits,
+            updated_at
+        ) VALUES (?, 86400, 2, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, ?)
+        ON CONFLICT(bucket_start, bucket_secs) DO UPDATE SET
+            total_requests = excluded.total_requests,
+            success_count = excluded.success_count,
+            error_count = excluded.error_count,
+            quota_exhausted_count = excluded.quota_exhausted_count,
+            valuable_success_count = excluded.valuable_success_count,
+            valuable_failure_count = excluded.valuable_failure_count,
+            valuable_failure_429_count = excluded.valuable_failure_429_count,
+            other_success_count = excluded.other_success_count,
+            other_failure_count = excluded.other_failure_count,
+            unknown_count = excluded.unknown_count,
+            mcp_non_billable = excluded.mcp_non_billable,
+            mcp_billable = excluded.mcp_billable,
+            api_non_billable = excluded.api_non_billable,
+            api_billable = excluded.api_billable,
+            local_estimated_credits = excluded.local_estimated_credits,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(bucket_start)
+    .bind(updated_at)
+    .execute(&pool)
+    .await
+    .expect("upsert initial rollup row");
+
+    expire_dashboard_overview_freshness_probe(&state).await;
+    let after_insert = load_dashboard_overview_after_background_refresh(&state).await;
+    assert_ne!(
+        after_insert.freshness.dashboard_rollup_signature,
+        initial.freshness.dashboard_rollup_signature,
+        "adding a rollup bucket should invalidate the cached overview freshness signature",
+    );
+
+    sqlx::query(
+        r#"
+        UPDATE dashboard_request_rollup_buckets
+        SET total_requests = 2,
+            success_count = 2,
+            error_count = 0,
+            valuable_success_count = 0,
+            valuable_failure_count = 0,
+            other_success_count = 2,
+            api_billable = 0,
+            api_non_billable = 2,
+            updated_at = ?
+        WHERE bucket_start = ?
+          AND bucket_secs = 86400
+        "#,
+    )
+    .bind(updated_at)
+    .bind(bucket_start)
+    .execute(&pool)
+    .await
+    .expect("update same bucket within same second");
+
+    expire_dashboard_overview_freshness_probe(&state).await;
+    let after_update = load_dashboard_overview_after_background_refresh(&state).await;
+    assert_ne!(
+        after_update.freshness.dashboard_rollup_signature,
+        after_insert.freshness.dashboard_rollup_signature,
+        "same-second rollup classification changes should still invalidate the cached overview freshness signature even when coarse totals stay the same",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_freshness_tracks_time_driven_stale_key_transitions() {
+    let db_path = temp_db_path("dashboard-overview-stale-key-transition");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-stale-key-transition".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy: proxy.clone(),
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("list key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+    let now_ts = Utc::now().timestamp();
+    sqlx::query("UPDATE api_keys SET last_used_at = ?, quota_synced_at = ? WHERE id = ?")
+        .bind(now_ts - 10 * 60)
+        .bind(now_ts - 15 * 60 + 1)
+        .bind(&key_id)
+        .execute(&pool)
+        .await
+        .expect("seed near-stale key");
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    assert_eq!(
+        first.payload.summary_windows.today.quota_charge.stale_key_count,
+        0,
+        "fresh key should not be counted stale before the 15 minute threshold",
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    reset_dashboard_overview_build_count(&state).await;
+    let second = load_dashboard_overview_after_background_refresh(&state).await;
+    assert_eq!(
+        second.payload.summary_windows.today.quota_charge.stale_key_count,
+        1,
+        "crossing the stale threshold should update the quota stale-key count without requiring a new sample row",
+    );
+    assert_ne!(
+        second.freshness.dashboard_stale_key_count,
+        first.freshness.dashboard_stale_key_count,
+        "cheap freshness should include time-driven stale-key transitions",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_rebuilds_when_displayed_log_signature_changes() {
+    let db_path = temp_db_path("dashboard-overview-log-order-freshness");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-log-order-freshness".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+
+    let newest_created_at = Utc::now().timestamp();
+    let newest_id = sqlx::query(
+        r#"
+        INSERT INTO observability.request_logs (
+            api_key_id, auth_token_id, method, path, query, status_code, tavily_status_code,
+            error_message, result_status, request_body, response_body, forwarded_headers,
+            dropped_headers, created_at
+        ) VALUES (NULL, NULL, 'POST', '/search', NULL, 200, 200, NULL, 'success', NULL, NULL, '', '', ?)
+        "#,
+    )
+    .bind(newest_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert newest request log")
+    .last_insert_rowid();
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    assert_eq!(
+        first.payload.recent_logs.first().map(|log| log.id),
+        Some(newest_id),
+        "dashboard payload should keep the most recent log first by created_at/id ordering",
+    );
+    assert_eq!(
+        first.freshness.latest_request_log_id,
+        Some(newest_id),
+        "snapshot freshness should track the same most recent visible log as the retention-filtered payload",
+    );
+    assert_eq!(
+        first.freshness.recent_request_logs,
+        vec![(newest_id, newest_created_at)],
+        "freshness should include the displayed recent-log signature",
+    );
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    let older_id = sqlx::query(
+        r#"
+        INSERT INTO observability.request_logs (
+            api_key_id, auth_token_id, method, path, query, status_code, tavily_status_code,
+            error_message, result_status, request_body, response_body, forwarded_headers,
+            dropped_headers, created_at
+        ) VALUES (NULL, NULL, 'POST', '/search', NULL, 200, 200, NULL, 'success', NULL, NULL, '', '', ?)
+        "#,
+    )
+    .bind(newest_created_at - 3600)
+    .execute(&pool)
+    .await
+    .expect("insert older request log")
+    .last_insert_rowid();
+    assert!(
+        older_id > newest_id,
+        "second insert should get a higher id while remaining older by created_at",
+    );
+
+    let second = load_dashboard_overview_after_background_refresh(&state).await;
+
+    assert!(
+        dashboard_overview_build_count(&state).await >= 1,
+        "displayed recent-log changes should rebuild the shared snapshot even when the newest log id is unchanged",
+    );
+    assert_eq!(second.freshness.latest_request_log_id, Some(newest_id));
+    assert_eq!(
+        second.freshness.recent_request_logs,
+        vec![(newest_id, newest_created_at), (older_id, newest_created_at - 3600)],
+        "freshness should stay aligned with the displayed recent-log ordering",
+    );
+    assert_eq!(
+        second
+            .payload
+            .recent_logs
+            .iter()
+            .map(|log| log.id)
+            .collect::<Vec<_>>(),
+        vec![newest_id, older_id],
+        "rebuilding should refresh the displayed recent-log rows after an older retained log is inserted",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_rebuilds_when_trend_only_log_window_changes() {
+    let db_path = temp_db_path("dashboard-overview-trend-log-freshness");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-trend-log-freshness".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let base_created_at = Utc::now().timestamp();
+
+    for offset in 0..DASHBOARD_TREND_SOURCE_LIMIT {
+        sqlx::query(
+            r#"
+            INSERT INTO observability.request_logs (
+                api_key_id, auth_token_id, method, path, query, status_code, tavily_status_code,
+                error_message, result_status, request_body, response_body, forwarded_headers,
+                dropped_headers, created_at
+            ) VALUES (NULL, NULL, 'POST', '/search', NULL, 200, 200, NULL, 'success', NULL, NULL, '', '', ?)
+            "#,
+        )
+        .bind(base_created_at - offset as i64)
+        .execute(&pool)
+        .await
+        .expect("seed trend request log");
+    }
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    let first_recent_ids = first
+        .payload
+        .recent_logs
+        .iter()
+        .map(|log| log.id)
+        .collect::<Vec<_>>();
+    let first_trend_error = first.payload.trend.error.clone();
+    let first_trend_signature = first.freshness.trend_request_logs.clone();
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    let extra_created_at = base_created_at - DASHBOARD_RECENT_LOGS_LIMIT as i64 - 1;
+    let extra_id = sqlx::query(
+        r#"
+        INSERT INTO observability.request_logs (
+            api_key_id, auth_token_id, method, path, query, status_code, tavily_status_code,
+            error_message, result_status, request_body, response_body, forwarded_headers,
+            dropped_headers, created_at
+        ) VALUES (NULL, NULL, 'POST', '/search', NULL, 500, 500, NULL, 'error', NULL, NULL, '', '', ?)
+        "#,
+    )
+    .bind(extra_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert trend-only request log")
+    .last_insert_rowid();
+
+    let second = load_dashboard_overview_after_background_refresh(&state).await;
+
+    assert!(
+        dashboard_overview_build_count(&state).await >= 1,
+        "trend-only freshness changes should rebuild the shared snapshot",
+    );
+    assert_eq!(
+        second
+            .payload
+            .recent_logs
+            .iter()
+            .map(|log| log.id)
+            .collect::<Vec<_>>(),
+        first_recent_ids,
+        "logs outside the displayed top-five window should not disturb the displayed recent-log list",
+    );
+    assert_ne!(
+        second.freshness.trend_request_logs,
+        first_trend_signature,
+        "the cached freshness should include the full trend source window, not only displayed logs",
+    );
+    assert_ne!(
+        second.payload.trend.error,
+        first_trend_error,
+        "trend data should refresh when a retained error log enters the trend window outside the displayed top-five list",
+    );
+    assert!(
+        second
+            .freshness
+            .trend_request_logs
+            .iter()
+            .any(|(id, created_at)| *id == extra_id && *created_at == extra_created_at),
+        "trend freshness signature should capture the new retained trend-only log",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_does_not_reuse_recent_cache_after_freshness_changes() {
+    let db_path = temp_db_path("dashboard-overview-shared-snapshot-freshness-change");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-shared-snapshot-freshness-change".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    let _ = first;
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    // The safety probe must not rebuild merely because its bounded read now
+    // has a later end-of-day timestamp. No quota sample changed here.
+    expire_dashboard_overview_freshness_probe(&state).await;
+
+    sqlx::query(
+        "UPDATE api_keys SET quota_limit = ?, quota_remaining = ?, quota_synced_at = ?",
+    )
+    .bind(2_000_i64)
+    .bind(1_234_i64)
+    .bind(Utc::now().timestamp())
+    .execute(&pool)
+    .await
+    .expect("update quota totals");
+
+    let refreshed = load_dashboard_overview_after_background_refresh(&state).await;
+
+    assert_eq!(
+        refreshed.payload.site_status.remaining_quota,
+        1_234,
+        "freshness changes should bypass the recently loaded cache entry"
+    );
+    assert!(
+        dashboard_overview_build_count(&state).await >= 1,
+        "overview snapshot should rebuild after freshness changes even inside the grace window"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_rebuilds_when_previous_month_lifecycle_changes() {
+    let db_path = temp_db_path("dashboard-overview-previous-month-lifecycle");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-previous-month-lifecycle".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy: proxy.clone(),
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let summary_windows = proxy.summary_windows().await.expect("summary windows");
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    let first_new_quarantines = first
+        .payload
+        .month_series
+        .comparison
+        .first()
+        .and_then(|point| point.new_quarantines);
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quarantines (
+            id,
+            key_id,
+            source,
+            reason_code,
+            reason_summary,
+            reason_detail,
+            created_at
+        ) VALUES (?, ?, 'system', 'test_previous_month_refresh', 'test previous month refresh', 'test previous month refresh detail', ?)
+        "#,
+    )
+    .bind("quarantine-previous-month-refresh")
+    .bind(
+        proxy
+            .list_api_key_metrics()
+            .await
+            .expect("key metrics")
+            .into_iter()
+            .next()
+            .expect("seeded key")
+            .id,
+    )
+    .bind(summary_windows.previous_month_start + 120)
+    .execute(&pool)
+    .await
+    .expect("insert previous month quarantine");
+
+    let second = load_dashboard_overview_after_background_refresh(&state).await;
+
+    assert!(
+        dashboard_overview_build_count(&state).await >= 1,
+        "previous-month lifecycle changes should rebuild the shared snapshot",
+    );
+    assert_ne!(
+        second
+            .payload
+            .month_series
+            .comparison
+            .first()
+            .and_then(|point| point.new_quarantines),
+        first_new_quarantines,
+        "comparison month series should refresh after previous-month lifecycle changes",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_snapshot_patches_contiguous_quota_samples() {
+    let db_path = temp_db_path("dashboard-overview-contiguous-quota-samples");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-contiguous-quota-samples".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy: proxy.clone(),
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let summary_windows = proxy.summary_windows().await.expect("summary windows");
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    let first_quota_token = first.freshness.dashboard_quota_charge_token;
+    let first_latest_sync = first
+        .payload
+        .summary_windows
+        .month
+        .quota_charge
+        .latest_sync_at;
+    let month_quota_sample_start = summary_windows
+        .month_start
+        .max(start_of_month_dt(Utc::now()).timestamp());
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id,
+            quota_limit,
+            quota_remaining,
+            captured_at,
+            source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(2_000_i64)
+    .bind(1_111_i64)
+    .bind(month_quota_sample_start + 90)
+    .bind("quota_sync")
+    .execute(&pool)
+    .await
+    .expect("insert contiguous quota sample");
+
+    let second = load_dashboard_overview_after_background_refresh(&state).await;
+
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        0,
+        "contiguous quota samples must publish a quota-only patch instead of building the overview",
+    );
+    assert_ne!(
+        second.payload.summary_windows.month.quota_charge.latest_sync_at,
+        first_latest_sync,
+        "the immutable quota patch should carry the appended sample",
+    );
+    assert_ne!(
+        second.freshness.dashboard_quota_charge_token,
+        first_quota_token,
+        "the patched snapshot should advance the append-only quota watermark",
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&second.http_json).expect("quota-patched overview JSON");
+    assert!(
+        payload
+            .pointer("/summaryWindows/month/quota_charge/upstream_actual_credits")
+            .is_some(),
+        "the quota-only patch must retain the public Dashboard response shape",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_future_quota_sample_patches_when_it_enters_the_window() {
+    let db_path = temp_db_path("dashboard-overview-future-quota-sample");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-future-quota-sample".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy: proxy.clone(),
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+    let now = loop {
+        let now = proxy.backend_time().now_ts();
+        if now.rem_euclid(5 * 60) <= 288 {
+            break now;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let future_captured_at = now.saturating_add(5);
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id, quota_limit, quota_remaining, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(2_000_i64)
+    .bind(2_000_i64)
+    .bind(now.saturating_sub(1))
+    .bind("quota_sync")
+    .execute(&pool)
+    .await
+    .expect("insert initial quota sample");
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    reset_dashboard_overview_build_count(&state).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id, quota_limit, quota_remaining, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(2_000_i64)
+    .bind(1_700_i64)
+    .bind(future_captured_at)
+    .bind("quota_sync")
+    .execute(&pool)
+    .await
+    .expect("insert future quota sample");
+
+    expire_dashboard_overview_freshness_probe(&state).await;
+    let still_future = load_dashboard_overview_after_background_refresh(&state).await;
+    assert_eq!(
+        still_future.freshness.dashboard_quota_charge_token,
+        first.freshness.dashboard_quota_charge_token,
+        "a future sample must not advance the effective quota watermark",
+    );
+    assert_eq!(
+        still_future
+            .payload
+            .summary_windows
+            .month
+            .quota_charge
+            .upstream_actual_credits,
+        0,
+        "the future sample must not be charged before it enters the window",
+    );
+    reset_dashboard_overview_build_count(&state).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while proxy.backend_time().now_ts() < future_captured_at {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("future sample should enter the dashboard window");
+
+    let effective_freshness = compute_dashboard_overview_freshness(&state)
+        .await
+        .expect("freshness after future sample becomes effective");
+    assert!(
+        first
+            .freshness
+            .differs_only_by_quota_charge(&effective_freshness),
+        "a newly effective quota sample must remain eligible for the quota-only patch",
+    );
+
+    expire_dashboard_overview_freshness_probe(&state).await;
+    let patched = load_dashboard_overview_after_background_refresh(&state).await;
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        0,
+        "an effective appended sample must publish through a quota-only patch",
+    );
+    assert_ne!(
+        patched.freshness.dashboard_quota_charge_token,
+        first.freshness.dashboard_quota_charge_token,
+        "entering the window must advance the effective quota watermark without another append",
+    );
+    assert_eq!(
+        patched
+            .payload
+            .summary_windows
+            .month
+            .quota_charge
+            .upstream_actual_credits,
+        300,
+        "the quota-only patch must charge the newly effective sample",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_quota_backfill_recovers_in_background_from_last_good() {
+    let db_path = temp_db_path("dashboard-overview-quota-backfill-recovery");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-quota-backfill-recovery".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy: proxy.clone(),
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+    let captured_at = start_of_month_dt(Utc::now()).timestamp().saturating_add(600);
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id, quota_limit, quota_remaining, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(2_000_i64)
+    .bind(1_500_i64)
+    .bind(captured_at)
+    .bind("quota_sync")
+    .execute(&pool)
+    .await
+    .expect("insert initial quota sample");
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    reset_dashboard_overview_build_count(&state).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id, quota_limit, quota_remaining, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(2_000_i64)
+    .bind(1_800_i64)
+    .bind(captured_at.saturating_sub(1))
+    .bind("ha_backfill")
+    .execute(&pool)
+    .await
+    .expect("insert out-of-order quota backfill");
+
+    let served_while_recovering = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("serve immutable last-good during quota recovery");
+    assert_eq!(
+        served_while_recovering.freshness.dashboard_quota_charge_token,
+        first.freshness.dashboard_quota_charge_token,
+        "HTTP/SSE callers must not receive a partial quota patch while recovery runs",
+    );
+
+    let recovered = wait_for_dashboard_overview_refresh(&state).await;
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        0,
+        "quota recovery must not rebuild unrelated Dashboard payload sections",
+    );
+    assert_ne!(
+        recovered.freshness.dashboard_quota_charge_token,
+        first.freshness.dashboard_quota_charge_token,
+        "the recovered snapshot should record the new source revision",
+    );
+    assert_eq!(
+        recovered
+            .payload
+            .summary_windows
+            .month
+            .quota_charge
+            .upstream_actual_credits,
+        300,
+        "the background recovery must recompute the out-of-order quota delta before publishing",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn dashboard_quota_baseline_backfill_recovers_from_source_revision() {
+    let db_path = temp_db_path("dashboard-overview-quota-baseline-backfill");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-dashboard-overview-quota-baseline-backfill".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let state = Arc::new(AppState {
+        proxy: proxy.clone(),
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: false,
+        usage_base: "http://127.0.0.1:58088".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let summary_windows = proxy.summary_windows().await.expect("summary windows");
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key")
+        .id;
+    let quota_sample_window_start = summary_windows
+        .yesterday_start
+        .min(start_of_month_dt(Utc::now()).timestamp());
+    let window_sample_at = quota_sample_window_start + 120;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id,
+            quota_limit,
+            quota_remaining,
+            captured_at,
+            source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(2_000_i64)
+    .bind(1_000_i64)
+    .bind(window_sample_at)
+    .bind("window_sample")
+    .execute(&pool)
+    .await
+    .expect("insert window sample");
+
+    let first = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("first overview snapshot");
+    let first_upstream_actual = first
+        .payload
+        .summary_windows
+        .month
+        .quota_charge
+        .upstream_actual_credits;
+    let first_latest_sync = first
+        .payload
+        .summary_windows
+        .month
+        .quota_charge
+        .latest_sync_at;
+    let first_quota_signature = first.freshness.dashboard_quota_charge_token;
+
+    reset_dashboard_overview_build_count(&state).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_quota_sync_samples (
+            key_id,
+            quota_limit,
+            quota_remaining,
+            captured_at,
+            source
+        ) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(2_000_i64)
+    .bind(1_400_i64)
+    .bind(quota_sample_window_start - 60)
+    .bind("baseline_backfill")
+    .execute(&pool)
+    .await
+    .expect("insert baseline backfill sample");
+
+    let served_while_recovering = load_dashboard_overview_snapshot(&state)
+        .await
+        .expect("serve immutable last-good dashboard");
+
+    assert_eq!(
+        served_while_recovering.freshness.dashboard_quota_charge_token,
+        first_quota_signature,
+        "source revisions must defer replacement until the quota recovery completes",
+    );
+    let recovered = wait_for_dashboard_overview_refresh(&state).await;
+
+    assert_eq!(
+        dashboard_overview_build_count(&state).await,
+        0,
+        "quota source-revision recovery must not build the complete overview payload",
+    );
+    assert_ne!(
+        recovered.freshness.dashboard_quota_charge_token,
+        first_quota_signature,
+        "the recovered quota patch should record the new source revision",
+    );
+    assert_eq!(
+        recovered
+            .payload
+            .summary_windows
+            .month
+            .quota_charge
+            .latest_sync_at,
+        first_latest_sync,
+        "an earlier baseline must not regress the displayed latest quota sync timestamp",
+    );
+    assert_eq!(
+        recovered
+            .payload
+            .summary_windows
+            .month
+            .quota_charge
+            .upstream_actual_credits,
+        first_upstream_actual + 400,
+        "recovery should fold the revised baseline into the immutable quota-only patch",
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn admin_dashboard_sse_snapshot_refreshes_when_quota_totals_change() {
+    let db_path = temp_db_path("admin-dashboard-snapshot-quota-change");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-admin-dashboard-quota".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("list api key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key exists")
+        .id;
+
+    let admin_password = "admin-dashboard-quota-password";
+    let admin_addr = spawn_builtin_keys_admin_server(proxy.clone(), admin_password).await;
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build client");
+
+    let login_resp = client
+        .post(format!("http://{}/api/admin/login", admin_addr))
+        .json(&serde_json::json!({ "password": admin_password }))
+        .send()
+        .await
+        .expect("admin login");
+    assert_eq!(login_resp.status(), reqwest::StatusCode::OK);
+    let admin_cookie = find_cookie_pair(login_resp.headers(), BUILTIN_ADMIN_COOKIE_NAME)
+        .expect("admin session cookie");
+
+    let mut events_resp = client
+        .get(format!("http://{}/api/events", admin_addr))
+        .header(reqwest::header::COOKIE, admin_cookie)
+        .send()
+        .await
+        .expect("admin events request");
+    assert_eq!(events_resp.status(), reqwest::StatusCode::OK);
+
+    let initial_snapshot = read_sse_event_until(
+        &mut events_resp,
+        |chunk| chunk.contains("event: snapshot"),
+        "initial admin snapshot event",
+    )
+    .await;
+    let initial_data = initial_snapshot
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("initial snapshot data");
+    let initial_json: serde_json::Value =
+        serde_json::from_str(initial_data).expect("initial snapshot payload json");
+    assert_eq!(
+        initial_json
+            .pointer("/siteStatus/remainingQuota")
+            .and_then(|value| value.as_i64()),
+        Some(0)
+    );
+    assert!(
+        initial_json
+            .pointer("/hourlyRequestWindow/buckets/0/localEstimatedCredits")
+            .is_some(),
+        "admin SSE snapshots should expose local estimated credits",
+    );
+    assert!(
+        initial_json
+            .pointer("/hourlyRequestWindow/buckets/0/upstreamActualCredits")
+            .is_some(),
+        "admin SSE snapshots should expose nullable upstream actual credits",
+    );
+
+    let options = SqliteConnectOptions::new()
+        .filename(&db_str)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open db pool");
+
+    sqlx::query(
+        "UPDATE api_keys SET quota_limit = ?, quota_remaining = ?, quota_synced_at = ? WHERE id = ?",
+    )
+    .bind(2_000_i64)
+    .bind(1_234_i64)
+    .bind(Utc::now().timestamp())
+    .bind(&key_id)
+    .execute(&pool)
+    .await
+    .expect("update quota totals");
+    proxy.mark_dashboard_read_dirty_for_test().await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    let mut buffer = String::new();
+    let mut refreshed_snapshot: Option<serde_json::Value> = None;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let chunk = tokio::time::timeout(remaining, events_resp.chunk())
+            .await
+            .expect("await refreshed event chunk in time")
+            .expect("read refreshed event chunk")
+            .expect("refreshed event chunk exists");
+        buffer.push_str(std::str::from_utf8(&chunk).expect("refreshed event chunk utf8"));
+        while let Some((event_chunk, rest)) = buffer.split_once("\n\n") {
+            let event_chunk = event_chunk.to_string();
+            buffer = rest.to_string();
+            if !event_chunk.contains("event: snapshot") {
+                continue;
+            }
+            let Some(data) = event_chunk
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+            else {
+                continue;
+            };
+            let payload: serde_json::Value =
+                serde_json::from_str(data).expect("refreshed snapshot payload json");
+            if payload
+                .pointer("/siteStatus/remainingQuota")
+                .and_then(|value| value.as_i64())
+                == Some(1_234)
+            {
+                refreshed_snapshot = Some(payload);
+                break;
+            }
+        }
+        if refreshed_snapshot.is_some() {
+            break;
+        }
+    }
+
+    let refreshed_snapshot = refreshed_snapshot.expect("quota snapshot refresh");
+    assert_eq!(
+        refreshed_snapshot
+            .pointer("/siteStatus/remainingQuota")
+            .and_then(|value| value.as_i64()),
+        Some(1_234)
+    );
+    assert_eq!(
+        refreshed_snapshot
+            .pointer("/siteStatus/totalQuotaLimit")
+            .and_then(|value| value.as_i64()),
+        Some(2_000)
+    );
+
+    drop(events_resp);
+    let _ = std::fs::remove_file(db_path);
+}

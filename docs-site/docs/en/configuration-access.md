@@ -31,6 +31,7 @@ No matter which access model you choose, these settings are the main runtime con
 | `--bind` / `PROXY_BIND`           | yes             | listen address                  |
 | `--port` / `PROXY_PORT`           | yes             | listen port                     |
 | `--db-path` / `PROXY_DB_PATH`     | yes             | SQLite database path            |
+| `LOW_QUOTA_DEPLETION_THRESHOLD`   | optional        | low-balance 432 key threshold   |
 | `--static-dir` / `WEB_STATIC_DIR` | depends         | frontend static asset directory |
 | `--keys` / `TAVILY_API_KEYS`      | optional        | one-time key bootstrap helper   |
 
@@ -39,6 +40,13 @@ Notes:
 - `TAVILY_UPSTREAM` has a default and usually does not need to be overridden in local development,
   but you should override it when using a mock, sandbox, or custom upstream.
 - `TAVILY_USAGE_BASE` defaults to `https://api.tavily.com` and affects usage / quota sync flows.
+- `TAVILY_UPSTREAM` is treated as the full MCP endpoint. If your reverse proxy preserves a path
+  prefix, include the final `/mcp` path in the configured URL.
+- `TAVILY_USAGE_BASE` may also include a path prefix. Hikari appends `/search`, `/extract`,
+  `/crawl`, `/map`, `/research`, `/research/{id}`, and `/usage` under that prefix.
+- `LOW_QUOTA_DEPLETION_THRESHOLD` defaults to `15`. When an upstream key returns 432 and its
+  latest known remaining credits are at or below this value, Hikari keeps it out of normal key
+  pools for the current UTC month while still allowing it as a final fallback.
 - `WEB_STATIC_DIR` is optional. If omitted, the app will try to use `web/dist` when that directory
   exists.
 - `TAVILY_API_KEYS` is convenient for bootstrapping, but long-term key lifecycle should be managed
@@ -133,6 +141,32 @@ Generate a hash like this:
 echo -n 'change-me' | cargo run --quiet --bin admin_password_hash
 ```
 
+### Node-local Passkeys in HA
+
+Passkey credentials, reset tokens, WebAuthn challenges, and passkey sessions are local to one node.
+Give every node a stable identity and HTTPS origin:
+
+```bash
+export ADMIN_AUTH_PASSKEY_ENABLED=true
+export NODE_ID=tavily-node-a
+export NODE_PUBLIC_SCHEME=https
+export NODE_PUBLIC_HOST=tavily-node-a.example.com
+```
+
+`ADMIN_PASSKEY_RP_ID` and `ADMIN_PASSKEY_RP_ORIGIN` override the derived values. Without overrides,
+Hikari derives RP settings from `NODE_PUBLIC_*` and falls back to `EDGEONE_DOMAIN` only when the node
+public host is missing. On the target node, generate the bootstrap URL with the same origin:
+
+```bash
+tavily-hikari admin passkey reset-url --base-url https://tavily-node-a.example.com
+```
+
+The command rejects a base URL whose origin differs from the effective RP origin. A credential from a
+different node or RP scope is temporarily disabled, not deleted; restoring the exact prior node/RP
+configuration makes it usable again. Upgrade the current `full_master` first, then roll the release
+to standby and recovery nodes, and run this local enrollment flow once per node. Legacy global
+Passkey records require re-enrollment on each node.
+
 ### `DEV_OPEN_ADMIN`
 
 This is the development shortcut:
@@ -184,6 +218,51 @@ Session tuning is also available:
 
 If Linux DO OAuth stays disabled, admins can still issue tokens manually for downstream clients.
 
+## Linux.do Credit recharge payments
+
+Linux.do Credit recharge lets signed-in Linux DO users buy additional monthly quota from the user
+console. It depends on Linux DO OAuth because every recharge order is attached to a logged-in local
+user account.
+
+Minimum payment config:
+
+```bash
+export LINUXDO_CREDIT_ENABLED=true
+export LINUXDO_CREDIT_CLIENT_ID='<linuxdo-credit-client-id>'
+export LINUXDO_CREDIT_CLIENT_SECRET='<linuxdo-credit-client-secret>'
+export LINUXDO_CREDIT_MERCHANT_PRIVATE_KEY='<ed25519-private-key>'
+export LINUXDO_CREDIT_NOTIFY_URL='https://<your-host>/api/linuxdo-credit/notify'
+export LINUXDO_CREDIT_RETURN_URL='https://<your-host>/console/dashboard'
+```
+
+Required values:
+
+- `LINUXDO_CREDIT_ENABLED`
+- `LINUXDO_CREDIT_CLIENT_ID`
+- `LINUXDO_CREDIT_CLIENT_SECRET`
+- `LINUXDO_CREDIT_MERCHANT_PRIVATE_KEY`
+
+The merchant private key signs official LDC order creation requests. The backend accepts Ed25519
+private material as base64/base64url/hex seed or PKCS#8 DER/PEM.
+
+Callback and browser URLs:
+
+- `LINUXDO_CREDIT_NOTIFY_URL` should normally point to
+  `https://<your-host>/api/linuxdo-credit/notify` and must be reachable by Linux.do Credit.
+- `LINUXDO_CREDIT_RETURN_URL` should normally point back to the user console, such as
+  `https://<your-host>/console/dashboard`.
+- `LINUXDO_CREDIT_SUBMIT_URL` defaults to the official Linux.do Credit LDC submit endpoint and
+  usually does not need to be changed.
+
+After the process starts with valid payment credentials, open admin system settings and turn on
+**Enable recharge**. Keep **Allow non-admin recharge** off while testing the payment flow with an
+admin session; turn it on only when regular users should see the recharge card and create orders.
+When **Enable recharge** is off, the user console hides recharge and the backend rejects new order
+creation while still accepting already-paid callbacks.
+
+For sandbox checks, `LINUXDO_CREDIT_TEST_PRICE_ENABLED=true` exposes a test offer where `1 LDC` buys
+`1` monthly credit. Keep it disabled for normal paid operation.
+
 ## Which token should clients use
 
 This distinction matters:
@@ -234,6 +313,8 @@ If you only want the shortest correct answer:
 - gateway integration:
   `ADMIN_AUTH_FORWARD_ENABLED=true` + `FORWARD_AUTH_HEADER` + `FORWARD_AUTH_ADMIN_VALUE`
 - end-user web login: additionally enable `LINUXDO_OAUTH_ENABLED=true`
+- user recharge payments: additionally enable `LINUXDO_CREDIT_ENABLED=true` and configure the
+  Linux.do Credit credentials + notify URL
 - downstream client access: always use `th-<id>-<secret>`, never raw Tavily API keys
 
 ## Related reading

@@ -16,7 +16,7 @@ describe('UserConsole Storybook acceptance controls', () => {
 
     expect(meta.argTypes?.consoleView).toMatchObject({
       name: 'Console view',
-      options: ['Console Home', 'Token Detail'],
+      options: ['Console Home', 'Setup Guide', 'Token Detail'],
       control: { type: 'inline-radio' },
     })
 
@@ -36,7 +36,7 @@ describe('UserConsole Storybook acceptance controls', () => {
       name: 'Token list state',
       options: ['Single Token', 'Multiple Tokens', 'Empty'],
       control: { type: 'inline-radio' },
-      if: { arg: 'consoleView', eq: 'Console Home' },
+      if: { arg: 'consoleView', neq: 'Token Detail' },
     })
 
     expect(meta.argTypes?.tokenDetailPreview).toMatchObject({
@@ -46,7 +46,7 @@ describe('UserConsole Storybook acceptance controls', () => {
       if: { arg: 'consoleView', eq: 'Token Detail' },
     })
 
-    expect(meta.argTypes?.routeHashOverride).toMatchObject({
+    expect(meta.argTypes?.routePathOverride).toMatchObject({
       table: { disable: true },
       control: false,
     })
@@ -60,11 +60,19 @@ describe('UserConsole Storybook acceptance controls', () => {
     })
     expect(userConsoleStories.ConsoleHomeRoot).toMatchObject({
       name: 'Console Home Root',
-      args: { consoleView: 'Console Home', isAdmin: false, landingFocus: 'Overview Focus', routeHashOverride: '' },
+      args: { consoleView: 'Console Home', isAdmin: false, landingFocus: 'Overview Focus', routePathOverride: '/console' },
     })
     expect(userConsoleStories.ConsoleHomeAdmin).toMatchObject({
       name: 'Console Home Admin',
       args: { consoleView: 'Console Home', isAdmin: true, landingFocus: 'Overview Focus' },
+    })
+    expect(userConsoleStories.ConsoleHomeRechargeDisabled).toMatchObject({
+      name: 'Console Home Recharge Disabled',
+      args: { consoleView: 'Console Home', isAdmin: false, landingFocus: 'Overview Focus', rechargePreview: 'disabled' },
+    })
+    expect(userConsoleStories.ConsoleHomeRechargeHidden).toMatchObject({
+      name: 'Console Home Recharge Hidden',
+      args: { consoleView: 'Console Home', isAdmin: false, landingFocus: 'Overview Focus', rechargePreview: 'hidden' },
     })
     expect(userConsoleStories.ConsoleHomeAdminMobile).toMatchObject({
       name: 'Console Home Admin Mobile',
@@ -86,28 +94,70 @@ describe('UserConsole Storybook acceptance controls', () => {
       name: 'Console Home Empty Tokens',
       args: { consoleView: 'Console Home', landingFocus: 'Token Focus', tokenListState: 'Empty' },
     })
-    expect(userConsoleStories.ConsoleHomeGuideTokenRevealed).toMatchObject({
-      name: 'Console Home Guide Token Revealed',
-      args: { consoleView: 'Console Home', isAdmin: false, landingFocus: 'Token Focus', tokenListState: 'Single Token' },
+    expect(userConsoleStories.SetupGuide).toMatchObject({
+      name: 'Setup Guide',
+      args: { consoleView: 'Setup Guide', tokenListState: 'Multiple Tokens' },
+    })
+    expect(userConsoleStories.SetupGuideCliSkills).toMatchObject({
+      name: 'Setup Guide CLI + Skills',
+      args: { consoleView: 'Setup Guide', tokenListState: 'Multiple Tokens', routePathOverride: '/console/setup?token=a1b2&guide=hikariCli' },
+    })
+    expect(userConsoleStories.SetupGuideMobile).toMatchObject({
+      name: 'Setup Guide Mobile',
+      args: { consoleView: 'Setup Guide', tokenListState: 'Multiple Tokens' },
+    })
+    expect(userConsoleStories.SetupGuideCliSkillsMobile).toMatchObject({
+      name: 'Setup Guide CLI + Skills Mobile',
+      args: { consoleView: 'Setup Guide', tokenListState: 'Multiple Tokens', routePathOverride: '/console/setup?token=a1b2&guide=hikariCli' },
+    })
+    expect(userConsoleStories.SetupGuideEmpty).toMatchObject({
+      name: 'Setup Guide Empty',
+      args: { consoleView: 'Setup Guide', tokenListState: 'Empty' },
     })
     expect(userConsoleStories.TokenDetailOverview).toMatchObject({
       name: 'Token Detail Overview',
       args: { consoleView: 'Token Detail', isAdmin: false, landingFocus: 'Overview Focus', tokenDetailPreview: 'Overview' },
     })
+    expect(userConsoleStories.TokenDetailSetupAction).toMatchObject({
+      name: 'Token Detail Setup Action',
+      args: { consoleView: 'Token Detail', isAdmin: false, tokenDetailPreview: 'Overview' },
+    })
+    expect(userConsoleStories.TokenDetailSetupNavigation).toMatchObject({
+      name: 'Token Detail Setup Navigation',
+      args: { consoleView: 'Token Detail', isAdmin: false, tokenDetailPreview: 'Overview' },
+    })
+    expect(userConsoleStories.TokenDetailMobileCredits).toMatchObject({
+      name: 'Token Detail Mobile Logs Entry',
+      args: { consoleView: 'Token Detail', isAdmin: false, landingFocus: 'Overview Focus', tokenDetailPreview: 'Overview' },
+    })
+    expect(userConsoleStories.TokenLogsMobile).toMatchObject({
+      name: 'Token Logs Mobile',
+      args: {
+        consoleView: 'Token Detail',
+        isAdmin: false,
+        landingFocus: 'Overview Focus',
+        tokenDetailPreview: 'Overview',
+        routePathOverride: '/console/tokens/a1b2/logs',
+      },
+    })
+    expect(userConsoleStories.TokenDetailPushWarning).toMatchObject({
+      name: 'Token Detail Push Warning',
+      args: {
+        consoleView: 'Token Detail',
+        isAdmin: false,
+        landingFocus: 'Overview Focus',
+        tokenDetailPreview: 'Overview',
+        pushStatusPreview: 'Reconnecting',
+        pushStatusBubbleOpen: true,
+      },
+    })
     expect(userConsoleStories.TokenRevealed).toMatchObject({
       name: 'Token Revealed',
       args: { consoleView: 'Token Detail', isAdmin: false, tokenDetailPreview: 'Token Revealed' },
     })
-    expect(userConsoleStories.TokenDetailGuideTokenRevealed).toMatchObject({
-      name: 'Token Detail Guide Token Revealed',
-      args: { consoleView: 'Token Detail', isAdmin: false, tokenDetailPreview: 'Overview' },
-    })
     expect(userConsoleStories.TokenDetailAdmin).toMatchObject({
       name: 'Token Detail Admin',
       args: { consoleView: 'Token Detail', isAdmin: true, landingFocus: 'Overview Focus', tokenDetailPreview: 'Overview' },
-    })
-    expect(userConsoleStories.MobileGuideMenuProof).toMatchObject({
-      name: 'Mobile Guide Menu Proof',
     })
 
     expect(userConsoleStories).not.toHaveProperty('Dashboard')
@@ -123,13 +173,13 @@ describe('UserConsole Storybook acceptance controls', () => {
     expect(userConsoleStories).not.toHaveProperty('QuotaBlocked')
   })
 
-  it('covers the no-hash console root as the merged landing default', () => {
+  it('covers the root console path as the merged landing default', () => {
     const rootArgs = {
       ...meta.args,
       ...userConsoleStories.ConsoleHomeRoot.args,
     }
 
-    expect(userConsoleStories.__testables.resolveStoryState(rootArgs).routeHash).toBe('')
-    expect(userConsoleStories.__testables.resolveStoryState(meta.args as typeof rootArgs).routeHash).toBe('#/dashboard')
+    expect(userConsoleStories.__testables.resolveStoryState(rootArgs).routePath).toBe('/console')
+    expect(userConsoleStories.__testables.resolveStoryState(meta.args as typeof rootArgs).routePath).toBe('/console/dashboard')
   })
 })

@@ -1,20 +1,57 @@
-import type { AdminUnboundTokenUsageSortField, AdminUsersSortField, SortDirection } from '../api'
+import type {
+  AdminTokenEnabledFilter,
+  AdminTokenOwnerFilter,
+  AdminTokenQuotaStateFilter,
+  AdminUnboundTokenUsageSortField,
+  AdminUsersSortField,
+  SortDirection,
+} from '../api'
 
 export type AdminUsersCollectionView = 'users' | 'usage'
 export type AdminTokensCollectionView = 'tokens' | 'unbound-usage'
+export type AlertsCenterView = 'events' | 'groups'
+export type AdminSystemSettingsView = 'general' | 'status' | 'admin' | 'ha'
+export type AdminAnalysisView = 'rankings' | 'usage' | 'pressure'
+export type AdminMcpSessionBindingsStatusView = 'active' | 'revoked' | 'all'
+export type RankingTabKey = 'last24h' | 'last7d' | 'last30d' | 'primarySuccess' | 'businessCredits' | 'uniqueIp'
+export type UserDetailTabKey = 'account' | 'quota' | 'activity'
+
+export interface AdminTokensListContext {
+  query?: string | null
+  group?: string | null
+  noGroup?: boolean | null
+  owner?: AdminTokenOwnerFilter | null
+  enabled?: AdminTokenEnabledFilter | null
+  quotaState?: AdminTokenQuotaStateFilter | null
+  page?: number | null
+  perPage?: number | null
+  resetSelection?: boolean | null
+}
 
 export type AdminModuleId =
   | 'dashboard'
+  | 'analysis'
+  | 'rankings'
   | 'tokens'
   | 'keys'
   | 'requests'
   | 'jobs'
   | 'users'
+  | 'announcements'
+  | 'recharges'
   | 'alerts'
+  | 'system-settings'
   | 'proxy-settings'
 
 export type AdminPathRoute =
-  | { name: 'module'; module: AdminModuleId }
+  | {
+      name: 'module'
+      module: AdminModuleId
+      systemSettingsView?: AdminSystemSettingsView
+      analysisView?: AdminAnalysisView
+    }
+  | { name: 'ha-node'; nodeId: string }
+  | { name: 'not-found'; path: string }
   | { name: 'token'; id: string }
   | { name: 'unbound-token-usage' }
   | { name: 'user-usage' }
@@ -22,10 +59,46 @@ export type AdminPathRoute =
   | { name: 'user-tags' }
   | { name: 'user-tag-editor'; mode: 'create' }
   | { name: 'user-tag-editor'; mode: 'edit'; id: string }
+  | { name: 'announcement-editor'; mode: 'create' }
+  | { name: 'announcement-editor'; mode: 'edit'; id: string }
+  | { name: 'mcp-session-bindings' }
   | { name: 'key'; id: string }
 
 const ADMIN_BASE = '/admin'
 const DEFAULT_KEYS_PER_PAGE = 20
+const DEFAULT_TOKENS_PER_PAGE = 20
+const DEFAULT_RANKINGS_TAB: RankingTabKey = 'last24h'
+const DEFAULT_USER_DETAIL_TAB: UserDetailTabKey = 'account'
+const TOKEN_PER_PAGE_OPTIONS = [20, 50, 100, 200] as const
+const ADMIN_USERS_OVERVIEW_SORT_FIELDS = new Set<AdminUsersSortField>([
+  'dailyCreditsUsed',
+  'monthlyCreditsUsed',
+  'recentIpCount7d',
+  'lastActivity',
+  'lastLoginAt',
+])
+const RANKING_TABS = new Set<RankingTabKey>([
+  'last24h',
+  'last7d',
+  'last30d',
+  'primarySuccess',
+  'businessCredits',
+  'uniqueIp',
+])
+const USER_DETAIL_TABS = new Set<UserDetailTabKey>([
+  'account',
+  'quota',
+  'activity',
+])
+const LEGACY_USER_DETAIL_TAB_ALIASES = new Set(['identity', 'tags', 'tokens'])
+
+function normalizeTokenPerPage(value?: number | null): number {
+  if (!Number.isFinite(value)) return DEFAULT_TOKENS_PER_PAGE
+  const parsed = Math.trunc(value as number)
+  return TOKEN_PER_PAGE_OPTIONS.includes(parsed as (typeof TOKEN_PER_PAGE_OPTIONS)[number])
+    ? parsed
+    : DEFAULT_TOKENS_PER_PAGE
+}
 
 function normalize(pathname: string): string {
   if (!pathname) return ADMIN_BASE
@@ -47,6 +120,21 @@ export function parseAdminPath(pathname: string): AdminPathRoute {
 
   if (path === ADMIN_BASE || path === `${ADMIN_BASE}/dashboard`) {
     return { name: 'module', module: 'dashboard' }
+  }
+  if (path === `${ADMIN_BASE}/analysis`) {
+    return { name: 'module', module: 'analysis', analysisView: 'rankings' }
+  }
+  if (path === `${ADMIN_BASE}/analysis/usage`) {
+    return { name: 'module', module: 'analysis', analysisView: 'usage' }
+  }
+  if (path === `${ADMIN_BASE}/analysis/rankings`) {
+    return { name: 'module', module: 'analysis', analysisView: 'rankings' }
+  }
+  if (path === `${ADMIN_BASE}/analysis/pressure`) {
+    return { name: 'module', module: 'analysis', analysisView: 'pressure' }
+  }
+  if (path === `${ADMIN_BASE}/rankings`) {
+    return { name: 'module', module: 'analysis', analysisView: 'rankings' }
   }
   if (path === `${ADMIN_BASE}/tokens`) {
     return { name: 'module', module: 'tokens' }
@@ -76,8 +164,11 @@ export function parseAdminPath(pathname: string): AdminPathRoute {
   if (path === `${ADMIN_BASE}/users`) {
     return { name: 'module', module: 'users' }
   }
+  if (path === `${ADMIN_BASE}/recharges`) {
+    return { name: 'module', module: 'recharges' }
+  }
   if (path === `${ADMIN_BASE}/users/usage`) {
-    return { name: 'user-usage' }
+    return { name: 'module', module: 'analysis', analysisView: 'usage' }
   }
   if (path === `${ADMIN_BASE}/users/tags`) {
     return { name: 'user-tags' }
@@ -98,17 +189,62 @@ export function parseAdminPath(pathname: string): AdminPathRoute {
   if (path === `${ADMIN_BASE}/alerts`) {
     return { name: 'module', module: 'alerts' }
   }
+  if (path === `${ADMIN_BASE}/announcements`) {
+    return { name: 'module', module: 'announcements' }
+  }
+  if (path === `${ADMIN_BASE}/announcements/new`) {
+    return { name: 'announcement-editor', mode: 'create' }
+  }
+  if (path.startsWith(`${ADMIN_BASE}/announcements/`) && path.endsWith('/edit')) {
+    const id = decodeSegment(path.slice(`${ADMIN_BASE}/announcements/`.length, -'/edit'.length))
+    if (id) return { name: 'announcement-editor', mode: 'edit', id }
+    return { name: 'module', module: 'announcements' }
+  }
+  if (path === `${ADMIN_BASE}/system-settings` || path === `${ADMIN_BASE}/settings`) {
+    return { name: 'module', module: 'system-settings', systemSettingsView: 'general' }
+  }
+  if (path === `${ADMIN_BASE}/system-settings/admin`) {
+    return { name: 'module', module: 'system-settings', systemSettingsView: 'admin' }
+  }
+  if (path === `${ADMIN_BASE}/system-settings/status` || path === `${ADMIN_BASE}/system-settings/privacy-status`) {
+    return { name: 'module', module: 'system-settings', systemSettingsView: 'status' }
+  }
+  if (path === `${ADMIN_BASE}/system-settings/mcp-session-bindings`) {
+    return { name: 'mcp-session-bindings' }
+  }
+  if (path === `${ADMIN_BASE}/system-settings/ha`) {
+    return { name: 'module', module: 'system-settings', systemSettingsView: 'ha' }
+  }
+  if (path.startsWith(`${ADMIN_BASE}/system-settings/ha/nodes/`)) {
+    const id = decodeSegment(path.slice(`${ADMIN_BASE}/system-settings/ha/nodes/`.length))
+    if (id) return { name: 'ha-node', nodeId: id }
+    return { name: 'module', module: 'system-settings', systemSettingsView: 'ha' }
+  }
   if (path === `${ADMIN_BASE}/proxy-settings`) {
     return { name: 'module', module: 'proxy-settings' }
   }
 
-  return { name: 'module', module: 'dashboard' }
+  return { name: 'not-found', path }
 }
 
 export function isSameAdminRoute(left: AdminPathRoute, right: AdminPathRoute): boolean {
   if (left.name !== right.name) return false
   if (left.name === 'module' && right.name === 'module') {
+    if (left.module === 'system-settings' || right.module === 'system-settings') {
+      return left.module === right.module
+        && (left.systemSettingsView ?? 'general') === (right.systemSettingsView ?? 'general')
+    }
+    if (left.module === 'analysis' || right.module === 'analysis') {
+      return left.module === right.module
+        && (left.analysisView ?? 'rankings') === (right.analysisView ?? 'rankings')
+    }
     return left.module === right.module
+  }
+  if (left.name === 'ha-node' && right.name === 'ha-node') {
+    return left.nodeId === right.nodeId
+  }
+  if (left.name === 'not-found' && right.name === 'not-found') {
+    return left.path === right.path
   }
   if (left.name === 'token' && right.name === 'token') {
     return left.id === right.id
@@ -124,6 +260,14 @@ export function isSameAdminRoute(left: AdminPathRoute, right: AdminPathRoute): b
     if (left.mode === 'edit' && right.mode === 'edit') return left.id === right.id
     return false
   }
+  if (left.name === 'announcement-editor' && right.name === 'announcement-editor') {
+    if (left.mode === 'create' && right.mode === 'create') return true
+    if (left.mode === 'edit' && right.mode === 'edit') return left.id === right.id
+    return false
+  }
+  if (left.name === 'mcp-session-bindings' && right.name === 'mcp-session-bindings') {
+    return true
+  }
   if (left.name === 'key' && right.name === 'key') {
     return left.id === right.id
   }
@@ -134,8 +278,214 @@ export function isSameAdminRoute(left: AdminPathRoute, right: AdminPathRoute): b
 }
 
 export function modulePath(module: AdminModuleId): string {
+  if (module === 'analysis') return `${ADMIN_BASE}/analysis/rankings`
   if (module === 'dashboard') return `${ADMIN_BASE}/dashboard`
   return `${ADMIN_BASE}/${module}`
+}
+
+export function analysisPath(view: AdminAnalysisView = 'rankings'): string {
+  return `${ADMIN_BASE}/analysis/${view}`
+}
+
+export function getRankingsTabFromSearch(search: string): RankingTabKey {
+  const rawValue = new URLSearchParams(search).get('tab')?.trim()
+  return rawValue && RANKING_TABS.has(rawValue as RankingTabKey)
+    ? rawValue as RankingTabKey
+    : DEFAULT_RANKINGS_TAB
+}
+
+export function rankingsPath(tab?: RankingTabKey | null): string {
+  const normalizedTab = tab && RANKING_TABS.has(tab) ? tab : DEFAULT_RANKINGS_TAB
+  return `${ADMIN_BASE}/rankings?tab=${encodeURIComponent(normalizedTab)}`
+}
+
+export function getUserDetailTabFromSearch(search: string): UserDetailTabKey {
+  const rawValue = new URLSearchParams(search).get('tab')?.trim()
+  if (rawValue && LEGACY_USER_DETAIL_TAB_ALIASES.has(rawValue)) {
+    return 'account'
+  }
+  return rawValue && USER_DETAIL_TABS.has(rawValue as UserDetailTabKey)
+    ? rawValue as UserDetailTabKey
+    : DEFAULT_USER_DETAIL_TAB
+}
+
+function appendUserDetailTab(path: string, tab?: UserDetailTabKey | null): string {
+  const normalizedTab = tab && USER_DETAIL_TABS.has(tab) ? tab : DEFAULT_USER_DETAIL_TAB
+  if (normalizedTab === DEFAULT_USER_DETAIL_TAB) return path
+  const separator = path.includes('?') ? '&' : '?'
+  return `${path}${separator}tab=${encodeURIComponent(normalizedTab)}`
+}
+
+export function systemSettingsHaPath(): string {
+  return `${ADMIN_BASE}/system-settings/ha`
+}
+
+export function systemSettingsAdminPath(): string {
+  return `${ADMIN_BASE}/system-settings/admin`
+}
+
+export function systemSettingsStatusPath(): string {
+  return `${ADMIN_BASE}/system-settings/status`
+}
+
+export interface AdminMcpSessionBindingsPathContext {
+  status?: AdminMcpSessionBindingsStatusView | null
+  createdFrom?: string | null
+  createdTo?: string | null
+  updatedFrom?: string | null
+  updatedTo?: string | null
+  page?: number | null
+}
+
+export function systemSettingsMcpSessionBindingsPath(
+  context?: AdminMcpSessionBindingsPathContext,
+): string {
+  const params = new URLSearchParams()
+  const status = context?.status ?? 'active'
+  if (status !== 'active') params.set('status', status)
+  if (context?.createdFrom?.trim()) params.set('createdFrom', context.createdFrom.trim())
+  if (context?.createdTo?.trim()) params.set('createdTo', context.createdTo.trim())
+  if (context?.updatedFrom?.trim()) params.set('updatedFrom', context.updatedFrom.trim())
+  if (context?.updatedTo?.trim()) params.set('updatedTo', context.updatedTo.trim())
+  const page = Number.isFinite(context?.page) ? Math.max(1, Math.trunc(context?.page as number)) : 1
+  if (page > 1) params.set('page', String(page))
+  const search = params.toString()
+  return search
+    ? `${ADMIN_BASE}/system-settings/mcp-session-bindings?${search}`
+    : `${ADMIN_BASE}/system-settings/mcp-session-bindings`
+}
+
+export function getMcpSessionBindingsStatusFromSearch(search: string): AdminMcpSessionBindingsStatusView {
+  const value = new URLSearchParams(search).get('status')?.trim()
+  return value === 'revoked' || value === 'all' ? value : 'active'
+}
+
+function getOptionalSearchValue(search: string, key: string): string | null {
+  const value = new URLSearchParams(search).get(key)?.trim() ?? ''
+  return value.length > 0 ? value : null
+}
+
+export function getMcpSessionBindingsCreatedFromSearch(search: string): string | null {
+  return getOptionalSearchValue(search, 'createdFrom')
+}
+
+export function getMcpSessionBindingsCreatedToSearch(search: string): string | null {
+  return getOptionalSearchValue(search, 'createdTo')
+}
+
+export function getMcpSessionBindingsUpdatedFromSearch(search: string): string | null {
+  return getOptionalSearchValue(search, 'updatedFrom')
+}
+
+export function getMcpSessionBindingsUpdatedToSearch(search: string): string | null {
+  return getOptionalSearchValue(search, 'updatedTo')
+}
+
+export function getMcpSessionBindingsPageFromSearch(search: string): number {
+  const rawPage = new URLSearchParams(search).get('page')?.trim() ?? ''
+  const parsedPage = Number.parseInt(rawPage, 10)
+  return Number.isFinite(parsedPage) && parsedPage > 1 ? parsedPage : 1
+}
+
+export function systemSettingsHaNodePath(nodeId: string): string {
+  return `${ADMIN_BASE}/system-settings/ha/nodes/${encodeURIComponent(nodeId)}`
+}
+
+export function announcementListPath(): string {
+  return `${ADMIN_BASE}/announcements`
+}
+
+export function announcementCreatePath(): string {
+  return `${ADMIN_BASE}/announcements/new`
+}
+
+export function announcementEditPath(id: string): string {
+  return `${ADMIN_BASE}/announcements/${encodeURIComponent(id)}/edit`
+}
+
+export interface AdminAlertsPathContext {
+  view?: AlertsCenterView | null
+  type?: string | null
+  since?: string | null
+  until?: string | null
+  userId?: string | null
+  tokenId?: string | null
+  keyId?: string | null
+  requestKinds?: string[] | null
+  page?: number | null
+}
+
+function normalizeAlertRequestKinds(values?: string[] | null): string[] {
+  const normalized = new Set<string>()
+  for (const value of values ?? []) {
+    const trimmed = value.trim()
+    if (!trimmed) continue
+    normalized.add(trimmed)
+  }
+  return Array.from(normalized)
+}
+
+export function alertsPath(context?: AdminAlertsPathContext): string {
+  const params = new URLSearchParams()
+  params.set('view', context?.view === 'events' ? 'events' : 'groups')
+  if (context?.type?.trim()) params.set('type', context.type.trim())
+  if (context?.since?.trim()) params.set('since', context.since.trim())
+  if (context?.until?.trim()) params.set('until', context.until.trim())
+  if (context?.userId?.trim()) params.set('userId', context.userId.trim())
+  if (context?.tokenId?.trim()) params.set('tokenId', context.tokenId.trim())
+  if (context?.keyId?.trim()) params.set('keyId', context.keyId.trim())
+  for (const requestKind of normalizeAlertRequestKinds(context?.requestKinds)) {
+    params.append('requestKinds', requestKind)
+  }
+  const normalizedPage = Number.isFinite(context?.page)
+    ? Math.max(1, Math.trunc(context?.page as number))
+    : 1
+  if (normalizedPage > 1) params.set('page', String(normalizedPage))
+  return `${ADMIN_BASE}/alerts?${params.toString()}`
+}
+
+export function getAlertsViewFromSearch(search: string): AlertsCenterView {
+  return new URLSearchParams(search).get('view') === 'events' ? 'events' : 'groups'
+}
+
+export function getAlertTypeFromSearch(search: string): string | null {
+  const value = new URLSearchParams(search).get('type')?.trim() ?? ''
+  return value.length > 0 ? value : null
+}
+
+export function getAlertSinceFromSearch(search: string): string | null {
+  const value = new URLSearchParams(search).get('since')?.trim() ?? ''
+  return value.length > 0 ? value : null
+}
+
+export function getAlertUntilFromSearch(search: string): string | null {
+  const value = new URLSearchParams(search).get('until')?.trim() ?? ''
+  return value.length > 0 ? value : null
+}
+
+export function getAlertUserIdFromSearch(search: string): string | null {
+  const value = new URLSearchParams(search).get('userId')?.trim() ?? ''
+  return value.length > 0 ? value : null
+}
+
+export function getAlertTokenIdFromSearch(search: string): string | null {
+  const value = new URLSearchParams(search).get('tokenId')?.trim() ?? ''
+  return value.length > 0 ? value : null
+}
+
+export function getAlertKeyIdFromSearch(search: string): string | null {
+  const value = new URLSearchParams(search).get('keyId')?.trim() ?? ''
+  return value.length > 0 ? value : null
+}
+
+export function getAlertRequestKindsFromSearch(search: string): string[] {
+  return normalizeAlertRequestKinds(new URLSearchParams(search).getAll('requestKinds'))
+}
+
+export function getAlertPageFromSearch(search: string): number {
+  const rawPage = new URLSearchParams(search).get('page')?.trim() ?? ''
+  const parsedPage = Number.parseInt(rawPage, 10)
+  return Number.isFinite(parsedPage) && parsedPage > 1 ? parsedPage : 1
 }
 
 function appendTokensContext(
@@ -145,21 +495,53 @@ function appendTokensContext(
   sort?: AdminUnboundTokenUsageSortField | null,
   order?: SortDirection | null,
   collection?: AdminTokensCollectionView | null,
+  listContext?: AdminTokensListContext | null,
 ): string {
   const params = new URLSearchParams()
   const normalizedQuery = query?.trim()
   const normalizedPage = Number.isFinite(page) ? Math.max(1, Math.trunc(page as number)) : 1
-  if (normalizedQuery) params.set('q', normalizedQuery)
-  if (normalizedPage > 1) params.set('page', String(normalizedPage))
-  if (sort) {
-    params.set('sort', sort)
-    params.set('order', order ?? 'desc')
-  }
   if (collection === 'unbound-usage') {
+    if (normalizedQuery) params.set('q', normalizedQuery)
+    if (normalizedPage > 1) params.set('page', String(normalizedPage))
+    if (sort) {
+      params.set('sort', sort)
+      params.set('order', order ?? 'desc')
+    }
     params.set('view', 'unbound-usage')
+  } else {
+    appendTokenListParams(params, listContext ?? { query, page })
   }
   const search = params.toString()
   return search ? `${path}?${search}` : path
+}
+
+function appendTokenListParams(params: URLSearchParams, context?: AdminTokensListContext | null): void {
+  const normalizedQuery = context?.query?.trim()
+  const normalizedGroup = context?.group?.trim()
+  const normalizedPage = Number.isFinite(context?.page) ? Math.max(1, Math.trunc(context?.page as number)) : 1
+  const normalizedPerPage = normalizeTokenPerPage(context?.perPage)
+  if (normalizedQuery) params.set('q', normalizedQuery)
+  if (context?.noGroup) {
+    params.set('no_group', 'true')
+  } else if (normalizedGroup) {
+    params.set('group', normalizedGroup)
+  }
+  if (context?.owner && context.owner !== 'all') params.set('owner', context.owner)
+  if (context?.enabled && context.enabled !== 'all') params.set('enabled', context.enabled)
+  if (context?.quotaState && context.quotaState !== 'all') params.set('quota_state', context.quotaState)
+  if (normalizedPage > 1) params.set('page', String(normalizedPage))
+  if (normalizedPerPage !== DEFAULT_TOKENS_PER_PAGE) params.set('perPage', String(normalizedPerPage))
+}
+
+function appendTokenListContext(path: string, context?: AdminTokensListContext | null): string {
+  const params = new URLSearchParams()
+  appendTokenListParams(params, context)
+  const search = params.toString()
+  return search ? `${path}?${search}` : path
+}
+
+export function buildAdminTokensPath(context?: AdminTokensListContext | null): string {
+  return appendTokenListContext(`${ADMIN_BASE}/tokens`, context)
 }
 
 export function tokenDetailPath(
@@ -169,6 +551,7 @@ export function tokenDetailPath(
   sort?: AdminUnboundTokenUsageSortField | null,
   order?: SortDirection | null,
   collection?: AdminTokensCollectionView | null,
+  listContext?: AdminTokensListContext | null,
 ): string {
   return appendTokensContext(
     `${ADMIN_BASE}/tokens/${encodeURIComponent(id)}`,
@@ -177,6 +560,7 @@ export function tokenDetailPath(
     sort,
     order,
     collection,
+    listContext,
   )
 }
 
@@ -236,6 +620,23 @@ export function buildAdminUsersPath(
   return appendUsersContext(`${ADMIN_BASE}/users`, query, tagId, page, sort, order)
 }
 
+export function isAdminUsersOverviewSortField(
+  value: AdminUsersSortField | null | undefined,
+): value is AdminUsersSortField {
+  return value != null && ADMIN_USERS_OVERVIEW_SORT_FIELDS.has(value)
+}
+
+export function buildAdminUsersOverviewPath(
+  query?: string,
+  tagId?: string | null,
+  page?: number | null,
+  sort?: AdminUsersSortField | null,
+  order?: SortDirection | null,
+): string {
+  const normalizedSort = isAdminUsersOverviewSortField(sort) ? sort : null
+  return buildAdminUsersPath(query, tagId, page, normalizedSort, normalizedSort ? order : null)
+}
+
 export function userUsagePath(
   query?: string,
   tagId?: string | null,
@@ -243,7 +644,7 @@ export function userUsagePath(
   sort?: AdminUsersSortField | null,
   order?: SortDirection | null,
 ): string {
-  return appendUsersContext(`${ADMIN_BASE}/users/usage`, query, tagId, page, sort, order)
+  return appendUsersContext(`${ADMIN_BASE}/analysis/usage`, query, tagId, page, sort, order)
 }
 
 export function userDetailPath(
@@ -254,8 +655,9 @@ export function userDetailPath(
   sort?: AdminUsersSortField | null,
   order?: SortDirection | null,
   collection?: AdminUsersCollectionView | null,
+  tab?: UserDetailTabKey | null,
 ): string {
-  return appendUsersContext(
+  return appendUserDetailTab(appendUsersContext(
     `${ADMIN_BASE}/users/${encodeURIComponent(id)}`,
     query,
     tagId,
@@ -263,7 +665,7 @@ export function userDetailPath(
     sort,
     order,
     collection,
-  )
+  ), tab)
 }
 
 export function userTagsPath(

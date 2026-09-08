@@ -59,7 +59,7 @@ export function operationalClassLabel(
     case 'system_error':
       return language === 'zh' ? '系统错误' : 'System Error'
     case 'quota_exhausted':
-      return language === 'zh' ? '额度耗尽' : 'Quota Exhausted'
+      return language === 'zh' ? '限额' : 'Quota Exhausted'
     default:
       return value?.trim() || (language === 'zh' ? '未知' : 'Unknown')
   }
@@ -116,8 +116,8 @@ export function failureKindGuidance(
         : 'The query exceeds the upstream length limit. Shorten the input before retrying.'
     case 'mcp_method_405':
       return language === 'zh'
-        ? '客户端使用了错误的 HTTP method，请按 MCP 端点要求改正请求方法。'
-        : 'The client used the wrong HTTP method for this MCP endpoint. Fix the request method.'
+        ? '这是 MCP transport 层返回的 405，请结合请求类型与上游响应判断是否属于控制面行为。'
+        : 'This is an MCP transport-level 405. Inspect the request kind and upstream response before treating it as a caller error.'
     case 'mcp_path_404':
       return language === 'zh'
         ? '客户端访问了不存在的 MCP 路径，请检查 endpoint 配置。'

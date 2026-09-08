@@ -3,12 +3,15 @@ import { Icon, getGuideClientIconName } from './lib/icons'
 import { StatusBadge, type StatusTone } from './components/StatusBadge'
 import CherryStudioMock from './components/CherryStudioMock'
 import {
+  buildPublicEventsUrl,
+  createBrowserTodayWindow,
   fetchPublicMetrics,
   fetchProfile,
   fetchSummary,
   fetchTokenMetrics,
   fetchUserToken,
   fetchPublicLogs,
+  millisecondsUntilNextBrowserDayBoundary,
   type Profile,
   type PublicMetrics,
   type Summary,
@@ -16,9 +19,12 @@ import {
   type PublicTokenLog,
 } from './api'
 import LanguageSwitcher from './components/LanguageSwitcher'
+import OfflineStatusBanner from './components/OfflineStatusBanner'
 import ThemeToggle from './components/ThemeToggle'
+import UpdateAvailableBanner from './components/UpdateAvailableBanner'
 import useUpdateAvailable from './hooks/useUpdateAvailable'
 import RollingNumber from './components/RollingNumber'
+import PublicHomeFooter from './components/PublicHomeFooter'
 import PublicHomeHeroCard from './components/PublicHomeHeroCard'
 import TokenSecretField from './components/TokenSecretField'
 import { Button } from './components/ui/button'
@@ -38,10 +44,11 @@ import {
 import { useLanguage, useTranslate, type Language } from './i18n'
 import { copyText, selectAllReadonlyText } from './lib/clipboard'
 import { useResponsiveModes } from './lib/responsive'
+import { useOfflineState } from './pwa/useOfflineState'
 
 type GuideLanguage = 'toml' | 'json' | 'bash'
 
-type GuideKey = 'codex' | 'claude' | 'vscode' | 'claudeDesktop' | 'cursor' | 'windsurf' | 'cherryStudio' | 'other'
+type GuideKey = 'codex' | 'hikariCli' | 'claude' | 'vscode' | 'claudeDesktop' | 'cursor' | 'windsurf' | 'cherryStudio' | 'other'
 
 interface GuideReference {
   label: string
@@ -81,6 +88,7 @@ const TOKEN_MONTHLY_LIMIT = 5000
 
 const GUIDE_KEY_ORDER: GuideKey[] = [
   'codex',
+  'hikariCli',
   'claude',
   'vscode',
   'claudeDesktop',
@@ -89,6 +97,7 @@ const GUIDE_KEY_ORDER: GuideKey[] = [
   'cherryStudio',
   'other',
 ]
+const PRIMARY_GUIDE_KEYS = new Set<GuideKey>(['codex', 'hikariCli', 'claude', 'vscode'])
 
 const numberFormatter = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
@@ -114,12 +123,17 @@ function PublicHome(): JSX.Element {
   const [publicLogsLoading, setPublicLogsLoading] = useState(false)
   const [invalidToken, setInvalidToken] = useState(false)
   const [summary, setSummary] = useState<Summary | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [metricsLoading, setMetricsLoading] = useState(true)
+  const [summaryLoading, setSummaryLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [profile, setProfile] = useState<Profile | null>(null)
+  const [profileLoading, setProfileLoading] = useState(true)
+  const [profileUnavailable, setProfileUnavailable] = useState(false)
   const [activeGuide, setActiveGuide] = useState<GuideKey>('codex')
   const [revealedGuideToken, setRevealedGuideToken] = useState<string | null>(null)
+  const [guideCopyState, setGuideCopyState] = useState<Record<string, 'idle' | 'copied' | 'error'>>({})
   const updateBanner = useUpdateAvailable()
+  const offline = useOfflineState()
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const pageRef = useRef<HTMLElement>(null)
   const accessTokenFieldRef = useRef<HTMLInputElement | null>(null)
@@ -127,22 +141,44 @@ function PublicHome(): JSX.Element {
   const { viewportMode, contentMode, isCompactLayout } = useResponsiveModes(pageRef)
   const [recentTokenUsage, setRecentTokenUsage] = useState<TokenMetrics | null>(null)
   const [userTokenHydrationDone, setUserTokenHydrationDone] = useState(false)
+  const [todayWindow, setTodayWindow] = useState(() => createBrowserTodayWindow())
 
   useEffect(() => {
-    const hash = window.location.hash.slice(1)
-    const decodedHash = hash ? decodeURIComponent(hash) : null
+    const timer = window.setTimeout(() => {
+      setTodayWindow(createBrowserTodayWindow())
+    }, millisecondsUntilNextBrowserDayBoundary())
+    return () => window.clearTimeout(timer)
+  }, [todayWindow.todayEnd])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setProfileLoading(true)
+    setProfileUnavailable(false)
+    fetchProfile(controller.signal)
+      .then((profileResult) => {
+        setProfile(profileResult)
+        setProfileUnavailable(false)
+      })
+      .catch((reason: Error & { name?: string }) => {
+        if (reason?.name !== 'AbortError') {
+          setProfile(null)
+          setProfileUnavailable(true)
+          setError((prev) => prev ?? publicStrings.errors.profile)
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setProfileLoading(false)
+        }
+      })
+    return () => controller.abort()
+  }, [publicStrings.errors.profile])
+
+  useEffect(() => {
     const tokenStore = loadTokenMap()
     const lastToken = loadLastToken()
 
-    let initialToken: string | null = null
-    if (decodedHash && isFullToken(decodedHash)) {
-      initialToken = decodedHash
-    } else if (decodedHash) {
-      const id = extractTokenId(decodedHash)
-      if (id && tokenStore[id]) {
-        initialToken = tokenStore[id]
-      }
-    }
+    let initialToken = resolveInitialTokenFromHash(window.location.hash, tokenStore)
 
     if (!initialToken && lastToken) {
       initialToken = lastToken
@@ -154,69 +190,73 @@ function PublicHome(): JSX.Element {
     }
 
     const controller = new AbortController()
-    setLoading(true)
-    Promise.allSettled([
-      fetchPublicMetrics(controller.signal),
-      fetchProfile(controller.signal),
-      fetchSummary(controller.signal),
-      initialToken && isFullToken(initialToken) ? fetchTokenMetrics(initialToken, controller.signal) : Promise.resolve(null),
-    ])
-      .then(([metricsResult, profileResult, summaryResult, tokenMetricsResult]) => {
-        if (metricsResult.status === 'fulfilled') {
-          setMetrics(metricsResult.value)
-          setError(null)
-        } else {
-          const reason = metricsResult.reason as Error
-          if (reason?.name !== 'AbortError') {
-            setError(reason instanceof Error ? reason.message : publicStrings.errors.metrics)
-          }
-        }
+    setMetricsLoading(true)
+    setSummaryLoading(true)
 
-        if (profileResult.status === 'fulfilled') {
-          setProfile(profileResult.value)
-        }
-
-        if (summaryResult.status === 'fulfilled') {
-          setSummary(summaryResult.value)
-        } else {
-          const reason = summaryResult.reason as Error
-          if (reason?.name !== 'AbortError') {
-            setError((prev) => prev ?? (reason instanceof Error ? reason.message : publicStrings.errors.summary))
-          }
-        }
-        if (initialToken && isFullToken(initialToken)) {
-          setInvalidToken(false)
-          if (tokenMetricsResult && tokenMetricsResult.status === 'fulfilled') {
-            setTokenMetrics(tokenMetricsResult.value)
-            setRecentTokenUsage(tokenMetricsResult.value)
-          }
-          setPublicLogsLoading(true)
-          fetchPublicLogs(initialToken, 20, controller.signal)
-            .then((ls) => {
-              setPublicLogs(ls)
-              setInvalidToken(false)
-            })
-            .catch((err: any) => {
-              setPublicLogs([])
-              setInvalidToken(Boolean(err?.status) && err.status >= 400 && err.status < 500)
-            })
-            .finally(() => setPublicLogsLoading(false))
+    fetchPublicMetrics(todayWindow, controller.signal)
+      .then((metricsResult) => {
+        setMetrics(metricsResult)
+        setError(null)
+      })
+      .catch((reason: Error & { name?: string }) => {
+        if (reason?.name !== 'AbortError') {
+          setError(reason instanceof Error ? reason.message : publicStrings.errors.metrics)
         }
       })
       .finally(() => {
         if (!controller.signal.aborted) {
-          setLoading(false)
+          setMetricsLoading(false)
         }
       })
-  return () => controller.abort()
-  }, [])
+
+    fetchSummary(controller.signal)
+      .then((summaryResult) => {
+        setSummary(summaryResult)
+      })
+      .catch((reason: Error & { name?: string }) => {
+        if (reason?.name !== 'AbortError') {
+          setError((prev) => prev ?? (reason instanceof Error ? reason.message : publicStrings.errors.summary))
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setSummaryLoading(false)
+        }
+      })
+
+    if (initialToken && isFullToken(initialToken)) {
+      setInvalidToken(false)
+      fetchTokenMetrics(initialToken, todayWindow, controller.signal)
+        .then((tokenMetricsResult) => {
+          setTokenMetrics(tokenMetricsResult)
+          setRecentTokenUsage(tokenMetricsResult)
+          setError(null)
+        })
+        .catch((reason: Error & { name?: string }) => {
+          if (reason?.name !== 'AbortError') {
+            setTokenMetrics(null)
+            setRecentTokenUsage(null)
+          }
+        })
+      setPublicLogsLoading(true)
+      fetchPublicLogs(initialToken, 20, controller.signal)
+        .then((ls) => {
+          setPublicLogs(ls)
+          setInvalidToken(false)
+        })
+        .catch((err: any) => {
+          setPublicLogs([])
+          setInvalidToken(Boolean(err?.status) && err.status >= 400 && err.status < 500)
+        })
+        .finally(() => setPublicLogsLoading(false))
+    }
+    return () => controller.abort()
+  }, [publicStrings.errors.metrics, publicStrings.errors.summary, todayWindow])
 
   // Realtime metrics via public SSE
   useEffect(() => {
     // build URL with optional token
-    const params = new URLSearchParams()
-    if (token && isFullToken(token)) params.set('token', token)
-    const url = `/api/public/events${params.toString() ? `?${params.toString()}` : ''}`
+    const url = buildPublicEventsUrl(token && isFullToken(token) ? token : undefined, todayWindow)
     const es = new EventSource(url)
     const onMetrics = (ev: MessageEvent) => {
       try {
@@ -248,7 +288,7 @@ function PublicHome(): JSX.Element {
       es.removeEventListener('metrics', onMetrics as unknown as EventListener)
       es.close()
     }
-  }, [token])
+  }, [token, todayWindow])
 
   // Fallback polling: if token metrics未就绪或 SSE 不返回 token 段，定期补一次拉取
   useEffect(() => {
@@ -256,7 +296,7 @@ function PublicHome(): JSX.Element {
     let active = true
     const tick = async () => {
       try {
-        const tm = await fetchTokenMetrics(token)
+        const tm = await fetchTokenMetrics(token, todayWindow)
         if (!active) return
         setTokenMetrics(tm)
         setRecentTokenUsage(tm)
@@ -271,18 +311,25 @@ function PublicHome(): JSX.Element {
       active = false
       window.clearInterval(id)
     }
-  }, [token])
+  }, [token, todayWindow])
 
   const isAdmin = profile?.isAdmin ?? false
   const builtinAuthEnabled = profile?.builtinAuthEnabled ?? false
+  const passkeyAuthEnabled = profile?.passkeyAuthEnabled ?? false
   const isLoggedOut = profile?.userLoggedIn === false
+  const showAuthStatusLoading = profileLoading
+  const showAuthStatusUnavailable = !profileLoading && profileUnavailable
   const showLinuxDoLogin = isLoggedOut
   const showRegistrationPausedNotice = isLoggedOut && profile?.allowRegistration === false
   const hasTokenInfo = token.trim().length > 0
   const canRevealGuideToken = isFullToken(token)
   const guideTokenVisible = shouldRevealPublicGuideToken(token, revealedGuideToken)
+  const guideTokenToggleLabel = guideTokenVisible
+    ? publicStrings.guide.tokenVisibility.hide
+    : publicStrings.guide.tokenVisibility.show
   const hasValidTokenForLogs = isFullToken(token) && !invalidToken
-  const hideTokenPanels = !hasTokenInfo && (loading || isLoggedOut)
+  const tokenMetricsPending = hasValidTokenForLogs && tokenMetrics === null
+  const hideTokenPanels = !hasTokenInfo && (showAuthStatusLoading || isLoggedOut)
   const availableKeys = summary?.active_keys ?? null
   const exhaustedKeys = summary?.exhausted_keys ?? null
   const totalKeys = availableKeys != null && exhaustedKeys != null ? availableKeys + exhaustedKeys : null
@@ -299,10 +346,24 @@ function PublicHome(): JSX.Element {
     () => GUIDE_KEY_ORDER.map((id) => ({ id, label: publicStrings.guide.tabs[id] ?? id })),
     [publicStrings.guide.tabs],
   )
+  const primaryGuideTabs = guideTabs.filter((tab) => PRIMARY_GUIDE_KEYS.has(tab.id))
+  const secondaryGuideTabs = guideTabs.filter((tab) => !PRIMARY_GUIDE_KEYS.has(tab.id))
 
-  const versionTagUrl = updateBanner.currentVersion
-    ? `${REPO_URL}/tree/v${encodeURIComponent(updateBanner.currentVersion)}`
-    : null
+  const copyGuideSample = useCallback(async (sampleKey: string, snippet: string) => {
+    const result = await copyText(guideSnippetToPlainText(snippet))
+    setGuideCopyState((previous) => ({
+      ...previous,
+      [sampleKey]: result.ok ? 'copied' : 'error',
+    }))
+    window.setTimeout(() => {
+      setGuideCopyState((previous) => {
+        if (previous[sampleKey] !== (result.ok ? 'copied' : 'error')) return previous
+        const next = { ...previous }
+        delete next[sampleKey]
+        return next
+      })
+    }, 1600)
+  }, [])
 
   const focusManualTokenField = useCallback(() => {
     window.requestAnimationFrame(() => {
@@ -377,7 +438,7 @@ function PublicHome(): JSX.Element {
       /* noop */
     }
     // Fetch token-scoped metrics and recent logs
-    void fetchTokenMetrics(next)
+    void fetchTokenMetrics(next, todayWindow)
       .then((tm) => {
         setTokenMetrics(tm)
         setRecentTokenUsage(tm)
@@ -391,7 +452,7 @@ function PublicHome(): JSX.Element {
       .then((ls) => { setPublicLogs(ls); setInvalidToken(false) })
       .catch((err: any) => { setPublicLogs([]); setInvalidToken(Boolean(err?.status) && err.status >= 400 && err.status < 500) })
       .finally(() => setPublicLogsLoading(false))
-  }, [])
+  }, [todayWindow])
 
   const openTokenAccessDialog = useCallback(() => {
     setTokenDraft(token)
@@ -475,38 +536,27 @@ function PublicHome(): JSX.Element {
         isCompactLayout ? ' is-compact-layout' : ''
       }`}
     >
-      {updateBanner.visible && (
-        <section className="surface update-banner" role="status" aria-live="polite">
-          <div className="update-banner-text">
-            <strong>{publicStrings.updateBanner.title}</strong>
-            <span>
-              {publicStrings.updateBanner.description(
-                updateBanner.currentVersion ?? 'unknown',
-                updateBanner.availableVersion ?? 'latest',
-              )}
-            </span>
-          </div>
-          <div className="update-banner-actions">
-            <Button type="button" onClick={updateBanner.reload}>
-              {publicStrings.updateBanner.refresh}
-            </Button>
-            <Button type="button" variant="ghost" onClick={updateBanner.dismiss}>
-              {publicStrings.updateBanner.dismiss}
-            </Button>
-          </div>
-        </section>
-      )}
+      {updateBanner.visible ? (
+        <UpdateAvailableBanner
+          strings={publicStrings.updateBanner}
+          currentVersion={updateBanner.currentVersion}
+          availableVersion={updateBanner.availableVersion}
+          status={updateBanner.status}
+          loading={updateBanner.loading}
+          onUpdate={updateBanner.applyUpdate}
+          onDismiss={updateBanner.dismiss}
+        />
+      ) : null}
       <PublicHomeHeroCard
         publicStrings={publicStrings}
-        loading={loading}
         metrics={metrics}
         availableKeys={availableKeys}
         totalKeys={totalKeys}
         error={error}
         showLinuxDoLogin={showLinuxDoLogin}
         showRegistrationPausedNotice={showRegistrationPausedNotice}
-        showTokenAccessButton={hideTokenPanels}
-        showAdminAction={isAdmin || builtinAuthEnabled}
+        showTokenAccessButton={hideTokenPanels && !showAuthStatusLoading && !showAuthStatusUnavailable}
+        showAdminAction={isAdmin || builtinAuthEnabled || passkeyAuthEnabled}
         adminActionLabel={isAdmin ? publicStrings.adminButton : publicStrings.adminLoginButton}
         topControls={(
           <>
@@ -514,10 +564,20 @@ function PublicHome(): JSX.Element {
             <LanguageSwitcher />
           </>
         )}
+        metricsLoading={metricsLoading}
+        summaryLoading={summaryLoading}
+        showAuthStatusLoading={showAuthStatusLoading}
+        showAuthStatusUnavailable={showAuthStatusUnavailable}
         onLinuxDoLogin={() => startLinuxDoLogin(token)}
         onTokenAccessClick={openTokenAccessDialog}
         onAdminActionClick={() => { window.location.href = isAdmin ? '/admin' : '/login' }}
       />
+      {offline.isOffline ? (
+        <OfflineStatusBanner
+          title="Offline shell loaded"
+          description="The page frame is available, but live metrics, profile checks, and sign-in actions need the network."
+        />
+      ) : null}
       {!hideTokenPanels && (
         <>
           <section className="surface panel access-panel">
@@ -528,16 +588,16 @@ function PublicHome(): JSX.Element {
               <div className="access-stats">
                 {/* Group 1: usage counts */}
                 <div className="access-stat">
-                  <h4>{publicStrings.accessPanel.stats.dailySuccess}</h4>
-                  <p><RollingNumber value={loading ? null : tokenMetrics?.dailySuccess ?? 0} /></p>
+                  <div className="access-stat-title">{publicStrings.accessPanel.stats.dailySuccess}</div>
+                  <p><RollingNumber value={tokenMetricsPending ? null : tokenMetrics?.dailySuccess ?? 0} /></p>
                 </div>
                 <div className="access-stat">
-                  <h4>{publicStrings.accessPanel.stats.dailyFailure}</h4>
-                  <p><RollingNumber value={loading ? null : tokenMetrics?.dailyFailure ?? 0} /></p>
+                  <div className="access-stat-title">{publicStrings.accessPanel.stats.dailyFailure}</div>
+                  <p><RollingNumber value={tokenMetricsPending ? null : tokenMetrics?.dailyFailure ?? 0} /></p>
                 </div>
                 <div className="access-stat">
-                  <h4>{publicStrings.accessPanel.stats.monthlySuccess}</h4>
-                  <p><RollingNumber value={loading ? null : tokenMetrics?.monthlySuccess ?? 0} /></p>
+                  <div className="access-stat-title">{publicStrings.accessPanel.stats.monthlySuccess}</div>
+                  <p><RollingNumber value={tokenMetricsPending ? null : tokenMetrics?.monthlySuccess ?? 0} /></p>
                 </div>
               </div>
               <div className="access-stats">
@@ -556,7 +616,7 @@ function PublicHome(): JSX.Element {
                     {formatNumber(recentTokenUsage?.quotaDailyUsed ?? 0)}
                     <span>/ {formatNumber(recentTokenUsage?.quotaDailyLimit ?? TOKEN_DAILY_LIMIT)}</span>
                   </div>
-                  <div className="quota-stat-description">Rolling 24-hour window</div>
+                  <div className="quota-stat-description">Server-local calendar day</div>
                 </div>
                 <div className="access-stat quota-stat-card">
                   <div className="quota-stat-label">{publicStrings.accessPanel.stats.monthlyLimit}</div>
@@ -564,7 +624,7 @@ function PublicHome(): JSX.Element {
                     {formatNumber(recentTokenUsage?.quotaMonthlyUsed ?? 0)}
                     <span>/ {formatNumber(recentTokenUsage?.quotaMonthlyLimit ?? TOKEN_MONTHLY_LIMIT)}</span>
                   </div>
-                  <div className="quota-stat-description">Calendar month</div>
+                  <div className="quota-stat-description">UTC calendar month</div>
                 </div>
               </div>
               <div className="access-token-box">
@@ -751,18 +811,25 @@ function PublicHome(): JSX.Element {
           </div>
         )}
         {!isCompactLayout && (
-        <div className="guide-tabs">
-          {guideTabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              className={`guide-tab${activeGuide === tab.id ? ' active' : ''}`}
-              onClick={() => setActiveGuide(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
+          <div className="guide-tabs">
+            {primaryGuideTabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                className={`guide-tab${activeGuide === tab.id ? ' active' : ''}`}
+                onClick={() => setActiveGuide(tab.id)}
+              >
+                {tab.label}
+              </button>
+            ))}
+            <MobileGuideDropdown
+              active={secondaryGuideTabs.some((tab) => tab.id === activeGuide) ? activeGuide : secondaryGuideTabs[0]?.id ?? 'other'}
+              onChange={(id) => setActiveGuide(id)}
+              labels={secondaryGuideTabs}
+              triggerClassName="guide-more-trigger"
+              triggerLabel={secondaryGuideTabs.some((tab) => tab.id === activeGuide) ? undefined : language === 'zh' ? '更多客户端' : 'More clients'}
+            />
+          </div>
         )}
         <div className="guide-panel">
           <div className="guide-panel-header">
@@ -774,6 +841,8 @@ function PublicHome(): JSX.Element {
               className="guide-token-toggle"
               disabled={!canRevealGuideToken}
               aria-pressed={guideTokenVisible}
+              aria-label={guideTokenToggleLabel}
+              title={guideTokenToggleLabel}
               onClick={() => setRevealedGuideToken(guideTokenVisible ? null : token)}
             >
               <Icon
@@ -782,11 +851,7 @@ function PublicHome(): JSX.Element {
                 height={16}
                 aria-hidden="true"
               />
-              <span>
-                {guideTokenVisible
-                  ? publicStrings.guide.tokenVisibility.hide
-                  : publicStrings.guide.tokenVisibility.show}
-              </span>
+              <span>{guideTokenToggleLabel}</span>
             </Button>
           </div>
           <ol>
@@ -794,46 +859,57 @@ function PublicHome(): JSX.Element {
               <li key={index}>{step}</li>
             ))}
           </ol>
-          {resolveGuideSamples(guideDescription).map((sample) => (
-            <div className="guide-sample" key={`${guideDescription.title}-${sample.title}`}>
-              <p className="guide-sample-title">{sample.title}</p>
-              <div className="mockup-code relative guide-code-shell">
-                <span className="guide-lang-badge badge badge-outline badge-sm">
-                  {(sample.language ?? 'code').toUpperCase()}
-                </span>
-                <pre>
-                  <code dangerouslySetInnerHTML={{ __html: sample.snippet }} />
-                </pre>
+          {resolveGuideSamples(guideDescription).map((sample) => {
+            const sampleKey = `${activeGuide}:${guideDescription.title}:${sample.title}`
+            const currentCopyState = guideCopyState[sampleKey] ?? 'idle'
+            const copyLabel = currentCopyState === 'copied'
+              ? publicStrings.copyToken.copied
+              : currentCopyState === 'error'
+                ? publicStrings.copyToken.error
+                : publicStrings.copyToken.copy
+            return (
+              <div className="guide-sample" key={`${guideDescription.title}-${sample.title}`}>
+                <p className="guide-sample-title">{sample.title}</p>
+                <div className="mockup-code relative guide-code-shell">
+                  <span className="guide-lang-badge badge badge-outline badge-sm">
+                    {(sample.language ?? 'code').toUpperCase()}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className={`guide-copy-button${currentCopyState === 'copied' ? ' copied' : currentCopyState === 'error' ? ' error' : ''}`}
+                    aria-label={copyLabel}
+                    title={copyLabel}
+                    onClick={() => void copyGuideSample(sampleKey, sample.snippet)}
+                  >
+                    <Icon
+                      icon={currentCopyState === 'copied' ? 'mdi:check' : 'mdi:content-copy'}
+                      width={14}
+                      height={14}
+                      aria-hidden="true"
+                    />
+                    <span>{copyLabel}</span>
+                  </Button>
+                  <pre>
+                    <code dangerouslySetInnerHTML={{ __html: sample.snippet }} />
+                  </pre>
+                </div>
+                {sample.reference ? (
+                  <p className="guide-reference">
+                    {publicStrings.guide.dataSourceLabel}
+                    <a href={sample.reference.url} target="_blank" rel="noreferrer">
+                      {sample.reference.label}
+                    </a>
+                  </p>
+                ) : null}
               </div>
-              {sample.reference ? (
-                <p className="guide-reference">
-                  {publicStrings.guide.dataSourceLabel}
-                  <a href={sample.reference.url} target="_blank" rel="noreferrer">
-                    {sample.reference.label}
-                  </a>
-                </p>
-              ) : null}
-            </div>
-          ))}
+            )
+          })}
         </div>
         {activeGuide === 'cherryStudio' && <CherryStudioMock apiKeyExample={exampleToken} />}
       </section>
-      <footer className="surface public-home-footer">
-        <a className="footer-gh" href={REPO_URL} target="_blank" rel="noreferrer">
-          <Icon icon="mdi:github" width={18} height={18} aria-hidden="true" style={{ color: '#2563eb' }} />
-          <span>GitHub</span>
-        </a>
-        <div className="footer-version">
-          <span>{publicStrings.footer.version}</span>
-          {versionTagUrl ? (
-            <a href={versionTagUrl} target="_blank" rel="noreferrer">
-              <code>v{updateBanner.currentVersion}</code>
-            </a>
-          ) : (
-            <code>—</code>
-          )}
-        </div>
-      </footer>
+      <PublicHomeFooter versionLabel={publicStrings.footer.version} version={updateBanner.currentBackendVersion} />
       <Dialog
         open={isTokenAccessDialogOpen}
         onOpenChange={(open) => {
@@ -911,6 +987,7 @@ export default PublicHome
 export const __testables = {
   resolvePublicGuideToken,
   resolveGuideSamples,
+  resolveInitialTokenFromHash,
   shouldRevealPublicGuideToken,
   buildGuideContent,
 }
@@ -919,16 +996,20 @@ function MobileGuideDropdown({
   active,
   onChange,
   labels,
+  triggerClassName = 'w-full',
+  triggerLabel,
 }: {
   active: GuideKey
   onChange: (id: GuideKey) => void
   labels: { id: GuideKey, label: string }[]
+  triggerClassName?: string
+  triggerLabel?: string
 }): JSX.Element {
   const current = labels.find((l) => l.id === active)
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button type="button" variant="outline" size="sm" className="w-full justify-between md:h-10">
+        <Button type="button" variant="outline" size="sm" className={`${triggerClassName} justify-between md:h-10`}>
           <span className="inline-flex items-center gap-2">
             <Icon
               icon={getGuideClientIconName(active)}
@@ -937,7 +1018,7 @@ function MobileGuideDropdown({
               aria-hidden="true"
               style={{ color: '#475569' }}
             />
-            {current?.label ?? active}
+            {triggerLabel ?? current?.label ?? active}
           </span>
           <Icon icon="mdi:chevron-down" width={16} height={16} aria-hidden="true" style={{ color: '#647589' }} />
         </Button>
@@ -966,6 +1047,8 @@ function MobileGuideDropdown({
 function buildGuideContent(language: Language, baseUrl: string, prettyToken: string): Record<GuideKey, GuideContent> {
   const isEnglish = language === 'en'
   const codexSnippet = buildCodexSnippet(baseUrl)
+  const hikariCliInstallSnippet = buildHikariCliInstallSnippet(baseUrl, prettyToken)
+  const hikariSkillsSnippet = buildHikariSkillsSnippet()
   const claudeSnippet = buildClaudeSnippet(baseUrl, prettyToken, language)
   const genericJsonSnippet = buildGenericJsonSnippet(baseUrl, prettyToken)
   const genericMcpSnippet = buildGenericMcpSnippet(baseUrl, prettyToken)
@@ -990,6 +1073,36 @@ function buildGuideContent(language: Language, baseUrl: string, prettyToken: str
       reference: {
         label: 'OpenAI Codex docs',
         url: CODEX_DOC_URL,
+      },
+    },
+    hikariCli: {
+      title: 'CLI + Agent Skills',
+      steps: isEnglish
+        ? [
+            <>Install <code>tvly-hikari</code> with this Hikari origin and token; the config is stored locally with <code>0600</code> permissions.</>,
+            <>Run Tavily commands through <code>tvly-hikari search/extract/crawl/map/research ... --json</code>; the wrapper injects <code>{baseUrl}/api/tavily</code> and the Hikari token.</>,
+            <>Install Agent Skills separately when you want agents to discover the Hikari-specific workflows.</>,
+          ]
+        : [
+            <>使用当前 Hikari origin 和 token 安装 <code>tvly-hikari</code>；本地配置会以 <code>0600</code> 权限保存。</>,
+            <>通过 <code>tvly-hikari search/extract/crawl/map/research ... --json</code> 调用 Tavily；wrapper 会注入 <code>{baseUrl}/api/tavily</code> 与 Hikari token。</>,
+            <>需要让 Agent 自动发现 Hikari 工作流时，再单独安装 Agent Skills。</>,
+          ],
+      samples: [
+        {
+          title: isEnglish ? 'Install tvly-hikari' : '安装 tvly-hikari',
+          language: 'bash',
+          snippet: hikariCliInstallSnippet,
+        },
+        {
+          title: isEnglish ? 'Optional: install Agent Skills' : '可选：安装 Agent Skills',
+          language: 'bash',
+          snippet: hikariSkillsSnippet,
+        },
+      ],
+      reference: {
+        label: 'Tavily Hikari GitHub Releases',
+        url: 'https://github.com/IvanLi-CN/tavily-hikari/releases/latest',
       },
     },
     claude: {
@@ -1159,6 +1272,22 @@ function buildGuideContent(language: Language, baseUrl: string, prettyToken: str
   }
 }
 
+function buildHikariCliInstallSnippet(baseUrl: string, prettyToken: string): string {
+  return `curl -fsSL "https://github.com/IvanLi-CN/tavily-hikari/releases/latest/download/install-tvly-hikari.sh" | bash -s -- \\
+  --base-url "${baseUrl}" \\
+  --token "${prettyToken}"`
+}
+
+function buildHikariSkillsSnippet(): string {
+  return 'npx skills add https://github.com/IvanLi-CN/tavily-hikari --global'
+}
+
+function guideSnippetToPlainText(snippet: string): string {
+  const template = document.createElement('template')
+  template.innerHTML = snippet
+  return template.content.textContent ?? ''
+}
+
 function buildCodexSnippet(baseUrl: string): string {
   return [
     '<span class="hl-comment"># ~/.codex/config.toml</span>',
@@ -1255,6 +1384,21 @@ function resolveGuideSamples(content: GuideContent): GuideSample[] {
 
 function resolvePublicGuideToken(token: string, placeholder: string, revealed: boolean): string {
   return revealed && isFullToken(token) ? token : placeholder
+}
+
+function resolveInitialTokenFromHash(hashValue: string, tokenStore: Record<string, string>): string | null {
+  const normalizedHash = hashValue.startsWith('#') ? hashValue.slice(1) : hashValue
+  const decodedHash = normalizedHash ? decodeURIComponent(normalizedHash) : null
+  if (decodedHash && isFullToken(decodedHash)) {
+    return decodedHash
+  }
+  if (!decodedHash) return null
+
+  const id = extractTokenId(decodedHash)
+  if (id && tokenStore[id]) {
+    return tokenStore[id]
+  }
+  return null
 }
 
 function shouldRevealPublicGuideToken(token: string, revealedToken: string | null): boolean {

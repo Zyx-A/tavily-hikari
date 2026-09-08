@@ -4,6 +4,12 @@ enum TavilyUpstreamMode {
     Json,
 }
 
+const HIKARI_ROUTING_KEY_HEADER: &str = "x-hikari-routing-key";
+
+fn should_use_api_rebalance(settings: &tavily_hikari::SystemSettings) -> bool {
+    settings.api_rebalance_enabled
+}
+
 #[derive(Clone, Copy)]
 struct TavilyEndpointConfig {
     upstream_path: &'static str,
@@ -95,6 +101,60 @@ fn non_empty_str(value: &Value) -> Option<&str> {
     value.as_str().map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn extract_http_project_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-project-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_hikari_routing_key(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(HIKARI_ROUTING_KEY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn record_rebalance_period_usage(
+    state: &Arc<AppState>,
+    use_rebalance: bool,
+    token_id: Option<&str>,
+    key_id: Option<&str>,
+    billing_subject: Option<&str>,
+    response_body: &[u8],
+    research_request_id: Option<&str>,
+) {
+    if !use_rebalance {
+        return;
+    }
+    let (Some(token_id), Some(key_id), Some(billing_subject)) =
+        (token_id, key_id, billing_subject)
+    else {
+        return;
+    };
+    let request_id = research_request_id
+        .map(ToOwned::to_owned)
+        .or_else(|| extract_research_request_id(response_body));
+    if let Err(err) = state
+        .proxy
+        .record_upstream_reconciliation_usage(
+            token_id,
+            key_id,
+            billing_subject,
+            request_id.as_deref(),
+        )
+        .await
+    {
+        eprintln!("record upstream reconciliation usage failed: {err}");
+    } else {
+        maintenance_worker_wake_for_state(state.as_ref()).notify_one();
+    }
+}
+
 fn chunked_credits(items: usize, chunk_size: usize, credits_per_chunk: i64) -> i64 {
     if items == 0 || credits_per_chunk <= 0 {
         return 0;
@@ -176,7 +236,61 @@ fn tavily_crawl_expected_credits(options: &Value) -> i64 {
     mapping_credits.saturating_add(extract_credits)
 }
 
-fn tavily_research_min_credits(options: &Value) -> i64 {
+fn tavily_research_model_validation_message(options: &Value) -> Option<&'static str> {
+    match options.get("model") {
+        None => None,
+        Some(Value::String(model)) => {
+            let model = model.trim().to_ascii_lowercase();
+            if matches!(model.as_str(), "mini" | "auto" | "pro" | "") {
+                None
+            } else {
+                Some("model must be one of mini, auto, or pro")
+            }
+        }
+        Some(_) => Some("model must be a string"),
+    }
+}
+
+fn tavily_http_free_account_validation_message(
+    upstream_path: &str,
+    options: &Value,
+) -> Option<&'static str> {
+    if upstream_path == "/search"
+        && let Value::Object(map) = options
+        && map.contains_key("safe_search")
+    {
+        return Some("safe_search is an Enterprise-only Tavily parameter and is not supported");
+    }
+
+    if upstream_path == "/research"
+        && options
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Some("stream=true is not supported by this proxy; use non-streaming research");
+    }
+
+    None
+}
+
+fn invalid_tavily_http_request_response(message: &str) -> Result<Response<Body>, StatusCode> {
+    let payload = json!({
+        "error": "invalid_request",
+        "message": message,
+    });
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(CONTENT_TYPE, "application/json; charset=utf-8")
+        .body(Body::from(payload.to_string()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn tavily_research_estimated_credits(options: &Value) -> Option<i64> {
+    if tavily_research_model_validation_message(options).is_some() {
+        return None;
+    }
+
     let model = options
         .get("model")
         .and_then(|v| v.as_str())
@@ -184,10 +298,12 @@ fn tavily_research_min_credits(options: &Value) -> i64 {
         .trim()
         .to_ascii_lowercase();
     match model.as_str() {
-        "pro" => 15,
-        // auto is billed variably upstream; we use the minimum to enforce & fallback.
-        "mini" | "auto" | "" => 4,
-        _ => 4,
+        "mini" => Some(40),
+        "pro" => Some(100),
+        // Tavily defaults missing model to auto; shared upstream keys make per-request
+        // research usage deltas unsafe to attribute, so auto gets its own estimate.
+        "auto" | "" => Some(50),
+        _ => None,
     }
 }
 
@@ -197,7 +313,7 @@ fn tavily_http_reserved_credits(upstream_path: &str, options: &Value) -> i64 {
         "/extract" => tavily_extract_expected_credits(options),
         "/crawl" => tavily_crawl_expected_credits(options),
         "/map" => tavily_map_expected_credits(options),
-        "/research" => tavily_research_min_credits(options),
+        "/research" => tavily_research_estimated_credits(options).unwrap_or(0),
         _ => 1,
     }
 }
@@ -208,24 +324,21 @@ fn tavily_mcp_reserved_credits(tool: &str, options: &Value) -> i64 {
         "tavily-extract" => tavily_extract_expected_credits(options),
         "tavily-crawl" => tavily_crawl_expected_credits(options),
         "tavily-map" => tavily_map_expected_credits(options),
-        "tavily-research" => tavily_research_min_credits(options),
+        "tavily-research" => tavily_research_estimated_credits(options).unwrap_or(0),
         _ => 1,
     }
 }
 
 fn quota_exhausted_now(verdict: &TokenQuotaVerdict) -> bool {
-    verdict.hourly_used >= verdict.hourly_limit
-        || verdict.daily_used >= verdict.daily_limit
-        || verdict.monthly_used >= verdict.monthly_limit
+    verdict.effective_window().is_some()
 }
 
 fn quota_would_exceed(verdict: &TokenQuotaVerdict, delta: i64) -> bool {
     if delta <= 0 {
-        return false;
+        return quota_exhausted_now(verdict);
     }
-    verdict.hourly_used.saturating_add(delta) > verdict.hourly_limit
-        || verdict.daily_used.saturating_add(delta) > verdict.daily_limit
-        || verdict.monthly_used.saturating_add(delta) > verdict.monthly_limit
+
+    verdict.projected_window(delta).is_some()
 }
 
 #[axum::debug_handler]
@@ -233,35 +346,35 @@ async fn tavily_http_search(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::search()).await
+    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::search(), None).await
 }
 
 async fn tavily_http_extract(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::extract()).await
+    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::extract(), None).await
 }
 
 async fn tavily_http_crawl(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::crawl()).await
+    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::crawl(), None).await
 }
 
 async fn tavily_http_map(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::map()).await
+    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::map(), None).await
 }
 
 async fn tavily_http_research(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::research()).await
+    proxy_tavily_http_endpoint(state, req, TavilyEndpointConfig::research(), None).await
 }
 
 async fn tavily_http_research_result(
@@ -272,6 +385,13 @@ async fn tavily_http_research_result(
     let (parts, _body) = req.into_parts();
     let method = parts.method.clone();
     let path = format!("/api/tavily/research/{request_id}");
+    if let Err(response) = ensure_ha_allows_basic_business(&state, &path).await {
+        return Ok(response);
+    }
+    let remote_addr = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0);
 
     let auth_bearer = parts
         .headers
@@ -337,15 +457,7 @@ async fn tavily_http_research_result(
                             Some(&message),
                         )
                         .await;
-                    let payload = json!({
-                        "error": "quota_exhausted",
-                        "message": "hourly request limit reached for this token",
-                    });
-                    let resp = Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
-                        .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                        .body(Body::from(payload.to_string()))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    let resp = request_limit_exceeded_response(&verdict)?;
                     return Ok(resp);
                 }
             }
@@ -373,41 +485,42 @@ async fn tavily_http_research_result(
         }
     }
 
-    if !using_dev_open_admin_fallback {
-        match state
-            .proxy
-            .is_research_request_owned_by(&request_id, auth_token_id.as_deref())
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Some(tid) = auth_token_id.as_deref() {
-                    let _ = state
-                        .proxy
-                        .record_token_attempt(
-                            tid,
-                            &method,
-                            &path,
-                            None,
-                            Some(StatusCode::NOT_FOUND.as_u16() as i64),
-                            Some(StatusCode::NOT_FOUND.as_u16() as i64),
-                            false,
-                            "error",
-                            Some("research request not found"),
-                        )
-                        .await;
+    let research_lookup = if using_dev_open_admin_fallback {
+        None
+    } else {
+        match lookup_research_request_local_or_peer(&state, &request_id).await {
+            Ok(Some(lookup)) => {
+                if auth_token_id.as_deref() != Some(lookup.token_id.as_str()) {
+                    if let Some(tid) = auth_token_id.as_deref() {
+                        let _ = state
+                            .proxy
+                            .record_token_attempt(
+                                tid,
+                                &method,
+                                &path,
+                                None,
+                                Some(StatusCode::NOT_FOUND.as_u16() as i64),
+                                Some(StatusCode::NOT_FOUND.as_u16() as i64),
+                                false,
+                                "error",
+                                Some("research request not found"),
+                            )
+                            .await;
+                    }
+                    let payload = json!({
+                        "error": "research_request_not_found",
+                        "message": "research request not found",
+                    });
+                    let resp = Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(CONTENT_TYPE, "application/json; charset=utf-8")
+                        .body(Body::from(payload.to_string()))
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    return Ok(resp);
                 }
-                let payload = json!({
-                    "error": "research_request_not_found",
-                    "message": "research request not found",
-                });
-                let resp = Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                    .body(Body::from(payload.to_string()))
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                return Ok(resp);
+                Some(lookup)
             }
+            Ok(None) => None,
             Err(err) => {
                 eprintln!("research request owner check failed for {path}: {err}");
                 if let Some(tid) = auth_token_id.as_deref() {
@@ -430,14 +543,59 @@ async fn tavily_http_research_result(
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
+    };
+    if !using_dev_open_admin_fallback && research_lookup.is_none() {
+        if let Some(tid) = auth_token_id.as_deref() {
+            let _ = state
+                .proxy
+                .record_token_attempt(
+                    tid,
+                    &method,
+                    &path,
+                    None,
+                    Some(StatusCode::NOT_FOUND.as_u16() as i64),
+                    Some(StatusCode::NOT_FOUND.as_u16() as i64),
+                    false,
+                    "error",
+                    Some("research request not found"),
+                )
+                .await;
+        }
+        let payload = json!({
+            "error": "research_request_not_found",
+            "message": "research request not found",
+        });
+        let resp = Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(payload.to_string()))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(resp);
     }
 
     // NOTE: `GET /api/tavily/research/:request_id` is a *result retrieval* endpoint.
-    // Billing is charged on `POST /api/tavily/research` (via /usage diff), so this endpoint
-    // must not consume business quota nor block due to exhausted credits quota.
+    // Billing is charged on `POST /api/tavily/research` using model-based estimates, so this
+    // endpoint must not consume business quota nor block due to exhausted credits quota.
 
     let mut headers = clone_headers(&parts.headers);
     headers.remove(axum::http::header::AUTHORIZATION);
+    headers.remove(HIKARI_ROUTING_KEY_HEADER);
+    let system_settings = state
+        .proxy
+        .get_system_settings()
+        .await
+        .map_err(|err| {
+            eprintln!("get system settings failed for {path}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let client_ip = resolve_client_ip_info(
+        remote_addr,
+        &parts.headers,
+        &TrustedClientIpSettings {
+            trusted_proxy_cidrs: system_settings.trusted_proxy_cidrs.clone(),
+            trusted_client_ip_headers: system_settings.trusted_client_ip_headers.clone(),
+        },
+    );
     let upstream_path = format!("/research/{}", urlencoding::encode(&request_id));
     let token_id_for_logs = auth_token_id.clone();
 
@@ -451,11 +609,19 @@ async fn tavily_http_research_result(
             &path,
             &headers,
             true,
+            Some(&client_ip),
+            research_lookup.as_ref().map(|lookup| lookup.key_id.as_str()),
         )
         .await;
 
     match result {
         Ok((resp, analysis)) => {
+            if research_response_is_terminal(&resp.body) {
+                let _ = state
+                    .proxy
+                    .mark_upstream_reconciliation_research_terminal(&request_id)
+                    .await;
+            }
             if let Some(tid) = token_id_for_logs.as_deref() {
                 let http_code = resp.status.as_u16() as i64;
                 let _ = state
@@ -471,8 +637,12 @@ async fn tavily_http_research_result(
                         analysis.status,
                         None,
                         analysis.failure_kind.as_deref(),
-                        Some(analysis.key_effect.code.as_str()),
-                        analysis.key_effect.summary.as_deref(),
+                        Some(resp.key_effect_code.as_str()),
+                        resp.key_effect_summary.as_deref(),
+                        Some(resp.binding_effect_code.as_str()),
+                        resp.binding_effect_summary.as_deref(),
+                        Some(resp.selection_effect_code.as_str()),
+                        resp.selection_effect_summary.as_deref(),
                         resp.request_log_id,
                     )
                     .await;
@@ -505,8 +675,11 @@ async fn tavily_http_research_result(
                 | ProxyError::PinnedMcpSessionUnavailable => StatusCode::BAD_GATEWAY,
                 ProxyError::Database(_)
                 | ProxyError::InvalidEndpoint { .. }
+                | ProxyError::LastAdminLoginMethod
                 | ProxyError::QuotaDataMissing { .. }
                 | ProxyError::UsageHttp { .. }
+                | ProxyError::StaleClaim { .. }
+                | ProxyError::Deferred { .. }
                 | ProxyError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
@@ -528,10 +701,20 @@ async fn proxy_tavily_http_endpoint(
     state: Arc<AppState>,
     req: Request<Body>,
     config: TavilyEndpointConfig,
+    remote_addr: Option<SocketAddr>,
 ) -> Result<Response<Body>, StatusCode> {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let path = parts.uri.path().to_owned();
+    if let Err(response) = ensure_ha_allows_basic_business(&state, &path).await {
+        return Ok(response);
+    }
+    let remote_addr = remote_addr.or_else(|| {
+        parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|connect_info| connect_info.0)
+    });
 
     let body_bytes = body::to_bytes(body, BODY_LIMIT)
         .await
@@ -603,19 +786,48 @@ async fn proxy_tavily_http_endpoint(
         && let Some(val) = map.get("max_results").and_then(|v| v.as_i64())
         && val < 0
     {
-        let payload = json!({
-            "error": "invalid_request",
-            "message": "max_results must be non-negative",
-        });
-        let resp = Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(CONTENT_TYPE, "application/json; charset=utf-8")
-            .body(Body::from(payload.to_string()))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        return Ok(resp);
+        return invalid_tavily_http_request_response(
+            "max_results must be non-negative",
+        );
+    }
+
+    if let Some(message) =
+        tavily_http_free_account_validation_message(config.upstream_path, &options)
+    {
+        return invalid_tavily_http_request_response(message);
     }
 
     let token_id_for_logs = auth_token_id.clone();
+    let hikari_routing_key = if using_dev_open_admin_fallback {
+        None
+    } else {
+        extract_hikari_routing_key(&parts.headers)
+    };
+    let http_project_id = if using_dev_open_admin_fallback {
+        None
+    } else {
+        extract_http_project_id(&parts.headers)
+    };
+    let api_routing_key = hikari_routing_key
+        .clone()
+        .or_else(|| http_project_id.clone());
+    let system_settings = state
+        .proxy
+        .get_system_settings()
+        .await
+        .map_err(|err| {
+            eprintln!("get system settings failed for {path}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let use_api_rebalance = should_use_api_rebalance(&system_settings);
+    let client_ip = resolve_client_ip_info(
+        remote_addr,
+        &parts.headers,
+        &TrustedClientIpSettings {
+            trusted_proxy_cidrs: system_settings.trusted_proxy_cidrs.clone(),
+            trusted_client_ip_headers: system_settings.trusted_client_ip_headers.clone(),
+        },
+    );
     let expected_search_credits = (config.upstream_path == "/search").then(|| {
         // Search billing is predictable based on `search_depth`.
         tavily_search_expected_credits(&options)
@@ -674,15 +886,7 @@ async fn proxy_tavily_http_endpoint(
                             Some(&message),
                         )
                         .await;
-                    let payload = json!({
-                        "error": "quota_exhausted",
-                        "message": "hourly request limit reached for this token",
-                    });
-                    let resp = Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
-                        .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                        .body(Body::from(payload.to_string()))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    let resp = request_limit_exceeded_response(&verdict)?;
                     return Ok(resp);
                 }
             }
@@ -708,6 +912,28 @@ async fn proxy_tavily_http_endpoint(
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
+    }
+
+    if config.upstream_path == "/research"
+        && let Some(message) = tavily_research_model_validation_message(&options)
+    {
+        if let Some(tid) = auth_token_id.as_deref() {
+            let _ = state
+                .proxy
+                .record_token_attempt(
+                    tid,
+                    &method,
+                    &path,
+                    None,
+                    Some(StatusCode::BAD_REQUEST.as_u16() as i64),
+                    Some(StatusCode::BAD_REQUEST.as_u16() as i64),
+                    false,
+                    "error",
+                    Some(message),
+                )
+                .await;
+        }
+        return invalid_tavily_http_request_response(message);
     }
 
     if let Some(ref tid) = auth_token_id {
@@ -772,37 +998,89 @@ async fn proxy_tavily_http_endpoint(
         }
     }
 
+    let mut business_calls_reservation = None;
+    if let Some(ref tid) = auth_token_id
+        && !using_dev_open_admin_fallback
+    {
+        let reservation = if let Some(subject) = billing_subject.as_deref() {
+            state
+                .proxy
+                .reserve_token_business_calls_1h_limit_for_subject(subject)
+                .await
+        } else {
+            state.proxy.reserve_token_business_calls_1h_limit(tid).await
+        };
+        match reservation {
+            Ok(tavily_hikari::BusinessCalls1hReservationOutcome::Reserved(reservation)) => {
+                business_calls_reservation = Some(reservation);
+            }
+            Ok(tavily_hikari::BusinessCalls1hReservationOutcome::Denied(verdict)) => {
+                let message = build_business_calls_1h_limit_error_message(&verdict);
+                let _ = state
+                    .proxy
+                    .record_token_attempt(
+                        tid,
+                        &method,
+                        &path,
+                        None,
+                        Some(StatusCode::TOO_MANY_REQUESTS.as_u16() as i64),
+                        None,
+                        false,
+                        "quota_exhausted",
+                        Some(&message),
+                    )
+                    .await;
+                let resp = business_calls_1h_limit_exceeded_response(&verdict)?;
+                return Ok(resp);
+            }
+            Ok(tavily_hikari::BusinessCalls1hReservationOutcome::NotApplicable) => {}
+            Err(err) => {
+                eprintln!("business calls 1h reserve failed for {path}: {err}");
+                let msg = err.to_string();
+                let _ = state
+                    .proxy
+                    .record_token_attempt(
+                        tid,
+                        &method,
+                        &path,
+                        None,
+                        Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i64),
+                        None,
+                        false,
+                        "error",
+                        Some(msg.as_str()),
+                    )
+                    .await;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
     let mut headers = clone_headers(&parts.headers);
     headers.remove(axum::http::header::AUTHORIZATION);
+    headers.remove(HIKARI_ROUTING_KEY_HEADER);
 
     if config.upstream_path == "/research" {
         let result = state
             .proxy
-            .proxy_http_research_with_usage_diff(
+            .proxy_http_research(
                 &state.usage_base,
                 auth_token_id.as_deref(),
+                use_api_rebalance,
+                api_routing_key.as_deref(),
+                http_project_id.as_deref(),
                 &method,
                 &path,
                 options,
                 &headers,
                 true,
+                Some(&client_ip),
             )
             .await;
 
         match result {
             Ok((resp, analysis, usage_delta)) => {
-                let mut billing_error: Option<String> = if resp.status.is_success()
-                    && analysis.status == "success"
-                    && usage_delta.is_none()
-                {
-                    let msg = format!(
-                        "research usage diff unavailable; charging reserved minimum {reserved_credits} credit(s)"
-                    );
-                    eprintln!("{msg}");
-                    Some(msg)
-                } else {
-                    None
-                };
+                let mut billing_error: Option<String> = None;
                 let mut attempt_logged = false;
 
                 if resp.status.is_success()
@@ -828,8 +1106,12 @@ async fn proxy_tavily_http_endpoint(
                                     subject,
                                     analysis.api_key_id.as_deref(),
                                     analysis.failure_kind.as_deref(),
-                                    Some(analysis.key_effect.code.as_str()),
-                                    analysis.key_effect.summary.as_deref(),
+                                    Some(resp.key_effect_code.as_str()),
+                                    resp.key_effect_summary.as_deref(),
+                                    Some(resp.binding_effect_code.as_str()),
+                                    resp.binding_effect_summary.as_deref(),
+                                    Some(resp.selection_effect_code.as_str()),
+                                    resp.selection_effect_summary.as_deref(),
                                     resp.request_log_id,
                                 )
                                 .await
@@ -849,8 +1131,12 @@ async fn proxy_tavily_http_endpoint(
                                     credits,
                                     analysis.api_key_id.as_deref(),
                                     analysis.failure_kind.as_deref(),
-                                    Some(analysis.key_effect.code.as_str()),
-                                    analysis.key_effect.summary.as_deref(),
+                                    Some(resp.key_effect_code.as_str()),
+                                    resp.key_effect_summary.as_deref(),
+                                    Some(resp.binding_effect_code.as_str()),
+                                    resp.binding_effect_summary.as_deref(),
+                                    Some(resp.selection_effect_code.as_str()),
+                                    resp.selection_effect_summary.as_deref(),
                                     resp.request_log_id,
                                 )
                                 .await
@@ -934,16 +1220,42 @@ async fn proxy_tavily_http_endpoint(
                             analysis.status,
                             billing_error.as_deref(),
                             analysis.failure_kind.as_deref(),
-                            Some(analysis.key_effect.code.as_str()),
-                            analysis.key_effect.summary.as_deref(),
+                            Some(resp.key_effect_code.as_str()),
+                            resp.key_effect_summary.as_deref(),
+                            Some(resp.binding_effect_code.as_str()),
+                            resp.binding_effect_summary.as_deref(),
+                            Some(resp.selection_effect_code.as_str()),
+                            resp.selection_effect_summary.as_deref(),
                             resp.request_log_id,
                         )
                         .await;
                 }
+                state
+                    .proxy
+                    .finalize_business_calls_1h_reservation_from_status(
+                        business_calls_reservation.take(),
+                        analysis.status,
+                        resp.request_log_id,
+                    )
+                    .await;
                 // Return the upstream response once billing either succeeded or we captured a local audit error.
+                record_rebalance_period_usage(
+                    &state,
+                    use_api_rebalance,
+                    token_id_for_logs.as_deref(),
+                    analysis.api_key_id.as_deref(),
+                    billing_subject.as_deref(),
+                    &resp.body,
+                    None,
+                )
+                .await;
                 return Ok(build_response(resp));
             }
             Err(err) => {
+                state
+                    .proxy
+                    .release_business_calls_1h_reservation(business_calls_reservation.take())
+                    .await;
                 eprintln!("tavily http {} proxy error: {err}", config.upstream_path);
                 if let Some(tid) = token_id_for_logs.as_deref() {
                     let msg = err.to_string();
@@ -971,6 +1283,9 @@ async fn proxy_tavily_http_endpoint(
                     | ProxyError::UsageHttp { .. } => StatusCode::BAD_GATEWAY,
                     ProxyError::Database(_)
                     | ProxyError::InvalidEndpoint { .. }
+                    | ProxyError::LastAdminLoginMethod
+                    | ProxyError::StaleClaim { .. }
+                    | ProxyError::Deferred { .. }
                     | ProxyError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
 
@@ -995,10 +1310,14 @@ async fn proxy_tavily_http_endpoint(
                 .proxy_http_search(
                     &state.usage_base,
                     auth_token_id.as_deref(),
+                    use_api_rebalance,
+                    api_routing_key.as_deref(),
+                    http_project_id.as_deref(),
                     &method,
                     &path,
                     options,
                     &headers,
+                    Some(&client_ip),
                 )
                 .await
         }
@@ -1009,11 +1328,15 @@ async fn proxy_tavily_http_endpoint(
                     &state.usage_base,
                     config.upstream_path,
                     auth_token_id.as_deref(),
+                    use_api_rebalance,
+                    api_routing_key.as_deref(),
+                    http_project_id.as_deref(),
                     &method,
                     &path,
                     options,
                     &headers,
                     true,
+                    Some(&client_ip),
                 )
                 .await
         }
@@ -1060,8 +1383,12 @@ async fn proxy_tavily_http_endpoint(
                                 subject,
                                 analysis.api_key_id.as_deref(),
                                 analysis.failure_kind.as_deref(),
-                                Some(analysis.key_effect.code.as_str()),
-                                analysis.key_effect.summary.as_deref(),
+                                Some(resp.key_effect_code.as_str()),
+                                resp.key_effect_summary.as_deref(),
+                                Some(resp.binding_effect_code.as_str()),
+                                resp.binding_effect_summary.as_deref(),
+                                Some(resp.selection_effect_code.as_str()),
+                                resp.selection_effect_summary.as_deref(),
                                 resp.request_log_id,
                             )
                             .await
@@ -1081,8 +1408,12 @@ async fn proxy_tavily_http_endpoint(
                                 credits,
                                 analysis.api_key_id.as_deref(),
                                 analysis.failure_kind.as_deref(),
-                                Some(analysis.key_effect.code.as_str()),
-                                analysis.key_effect.summary.as_deref(),
+                                Some(resp.key_effect_code.as_str()),
+                                resp.key_effect_summary.as_deref(),
+                                Some(resp.binding_effect_code.as_str()),
+                                resp.binding_effect_summary.as_deref(),
+                                Some(resp.selection_effect_code.as_str()),
+                                resp.selection_effect_summary.as_deref(),
                                 resp.request_log_id,
                             )
                             .await
@@ -1160,17 +1491,43 @@ async fn proxy_tavily_http_endpoint(
                         analysis.status,
                         billing_error.as_deref(),
                         analysis.failure_kind.as_deref(),
-                        Some(analysis.key_effect.code.as_str()),
-                        analysis.key_effect.summary.as_deref(),
+                        Some(resp.key_effect_code.as_str()),
+                        resp.key_effect_summary.as_deref(),
+                        Some(resp.binding_effect_code.as_str()),
+                        resp.binding_effect_summary.as_deref(),
+                        Some(resp.selection_effect_code.as_str()),
+                        resp.selection_effect_summary.as_deref(),
                         resp.request_log_id,
                     )
                     .await;
             }
+            state
+                .proxy
+                .finalize_business_calls_1h_reservation_from_status(
+                    business_calls_reservation.take(),
+                    analysis.status,
+                    resp.request_log_id,
+                )
+                .await;
             // Always return the upstream response, even if local billing persistence fails.
             // Returning a 5xx here can trigger client retries and cause duplicate upstream charges.
+            record_rebalance_period_usage(
+                &state,
+                use_api_rebalance,
+                token_id_for_logs.as_deref(),
+                analysis.api_key_id.as_deref(),
+                billing_subject.as_deref(),
+                &resp.body,
+                None,
+            )
+            .await;
             Ok(build_response(resp))
         }
         Err(err) => {
+            state
+                .proxy
+                .release_business_calls_1h_reservation(business_calls_reservation.take())
+                .await;
             eprintln!("tavily http {} proxy error: {err}", config.upstream_path);
             if let Some(tid) = token_id_for_logs.as_deref() {
                 let msg = err.to_string();
@@ -1196,8 +1553,11 @@ async fn proxy_tavily_http_endpoint(
                 | ProxyError::PinnedMcpSessionUnavailable => StatusCode::BAD_GATEWAY,
                 ProxyError::Database(_)
                 | ProxyError::InvalidEndpoint { .. }
+                | ProxyError::LastAdminLoginMethod
                 | ProxyError::QuotaDataMissing { .. }
                 | ProxyError::UsageHttp { .. }
+                | ProxyError::StaleClaim { .. }
+                | ProxyError::Deferred { .. }
                 | ProxyError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 

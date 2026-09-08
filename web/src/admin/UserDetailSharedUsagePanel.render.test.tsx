@@ -1,0 +1,436 @@
+import '../../test/happydom'
+
+import { afterEach, describe, expect, it } from 'bun:test'
+import { Chart as ChartJS } from 'chart.js'
+import { act, type ComponentProps } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+
+import type { AdminUserUsageSeries, AdminUserUsageSeriesKey } from '../api'
+import { ZH } from '../i18n/translations/zh'
+import { ThemeProvider, useTheme } from '../theme'
+import { UserDetailSharedUsagePanel, isBusinessCalls1hStacked } from './UserDetailSharedUsagePanel'
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve
+    reject = innerReject
+  })
+  return { promise, resolve, reject }
+}
+
+async function flushEffects(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+}
+
+function abortError(): Error {
+  try {
+    return new DOMException('Aborted', 'AbortError') as Error
+  } catch {
+    const error = new Error('Aborted')
+    error.name = 'AbortError'
+    return error
+  }
+}
+
+interface AbortableSeriesRequest {
+  signal: AbortSignal
+  deferred: ReturnType<typeof deferred<AdminUserUsageSeries>>
+}
+
+function createAbortableLoader() {
+  const requests: Partial<Record<AdminUserUsageSeriesKey, AbortableSeriesRequest[]>> = {}
+
+  const loadSeries: ComponentProps<typeof UserDetailSharedUsagePanel>['loadSeries'] = (series, signal) => {
+    const request = { signal, deferred: deferred<AdminUserUsageSeries>() }
+    requests[series] = [...(requests[series] ?? []), request]
+    signal.addEventListener(
+      'abort',
+      () => {
+        request.deferred.reject(abortError())
+      },
+      { once: true },
+    )
+    return request.deferred.promise
+  }
+
+  return {
+    loadSeries,
+    requests,
+  }
+}
+
+function buildEmptySeries(limit: number): AdminUserUsageSeries {
+  return {
+    kind: 'quotaLike',
+    limit,
+    points: [{ bucketStart: 1_776_200_400, value: null, limitValue: null }],
+  }
+}
+
+interface MountedPanel {
+  container: HTMLDivElement
+  root: Root
+}
+
+async function mountPanel(
+  props: Partial<ComponentProps<typeof UserDetailSharedUsagePanel>> = {},
+): Promise<MountedPanel> {
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+
+  await act(async () => {
+    root.render(
+      <ThemeProvider>
+        <UserDetailSharedUsagePanel
+          usersStrings={ZH.admin.users}
+          language="zh"
+          loadSeries={async () => buildEmptySeries(100)}
+          {...props}
+        />
+      </ThemeProvider>,
+    )
+  })
+  await flushEffects()
+
+  return { container, root }
+}
+
+function clickTab(container: HTMLElement, label: string) {
+  const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button[role="radio"]'))
+  const target = buttons.find((button) => button.textContent?.trim() === label)
+  if (!target) {
+    throw new Error(`tab not found: ${label}`)
+  }
+  target.click()
+}
+
+afterEach(() => {
+  document.body.innerHTML = ''
+  document.documentElement.classList.remove('dark')
+  document.documentElement.style.colorScheme = ''
+  window.localStorage.clear()
+})
+
+describe('UserDetailSharedUsagePanel tab presentation', () => {
+  it('orders windows from shortest to longest while keeping business 1h as the default active series', async () => {
+    const { container, root } = await mountPanel()
+
+    const labels = Array.from(container.querySelectorAll<HTMLButtonElement>('button[role="radio"]'))
+      .map((button) => button.textContent?.trim())
+
+    expect(labels).toEqual([
+      ZH.admin.users.detail.sharedUsageTabs.fiveMinute,
+      ZH.admin.users.detail.sharedUsageTabs.businessOneHour,
+      ZH.admin.users.detail.sharedUsageTabs.daily,
+      ZH.admin.users.detail.sharedUsageTabs.monthly,
+      ZH.admin.users.detail.sharedUsageTabs.ip,
+    ])
+    expect(container.querySelector<HTMLElement>('.admin-user-shared-usage-panel')?.dataset.activeSeries).toBe('businessCalls1h')
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+})
+
+describe('UserDetailSharedUsagePanel loading behavior', () => {
+  it('renders the IP tab with timeline and 24h/7d unique address lists without loading a quota series', async () => {
+    let loadAttempts = 0
+    const { container, root } = await mountPanel({
+      ipTimeline: [
+        {
+          ipAddress: '203.0.113.7',
+          firstSeenAt: 1_700_000_000,
+          lastSeenAt: 1_700_003_600,
+          requestCount: 12,
+        },
+      ],
+      ipAddresses24h: ['203.0.113.7'],
+      ipAddresses7d: ['203.0.113.7', '198.51.100.10'],
+      loadSeries: (series, signal) => {
+        void series
+        void signal
+        loadAttempts += 1
+        return Promise.resolve(buildEmptySeries(100))
+      },
+    })
+
+    await act(async () => {
+      clickTab(container, ZH.admin.users.detail.sharedUsageTabs.ip)
+      await Promise.resolve()
+    })
+
+    expect(container.querySelector<HTMLElement>('.admin-user-shared-usage-panel')?.dataset.activeSeries).toBe('ip')
+    expect(container.querySelector('.admin-user-ip-gantt-chart')).not.toBeNull()
+    expect(container.querySelector('.admin-user-ip-gantt-chart canvas')).not.toBeNull()
+    expect(container.textContent).toContain('203.0.113.7')
+    expect(container.textContent).toContain(ZH.admin.users.detail.ipUsage24hTitle)
+    expect(container.textContent).toContain(ZH.admin.users.detail.ipUsage7dTitle)
+    expect(loadAttempts).toBe(1)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('keeps an in-flight tab request usable after switching away and back', async () => {
+    const loader = createAbortableLoader()
+    const { container, root } = await mountPanel({ loadSeries: loader.loadSeries })
+
+    expect(loader.requests.businessCalls1h?.length).toBe(1)
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageLoading)
+
+    await act(async () => {
+      clickTab(container, ZH.admin.users.detail.sharedUsageTabs.fiveMinute)
+    })
+    await flushEffects()
+
+    expect(loader.requests.rate5m?.length).toBe(1)
+    expect(loader.requests.businessCalls1h?.[0]?.signal.aborted).toBe(false)
+
+    await act(async () => {
+      clickTab(container, ZH.admin.users.detail.sharedUsageTabs.businessOneHour)
+    })
+    await flushEffects()
+
+    expect(loader.requests.businessCalls1h?.length).toBe(1)
+    loader.requests.businessCalls1h?.[0]?.deferred.resolve(buildEmptySeries(120))
+    await flushEffects()
+
+    expect(container.textContent).not.toContain(ZH.admin.users.detail.sharedUsageLoading)
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageEmpty)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('keeps missing historical limit snapshots out of the always-visible copy', async () => {
+    const { container, root } = await mountPanel({
+      loadSeries: async () => ({
+        kind: 'quotaLike',
+        limit: 120,
+        points: [{ bucketStart: 1_776_200_400, value: 36, limitValue: null }],
+      }),
+    })
+
+    expect(container.textContent).not.toContain(ZH.admin.users.detail.sharedUsagePartialHint)
+    expect(container.textContent).not.toContain('· 120')
+    expect(container.textContent).not.toContain(ZH.admin.users.detail.sharedUsageEmpty)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('renders the business 1h legend with success, failure, pressure, and limit labels', async () => {
+    const { container, root } = await mountPanel({
+      loadSeries: async () => ({
+        kind: 'businessCalls1h',
+        limit: 120,
+        points: [
+          {
+            bucketStart: 1_776_200_400,
+            bars: { success: 5, failure: 1 },
+            pressure: 24,
+            limitValue: 120,
+          },
+        ],
+      }),
+    })
+
+    const legendText = container.querySelector('.admin-user-shared-usage-legend')?.textContent ?? ''
+    expect(legendText).toContain(ZH.admin.users.detail.sharedUsageLegendSuccess)
+    expect(legendText).toContain(ZH.admin.users.detail.sharedUsageLegendFailure)
+    expect(legendText).toContain(ZH.admin.users.detail.sharedUsageLegendPressure)
+    expect(legendText).toContain(ZH.admin.users.detail.sharedUsageLegendLimit)
+    expect(container.textContent).not.toContain(ZH.admin.users.detail.sharedUsageEmpty)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('keeps business pressure and limit lines out of the stacked bar totals', async () => {
+    const { container, root } = await mountPanel({
+      loadSeries: async () => ({
+        kind: 'businessCalls1h',
+        limit: 120,
+        points: [
+          {
+            bucketStart: 1_776_200_400,
+            bars: { success: 5, failure: 1 },
+            pressure: 24,
+            limitValue: 120,
+          },
+          {
+            bucketStart: 1_776_200_700,
+            bars: { success: 4, failure: 0 },
+            pressure: 24,
+            limitValue: 120,
+          },
+        ],
+      }),
+    })
+
+    const canvas = container.querySelector('canvas')
+    expect(canvas).not.toBeNull()
+    const chart = canvas ? ChartJS.getChart(canvas) : undefined
+    expect(chart).toBeDefined()
+
+    const stacks = chart?.data.datasets.map((dataset) => dataset.stack)
+    expect(stacks).toEqual([
+      'business-bars',
+      'business-bars',
+      'business-pressure-line',
+      'business-limit-line',
+    ])
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('refetches the active series after the backing user detail refreshes', async () => {
+    const firstLoader = createAbortableLoader()
+    const secondLoader = createAbortableLoader()
+    const { container, root } = await mountPanel({ loadSeries: firstLoader.loadSeries })
+
+    expect(firstLoader.requests.businessCalls1h?.length).toBe(1)
+    firstLoader.requests.businessCalls1h?.[0]?.deferred.resolve(buildEmptySeries(120))
+    await flushEffects()
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageEmpty)
+
+    await act(async () => {
+      root.render(
+        <ThemeProvider>
+          <UserDetailSharedUsagePanel
+            key="after-refresh"
+            usersStrings={ZH.admin.users}
+            language="zh"
+            loadSeries={secondLoader.loadSeries}
+          />
+        </ThemeProvider>,
+      )
+    })
+    await flushEffects()
+
+    expect(secondLoader.requests.businessCalls1h?.length).toBe(1)
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageLoading)
+
+    secondLoader.requests.businessCalls1h?.[0]?.deferred.resolve(buildEmptySeries(200))
+    await flushEffects()
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageEmpty)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('settles into an error state without retrying forever and lets the operator retry manually', async () => {
+    let attempts = 0
+    const { container, root } = await mountPanel({
+      loadSeries: async () => {
+        attempts += 1
+        if (attempts === 1) {
+          throw new Error('boom')
+        }
+        return buildEmptySeries(100)
+      },
+    })
+
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageLoadFailed)
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageRetryAction)
+    expect(attempts).toBe(1)
+
+    await flushEffects()
+    await flushEffects()
+
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageLoadFailed)
+    expect(attempts).toBe(1)
+
+    const retryButton = Array.from(container.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === ZH.admin.users.detail.sharedUsageRetryAction,
+    )
+    expect(retryButton).toBeDefined()
+
+    await act(async () => {
+      retryButton?.click()
+    })
+    await flushEffects()
+
+    expect(attempts).toBe(2)
+    expect(container.textContent).toContain(ZH.admin.users.detail.sharedUsageEmpty)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+})
+
+describe('UserDetailSharedUsagePanel theme behavior', () => {
+  it('refreshes its theme-bound chart state when the admin theme changes', async () => {
+    function ThemeHarness(): JSX.Element {
+      const { setMode } = useTheme()
+      return (
+        <>
+          <button type="button" onClick={() => setMode('dark')}>
+            toggle-dark
+          </button>
+          <UserDetailSharedUsagePanel
+            usersStrings={ZH.admin.users}
+            language="zh"
+            loadSeries={async () => buildEmptySeries(100)}
+          />
+        </>
+      )
+    }
+
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+
+    await act(async () => {
+      root.render(
+        <ThemeProvider>
+          <ThemeHarness />
+        </ThemeProvider>,
+      )
+    })
+    await flushEffects()
+
+    const panel = container.querySelector<HTMLElement>('.admin-user-shared-usage-panel')
+    const toggle = Array.from(container.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent === 'toggle-dark',
+    )
+    expect(panel?.dataset.resolvedTheme).toBe('light')
+    expect(toggle).toBeDefined()
+
+    await act(async () => {
+      toggle?.click()
+    })
+    await flushEffects()
+
+    expect(panel?.dataset.resolvedTheme).toBe('dark')
+    expect(document.documentElement.classList.contains('dark')).toBe(true)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+})
+
+describe('UserDetailSharedUsagePanel business chart config', () => {
+  it('treats the business 1h chart as stacked on both axes', () => {
+    expect(isBusinessCalls1hStacked('businessCalls1h')).toBe(true)
+    expect(isBusinessCalls1hStacked('quota1h')).toBe(false)
+    expect(isBusinessCalls1hStacked('rate5m')).toBe(false)
+  })
+})

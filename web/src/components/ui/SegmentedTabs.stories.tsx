@@ -18,7 +18,7 @@ const meta = {
       { value: 'all', label: '全部' },
       { value: 'success', label: '成功' },
       { value: 'error', label: '错误' },
-      { value: 'quota_exhausted', label: '额度耗尽' },
+      { value: 'quota_exhausted', label: '限额' },
     ] as ReadonlyArray<SegmentedTabsOption<DemoValue>>,
     onChange: () => undefined,
   },
@@ -51,7 +51,7 @@ export const RequestResult: Story = {
       { value: 'all', label: '全部' },
       { value: 'success', label: '成功' },
       { value: 'error', label: '错误' },
-      { value: 'quota_exhausted', label: '额度耗尽' },
+      { value: 'quota_exhausted', label: '限额' },
     ],
   },
 }
@@ -66,5 +66,21 @@ export const JobType: Story = {
       { value: 'usage', label: '用量聚合' },
       { value: 'logs', label: '清理日志' },
     ],
+  },
+}
+
+export const MobileButtons: Story = {
+  args: {
+    ariaLabel: '移动端按钮分段',
+    value: 'all',
+    smallViewportBehavior: 'buttons',
+    options: [
+      { value: 'all', label: 'Any' },
+      { value: 'success', label: 'Paid' },
+      { value: 'error', label: 'Free' },
+    ],
+  },
+  parameters: {
+    viewport: { defaultViewport: 'mobile1' },
   },
 }
